@@ -1,0 +1,559 @@
+name: New Firewall Rule Added Via Netsh.EXE
+id: 731bcf2d-2570-41f3-8751-068dbb0a55ed
+description: |
+  Detects netsh.exe (matched by image name or original filename) run with a command line containing both "firewall" and "add", which creates a new Windows Defender Firewall rule, excluding the known-good Dropbox inbound-rule case. Adding a firewall rule opens the host's network controls — an inbound allow rule for a port or program exposes a service to remote access, commonly used to enable RDP, a reverse shell listener, or command-and-control before lateral movement. Administrators and software installers also add firewall rules legitimately, so the investigation should decode exactly which rule was created and what it permits, confirm what process launched netsh, and look for the inbound access the rule enabled along with other defense tampering and persistence.
+type: detection
+detection_id: cd5cfd80-aa5f-44c0-9c20-108c4ae12e3c
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-03
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does this match the rule — netsh.exe adding a firewall rule?
+  context: Confirm the alert before investing time. The rule fires when the image (or original filename) is netsh.exe and the command line contains both "firewall" and "add", with the known-good Dropbox inbound rule excluded. Read the full command line and identify the exact rule that was created — its name, direction, action, and the port or program it allows are what determine the impact.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- source: template:defense_tampering.what_was_disabled
+  question: Which firewall rule was added, and what does it permit?
+  context: The impact is in the rule. An inbound allow rule for a port or program exposes a service to remote access — a rule opening 3389 enables RDP, one allowing a custom program permits a backdoor or listener, and dir=in action=allow on a broad profile widens exposure. Read the rule name, direction, action, port, and program in the command line to determine what was opened and to whom, and set the investigation priority.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to add firewall rules?
+  context: Administrators and software installers legitimately add firewall rules during configuration and setup, so the question is whether this account and host have a reason to. A documented admin change or a known installer differs from a standard user account, or an unexpected service principal, opening an inbound rule — the latter is the access-enabling pattern.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.process_chain
+  question: What process spawned this netsh, and is that parent chain expected?
+  context: A firewall change from an installer (msiexec, a setup executable) or an interactive admin shell is routine; the same netsh spawned by a script (cmd or powershell running a .bat), by a remote-execution tool, or by an Office application points to automated, hands-on configuration of remote access. If the netsh add shares a parent with other tampering or access-enabling commands, that parent is the operator's script — its command line and origin are central to scoping the activity.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:defense_tampering.activity_after_tampering
+  question: What activity occurred on this host after the firewall rule was added?
+  context: A rule is opened to allow something — an inbound RDP session, a connection to a newly started listener, or a remote-management tool. Examining what executed in the window after the change reveals what it enabled. A listener process starting, a remote-access tool, or a fresh inbound connection on the opened port shortly after the rule was added points to the access the change was meant to grant.
+  range: +1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - User
+- source: template:defense_tampering.other_tampering_activity
+  question: Were other defense-tampering actions performed on this host?
+  context: Operators who open the firewall for access usually pair it with other changes — disabling antivirus, stopping logging, or removing protective rules — to clear the path. This surfaces other tampering tools and verbs on the host around the alert. Multiple tampering actions sharing the same user or parent process confirm a coordinated operation rather than an isolated administrative change.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_tamper:
+        Image|endswith:
+          - '\wevtutil.exe'
+          - '\vssadmin.exe'
+          - '\bcdedit.exe'
+          - '\wbadmin.exe'
+          - '\netsh.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\powershell.exe'
+        CommandLine|contains:
+          - 'cl '
+          - 'clear-log'
+          - 'delete shadows'
+          - 'recoveryenabled'
+          - 'DisableRealtimeMonitoring'
+          - 'advfirewall'
+          - 'stop'
+          - 'delete'
+      condition: selection and selection_tamper
+    fields:
+      - Image
+      - User
+- source: attack:T1562.004.registry_firewall
+  question: Was the firewall changed through the registry rather than netsh?
+  context: Firewall rules and policy live under HKLM\SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy, so a rule can be added or the firewall reconfigured by editing the registry directly, bypassing the netsh command this rule watches. Reviewing registry changes to the firewall policy on this host around the alert catches a registry-based change that would otherwise be missed and shows whether the netsh add was part of a wider firewall reconfiguration.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|contains: '\SharedAccess\Parameters\FirewallPolicy'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+- source: template:lolbin.renamed_binary_check
+  question: Was netsh.exe executed from its expected System32 path, and is it the genuine signed binary?
+  context: The genuine netsh.exe is a signed Microsoft binary under System32 / SysWOW64. A copy running from a user temp directory, ProgramData, or another non-standard path — or one whose original filename is not netsh.exe — suggests the binary was staged to dodge path-based allowlists, which raises the priority of an otherwise routine-looking firewall command.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- source: template:lolbin.historical_lolbin_baseline
+  question: How often has this host added firewall rules with netsh over the past 90 days, and what command shapes are typical?
+  context: A firewall-rule addition with no prior history on a host is more notable than one that recurs under a stable configuration or deployment routine. This mirrors the rule's exact pattern scoped to this host, so the count reflects the rule's specific firing, and the command-line projection lets you compare the historical rule names, ports, and programs against the alerting one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \netsh.exe
+      - OriginalFileName: netsh.exe
+      selection_cli:
+        CommandLine|contains|all:
+        - ' firewall '
+        - ' add '
+      filter_optional_dropbox:
+        CommandLine|contains:
+        - advfirewall firewall add rule name=Dropbox dir=in action=allow "program=?:\Program Files (x86)\Dropbox\Client\Dropbox.exe" enable=yes profile=Any
+        - advfirewall firewall add rule name=Dropbox dir=in action=allow "program=?:\Program Files\Dropbox\Client\Dropbox.exe" enable=yes profile=Any
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_* and not 1 of filter_optional_*) and _pb_scope
+    fields:
+    - CommandLine
+- source: template:universal.endpoint_protection_health
+  question: Were tamper attempts against endpoint protection seen on this host in the hour before the alert?
+  context: Opening the firewall for access is often paired with weakening other defenses. This surfaces direct attempts to disable AV/EDR services, flip Defender settings, add broad exclusions, clear logs, or patch AMSI/ETW. Zero rows is a useful "the rest of protection looks healthy" signal — kernel-level driver tampering and in-memory patches will not appear here. Populated rows confirm a coordinated tampering operation; review the writing process and its signing chain.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+- source: template:persistence_scope.process_based_persistence
+  question: Were process-based persistence mechanisms installed on this host around this time?
+  context: Opening the firewall for inbound access is often paired with establishing a foothold to receive that access. This surfaces persistence tool executions — schtasks, sc, reg, at, bitsadmin, wmic — clustered around the alert. Multiple persistence installations in the same window indicate intentional staging rather than an isolated firewall change, and identify footholds to remediate.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_user_actor.baseline
+  question: Does this user normally modify firewall rules across the environment?
+  context: Compare this user's current action against their historical pattern. A user who has never managed the firewall is more notable than an administrator or service account that does so routinely. This pivot is meaningful only when a real user account fired the alert; the launch-mechanism baseline alongside it carries the answer when the actor is a service or computer account.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent-and-netsh combination historically routine on this host or across the environment?
+  context: When the alert fires under a service or computer account, user identity does not attribute behavior, so the meaningful baseline is the launch mechanism — which parent process spawned netsh, and whether that pairing is historically common. A new or rare parent (a script interpreter or remote-execution tool where none was seen before) is the deviation worth chasing; a pairing that already accounts for many prior events points to a configuration or deployment routine.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts in a tight window reveals lateral movement or activity spanning multiple endpoints. If the same user opened firewalls or ran tooling on other hosts in the same window, the scope is a network-wide operation. This pivot is meaningful only when a real user account fired the alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this parent-and-netsh combination fire on other hosts in the same window?
+  context: Under a service or computer account, asking what else the user did returns agent-telemetry noise. The meaningful question is whether the same launch mechanism — this parent spawning netsh — fired on other hosts in the alert window. Multiple hosts at once points to a scripted firewall change pushed across the environment; a single host points to a host-local action.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_process_tool.scope
+  question: Have other hosts added firewall rules via netsh in the past week, and does the distribution look like automation or one-off activity?
+  context: This mirrors the rule's pattern with no host scope, giving a fleet-wide count of where firewall-rule additions fired. Many hosts at once points to a configuration push or deployment routine; one host or a small unrelated set points to manual or targeted access-enabling. Use the distribution to judge how unusual this single alert is.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \netsh.exe
+      - OriginalFileName: netsh.exe
+      selection_cli:
+        CommandLine|contains|all:
+        - ' firewall '
+        - ' add '
+      filter_optional_dropbox:
+        CommandLine|contains:
+        - advfirewall firewall add rule name=Dropbox dir=in action=allow "program=?:\Program Files (x86)\Dropbox\Client\Dropbox.exe" enable=yes profile=Any
+        - advfirewall firewall add rule name=Dropbox dir=in action=allow "program=?:\Program Files\Dropbox\Client\Dropbox.exe" enable=yes profile=Any
+      condition: all of selection_* and not 1 of filter_optional_*
+    fields:
+    - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — reconnaissance, credential access, a download cradle, or other defense tampering — may reveal the intrusion stage this firewall change belongs to and help reconstruct the timeline. Opening an inbound rule often sits just before remote access or lateral movement, so what follows is as important as what came before.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1562.004
+      name: Impair Defenses - Disable or Modify System Firewall
+      role: primary
+  attack_chain_coverage:
+    - stage: 1
+      label: firewall_rule_addition
+      description: "netsh adds a firewall rule (the rule trigger)"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 1
+      label: rule_decode
+      description: "Identify which rule was created and what it permits"
+      mapped_to: Q2
+      source: template:defense_tampering.what_was_disabled
+    - stage: 2
+      label: enabled_access
+      description: "The inbound access the new rule was meant to allow (RDP, listener, C2)"
+      mapped_to: Q5
+      source: template:defense_tampering.activity_after_tampering
+  dimension_coverage:
+    - dimension: process_identification
+      technique: T1562.004
+      covered_by: Q1
+      source: template:universal.verify_trigger_match
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1562.004
+      covered_by: Q5
+      source: template:defense_tampering.activity_after_tampering
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1562.004
+      covered_by: Q2
+      source: template:defense_tampering.what_was_disabled
+      coverage_type: direct
+  mutable_dispositions:
+    - element: firewall_rule_target
+      dimension: tuning_parameter
+      specific_values: "the added rule name, port, program, direction, and action"
+      disposition: context
+      target_question: Q2
+      notes: "what_was_disabled (Q2) directs the analyst to the exact rule and what inbound access it permits."
+    - element: post_change_window
+      dimension: time_correlation
+      specific_values: "+1h activity after the addition"
+      disposition: query_injection
+      target_question: Q5
+      notes: "activity_after_tampering (Q5) uses a forward window to surface the inbound access or listener the rule enabled."
+    - element: registry_path_variant
+      dimension: process_identification
+      specific_values: "HKLM\\SYSTEM\\CurrentControlSet\\Services\\SharedAccess\\Parameters\\FirewallPolicy"
+      disposition: query_injection
+      target_question: Q7
+      notes: "registry_firewall (Q7) catches a registry-based firewall change that bypasses the netsh command the rule detects."
+  dedup_decisions:
+    - dropped: cue_process_tool.mechanism_decode
+      reason: "Brief hint 'defense_tampering.what_was_disabled replaces cue_process_tool.mechanism_decode'. The decode is filled by what_was_disabled (Q2)."
+      kept: template:defense_tampering.what_was_disabled
+    - dropped: cue_process_tool.baseline
+      reason: "Generic host+Image frequency of netsh is subsumed by the rule-specific host-pattern baseline (Q9), which counts only the firewall-add pattern."
+      kept: template:lolbin.historical_lolbin_baseline
+    - dropped: cue_process_tool.baseline_deviation
+      reason: "REFLECTED host-pattern baseline duplicating lolbin.historical_lolbin_baseline (Q9); kept the lolbin version (must_include)."
+      kept: template:lolbin.historical_lolbin_baseline
+    - dropped: cue_process_tool.follow_on
+      reason: "netsh rarely spawns children; the post-addition activity that matters is host-wide and forward-looking, covered by activity_after_tampering (Q5)."
+      kept: template:defense_tampering.activity_after_tampering
+    - dropped: cue_process_tool.clustering
+      reason: "Host-wide tool clustering overlaps other_tampering_activity (Q6), activity_after_tampering (Q5), and precursor (Q16)."
+      kept: cue_host_context.precursor
+    - dropped: cue_host_context.clustering
+      reason: "Surrounding host activity is reached via Q5, Q6, the persistence sweep (Q11), and precursor (Q16); avoided a near-duplicate broad host-scope aggregation."
+      kept: cue_host_context.precursor
+  skipped_templates:
+    - template: defense_tampering.protection_status
+      reason: "The relevant follow-up for an added rule is what access it enabled (Q5) and whether the registry was also touched (Q7), not a binary 'is protection restored' check; remediation is to remove the rule."
+    - template: lolbin.technique_class_lateral
+      reason: "The LOLBin hint's 'other LOLBins' angle is lower value than the tampering, registry, and persistence questions for a firewall-opening rule; renamed_binary_check (Q8) covers the path-integrity half of the hint."
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "defense_tampering.what_was_disabled replaces cue_process_tool.mechanism_decode"
+      disposition: acted_on
+      reason: "what_was_disabled is included as Q2 (reframed to identify the rule added and what it permits); cue_process_tool.mechanism_decode is recorded under dedup_decisions."
+    - hint: "defense_tampering → persistence_scope cascade activated"
+      disposition: acted_on
+      reason: "persistence_scope.process_based_persistence is included as Q11 to catch a foothold installed alongside opening the firewall."
+    - hint: "LOLBin rule — check for renamed binary and other LOLBins achieving same objective"
+      disposition: acted_on
+      reason: "lolbin.renamed_binary_check (Q8) checks netsh's path integrity; lolbin.technique_class_lateral is recorded as skipped — lower value than the tampering questions for this rule."
+    - hint: >-
+        logsource 'registry_set' (recommended by techniques: T1562.004) is not covered — pull in cue_registry_key.* or author
+        a custom question with `category: registry_set`
+      disposition: acted_on
+      reason: >-
+        Authored Q7 (attack:T1562.004.registry_firewall, category: registry_set),
+        which catches a firewall change made by editing the SharedAccess
+        FirewallPolicy registry keys directly — the registry-based equivalent of
+        the netsh add, which this process-creation rule would otherwise miss.
+  contextual_sets:
+    included: []
+    excluded:
+      - id: data_staging_exfil
+        confidence: low
+        reason: "Match is on an incidental 'staging' keyword in the references. This rule adds a firewall rule (defense evasion / enabling access); it does not collect or stage data for exfiltration, so data-staging questions would not fit what the rule fires on."
+  technique_sets_applied:
+    - universal
+    - defense_tampering
+    - lolbin
+    - persistence_scope
+  user_actor_pairs:
+    - reason: "user_actor pair — non-deduplicable (baseline): Q12 pivots on user identity, Q13 on launch mechanism (parent+netsh)"
+    - reason: "user_actor pair — non-deduplicable (clustering): Q14 pivots on user identity, Q15 on launch mechanism (parent+netsh)"
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 16
+      attack: 1
+      llm_generated: 0
+    phase_distribution:
+      triage: 1
+      analysis: 1
+      context: 15
+    logsource_diversity:
+      process_creation: 15
+      registry_set: 1
+      sigma_alert: 1

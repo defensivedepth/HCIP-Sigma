@@ -1,0 +1,467 @@
+name: Rundll32 Spawned Via Explorer.EXE
+id: e718d5b0-dc5f-4870-a0d4-4af7972e81fb
+description: |
+  Detects rundll32.exe (matched by image name or original filename) launched directly by explorer.exe, excluding the benign cases where it runs a DLL from C:\Windows\System32\ or registers the known shell -localserver COM object. explorer.exe spawns rundll32 routinely for shell and Control Panel actions that load System32 DLLs; once those are filtered out, an explorer-launched rundll32 loading a DLL from somewhere else is unusual and has been observed delivering malware — a user double-clicking a malicious shortcut or file (for example a USB-borne worm) causes the shell to run rundll32 against an attacker DLL on removable, network, or temporary storage. The investigation should decode which DLL and export rundll32 ran and from what path, establish what the user opened in explorer to trigger it, and trace the module load and what executed next.
+type: detection
+detection_id: 1723e720-616d-4ddc-ab02-f7e3685a4713
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-03
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does this match the rule — rundll32.exe launched by explorer.exe and not loading a System32 DLL?
+  context: Confirm the alert before investing time. The rule fires when the parent is explorer.exe and the image (or original filename) is rundll32.exe, with the benign cases excluded — a command line referencing C:\Windows\System32\ or ending in the shell -localserver COM GUID. Read the full command line and confirm rundll32 is loading a DLL from outside System32; the path it points to (a temp folder, a network share, or a removable drive letter) is the first strong signal.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - OriginalFileName
+- source: template:cue_process_tool.mechanism_decode
+  question: Which DLL and export did rundll32 run, and from what path?
+  context: Decode rundll32's full command line. Recover the DLL it loaded, the exported function or ordinal it called, and — most importantly — where the DLL lives. A DLL under a user temp directory, AppData, a network share, or a removable drive (a bare drive letter) is the delivery signal; a registered ordinal with no readable name, or a path with unusual casing or spacing, points to obfuscation. This classification drives the priority of the alert.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:parent_child.parent_process_legitimacy
+  question: What did the user open in explorer that caused it to spawn rundll32?
+  context: explorer.exe spawns rundll32 in response to a user action — double-clicking a file, a shortcut, or a Control Panel item. The explorer parent's context and the surrounding shell activity reveal what was opened. A malicious .lnk or a disguised file on removable or network media is a common trigger for this chain, so establishing what the user interacted with just before the spawn is central to deciding whether this was a deliberate launch of attacker content.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to launch DLLs through rundll32 from the shell?
+  context: Most users never knowingly run rundll32 against a non-System32 DLL. Knowing whether this user's role and host function involve software or admin workflows that legitimately do so helps separate an unusual but sanctioned action from delivery of attacker content. A developer or IT host differs from a standard user endpoint where this chain is anomalous.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: llm_generated
+  question: Did rundll32 load a DLL from a user-writable or temp location?
+  context: Confirming the actual module load corroborates the command line and catches cases where the path is obfuscated. A DLL loaded by this rundll32 instance from a temp, AppData, ProgramData, or public path — rather than from System32 — is the attacker-content signal. Where the DLL was delivered from removable or network media, that path shows in the command line; this question pins down the load from disk and any additional modules the payload pulled in.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+        ImageLoaded|contains:
+          - '\AppData\Local\Temp\'
+          - '\AppData\Roaming\'
+          - '\Windows\Temp\'
+          - '\Users\Public\'
+          - '\ProgramData\'
+      condition: selection
+    fields:
+      - ImageLoaded
+- source: llm_generated
+  question: What child processes did this rundll32 spawn afterward?
+  context: The DLL rundll32 loaded reveals its purpose through what it launches next. Children of this rundll32 instance — a new cmd.exe or powershell.exe, a dropped binary, reconnaissance commands, or a network tool — turn a module load into a follow-on stage. A worm-style loader often spawns further copies of itself or additional rundll32 invocations, so the child activity is where intent becomes clear.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:lolbin.technique_class_lateral
+  question: Were other proxy-execution or download LOLBins used on this host recently?
+  context: Operators who proxy execution through one signed binary usually use several. Alongside rundll32, look for the other proxy-execution binaries (regsvr32, mshta, msbuild, installutil, msiexec, cmstp) and download tools (certutil, bitsadmin, curl) that fetch or run a payload. Several of these in the same day on the same host strengthens the case that the explorer-launched rundll32 was one step in a delivery chain rather than a stray shell action.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_img:
+        Image|endswith:
+          - '\regsvr32.exe'
+          - '\mshta.exe'
+          - '\msbuild.exe'
+          - '\installutil.exe'
+          - '\msiexec.exe'
+          - '\cmstp.exe'
+          - '\certutil.exe'
+          - '\bitsadmin.exe'
+          - '\curl.exe'
+          - '\forfiles.exe'
+          - '\pcalua.exe'
+      condition: selection and selection_img
+    fields:
+      - Image
+      - CommandLine
+- source: template:lolbin.renamed_binary_check
+  question: Was rundll32.exe executed from its expected System32 / SysWOW64 path, and is it the genuine signed binary?
+  context: The genuine rundll32.exe is a signed Microsoft binary under System32 / SysWOW64. A copy running from a user temp directory, ProgramData, a network share, or a removable drive — or one whose original filename is not RUNDLL32.EXE — suggests the binary was staged alongside the payload to dodge path-based allowlists, which raises the priority of the alert.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- source: template:lolbin.historical_lolbin_baseline
+  question: How often has explorer spawned a non-System32 rundll32 on this host over the past 90 days, and what command shapes are typical?
+  context: An explorer-launched rundll32 loading a non-System32 DLL with no prior history on a host is more notable than one that recurs under a stable application. This mirrors the rule's exact pattern scoped to this host, so the count reflects the rule's specific firing (not all rundll32 usage), and the command-line projection lets you compare the historical DLL paths and exports against the alerting one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_parent:
+        ParentImage|endswith: \explorer.exe
+      selection_img:
+      - Image|endswith: \rundll32.exe
+      - OriginalFileName: RUNDLL32.EXE
+      filter_main_generic:
+      - CommandLine|contains: ' C:\Windows\System32\'
+      - CommandLine|endswith: ' -localserver 22d8c27b-47a1-48d1-ad08-7da7abd79617'
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_* and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - CommandLine
+- source: template:cue_parent_process.baseline
+  question: Does explorer normally spawn rundll32 this way on this host?
+  context: explorer launches rundll32 constantly for shell and Control Panel actions, but those load System32 DLLs and are filtered out. This counts how often the explorer-to-rundll32 pairing has fired the rule's pattern here historically; zero or very low counts mean a novel and suspicious spawning relationship, while a recurring count may reflect a specific application that drives the shell this way.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in the hour before the alert?
+  context: Delivery of attacker content is often preceded by disabling protection. This surfaces direct attempts to disable AV/EDR services, flip Defender settings, add broad exclusions, clear logs, or patch AMSI/ETW. Zero rows is a useful "protection looks healthy" signal — kernel-level driver tampering and in-memory patches will not appear here. Populated rows shift the disposition toward operator preparation; review the writing process and its signing chain.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run rundll32 across the environment?
+  context: Compare this user's current action against their historical pattern. This counts the user's rundll32 executions broadly rather than the specific explorer-launched pattern, so read it as a coarse baseline — a user with little rundll32 history is more notable than an admin or a host running software that drives it. This pivot is meaningful only when a real user account fired the alert.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this explorer-and-rundll32 launch combination historically routine on this host or across the environment?
+  context: When the alert fires under a service or computer account, user identity does not attribute behavior, so the meaningful baseline is the launch mechanism — explorer spawning rundll32 in this way, and whether that pairing is historically common against the rule's pattern. A new or rare occurrence is the deviation worth chasing; a recurring one points to a specific application.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts in a tight window reveals lateral movement or activity spanning multiple endpoints. If the same user opened or ran similar content on other hosts in the same window, the scope is larger than a single machine — relevant for a USB-borne or share-delivered loader. This pivot is meaningful only when a real user account fired the alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this explorer-and-rundll32 combination fire on other hosts in the same window?
+  context: Under a service or computer account, asking what else the user did returns agent-telemetry noise. The meaningful question is whether the same launch mechanism — explorer spawning rundll32 — fired on other hosts in the alert window. Multiple hosts at once points to a worm or a payload spread across the environment; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — removable-media activity, a download, defense tampering, or reconnaissance — may reveal how the DLL arrived and help reconstruct the timeline that led to the shell launching rundll32 against it.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: false
+  techniques: []
+  attack_chain_coverage: []
+  dimension_coverage: []
+  mutable_dispositions: []
+  dedup_decisions:
+    - dropped: cue_process_tool.process_chain
+      reason: "Brief hint 'parent_process is primary — drop cue_process_tool:process_chain'. The parent (explorer) analysis is covered by parent_process_legitimacy (Q3)."
+      kept: template:parent_child.parent_process_legitimacy
+    - dropped: cue_parent_process.mechanism_decode
+      reason: "Asks why the parent spawned the child; parent_process_legitimacy (Q3) is the more specific must_include parent-analysis question for what the user opened in explorer."
+      kept: template:parent_child.parent_process_legitimacy
+    - dropped: parent_child.sibling_processes
+      reason: "explorer.exe is a long-lived shell whose ParentProcessGuid-scoped children are essentially everything the user launched in the session — too broad to be a useful sibling list. The rundll32's own children are covered by the follow_on question (Q6) and surrounding activity by precursor (Q16)."
+      kept: llm_generated
+    - dropped: cue_parent_process.follow_on
+      reason: "Pivots on the parent name (explorer) host-wide, returning all shell-launched activity; the precise 'what rundll32 spawned' is covered by Q6 (ParentProcessGuid-scoped)."
+      kept: llm_generated
+    - dropped: cue_parent_process.clustering
+      reason: "explorer host-wide activity is noise; surrounding activity is reached via Q6 and the precursor alert timeline (Q16)."
+      kept: cue_host_context.precursor
+    - dropped: cue_parent_process.scope
+      reason: "Cross-host occurrence of the explorer+rundll32 pattern is covered by the service-principal clustering substitute (Q15)."
+      kept: template:cue_user_actor.clustering_svc
+    - dropped: cue_process_tool.baseline
+      reason: "Generic host+Image frequency of rundll32 is subsumed by the rule-specific host-pattern baseline (Q9), which counts only the explorer-launched non-System32 pattern."
+      kept: template:lolbin.historical_lolbin_baseline
+    - dropped: cue_host_context.clustering
+      reason: "Surrounding host activity is reached via the precursor alert question (Q16) and the LOLBin sweep (Q7); avoided a near-duplicate broad host-scope aggregation."
+      kept: cue_host_context.precursor
+  skipped_templates: []
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "parent_process is primary — drop cue_process_tool:process_chain"
+      disposition: acted_on
+      reason: >-
+        cue_process_tool.process_chain is dropped (recorded under dedup_decisions);
+        the parent-analysis slot is parent_child.parent_process_legitimacy (Q3),
+        framed around what the user opened in explorer.
+    - hint: "LOLBin rule — check for renamed binary and other LOLBins achieving same objective"
+      disposition: acted_on
+      reason: >-
+        lolbin.renamed_binary_check (Q8) confirms rundll32 ran from its expected
+        signed path, and lolbin.technique_class_lateral (Q7), adapted to the
+        proxy-execution and download classes, surfaces the broader toolkit
+        (regsvr32, mshta, msbuild, certutil, etc.).
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - parent_child
+    - lolbin
+  user_actor_pairs:
+    - reason: "user_actor pair — non-deduplicable (baseline): Q12 pivots on user identity, Q13 on launch mechanism (explorer+rundll32)"
+    - reason: "user_actor pair — non-deduplicable (clustering): Q14 pivots on user identity, Q15 on launch mechanism (explorer+rundll32)"
+  generation_stats:
+    total_questions: 16
+    source_counts:
+      template: 14
+      attack: 0
+      llm_generated: 2
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 13
+    logsource_diversity:
+      process_creation: 14
+      image_load: 1
+      sigma_alert: 1

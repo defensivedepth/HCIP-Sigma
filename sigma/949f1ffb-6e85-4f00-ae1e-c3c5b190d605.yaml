@@ -1,0 +1,453 @@
+name: Explorer Process Tree Break
+id: d26f0f4a-20f6-4068-81b7-cbb69af3a2ac
+description: |
+  Detects explorer.exe used to deliberately break the process tree, EITHER by invoking the Explorer COM factory CLSID (/factory,{75dff2b7-6936-4c06-a8bb-676a7b00b24b}) OR by launching with the ' /root,' switch. Both forms cause a new explorer instance to spawn the intended process, so the payload appears as a child of explorer.exe rather than of the process that actually launched it — a masquerading and parent-spoofing trick that hides the true lineage and makes attacker activity look like ordinary shell behavior. Because the visible parent is now misleading, the investigation centers on recovering the real process that ran this explorer command, decoding what was launched, and following what the new explorer instance spawned, while confirming the explorer binary itself is genuine.
+type: detection
+detection_id: 949f1ffb-6e85-4f00-ae1e-c3c5b190d605
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-03
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does this match the rule — explorer.exe invoked with the factory CLSID or the /root switch?
+  context: Confirm the alert before investing time. The rule fires when a command line EITHER contains the Explorer COM factory CLSID (/factory,{75dff2b7-6936-4c06-a8bb-676a7b00b24b}) OR references explorer.exe together with a ' /root,' switch. Read the full command line and note which form fired — both are process-tree-break techniques, but the factory CLSID and the /root variant arrive through slightly different launch paths and tooling.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:cue_process_tool.mechanism_decode
+  question: What did this explorer command launch, and how was the tree broken?
+  context: Decode the full command line. The /factory CLSID spins up the Explorer COM server so that a subsequently launched process is reparented under a fresh explorer; the ' /root,' switch opens a new explorer rooted at a given path or object. Identify what was actually launched or targeted — a path, a file, or a follow-on command — because that is the payload whose true parent the technique is hiding.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:universal.host_user_context
+  question: Is this user and host expected to launch explorer in a way that breaks the process tree?
+  context: The factory and /root forms are rarely used by ordinary user activity, though some software and shell extensions do invoke them. Knowing whether this account and host run software that legitimately uses these explorer launch paths helps separate a benign shell extension from a deliberate attempt to disguise a payload's lineage.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.process_chain
+  question: What process actually ran this explorer command — the real parent the tree-break hides?
+  context: This is the central question. Because the technique reparents the payload under a new explorer, the process that genuinely launched "explorer /factory" or "explorer /root" is the true lineage the attacker is concealing. Look up the parent of this explorer process — a macro-spawned shell (winword, excel), a script host, a download cradle, or a loader running from a user-writable path is the real origin, and an ordinary interactive shell points to a more benign cause.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.follow_on
+  question: What did this new explorer instance spawn afterward?
+  context: The point of the tree-break is to launch a payload that appears to descend from explorer. The children of this explorer instance are that payload — a new interpreter, a dropped binary, reconnaissance, or a download — now wearing explorer as a disguise. Listing them recovers what the technique was protecting and reconnects it, through this playbook's findings, to the real parent.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:masquerading.true_identity
+  question: Is this the genuine signed explorer.exe, by path and metadata?
+  context: The technique relies on a real explorer.exe, but an attacker could also run a planted copy to compound the disguise. Confirm the binary is the legitimate Windows Explorer — running from C:\Windows\explorer.exe, with the expected original filename and signature — rather than a renamed or relocated copy. A non-standard path or mismatched metadata turns this from a lineage trick into a binary masquerade as well.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - Hashes
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously broken the process tree this way, what parents and users drove it, and does the current alert fit?
+  context: Even this technique can have a benign source on a given host, such as a particular shell extension or software package. This mirrors the rule's pattern scoped to this host, so the parent/user distribution reflects how these explorer launches have historically run here. A new parent process, an unexpected user, or a first-time appearance against that baseline is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_factory:
+        CommandLine|contains: /factory,{75dff2b7-6936-4c06-a8bb-676a7b00b24b}
+      selection_root:
+        CommandLine|contains: explorer.exe
+        CommandLine|contains|windash: ' /root,'
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (1 of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in the hour before the alert?
+  context: Disguising a payload's lineage is often paired with weakening protection. This surfaces direct attempts to disable AV/EDR services, flip Defender settings, add broad exclusions, clear logs, or patch AMSI/ETW. Zero rows is a useful "protection looks healthy" signal — kernel-level driver tampering and in-memory patches will not appear here. Populated rows shift the disposition toward operator preparation; review the writing process and its signing chain.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+- source: template:cue_user_actor.baseline
+  question: Does this user normally launch explorer in this way across the environment?
+  context: Compare this user's current action against their historical pattern. A user who has never triggered an explorer process-tree break is more notable than one whose installed software does so routinely. This pivot is meaningful only when a real user account fired the alert; the launch-mechanism baseline alongside it carries the answer when the actor is a service or computer account.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent-and-explorer combination historically routine on this host or across the environment?
+  context: When the alert fires under a service or computer account, user identity does not attribute behavior, so the meaningful baseline is the launch mechanism — which parent process ran this explorer command, and whether that pairing is historically common. A new or rare parent is exactly the deviation this technique produces; a pairing that already accounts for many prior events points to a legitimate shell extension or package.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts in a tight window reveals lateral movement or activity spanning multiple endpoints. If the same user triggered similar activity on other hosts in the same window, the scope is larger than a single machine. This pivot is meaningful only when a real user account fired the alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this parent-and-explorer combination fire on other hosts in the same window?
+  context: Under a service or computer account, asking what else the user did returns agent-telemetry noise. The meaningful question is whether the same launch mechanism — this parent running the explorer process-tree break — fired on other hosts in the alert window. Multiple hosts at once points to a payload or package distributed across the environment; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_process_tool.scope
+  question: Have other hosts broken the process tree via explorer in the past week, and does the distribution look like automation or one-off activity?
+  context: This mirrors the rule's pattern with no host scope, giving a fleet-wide count of where this explorer technique fired. Many hosts at once points to a software package or a payload deployed widely that uses these launch paths; one host or a small unrelated set points to manual or targeted activity. Use the distribution to judge how unusual this single alert is.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_factory:
+        CommandLine|contains: /factory,{75dff2b7-6936-4c06-a8bb-676a7b00b24b}
+      selection_root:
+        CommandLine|contains: explorer.exe
+        CommandLine|contains|windash: ' /root,'
+      condition: 1 of selection_*
+    fields:
+    - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — a macro-spawned shell, a download cradle, defense tampering, or reconnaissance — may reveal the real origin the tree-break is hiding and help reconstruct the timeline. The technique exists to obscure lineage, so the surrounding alerts often tell the story the process tree no longer can.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1036
+      name: Masquerading
+      role: primary
+  attack_chain_coverage:
+    - stage: 1
+      label: tree_break_invocation
+      description: "explorer is invoked with the factory CLSID or /root to break the process tree (the rule trigger)"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 1
+      label: command_decode
+      description: "Decode what the explorer command launched and how the tree was broken"
+      mapped_to: Q2
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 2
+      label: real_parent
+      description: "Recover the true parent the reparenting hides"
+      mapped_to: Q4
+      source: template:cue_process_tool.process_chain
+    - stage: 3
+      label: disguised_payload
+      description: "The payload now appearing as a child of the new explorer"
+      mapped_to: Q5
+      source: template:cue_process_tool.follow_on
+  dimension_coverage:
+    - dimension: execution_context
+      technique: T1036
+      covered_by: Q4
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1036
+      covered_by: Q14
+      source: template:cue_host_context.precursor
+      coverage_type: indirect
+    - dimension: tuning_parameter
+      technique: T1036
+      covered_by: Q2
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: direct
+  mutable_dispositions:
+    - element: tree_break_variant
+      dimension: tuning_parameter
+      specific_values: "/factory,{75dff2b7-6936-4c06-a8bb-676a7b00b24b} or ' /root,'"
+      disposition: context
+      target_question: Q2
+      notes: "mechanism_decode (Q2) reads which variant fired and what it launched; the verify question (Q1) frames the EITHER/OR."
+    - element: hidden_lineage
+      dimension: execution_context
+      specific_values: "the real parent of the explorer command (macro / loader / script vs interactive shell)"
+      disposition: context
+      target_question: Q4
+      notes: "process_chain (Q4) recovers the concealed true parent — the load-bearing question for this technique."
+  dedup_decisions:
+    - dropped: cue_process_tool.baseline
+      reason: "Detection is CommandLine-only with no fixed payload binary; a host+Image baseline of explorer is uninformative (explorer runs constantly). baseline_deviation (Q7) reflects the rule's actual tree-break pattern scoped to the host."
+      kept: cue_process_tool.baseline_deviation
+    - dropped: cue_process_tool.clustering
+      reason: "Host-wide tool clustering overlaps the follow_on payload question (Q5) and the precursor alert timeline (Q14)."
+      kept: cue_host_context.precursor
+    - dropped: cue_host_context.clustering
+      reason: "Surrounding host activity is reached via follow_on (Q5) and precursor alerts (Q14); avoided a near-duplicate broad host-scope aggregation."
+      kept: cue_host_context.precursor
+  skipped_templates:
+    - template: masquerading.binary_origin
+      reason: "Targets how a renamed/dropped binary arrived on disk; explorer.exe is a resident system binary, not a planted file, so a file_event origin query scoped to explorer is not informative. The disguised payload's origin is reached via follow_on (Q5) and precursor (Q14)."
+    - template: masquerading.renamed_binary_activity
+      reason: "Targets a renamed binary's post-execution behavior and cross-host spread; for this lineage-spoofing rule the equivalent coverage is the orphaned-payload follow_on (Q5) and the fleet scope (Q13)."
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "CommandLine-only detection — no Image field in rule. Use CommandLine pattern matching for scoping, not Image-based queries"
+      disposition: acted_on
+      reason: >-
+        mechanism_decode (Q2) is scoped to the triggering event via ProcessGuid
+        rather than host+Image; the generic host+Image baseline was dropped (see
+        dedup_decisions), and baseline_deviation (Q7) / scope (Q13) use the
+        reflected factory/root CommandLine pattern instead of an Image-only count.
+    - hint: >-
+        Condition uses OR among selection groups: (selection_factory OR selection_root). Q1 (verify_trigger_match) and the playbook
+        description must frame this as 'EITHER ... OR ...', not 'X AND Y AND Z'.
+      disposition: acted_on
+      reason: >-
+        Q1 and the playbook description both use disjunctive framing — explorer
+        invoked EITHER with the factory CLSID OR with the ' /root,' switch. Q1's
+        context tells the analyst to note which form fired.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - masquerading
+  user_actor_pairs:
+    - reason: "user_actor pair — non-deduplicable (baseline): Q9 pivots on user identity, Q10 on launch mechanism (parent+explorer)"
+    - reason: "user_actor pair — non-deduplicable (clustering): Q11 pivots on user identity, Q12 on launch mechanism (parent+explorer)"
+  generation_stats:
+    total_questions: 14
+    source_counts:
+      template: 14
+      attack: 0
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 11
+    logsource_diversity:
+      process_creation: 13
+      sigma_alert: 1

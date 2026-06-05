@@ -1,0 +1,696 @@
+name: Microsoft IIS Service Account Password Dumped
+id: e8df9d73-8d55-4f3a-b583-80afd49aa727
+description: |
+  Detects the IIS command-line tool appcmd.exe being used to list configuration in a form that decrypts and reveals
+  application-pool or virtual-directory service-account passwords stored in applicationHost.config. The rule fires when the
+  command targets appcmd.exe (by image name or original file name) with a 'list ' verb AND EITHER references the IIS config
+  (/config, /xml) OR uses one of the value-dumping flags (/text, /@t, /show, including the undocumented variants) OR includes
+  password-revealing tokens (:\* or 'password'). Legitimate administrators do enumerate IIS configuration, but reading the
+  cleartext processmodel password is a credential-access action; an operator who has reached the IIS host via a web shell or
+  RDP uses this same command to extract the service-account credential and pivot. The investigation should confirm which
+  credential store was targeted, who and what launched the command, and whether the stolen credential was immediately reused.
+type: detection
+detection_id: 2d3cdeec-c0db-45b4-aa86-082f7eb75701
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the appcmd command line match this rule — a 'list' verb on appcmd.exe combined with either an IIS config reference or a value-dumping flag or a password token?
+  context: >-
+    Confirm the alert is a true positive before investing time. The rule fires when appcmd.exe (by image name or original
+    file name) runs 'list ' AND at least one of three branches matched: an IIS config reference (/config, /xml), a value-dumping
+    flag (/text, /@t, /show and their undocumented variants), or a password-revealing token (:\* or the literal 'password').
+    Note which branch fired — a bare /config or /xml dump exposes the whole applicationHost.config including encrypted-then-decrypted
+    secrets, while /text:processmodel.password or /text:* targets the cleartext credential directly, and that distinction
+    shapes how aggressively to treat the result.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to enumerate IIS configuration and read application-pool credentials with appcmd?
+  context: >-
+    Legitimate IIS administration includes listing pools and sites, but reading the decrypted processmodel password is a
+    narrower action. A web server whose administrators routinely run appcmd, under a known admin account, is a different
+    disposition than the same command appearing under an application-pool identity or a service account that should never be
+    interactive. Knowing whether this host is an IIS server and whether the user is its expected administrator is often the
+    fastest triage step.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:credential_access.credential_target_identification
+  question: Which credential store did this command target — a specific application pool, a virtual directory, or the whole applicationHost.config?
+  context: >-
+    appcmd reads credentials that IIS stores encrypted at rest in applicationHost.config and decrypts them in place. Parse
+    the command to identify the scope: 'list apppool <name>' or 'list vdir <name>' narrows to one identity, while 'list
+    apppool' with /text:* or a config dump exposes every encrypted identity on the server. The object named (or its absence)
+    tells you whether a single service account or every IIS credential on the host should be treated as exposed.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: attack:T1003.tuning_parameter
+  question: Did this command use a value-extraction flag that returns the cleartext password rather than only listing object names?
+  context: >-
+    Not every appcmd list reveals secrets. /text:processmodel.password and /text:* return the decrypted credential, and the
+    undocumented /show, /@t, and /@text variants do the same while evading rules that only watch for /text:*. A bare 'list
+    apppool' that returns names is reconnaissance; a value-dumping flag turns it into credential extraction. This query scopes
+    to appcmd executions on this host that carry one of those value-dumping flags so the analyst can see whether the credential
+    itself, not just the inventory, was pulled.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_base:
+      - Image|endswith: \appcmd.exe
+      - OriginalFileName: appcmd.exe
+      selection_value_flags:
+        CommandLine|contains:
+          - ' /@t'
+          - ' /text'
+          - ' /show'
+          - ' -@t'
+          - ' -text'
+          - ' -show'
+          - ':\*'
+          - 'password'
+      condition: selection_base and selection_value_flags
+    fields:
+      - host.name
+      - CommandLine
+      - User
+- source: template:cue_process_tool.process_chain
+  question: What process spawned appcmd, and is that parent chain consistent with administrative use rather than a web shell?
+  context: >-
+    The parent process distinguishes routine administration from post-exploitation. An IIS administrator running appcmd
+    typically descends from an interactive shell or a management console. A parent of w3wp.exe, a scripting host, cmd.exe
+    launched by the IIS worker process, or any child of the application pool indicates the command originated from web-server
+    code execution — the classic web-shell-to-credential-dump path on an IIS host. Walk up the tree: what spawned the parent,
+    and what else did it spawn?
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in the hour before the alert?
+  context: >-
+    Tampering often precedes hands-on credential access. The query surfaces direct attempts to disable AV/EDR services, flip
+    Defender flags, add broad exclusions, clear logs, or patch AMSI/ETW. Zero rows is a useful "protection looks healthy"
+    signal — kernel-level driver tampering and in-memory patches will not appear here. Populated rows shift the disposition
+    toward operator preparation; review the parent process and signing chain to identify the writer.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+- source: template:credential_access.credential_exposure_assessment
+  question: Which service accounts may be exposed, and do any have elevated or domain privileges?
+  context: >-
+    The severity depends on the privilege of the application-pool or virtual-directory identity whose password was read. A
+    pool running under a low-privilege ApplicationPoolIdentity is far less serious than one configured with a domain service
+    account or a local administrator. Cross-reference the identities named in the command (or every IIS identity, if the dump
+    was server-wide) against directory group memberships; domain or admin-level service accounts require escalation and a
+    credential reset.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired the rule's appcmd credential-listing pattern, what parents and users normally drive it, and does the current alert fit?
+  context: >-
+    Even on a managed IIS server, the rule's specific firing pattern has a historical shape. The query mirrors the rule's
+    selection structure scoped to this host, so the resulting parent/user distribution reflects how this credential-listing
+    pattern (not generic appcmd usage) has run here before. A new parent process, an unexpected user, or the application-pool
+    worker showing up as the launcher is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_base_name:
+      - Image|endswith: \appcmd.exe
+      - OriginalFileName: appcmd.exe
+      selection_base_list:
+        CommandLine|contains: 'list '
+      selection_standalone:
+        CommandLine|contains:
+        - ' /config'
+        - ' /xml'
+        - ' -config'
+        - ' -xml'
+      selection_cmd_flags:
+        CommandLine|contains:
+        - ' /@t'
+        - ' /text'
+        - ' /show'
+        - ' -@t'
+        - ' -text'
+        - ' -show'
+      selection_cmd_grep:
+        CommandLine|contains:
+        - :\*
+        - password
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_base_* and (selection_standalone or all of selection_cmd_*)) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.follow_on
+  question: What child processes did appcmd spawn afterward, and do any stage or exfiltrate the dumped credentials?
+  context: >-
+    The processes that follow reveal the actual impact. Credential dumping is often followed by writing the output to a file,
+    compressing it, or piping it to a network tool for exfiltration, and sometimes by immediate reuse of the stolen account.
+    Unexpected children such as cmd.exe, powershell.exe, or archive and transfer utilities indicate the credential left the
+    host or fed a follow-on action.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: attack:T1003.credential_file_staging
+  question: Was the dumped credential written to a file on this host around the time of the alert?
+  context: >-
+    appcmd prints the decrypted password to standard output, so operators commonly redirect or export it to disk before
+    moving it off the host — for example a CSV or text file under a user-writable or temporary path. A file written in the
+    same window with a name suggesting configuration, passwords, or an export is evidence the credential was captured for
+    reuse. This pivots to file-write evidence rather than the process_creation event the alert fired on.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      filter_ext:
+        TargetFilename|endswith:
+          - '.txt'
+          - '.csv'
+          - '.log'
+          - '.xml'
+          - '.config'
+          - '.tmp'
+      condition: selection and filter_ext
+    fields:
+      - TargetFilename
+      - Image
+      - User
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run appcmd to read IIS configuration?
+  context: >-
+    Compare this user's current action against their historical pattern across all hosts. A user who has never run appcmd, or
+    never run it against credential-bearing configuration, is more suspicious than one who does so as part of their IIS
+    administration role. The user's role and typical toolset should align with reading service-account passwords.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent-plus-appcmd combination historically routine on this host or across the environment, or is the parent unusual for appcmd?
+  context: >-
+    When the alert fires under a service principal or application-pool identity, the user name does not attribute behavior.
+    The meaningful pivot is the launch mechanism: which parent process spawned appcmd, and is that pair historically common.
+    A new or rare parent for appcmd — especially the IIS worker process or a scripting host — is the deviation worth chasing,
+    while a parent that already accounts for thousands of prior events is configuration-management automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: >-
+    Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints. If the
+    same user triggered credential listing or other administrative actions on several IIS servers in this window, the scope
+    is broader than a single host and the dumped credentials may already be in use elsewhere.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent-plus-appcmd combination fire on other hosts in the same window — a coordinated rollout, or isolated to this host?
+  context: >-
+    Under a service principal, asking what the user did network-wide returns agent-telemetry noise. The meaningful question
+    is whether the same launch mechanism — parent process plus appcmd — fired on other hosts in the alert window. Multiple
+    IIS servers showing the same parent-plus-appcmd pattern points to scripted or pushed automation across the web tier; a
+    single host points to a host-local trigger such as a web shell on that one server.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:credential_access.post_access_lateral_movement
+  question: Were any new logon sessions or remote connections initiated after this event?
+  context: >-
+    Credential theft is typically followed by reuse — the stolen service-account credential is used to authenticate to other
+    systems. Look for follow-on alerts on this host indicating new logons, RDP, SMB, WinRM, or remote-execution activity
+    shortly after the credential listing, which would indicate the dumped account is being actively exercised to pivot off
+    the IIS host.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - rule.name
+      - rule.uuid
+      - event.severity_label
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: >-
+    Alerts rarely occur in isolation. Examining activity around the alert reveals the immediate context: what led to this
+    credential listing, what happened after, and whether it is part of a larger sequence on the web server. Look for prior
+    web-server code execution, reconnaissance, or staging, and novel parent-child pairs that stand out at low counts against
+    the host's routine telemetry.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Alerts rarely happen in isolation. Earlier detections on the same host — web-shell activity, defense tampering, or
+    reconnaissance — may reveal the attack stages that preceded the credential listing and help reconstruct how the operator
+    reached the point of reading IIS service-account passwords.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired the rule's appcmd credential-listing pattern in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: >-
+    The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of this specific
+    credential-listing pattern, not generic appcmd usage. Many IIS servers firing the same pattern points to scripted
+    deployment or configuration tooling; one host or a small unrelated set points to manual operator activity. Use the host
+    distribution to calibrate whether this is routine web-tier management or targeted credential extraction.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_base_name:
+      - Image|endswith: \appcmd.exe
+      - OriginalFileName: appcmd.exe
+      selection_base_list:
+        CommandLine|contains: 'list '
+      selection_standalone:
+        CommandLine|contains:
+        - ' /config'
+        - ' /xml'
+        - ' -config'
+        - ' -xml'
+      selection_cmd_flags:
+        CommandLine|contains:
+        - ' /@t'
+        - ' /text'
+        - ' /show'
+        - ' -@t'
+        - ' -text'
+        - ' -show'
+      selection_cmd_grep:
+        CommandLine|contains:
+        - :\*
+        - password
+      condition: all of selection_base_* and (selection_standalone or all of selection_cmd_*)
+    fields:
+    - host.name
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1003
+      name: OS Credential Dumping
+      role: primary
+  attack_chain_coverage:
+    - stage: 1
+      label: credential_store_access
+      description: >-
+        Actor invokes appcmd to access and decrypt credentials held in applicationHost.config (the rule's adaptation of the
+        T1003 "process accessing a credential store outside trusted tools" stage; here the store is the IIS config file
+        rather than LSASS memory or the SAM hive).
+      mapped_to: Q3
+      source: template:credential_access.credential_target_identification
+    - stage: 2
+      label: value_extraction
+      description: >-
+        The command uses a value-dumping flag (/text, /show, /@t, :\*, password) to return the cleartext credential rather
+        than just listing object names — the point at which listing becomes credential extraction.
+      mapped_to: Q4
+      source: attack:T1003.tuning_parameter
+    - stage: 3
+      label: follow_on_staging_or_movement
+      description: >-
+        Dumped credential is staged to a file, exfiltrated, or reused for lateral movement (the analytic's "often followed
+        by file creation or lateral movement" tail). Covered by both the child-process follow-on (Q9) and the file-write
+        staging question (Q10), with lateral-movement reuse at Q15.
+      mapped_to: Q9
+      source: template:cue_process_tool.follow_on
+    - stage: 4
+      label: file_creation
+      description: >-
+        The analytic's explicit "followed by file creation" sub-stage — the decrypted credential written to disk for
+        staging/exfil. Covered by a dedicated file_event question (acts on the brief's file_event logsource-coverage hint).
+      mapped_to: Q10
+      source: attack:T1003.credential_file_staging
+  dimension_coverage:
+    - dimension: access_verification
+      technique: T1003
+      covered_by: Q4
+      source: attack:T1003.tuning_parameter
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1003
+      covered_by: Q5
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1003
+      covered_by: Q16
+      source: template:cue_host_context.clustering
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1003
+      covered_by: Q4
+      source: attack:T1003.tuning_parameter
+      coverage_type: direct
+  mutable_dispositions:
+    - element: AccessMask
+      dimension: access_verification
+      specific_values: "0x1F0FFF (full access rights)"
+      disposition: context
+      target_question: Q4
+      notes: >-
+        AccessMask (0x1F0FFF) is a process_access (handle-to-LSASS) tuning value. This rule is process_creation on appcmd
+        reading the IIS config file — there is no handle-open event to apply a GrantedAccess mask to. The access_verification
+        dimension is instead realized as "did the command use a value-extraction flag that decrypts the credential" (Q4).
+        AccessMask is not injectable into any query for this rule's logsource; recorded as rationale-only context.
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only (define how soon access is followed by suspicious activity)"
+      disposition: context
+      target_question: Q16
+      notes: >-
+        Tuning rationale, no concrete value. Realized as the +/-15m host-context correlation window (Q16) and the +4h
+        follow-on / lateral-movement windows (Q9, Q15).
+    - element: ParentProcessFilter
+      dimension: parent_process_analysis
+      specific_values: "rationale only (allowlist known security tools / system processes)"
+      disposition: context
+      target_question: Q5
+      notes: >-
+        Tuning rationale, no concrete value. Realized as the parent-chain question (Q5), which asks whether the parent is
+        consistent with administration versus a web shell / IIS worker — the appcmd analogue of allowlisting expected parents.
+  dedup_decisions:
+    - dropped: cue_process_tool.baseline
+      reason: >-
+        Generic "does this host run appcmd" 90d frequency is subsumed by the more precise reflected baseline_deviation (Q8),
+        which aggregates parent/user for the rule's exact credential-listing pattern scoped to this host rather than all
+        appcmd usage. Dropped to free a slot for the file_event staging question (Q10) that acts on the file_event
+        logsource-coverage hint, keeping the playbook at 18.
+      kept: cue_process_tool.baseline_deviation
+    - dropped: cue_process_tool.clustering
+      reason: >-
+        Near-duplicate of cue_host_context.clustering on the same host with the same +/-15m window. host_context.clustering
+        aggregates Image+ParentImage (surfaces novel parent-child pairs) and strictly subsumes the cue_process_tool variant,
+        which aggregates Image only. Kept the host_context version for the time_correlation dimension.
+      kept: cue_host_context.clustering
+    - dropped: cue_user_actor.baseline_svc / cue_user_actor.baseline pairing
+      reason: "user_actor pair — non-deduplicable (subject-identity vs. launch-mechanism pivots); emitted BOTH per AGENTS.md"
+      kept: both
+    - dropped: cue_user_actor.clustering_svc / cue_user_actor.clustering pairing
+      reason: "user_actor pair — non-deduplicable (subject-identity vs. launch-mechanism pivots); emitted BOTH per AGENTS.md"
+      kept: both
+  skipped_templates:
+    - template: cue_process_tool.mechanism_decode
+      reason: "replaced_by: credential_access.credential_target_identification (Phase 2 analysis slot — Q3)"
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "logsource 'process_access' (recommended by techniques: T1003) is not covered and no template family exists — author a custom question with category: process_access"
+      disposition: declined
+      reason: >-
+        This rule's detection mechanism is appcmd.exe reading and decrypting credentials from applicationHost.config (a
+        config-file credential store), not handle access to LSASS memory. process_access (Sysmon EventCode 10 / GrantedAccess
+        0x1F0FFF) answers the LSASS-memory branch of T1003.001, which this rule does not exercise — no process opens a handle
+        to lsass.exe in the appcmd path. A process_access query would return unrelated handle-open noise with no bearing on
+        this alert. The credential-store-access stage is instead covered by Q3 (credential_target_identification) and Q4
+        (value-extraction flag) over process_creation evidence, which is the logsource this rule actually fires on.
+    - hint: "logsource 'security' (recommended by techniques: T1003) is not covered and no template family exists — author a custom question with category: security"
+      disposition: declined
+      reason: >-
+        The 'security' analytic (EventCode 4662 object-access on directory/registry objects) targets the SAM/NTDS/LSA-secrets
+        and DCSync branches of T1003. appcmd reads cleartext from a flat config file on the IIS host's local filesystem; it
+        generates no 4662 object-access on a credential database. Q3/Q4 (which credential store, value-extraction flag) and
+        Q5 (parent chain) cover the credential-access stage from the process_creation evidence the rule produces. No 4662
+        signal exists to query for this rule's path.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - credential_access
+    - cue_process_tool
+    - cue_user_actor
+    - cue_host_context
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 16
+      attack: 2
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 15
+    logsource_diversity:
+      process_creation: 15
+      file_event: 1
+      sigma_alert: 2

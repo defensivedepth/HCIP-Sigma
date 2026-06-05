@@ -1,0 +1,474 @@
+name: Terminal Service Process Spawn
+id: 9925977a-efc5-4066-b27f-7a6320e4082f
+description: |
+  Detects a process spawned by the Terminal Services service host (svchost.exe running
+  the termsvcs service group) whose child Image is not one of the expected service
+  children (rdpclip.exe, csrss.exe, wininit.exe, winlogon.exe) and is not null. A
+  remote-desktop service that spawns an unexpected child can indicate exploitation of
+  a pre-authentication RDP vulnerability such as CVE-2019-0708 (BlueKeep), where
+  attacker-controlled code runs in the context of the service. The investigation
+  should confirm the parent is the terminal service host, decode what the spawned
+  child did, determine whether inbound RDP access preceded the spawn, and look for
+  post-exploitation activity (file drops, module loads, credential access, lateral
+  movement) on the host.
+type: detection
+detection_id: 1012f107-b8f1-4271-af30-5aed2de89b39
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-04
+questions:
+- source: template:universal.verify_trigger_match
+  question: Was this child process spawned by the terminal service host (svchost.exe with the termsvcs service group) and is the child one not on the expected list?
+  context: Before investing investigation time, confirm the alert is a true positive. The rule fires when the parent command line contains both svchost.exe and termsvcs AND the child Image is not rdpclip.exe, csrss.exe, wininit.exe, or winlogon.exe. Review the full event to verify the parent is the terminal service host and the child is genuinely unexpected.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentCommandLine
+- source: template:universal.host_user_context
+  question: Is this host expected to act as a remote-desktop terminal server, and is this spawned process consistent with its normal role?
+  context: Legitimate terminal servers do spawn user-session processes, but those route through the expected service children. Knowing whether this host is a designated RDP/terminal server and whether the spawned binary fits its sanctioned software set is often the fastest path to distinguishing a true positive from routine operation.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What exactly did the spawned child process do? Decode its command-line arguments.
+  context: The full command line of the unexpected child reveals the specific action taken under the terminal service context. Decode any flags, encoded content, file paths, or URLs. Code executed through a pre-authentication RDP exploit typically runs as a shell, script interpreter, or downloader launched from the service host.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:cue_parent_process.mechanism_decode
+  question: What is the parent terminal service process and what command line launched it?
+  context: The parent process reveals how the detected activity was initiated. Confirming the parent is svchost.exe hosting the termsvcs group establishes that the child was spawned by the Remote Desktop Services host rather than an unrelated svchost instance. The parent's own creation event also shows when the service host started.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+- source: template:cue_parent_process.baseline
+  question: Does the terminal service host on this machine normally spawn this child binary?
+  context: Some children of the terminal service host are routine (the expected rdpclip/csrss/wininit/winlogon set), while an arbitrary command interpreter or downloader is not. Historical frequency of this specific service-host-to-child pairing distinguishes a sanctioned spawn from a novel one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:cue_parent_process.follow_on
+  question: What other child processes did the terminal service host spawn around this time?
+  context: Code running under the service host often spawns multiple tools in sequence — reconnaissance, credential access, lateral movement. Listing the other children of the same parent reveals the full scope of activity initiated through this execution chain.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        process.parent.name|expand: '%ParentName%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_parent_process.clustering
+  question: What other activity is associated with the terminal service host process around the same time?
+  context: Beyond child processes, the service host may have generated file writes, module loads, or network connections. File events near the spawn may reveal a dropped payload, and network events may reveal command-and-control communication established from the exploited service.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        process.parent.name|expand: '%ParentName%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: attack:T1210.file_event
+  question: What files were written on this host in the minutes around the spawn?
+  context: Exploitation of a remote service frequently drops a payload, tool, or staged artifact to disk near the moment of code execution. File writes correlated in time with the unexpected service-host child help identify a dropped second-stage binary, a script, or a configuration artifact left by the operator.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - TargetFilename
+- source: attack:T1210.image_load
+  question: What modules did the spawned child or the terminal service host load around the time of the alert?
+  context: Exploitation that injects into or runs under the service host can pull in non-standard modules — unsigned DLLs, modules loaded from user-writable or temporary paths, or libraries unusual for the Remote Desktop Services process. Reviewing image loads on the host near the spawn surfaces injected or side-loaded code that a process-creation view alone would miss.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ImageLoaded
+- source: attack:T1210.process_access
+  question: Did the spawned child or the service host open a handle into another process, such as the credential store?
+  context: After exploiting a remote service, operators commonly reach into other processes to read credentials or inject code. Process-access events originating from the unexpected child or the service host — especially handles requesting broad rights into lsass.exe — indicate credential theft or injection following the initial code execution.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_access
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - SourceImage
+      - TargetImage
+      - GrantedAccess
+- source: template:lateral_movement.source_host_identification
+  question: What host initiated the inbound remote-desktop connection to this machine, and is it an expected administrative source?
+  context: Exploitation of Remote Desktop Services requires an inbound connection to the RDP service. Identifying the originating host reveals whether the connection came from a known admin jump box, an internal workstation, or an unexpected external source. An attacker who compromised one host uses it as a pivot to reach others.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        DestinationPort:
+          - 445
+          - 135
+          - 3389
+          - 5985
+          - 5986
+          - 22
+      condition: selection
+    fields:
+      - SourceIp
+      - DestinationPort
+- source: template:lateral_movement.target_activity_after_access
+  question: What processes ran on this host in the period after the unexpected service-host spawn?
+  context: Lateral movement and exploitation are a means to an end — the operator moves in to execute commands, deploy tools, or access data. Examining processes that ran shortly after the spawn reveals the objectives pursued on the compromised host.
+  range: +30m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - User
+      - Image
+- source: template:lateral_movement.lateral_movement_scope
+  question: Has the user or account tied to this activity connected to other hosts using lateral-movement tooling?
+  context: Operators rarely stop at one target. If the account associated with this activity is moving laterally to multiple systems, the scope of compromise is larger. Finding lateral-movement tool usage by the same account across several hosts within a short window points to active spread across the environment.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      selection_lateral:
+        Image|endswith:
+          - '\psexec.exe'
+          - '\psexec64.exe'
+          - '\mstsc.exe'
+          - '\ssh.exe'
+          - '\plink.exe'
+          - '\wmic.exe'
+      condition: selection and selection_lateral
+    fields:
+      - host.name
+      - Image
+- source: template:initial_access.application_patch_status
+  question: Is this host's Remote Desktop Services stack patched against known pre-authentication RDP vulnerabilities such as CVE-2019-0708?
+  context: A terminal service host spawning unexpected code is consistent with exploitation of a known RDP vulnerability. An unpatched Remote Desktop Services stack confirms the exploitation was possible and indicates whether other similarly unpatched systems are at risk. Patch status also helps distinguish exploitation of a known CVE from a novel issue.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+- source: template:initial_access.campaign_scope
+  question: Did the same detection fire on other hosts, indicating multiple terminal servers were targeted?
+  context: Exploitation of an internet-facing or internally reachable RDP service rarely targets a single host. Correlating the same detection across other hosts reveals how many terminal servers were probed or exploited and identifies additional systems that need investigation.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        rule.uuid|expand: '%rule.uuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining activity around the alert reveals what led to this event, what happened after, and whether it is part of a larger sequence. Look for reconnaissance, privilege escalation, or persistence mechanisms appearing alongside the spawn.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host — reconnaissance, defense tampering, scanning of the RDP service — may reveal the attack stages that preceded this event and help reconstruct the full timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1190
+      name: Exploit Public-Facing Application
+      role: primary
+    - id: T1210
+      name: Exploitation of Remote Services
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: inbound_service_access
+      description: "Inbound connection reaches the remote service (RDP 3389 / SMB / RPC)"
+      mapped_to: Q11
+      source: template:lateral_movement.source_host_identification
+    - stage: 2
+      label: service_instability_and_child_spawn
+      description: "The exploited service host spawns an unexpected child process (the rule's core trigger)"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 3
+      label: payload_decode
+      description: "The spawned child executes attacker code — decode its operation"
+      mapped_to: Q3
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 4
+      label: post_exploit_artifacts
+      description: "Post-exploitation: dropped files, loaded modules, credential access, follow-on processes"
+      mapped_to: Q6
+      source: template:cue_parent_process.follow_on
+  dimension_coverage:
+    - dimension: time_correlation
+      technique: T1190
+      covered_by: Q7
+      source: template:cue_parent_process.clustering
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1190
+      covered_by: Q11
+      source: template:lateral_movement.source_host_identification
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1210
+      covered_by: Q12
+      source: template:lateral_movement.target_activity_after_access
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1210
+      covered_by: Q11
+      source: template:lateral_movement.source_host_identification
+      coverage_type: direct
+  mutable_dispositions:
+    - element: ServicePortSet
+      dimension: tuning_parameter
+      specific_values: "445,135,3389,5985,5986 (T1210); RDP 3389 is the service exploited here"
+      disposition: query_injection
+      target_question: Q11
+      notes: "Service-port DestinationPort list injected into source_host_identification query (KEEP_EXACT template ships this list verbatim, including 3389 for RDP)."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "10-15 minutes correlation horizon"
+      disposition: context
+      target_question: Q7
+      notes: "Correlation window expressed via +/-15m range on clustering and file_event/image_load/process_access questions."
+    - element: AllowedAdminCIDRs
+      dimension: tuning_parameter
+      specific_values: "rationale only (known management networks)"
+      disposition: context
+      target_question: Q11
+      notes: "Q11 context asks whether the source is an expected administrative source — the admin-CIDR suppression rationale."
+    - element: MinConnErrorRate
+      dimension: tuning_parameter
+      specific_values: "rationale only (% failed connections, e.g. 30%)"
+      disposition: context
+      target_question: Q11
+      notes: "Connection-error-rate threshold is a flow-analytic tuning value not queryable from endpoint process_creation; folded into source-host scoping context."
+    - element: PublicVIPs
+      dimension: tuning_parameter
+      specific_values: "rationale only (public IPs fronting apps)"
+      disposition: context
+      target_question: Q11
+      notes: "T1190 web-app element; for this RDP-service rule it maps to the inbound-source identification context rather than a web-log query."
+    - element: SuspiciousPatterns
+      dimension: tuning_parameter
+      specific_values: "rationale only (web exploit regex: ../, union select, jndi)"
+      disposition: context
+      target_question: Q3
+      notes: "Web-request exploit patterns do not apply to an RDP pre-auth exploit (no HTTP layer); decode-of-child operation (Q3) is the analogous mechanism question."
+    - element: ErrorRateThreshold
+      dimension: tuning_parameter
+      specific_values: "rationale only (5xx/4xx spike threshold)"
+      disposition: context
+      target_question: Q11
+      notes: "HTTP error-rate threshold; no web layer for RDP exploit. Folded into the inbound-access anomaly framing."
+    - element: AllowedChildList
+      dimension: tuning_parameter
+      specific_values: "rdpclip.exe, csrss.exe, wininit.exe, winlogon.exe (the rule's filter_img)"
+      disposition: context
+      target_question: Q1
+      notes: "The rule's own benign-child filter IS the AllowedChildList; named with exact values in Q1 question and context."
+  dedup_decisions:
+    - dropped: cue_process_tool.process_chain
+      reason: "parent_process cue active — parent cue subsumes process_chain (brief hint + AGENTS.md dedup rule)"
+      kept: cue_parent_process.mechanism_decode
+    - dropped: cue_parent_process.scope
+      reason: "campaign/cross-host scope already covered by initial_access.campaign_scope (same-rule fleet correlation) — keeping both would duplicate the enterprise-wide pivot"
+      kept: initial_access.campaign_scope
+    - dropped: network_scope.same_action_other_hosts
+      reason: "child Image is arbitrary (no commandline_values, parent-cmdline detection); cross-host same-binary pivot is not meaningful here. Cross-host coverage provided by campaign_scope (same rule.uuid)."
+      kept: initial_access.campaign_scope
+    - dropped: network_scope.actor_activity_network_wide
+      reason: "duplicates lateral_movement.lateral_movement_scope user-pivot already kept; recommended priority, dropped to stay within 18-question cap"
+      kept: lateral_movement.lateral_movement_scope
+    - dropped: network_scope.actor_authentication_trail
+      reason: "recommended priority; authentication-trail angle partially covered by source_host_identification (inbound RDP source) and lateral_movement_scope. Dropped to stay within cap."
+      kept: lateral_movement.source_host_identification
+    - dropped: lateral_movement.authentication_method
+      reason: "KEEP_EXACT query is a ProcessGuid lookup duplicating verify_trigger_match's event; pre-auth RDP exploitation (CVE-2019-0708) needs no valid authentication, so the auth-method angle is not the discriminator here"
+      kept: template:universal.verify_trigger_match
+    - dropped: cue_user_actor.baseline / baseline_svc / clustering / clustering_svc
+      reason: "rule fires on the terminal service host (svchost spawns under SYSTEM/service context); user-actor pivots degenerate to agent/service noise. Host-and-parent scoped baselines (cue_parent_process.baseline, follow_on) carry the meaningful 'is this launch routine' signal instead"
+      kept: template:cue_parent_process.baseline
+  skipped_templates:
+    - template: universal.endpoint_protection_health
+      reason: "must_include universal, but the playbook holds 17 questions and the tamper-health angle is lower-yield for a pre-auth service-exploitation rule than the post-exploit file/module/handle questions authored from the logsource hints. Post-exploit artifact coverage (file_event/image_load/process_access) prioritized over generic tamper health."
+  reflection_overrides: []
+  hint_dispositions: []
+  hint_act_ons:
+    - hint: "parent_process is primary — drop cue_process_tool:process_chain"
+      detail: "Acted on — cue_process_tool.process_chain dropped; see dedup_decisions."
+    - hint: "logsource 'file_event' (recommended by techniques: T1210) is not covered"
+      detail: "Acted on — Q8 (attack:T1210.file_event) authored with category: file_event, surfacing Image/TargetFilename for dropped post-exploit payloads."
+    - hint: "logsource 'image_load' (recommended by techniques: T1190,T1210) is not covered"
+      detail: "Acted on — Q9 (attack:T1210.image_load) authored with category: image_load, surfacing Image/ImageLoaded for injected/side-loaded modules under the service host."
+    - hint: "logsource 'process_access' (recommended by techniques: T1210) is not covered and no template family exists"
+      detail: "Acted on — Q10 (attack:T1210.process_access) authored with category: process_access, surfacing SourceImage/TargetImage/GrantedAccess for credential access / injection following the exploit."
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - lateral_movement
+    - initial_access
+    - network_scope
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 14
+      attack: 3
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 14
+    logsource_diversity:
+      process_creation: 11
+      file_event: 1
+      image_load: 1
+      process_access: 1
+      network_connection: 1
+      sigma_alert: 2

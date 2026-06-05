@@ -1,0 +1,461 @@
+name: Potential Product Reconnaissance Via Wmic.EXE
+id: 7414ddba-81d0-4c15-829f-29722ff31f41
+description: |
+  Detects execution of wmic.exe (by image name or original filename) with a command line containing 'Product', while excluding install and uninstall operations. The 'wmic product' query enumerates MSI-installed software (names, versions, install paths) from the local Windows Installer database, which adversaries use to fingerprint installed security tooling and applications shortly after gaining a foothold. The same command is also run legitimately by patch-management and inventory tooling, so the investigation should establish who ran it, what was enumerated, and whether the surrounding activity looks like routine inventory or hands-on-keyboard reconnaissance.
+type: detection
+detection_id: 15434e33-5027-4914-88d5-3d4145ec25a9
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-04
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line match what this rule detects — wmic.exe running a 'Product' query without an install or uninstall operation?
+  context: Before investing investigation time, confirm the alert is a true positive by reviewing the exact command line and process details. The rule fires when the image is wmic.exe (or its original filename is wmic.exe) AND the command line contains 'Product' AND it is not an install or uninstall operation. Confirm all three conditions hold for the triggering event.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to enumerate installed software via command-line WMI?
+  context: Legitimate inventory, patch-management, and software-asset tooling enumerates installed products routinely. Knowing whether the user role and host function are consistent with software-inventory activity is often the fastest path to distinguishing routine operations from hands-on reconnaissance.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What exactly did this wmic invocation enumerate? Decode the full command line, including any get attributes, output redirection, or vendor filters.
+  context: |
+    The full command line reveals what was queried and where the output went. Note any 'get' attributes (name, version, installlocation), output redirection (an /output flag or a /format switch writing to a file or HTML report), and WQL-style 'where' filters that narrow results to a specific vendor or product. Redirected output to a text or HTML file suggests the operator intended to collect and exfiltrate the inventory.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+        CommandLine|contains: 'Product'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:cue_process_tool.process_chain
+  question: What process spawned this wmic.exe and is that parent chain expected?
+  context: The parent process reveals how wmic was invoked. Inventory tooling typically launches it from a service host or a scheduled task; interactive reconnaissance often shows a shell parent (cmd.exe, powershell.exe) or an unusual parent such as mshta.exe, wscript.exe, or an Office application, which may indicate exploitation or a malicious script.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: attack:T1047.wmi
+  question: Did corresponding WMI-activity events show this enumeration running against a remote namespace rather than the local install database?
+  context: A 'wmic product' query normally reads the local Windows Installer database, but wmic can also target a remote host or a suspicious namespace such as root\subscription or root\cimv2 on another machine. WMI-activity events for the same host and window distinguish local software inventory from remote WMI execution. If WMI activity logs are not ingested in this environment, treat zero results as a visibility gap rather than evidence the query was local.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: wmi
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - User
+      - Operation
+      - Namespace
+- source: attack:T1047.network_connection
+  question: Did wmic.exe open any network connections around the time of this enumeration, and to how many distinct remote hosts?
+  context: Local 'wmic product' recon should not generate outbound connections. Network connections originating from wmic.exe — especially to multiple distinct remote hosts in a short window — indicate the tool was used for remote WMI execution or lateral movement rather than local inventory. A single host or no connections is consistent with local enumeration; fan-out to several destinations points to scripted remote operation.
+  range: +/-5m
+  query: |
+    aggregation: true
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+        Initiated: 'true'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+- source: template:lolbin.renamed_binary_check
+  question: Was wmic.exe executed from its expected System32 or SysWOW64 path?
+  context: wmic.exe running from a non-standard path (outside System32 or SysWOW64) may indicate the binary was copied or renamed to evade path-based allowlists. Compare the Image path against OriginalFileName — a wmic.exe running from a user temp or download directory is more suspicious than one in System32.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired this 'wmic product' pattern, what parents and users normally drive it, and does the current alert fit that pattern?
+  context: Even routine inventory tools can be abused. The query mirrors the rule's selection structure scoped to this host, so the resulting parent and user distribution reflects how the rule's specific firing pattern has historically run here. A new parent process, an unexpected user account, or an unusual command-line shape is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \wmic.exe
+      - OriginalFileName: wmic.exe
+      selection_cli:
+        CommandLine|contains: Product
+      filter_main_call_operations:
+        CommandLine|contains:
+        - ' uninstall'
+        - ' install'
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_* and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:lolbin.historical_lolbin_baseline
+  question: How often has this host fired the 'wmic product' pattern over the past 90 days, and what command-line shapes are typical?
+  context: A pattern with no prior history on a host is more suspicious than one used daily under stable parents. The query mirrors the rule's selection structure scoped to this host, so the count reflects the rule's specific firing pattern rather than generic wmic usage. The command-line projection lets the analyst compare typical invocation shapes against the alerting one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \wmic.exe
+      - OriginalFileName: wmic.exe
+      selection_cli:
+        CommandLine|contains: Product
+      filter_main_call_operations:
+        CommandLine|contains:
+        - ' uninstall'
+        - ' install'
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_* and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - CommandLine
+- source: template:cue_process_tool.follow_on
+  question: What child processes did this wmic.exe spawn afterward?
+  context: A 'wmic product' query itself triggers per-product MSI consistency checks but should not spawn unrelated children. Processes such as cmd.exe, powershell.exe, or certutil.exe spawned from wmic indicate the recon was followed by further hands-on activity or post-exploitation rather than a self-contained inventory query.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_user_actor.baseline
+  question: Does this user normally enumerate installed software with wmic?
+  context: Compare this user's current action against their historical behavior. A user who has never run wmic for software enumeration is more suspicious than one who does so regularly as part of an inventory or support role. User role and typical toolset should align.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent-plus-wmic combination historically routine on this host or across the environment, or is the parent unusual for wmic?
+  context: When the alert fires under a service principal, user identity does not attribute behavior. The meaningful pivot is the launch mechanism — which parent process spawned wmic.exe, and whether that pair is historically common. A new or rare parent for wmic on this host or environment-wide is the deviation worth chasing; a pair that already accounts for thousands of prior events is inventory or OS automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals whether the same account ran similar enumeration or follow-on tooling on multiple endpoints. If the same user triggered comparable activity across several hosts, the scope of the operation may be larger than a single recon command.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent-plus-wmic combination fire on other hosts in the same window — a coordinated automation rollout, or activity isolated to this host?
+  context: Under a service principal, asking what else the user did across the network returns agent-telemetry noise. The meaningful question is whether the same launch mechanism — parent process plus wmic.exe — fired on other hosts in the alert window. Multiple hosts in the same window points to scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining activity around the alert reveals what led to this event and what followed. Software-discovery recon is commonly bracketed by other discovery commands (account, network, or process enumeration) and may precede credential access or lateral movement.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:lolbin.technique_class_lateral
+  question: Were any other discovery or proxy-execution LOLBins used on this host recently?
+  context: Operators who use one living-off-the-land binary often use several. Software-discovery recon via wmic is frequently accompanied by other built-in enumeration or proxy-execution tools. Finding multiple LOLBins running discovery or code-proxy actions in the same window strengthens the case for hands-on activity rather than isolated inventory.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_img:
+        Image|endswith:
+          - '\certutil.exe'
+          - '\bitsadmin.exe'
+          - '\curl.exe'
+          - '\rundll32.exe'
+          - '\regsvr32.exe'
+          - '\mshta.exe'
+          - '\msbuild.exe'
+          - '\cmstp.exe'
+          - '\msiexec.exe'
+          - '\forfiles.exe'
+          - '\pcalua.exe'
+          - '\presentationhost.exe'
+          - '\control.exe'
+          - '\hh.exe'
+          - '\ie4uinit.exe'
+          - '\infdefaultinstall.exe'
+          - '\installutil.exe'
+          - '\msdt.exe'
+          - '\mavinject.exe'
+          - '\diskshadow.exe'
+          - '\dnscmd.exe'
+          - '\esentutl.exe'
+          - '\expand.exe'
+          - '\extrac32.exe'
+          - '\makecab.exe'
+          - '\replace.exe'
+          - '\xwizard.exe'
+      condition: selection and selection_img
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering, other reconnaissance, or initial access — may reveal the attack stages that preceded this enumeration and help reconstruct the full timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1047
+      name: Windows Management Instrumentation
+      role: primary
+  attack_chain_coverage:
+    - stage: 1
+      label: process_creation
+      description: "wmic.exe process is created to run a 'Product' enumeration query"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: command_execution
+      description: "Command line executes the local software-inventory query (decode get attributes, output redirection, WQL filters)"
+      mapped_to: Q3
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 3
+      label: remote_connection
+      description: "Corresponding network connection if the WMI execution is remote rather than local"
+      mapped_to: Q6
+      source: attack:T1047.network_connection
+  dimension_coverage:
+    - dimension: time_correlation
+      technique: T1047
+      covered_by: Q6
+      source: attack:T1047.network_connection
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1047
+      covered_by: Q5
+      source: attack:T1047.wmi
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1047
+      covered_by: Q2
+      source: template:universal.host_user_context
+      coverage_type: direct
+  mutable_dispositions:
+    - element: WMIQueryScope
+      dimension: tuning_parameter
+      specific_values: "namespaces root\\cimv2, root\\subscription"
+      disposition: new_question
+      target_question: Q5
+      notes: "Namespace scope surfaced via the authored wmi-logsource question (Namespace field projected) and named in context to distinguish local install-DB reads from remote/suspicious namespaces."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q6
+      notes: "Correlation window between process creation and remote connection is realized as the +/-5m range on the network_connection question; threshold is a tuning rationale, not a queryable value."
+    - element: UserContext
+      dimension: user_context
+      specific_values: "interactive vs SYSTEM/low-privileged"
+      disposition: context
+      target_question: Q2
+      notes: "Interactive-vs-system distinction covered by host_user_context plus the service-principal baseline/clustering pairs."
+    - element: RemoteDestinationThreshold
+      dimension: tuning_parameter
+      specific_values: "count of unique remote hosts contacted via WMI in window"
+      disposition: new_question
+      target_question: Q6
+      notes: "Authored network_connection question aggregates DestinationIp/DestinationPort so the analyst can count distinct remote hosts contacted by wmic.exe."
+    - element: SuspiciousCommandPatterns
+      dimension: tuning_parameter
+      specific_values: "wmic process call, powershell Invoke-WmiMethod"
+      disposition: context
+      target_question: Q3
+      notes: "Generic WMI-abuse command patterns are out of this rule's selection (rule constrains to 'Product' recon); mechanism_decode context directs decoding of get/output/where shape rather than call/method patterns this rule does not fire on."
+  dedup_decisions:
+    - dropped: cue_user_actor.baseline + cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable (subject vs launch-mechanism identity); emitted both per AGENTS.md"
+      kept: both (Q11, Q12)
+    - dropped: cue_user_actor.clustering + cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable (subject vs launch-mechanism identity); emitted both per AGENTS.md"
+      kept: both (Q13, Q14)
+  skipped_templates:
+    - template: cue_process_tool.baseline
+      reason: "Superseded by lolbin.historical_lolbin_baseline (REFLECTED, rule-pattern-scoped) which is more specific than the generic Image-only host baseline for this LOLBin rule."
+    - template: cue_process_tool.clustering
+      reason: "Duplicate of cue_host_context.clustering (same host-scoped aggregation by Image) — kept the host_context version to avoid two near-identical fleet/host clustering queries; cross-host scope is covered by lolbin.technique_class_lateral and the user clustering pair."
+    - template: cue_process_tool.scope
+      reason: "fleet_pattern reflection overlaps cue_user_actor.clustering_svc (cross-host same-window rollout detection) and lolbin.technique_class_lateral; dropped to stay within the 14-18 budget while keeping host-scoped reflections (baseline_deviation, historical_lolbin_baseline) which carry the rule-pattern signal."
+    - template: persistence_scope.process_based_persistence
+      reason: "Rule is software-discovery recon, not persistence (is_persistence_rule false). persistence_scope confirmed only because the binary wmic.exe appears in persistence tool lists; no persistence behavior in this rule's selection. Process/file persistence questions would not advance a recon investigation."
+    - template: persistence_scope.file_based_persistence
+      reason: "Same as process_based_persistence — recon rule, no persistence behavior; file-drop persistence locations are off-pattern for a 'wmic product' enumeration."
+    - template: universal.endpoint_protection_health
+      reason: "Dropped to keep within the 14-18 question budget; this recon rule's investigation is better served by the discovery-focused LOLBin and clustering questions. Tamper precursors, if present, surface via cue_host_context.precursor (prior sigma alerts on host)."
+  reflection_overrides: []
+  hint_dispositions: []
+  hints_acted_on:
+    - hint: "LOLBin rule — check for renamed binary and other LOLBins achieving same objective"
+      manifested_as: "Q7 (lolbin.renamed_binary_check — wmic path verification) and Q16 (lolbin.technique_class_lateral — other discovery/proxy-exec LOLBins)."
+    - hint: >-
+        logsource 'network_connection' (recommended by techniques: T1047) is not covered — pull in cue_network_endpoint.* or author a custom question with category: network_connection
+      manifested_as: "Q6 (attack:T1047.network_connection) — category network_connection, scoping wmic.exe outbound connections to count distinct remote hosts and separate local inventory from remote WMI execution."
+    - hint: >-
+        logsource 'wmi' (recommended by techniques: T1047) is not covered and no template family exists — author a custom question with category: wmi
+      manifested_as: "Q5 (attack:T1047.wmi) — category wmi, projecting Namespace/Operation to distinguish a local install-DB read from a remote/suspicious-namespace WMI execution."
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - lolbin
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 15
+      attack: 2
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 14
+    logsource_diversity:
+      process_creation: 14
+      wmi: 1
+      network_connection: 1
+      sigma_alert: 1

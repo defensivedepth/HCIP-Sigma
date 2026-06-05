@@ -1,0 +1,644 @@
+name: Potential Reconnaissance Activity Via GatherNetworkInfo.VBS
+id: 0b9ec793-a55f-48a7-84e7-e9a177e97a77
+description: |
+  Detects execution of the built-in script gatherNetworkInfo.vbs through a
+  Visual Basic script host. The rule fires when a process is cscript.exe or
+  wscript.exe (by Image path or OriginalFileName) AND its command line contains
+  gatherNetworkInfo.vbs - both conditions must hold. gatherNetworkInfo.vbs is a
+  Microsoft-signed script that enumerates the host: event logs, full net command
+  output, hardware inventory, running services, network configuration, and ARP
+  tables, writing the results into the System32\config directory. Because the
+  script is signed it passes application allowlisting, runs without a GUI, and
+  produces pre-formatted reconnaissance output, so it is attractive both as a
+  standalone discovery primitive and as a beachhead when its scheduled task is
+  modified. Administrative troubleshooting can invoke it legitimately, so the
+  investigation should confirm the command line matches, identify the launching
+  parent, determine whether the surrounding activity is an isolated diagnostic
+  run or part of a discovery burst with follow-on staging, and check whether the
+  same pattern appears on other hosts.
+type: detection
+detection_id: 575dce0c-8139-4e30-9295-1ee75969f7fe
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Was a Visual Basic script host (cscript.exe or wscript.exe) used to run
+    gatherNetworkInfo.vbs, matching what this rule detects?
+  context: Before investing investigation time, confirm the alert is a true positive.
+    The rule fires only when both conditions hold - the process is cscript.exe or
+    wscript.exe (by image path or original file name) AND the command line contains
+    gatherNetworkInfo.vbs. Read the exact command line and confirm the script
+    argument is present and that the binary is a genuine script host, since the
+    original file name distinguishes a real cscript.exe from a renamed copy.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run the built-in network-inventory
+    script through a script host?
+  context: gatherNetworkInfo.vbs has near-zero routine interactive use; it is most
+    often invoked by its own scheduled task. An administrator troubleshooting a
+    workstation may run it by hand, but a standard user account or a server with no
+    diagnostics function launching it is more notable. Knowing whether the acting
+    account and the host role involve host diagnostics is often the fastest path to
+    separating a benign run from operator-driven reconnaissance.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What did this cscript invocation actually run? Decode the full command
+    line and identify the script path and any additional arguments.
+  context: The full command line shows exactly how the script host was driven. Confirm
+    the path the VBS was loaded from - the signed copy lives in System32, while a
+    script of the same name staged in a user-writable directory is a different
+    finding. Note any extra arguments or chained commands. gatherNetworkInfo.vbs run
+    via cscript writes its enumeration output into the System32\config directory, so
+    a completed run leaves host inventory artifacts there to corroborate the activity.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains: gatherNetworkInfo.vbs
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: attack:T1059.005.image_load
+  question: Did the script host load the VBScript engine modules during this activity,
+    confirming script interpretation rather than a renamed binary?
+  context: A genuine VBS execution by cscript.exe or wscript.exe loads the scripting
+    engine modules - vbscript.dll and scrrun.dll. Their presence in the load events
+    for the alerting process confirms the script host actually interpreted a script
+    rather than the name being reused by an unrelated binary. If image-load telemetry
+    is not collected in this environment, treat an empty result as a visibility gap
+    rather than evidence the modules were not loaded.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+        ImageLoaded|endswith:
+          - '\vbscript.dll'
+          - '\scrrun.dll'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Image
+- source: template:discovery_recon.discovery_parent_chain
+  question: What process spawned the script host, and is that parent chain expected
+    for running this script?
+  context: The parent process reveals how the script run was initiated. The built-in
+    network-inventory script is normally driven by its own scheduled task, so a
+    parent of svchost.exe under the task scheduler is routine. An interactive shell,
+    a remote-execution host such as wmiprvse.exe or wsmprovhost.exe, an Office
+    application, or mshta.exe spawning the script host points to hands-on or automated
+    operator activity rather than the scheduled maintenance run.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+- source: template:obfuscation.encoded_payload_decode
+  question: Does the command line carry any encoded or obfuscated content beyond the
+    script path, and what does it decode to?
+  context: VBScript invocations can carry obfuscation - Chr() character chains, string
+    concatenation, or environment-variable substitution that hides an additional
+    command from casual inspection. Reconstruct any such content from the command line
+    to see whether the run is the plain signed script or whether extra arguments
+    smuggle a download cradle, a secondary script, or chained execution. A clean
+    invocation with only the script path argues for a benign or task-driven run.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:discovery_recon.discovery_burst_detection
+  question: Did other reconnaissance commands run on this host around the same time?
+  context: A single inventory script may be legitimate troubleshooting, but several
+    discovery commands in rapid succession - net, ipconfig, nltest, nbtstat, arp,
+    netstat, systeminfo - is a signature of post-compromise enumeration. The
+    network-inventory script gathers much of this already, so additional native
+    recon binaries firing in the same window suggest an operator confirming or
+    extending what the script collected before moving to the next stage.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_recon:
+        Image|endswith:
+          - '\whoami.exe'
+          - '\systeminfo.exe'
+          - '\ipconfig.exe'
+          - '\net.exe'
+          - '\net1.exe'
+          - '\nltest.exe'
+          - '\nbtstat.exe'
+          - '\arp.exe'
+          - '\netstat.exe'
+          - '\tasklist.exe'
+          - '\quser.exe'
+          - '\hostname.exe'
+          - '\nslookup.exe'
+          - '\dsquery.exe'
+          - '\setspn.exe'
+      condition: selection and selection_recon
+    fields:
+      - Image
+      - User
+- source: template:cue_process_tool.follow_on
+  question: What child processes did the script host spawn afterward on this host?
+  context: A standalone signed inventory run typically spawns no children. Children
+    spawned by the script host in the window after the alert reveal what the
+    reconnaissance enabled - archiving utilities staging the collected output,
+    command-line transfer tools moving it off the host, or a shell launching the
+    next stage. cmd.exe, powershell.exe, makecab.exe, certreq.exe, bitsadmin.exe, or
+    curl.exe descending from the script host point to collection and exfiltration
+    rather than diagnostics.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith:
+          - '\cscript.exe'
+          - '\wscript.exe'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:lolbin.renamed_binary_check
+  question: Was the script host executed from its expected System32 path, and does
+    its original file name match?
+  context: cscript.exe and wscript.exe normally live in System32 or SysWOW64. A script
+    host running from a user-writable or temporary directory, or one whose original
+    file name does not match the running image, suggests the binary was copied or
+    renamed to evade path-based allowlists. Confirm the image path and original file
+    name to rule out a relocated or masqueraded script host driving the run.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- source: template:lolbin.technique_class_lateral
+  question: Were any other staging or transfer LOLBins used on this host recently?
+  context: Reconnaissance that precedes exfiltration is often followed by living-off-
+    the-land utilities that archive and move the collected data. The built-in
+    inventory script writes host data locally; check whether archive and transfer
+    binaries ran on the same host afterward, since several of these performing the
+    same collect-and-exfil objective strengthens the case for operator activity over
+    routine diagnostics.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_img:
+        Image|endswith:
+          - '\makecab.exe'
+          - '\certutil.exe'
+          - '\certreq.exe'
+          - '\bitsadmin.exe'
+          - '\curl.exe'
+          - '\expand.exe'
+          - '\extrac32.exe'
+          - '\esentutl.exe'
+          - '\replace.exe'
+          - '\wmic.exe'
+          - '\forfiles.exe'
+      condition: selection and selection_img
+    fields:
+      - Image
+      - CommandLine
+- source: template:lolbin.historical_lolbin_baseline
+  question: How often has this host fired the rule's gatherNetworkInfo.vbs pattern
+    over the past 90 days, and what command-line shapes are typical?
+  context: A script-host invocation of gatherNetworkInfo.vbs with no prior history on
+    a host is more notable than one that recurs on a stable schedule. The query
+    mirrors the rule's selection structure scoped to this host, so the count reflects
+    the rule's specific firing pattern rather than generic script-host usage. The
+    command-line projection lets the analyst compare the historical invocation shapes
+    against the alerting one to spot a deviation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \cscript.exe
+        - \wscript.exe
+      - OriginalFileName:
+        - cscript.exe
+        - wscript.exe
+      selection_cli:
+        CommandLine|contains: gatherNetworkInfo.vbs
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - CommandLine
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired the rule's gatherNetworkInfo.vbs
+    pattern, what parents and users normally drive it, and does the current alert fit?
+  context: Even the legitimate scheduled-task run sets a baseline. This query mirrors
+    the rule's selection structure scoped to this host, so the resulting parent and
+    user distribution reflects how this specific firing pattern has historically run
+    here, not generic script activity. A new parent process, an unexpected account,
+    or a first-ever occurrence is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \cscript.exe
+        - \wscript.exe
+      - OriginalFileName:
+        - cscript.exe
+        - wscript.exe
+      selection_cli:
+        CommandLine|contains: gatherNetworkInfo.vbs
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired the rule's gatherNetworkInfo.vbs pattern in the
+    past week, and does the cross-host distribution look like consistent automation
+    or one-off activity?
+  context: This query mirrors the rule's selection structure with no host scope, so
+    the result is a fleet-wide count of the gatherNetworkInfo.vbs firing pattern
+    rather than generic script-host activity. Many hosts firing the same pattern in
+    a tight window points to a pushed or scheduled trigger - which on patched systems
+    can mean the script's scheduled task was modified across the fleet. One host or a
+    small unrelated set points to manual operator activity. Use the host distribution
+    to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \cscript.exe
+        - \wscript.exe
+      - OriginalFileName:
+        - cscript.exe
+        - wscript.exe
+      selection_cli:
+        CommandLine|contains: gatherNetworkInfo.vbs
+      condition: all of selection_*
+    fields:
+    - host.name
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run the network-inventory script through a script
+    host?
+  context: Compare the acting account against its own history. An IT or diagnostics
+    account may run gatherNetworkInfo.vbs occasionally for host troubleshooting; an
+    account that has never driven this pattern launching it is more notable. The
+    user role and typical toolset should align with host diagnostics for this to read
+    as routine.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        CommandLine|contains: gatherNetworkInfo.vbs
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent and gatherNetworkInfo.vbs command-line pattern historically
+    routine on this host or across the environment, or is the parent unusual for it?
+  context: When the alert fires under a service principal, user identity does not
+    attribute the behavior; the meaningful pivot is which parent process launched a
+    script host carrying the gatherNetworkInfo.vbs pattern and whether that pairing is
+    historically common. The legitimate run descends from the task scheduler, so a new
+    or rare parent for this pattern on this host or environment-wide is the deviation
+    worth chasing, while a parent that already accounts for many prior events is more
+    likely the scheduled maintenance task.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        CommandLine|contains: gatherNetworkInfo.vbs
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the acting account's activity across all hosts reveals whether the
+    inventory run was a single event or part of activity spanning multiple endpoints.
+    If the same user triggered recon or staging on other hosts in the same window, the
+    scope of the activity is larger than one machine.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent and gatherNetworkInfo.vbs command-line pattern fire
+    on other hosts in the same window, indicating a coordinated rollout rather than
+    isolated activity?
+  context: Under a service principal, asking what else the user did across the network
+    returns agent-telemetry noise, since every host runs system-owned agents
+    constantly. The meaningful question is whether the same launch mechanism - a parent
+    process spawning a script host that carries the gatherNetworkInfo.vbs pattern -
+    fired on other hosts in the alert window. Multiple hosts in the same window points
+    to a scheduled or pushed trigger across the fleet; a single host points to a
+    host-local invocation.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        CommandLine|contains: gatherNetworkInfo.vbs
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host - script-host abuse, credential access,
+    or scheduled-task modification - may reveal the stages that preceded this
+    reconnaissance and help reconstruct the timeline. Host inventory collection is
+    often an early step in a sequence, so prior alerts give context for why the
+    enumeration was run and what it was preparing for.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1059.005
+      name: Visual Basic
+      role: primary
+    - id: T1615
+      name: Group Policy Discovery
+      role: secondary
+    - id: T1059
+      name: Command and Scripting Interpreter
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: script_host_invocation
+      description: "A VB script host (cscript.exe/wscript.exe) runs gatherNetworkInfo.vbs, the act the rule detects"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: launch_mechanism
+      description: "Identify the parent that spawned the script host - scheduled task vs. interactive/remote/Office invocation"
+      mapped_to: Q5
+      source: template:discovery_recon.discovery_parent_chain
+    - stage: 3
+      label: recon_and_followon
+      description: "Correlate surrounding discovery commands and the children spawned by the script host - the collection and staging the inventory enabled"
+      mapped_to: Q7
+      source: template:discovery_recon.discovery_burst_detection
+  dimension_coverage:
+    - dimension: command_analysis
+      technique: T1059
+      covered_by: Q3
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1059.005
+      covered_by: Q5
+      source: template:discovery_recon.discovery_parent_chain
+      coverage_type: direct
+    - dimension: obfuscation_check
+      technique: T1059.005
+      covered_by: Q6
+      source: template:obfuscation.encoded_payload_decode
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1615
+      covered_by: Q7
+      source: template:discovery_recon.discovery_burst_detection
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1615
+      covered_by: Q2
+      source: template:universal.host_user_context
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1615
+      covered_by: Q9
+      source: template:lolbin.renamed_binary_check
+      coverage_type: partial
+  mutable_dispositions:
+    - element: ModuleName
+      dimension: tuning_parameter
+      specific_values: "vbscript.dll, scrrun.dll"
+      disposition: new_question
+      target_question: Q4
+      notes: "Concrete scripting-engine module names from T1059.005. Authored as attack:T1059.005.image_load with an image_load query matching ImageLoaded|endswith vbscript.dll / scrrun.dll on the alerting ProcessGuid. Also satisfies the image_load logsource-coverage hint."
+    - element: CommandLinePattern
+      dimension: command_analysis
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q3
+      notes: "Tuning rationale for encoded/uncommon script patterns; no concrete values in the analytic. Realized as the decode task in cue_process_tool.mechanism_decode (Q3) and the obfuscation decode in Q6."
+    - element: ParentProcess
+      dimension: parent_process_analysis
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q5
+      notes: "Analytic names Office/mshta.exe as suspicious script-host parents; folded into the discovery_parent_chain context naming wmiprvse/wsmprovhost/Office/mshta as the suspect parents versus the scheduled-task baseline."
+    - element: UserContext
+      dimension: user_context
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q2
+      notes: "Admin vs. standard/service-account distinction; no concrete values. Realized in host_user_context (Q2) and the cue_user_actor baseline questions (Q14/Q15)."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q7
+      notes: "Correlation-window rationale; no concrete threshold values. Realized as the +/-15m discovery burst window (Q7) and the follow-on +4h window (Q8)."
+    - element: CommandLinePatterns
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q12
+      notes: "gpresult/PowerShell GPO cmdlet tuning from T1615; not applicable to this script-recon rule (no GPO enumeration). Severity tuning is realized via the host-scoped baseline_deviation (Q12) and fleet scope (Q13) on the rule's own pattern."
+    - element: PayloadEntropyThreshold
+      dimension: obfuscation_check
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q6
+      notes: "Entropy/obfuscation rationale; no concrete threshold. Realized as the manual obfuscation decode in Q6 (Chr() chains, concatenation, env-var substitution)."
+  dedup_decisions:
+    - dropped: cue_process_tool.process_chain
+      reason: "parent_process_analysis covered more specifically by discovery_recon.discovery_parent_chain (technique set preferred over cue when overlapping); both retrieve the alerting event's parent, discovery_parent_chain projects ParentImage+ParentCommandLine"
+      kept: discovery_recon.discovery_parent_chain
+    - dropped: discovery_recon.discovery_user_context
+      reason: "near-identical user-role judgment to universal.host_user_context; kept host_user_context as the triage user/host check to avoid two near-duplicate user questions"
+      kept: universal.host_user_context
+    - dropped: cue_user_actor.baseline + cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable; both emitted (subject-pivot and launch-mechanism-pivot). Image-pivot adapted to the CommandLine gatherNetworkInfo.vbs pattern so the count reflects the rule's firing pattern, not all script-host usage"
+      kept: both
+    - dropped: cue_user_actor.clustering + cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable; both emitted (subject-pivot and launch-mechanism-pivot)"
+      kept: both
+    - dropped: cue_host_context.clustering
+      reason: "host-activity-around-alert covered by discovery_recon.discovery_burst_detection (recon in +/-15m), cue_process_tool.follow_on (children of the script host), and cue_host_context.precursor (prior alerts); trimmed to stay within the 14-18 target"
+      kept: discovery_recon.discovery_burst_detection
+    - dropped: cue_process_tool.baseline
+      reason: "generic Image|endswith host baseline is subsumed by the REFLECTED host-pattern question (lolbin.historical_lolbin_baseline / cue_process_tool.baseline_deviation), which scope to the rule's actual gatherNetworkInfo.vbs firing pattern rather than all cscript/wscript usage"
+      kept: cue_process_tool.baseline_deviation
+    - dropped: cue_process_tool.clustering
+      reason: "Image-only host aggregation subsumed by discovery_recon.discovery_burst_detection (recon binaries) and cue_process_tool.follow_on; trimmed to stay within the 14-18 target"
+      kept: discovery_recon.discovery_burst_detection
+  skipped_templates:
+    - template: universal.endpoint_protection_health
+      reason: "recommended-tier generic host-tamper sweep. Per its notes_to_llm safe-to-drop (b): cue_host_context.precursor is present and this rule detects host reconnaissance, not credential access or payload execution, so the disposition does not turn on whether protection was weakened first. Prior-tamper context is carried by the precursor question."
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "logsource 'security' (recommended by techniques: T1615) is not covered and no template family exists — author a custom question with category: security"
+      disposition: declined
+      reason: >-
+        The T1615 security-logsource analytic targets EventCode 4661 LDAP access to
+        groupPolicyContainer objects and gpresult/Get-DomainGPO enumeration on domain
+        controllers. This rule detects gatherNetworkInfo.vbs, which enumerates local
+        host and network configuration (event logs, net output, hardware, services,
+        ARP, network config) and does not touch Group Policy objects or generate LDAP
+        groupPolicyContainer queries. The rule's detection logic genuinely constrains
+        the analysis to script-host process_creation, not GPO/LDAP security events, so
+        a category:security question would return unrelated activity. No compensating
+        attack:T1615.security question authored.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - discovery_recon
+    - obfuscation
+    - lolbin
+    - cue_process_tool
+    - cue_user_actor
+    - cue_host_context
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 17
+      attack: 1
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 15
+    logsource_diversity:
+      process_creation: 16
+      image_load: 1
+      sigma_alert: 1

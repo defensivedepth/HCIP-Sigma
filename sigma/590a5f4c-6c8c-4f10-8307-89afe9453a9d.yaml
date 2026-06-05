@@ -1,0 +1,639 @@
+name: Suspicious Child Process Created as System
+id: 53071cb6-094b-46df-be64-ec1bb48a4874
+description: |
+  Detects a process running as a service account (a ParentUser ending in LOCAL
+  SERVICE or NETWORK SERVICE) spawning a child process running as SYSTEM at
+  System integrity level. The rule fires when the parent user is a service
+  account AND the child user is SYSTEM AND the child integrity level is System,
+  while excluding the benign rundll32.exe DavSetCookie WebDAV case. Service
+  accounts that hold SeImpersonatePrivilege can be elevated to SYSTEM by relaying
+  or duplicating a SYSTEM token and then calling CreateProcessWithTokenW or
+  CreateProcessAsUserW to launch a new process under that token - the
+  service-to-SYSTEM "potato" family of local privilege escalation. Some service
+  frameworks legitimately transition to SYSTEM, so the investigation should
+  identify which child binary was launched, what it did once running as SYSTEM,
+  which parent and service account drove the transition, and whether token access
+  against sensitive processes preceded the spawn.
+type: detection
+detection_id: 590a5f4c-6c8c-4f10-8307-89afe9453a9d
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Did a service-account parent (LOCAL SERVICE or NETWORK SERVICE) spawn a
+    child running as SYSTEM at System integrity, matching what this rule detects?
+  context: Before investing investigation time, confirm the alert is a true positive.
+    The rule fires when the parent user ends in LOCAL SERVICE or NETWORK SERVICE AND
+    the child user resolves to SYSTEM AND the child integrity level is System, with
+    the benign rundll32.exe DavSetCookie WebDAV case excluded. Read the ParentUser,
+    User, and IntegrityLevel of the alerting event and confirm all three conditions
+    hold - a service account producing a SYSTEM child is the integrity jump the rule
+    is built to surface.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - User
+      - IntegrityLevel
+      - ParentUser
+- source: template:universal.host_user_context
+  question: Is this host and service account expected to transition from a service
+    account to SYSTEM?
+  context: Some service frameworks and management agents legitimately run helper
+    processes as SYSTEM, so a small set of hosts will produce this transition by
+    design. Most service-account processes never spawn a SYSTEM child. Knowing
+    whether the host role and the originating service involve a known
+    service-to-SYSTEM workflow is often the fastest path to separating expected
+    behavior from token abuse.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: attack:T1134.002.child_process_identification
+  question: Which binary was spawned as SYSTEM, where does it live, and is it an
+    expected payload for this service account?
+  context: The rule constrains only the user and integrity context, not the image,
+    so any binary can be the SYSTEM child. Identify the executable that ran as SYSTEM
+    and the path it ran from. A signed system binary in System32 launched by a known
+    service framework is a different finding than an unknown or unsigned binary
+    running from a user-writable directory such as a temp or public folder. A command
+    interpreter (cmd.exe, powershell.exe) or a network utility spawned as SYSTEM by a
+    service account is the classic potato outcome - an interactive or staging process
+    obtained at the highest privilege.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - IntegrityLevel
+- source: template:cue_process_tool.mechanism_decode
+  question: What exactly did the SYSTEM child process do? Decode its full command line.
+  context: The full command line of the SYSTEM child reveals what the elevated process
+    was used for. Decode any flags, encoded content, file paths, URLs, or downstream
+    commands. A service account that elevates to SYSTEM only to run a benign
+    maintenance task looks very different from one that elevates and then launches a
+    shell, a download, or a credential-access tool. This is the operational purpose
+    the privilege escalation was performed to obtain.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:cue_process_tool.process_chain
+  question: What process spawned the SYSTEM child, and is that service-account parent
+    chain expected?
+  context: The parent process is the service-account process that performed the token
+    operation and called the process-creation API. Identify the parent binary and how
+    it was itself launched. Service accounts such as LOCAL SERVICE and NETWORK SERVICE
+    normally host fixed sets of system services; a parent that is a script host, a
+    web or database worker process, or an unexpected utility spawning a SYSTEM child
+    points to abuse of SeImpersonatePrivilege rather than a designed service
+    transition.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: attack:T1134.002.token_access_on_sensitive_targets
+  question: Did the service-account parent open a handle to a sensitive process such
+    as lsass.exe, winlogon.exe, or services.exe shortly before the SYSTEM child was
+    spawned?
+  context: Service-to-SYSTEM elevation often requires obtaining or duplicating a
+    SYSTEM token, which leaves a process-access handle open against a SYSTEM-owned
+    process before the elevated child is created. This query surfaces handle opens
+    targeting lsass.exe, winlogon.exe, services.exe, csrss.exe, or wininit.exe so the
+    analyst can correlate a token-acquisition step with the spawn that followed.
+    Granted-access masks that include duplicate-handle or query rights against these
+    targets, paired closely in time with the alerting child, strengthen the case for
+    token manipulation rather than a designed service transition.
+  range: -10m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_access
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetImage|endswith:
+          - \lsass.exe
+          - \winlogon.exe
+          - \services.exe
+          - \csrss.exe
+          - \wininit.exe
+      condition: selection
+    fields:
+      - SourceImage
+      - TargetImage
+      - GrantedAccess
+- source: attack:T1134.002.privilege_assignment
+  question: Was a logon assigned sensitive privileges such as SeImpersonatePrivilege
+    or SeAssignPrimaryTokenPrivilege on this host around the time of the alert?
+  context: Creating a process under a stolen or duplicated SYSTEM token exercises
+    sensitive privileges - SeImpersonatePrivilege, SeAssignPrimaryTokenPrivilege, and
+    SeTcbPrivilege are the ones the potato family relies on. Special-privilege logon
+    events recorded near the spawn help confirm that an impersonation or
+    token-assignment step took place and identify the account that received those
+    privileges. Correlate the timing of any such event with the alerting child to tie
+    the privilege use to the SYSTEM process that was created.
+  range: +/-10m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: security
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4672
+      condition: selection
+    fields:
+      - SubjectUserName
+      - PrivilegeList
+- source: attack:T1134.002.followon_privileged_actions
+  question: What did the SYSTEM child do next on this host, and did it perform
+    privileged or lateral actions?
+  context: A process obtained at SYSTEM is typically the means to a follow-on end -
+    credential dumping, persistence installation, service or registry changes,
+    account creation, or lateral movement using the new privilege level. Examining
+    process creation in the window immediately after the SYSTEM child launched reveals
+    what the elevation was used for. A burst of privileged activity right after the
+    spawn indicates the elevation was operational, not incidental, and points to the
+    next stage of the operation.
+  range: +1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        User|endswith:
+          - \SYSTEM
+          - \Système
+          - \СИСТЕМА
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in
+    the hour before the alert?
+  context: Operators who reach SYSTEM frequently weaken endpoint protection before or
+    just after escalation so that follow-on actions run unobserved. This query surfaces
+    direct attempts to disable AV/EDR services, flip Defender flags, add broad
+    exclusions, clear logs, or patch AMSI and ETW from the command line. Zero rows is
+    a useful signal that no command-line tampering of these kinds was visible;
+    populated rows shift the disposition toward operator preparation. Review the parent
+    process and signing chain to identify the writer.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+- source: template:cue_user_actor.baseline
+  question: Has this account history of producing a service-account-to-SYSTEM
+    transition, or is this elevation pattern new for it?
+  context: Compare the acting account against its own history for this specific
+    pattern - a service-account parent spawning a SYSTEM child. A management framework
+    or service that elevates by design will have prior occurrences; an account that
+    has never produced this transition before is the more notable case. The query
+    pivots on the acting user and the rule's parent-user and child-user pattern over a
+    long window so the result reflects how often this elevation has occurred for this
+    account, not generic activity.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        ParentUser|endswith:
+          - \NETWORK SERVICE
+          - \LOCAL SERVICE
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent process producing a service-account-to-SYSTEM transition
+    historically routine on this host or across the environment, or is the parent
+    unusual for it?
+  context: When the alert fires under SYSTEM, user identity does not attribute the
+    behavior; the meaningful pivot is which parent process drove the elevation and
+    whether that pairing is historically common. This query scopes to the alerting
+    parent process and the rule's service-account-to-SYSTEM pattern over a long
+    window. A new or rare parent for this elevation on this host or environment-wide
+    is the deviation worth chasing, while a parent that already accounts for many
+    prior events is more likely a designed service transition or management agent.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        ParentUser|endswith:
+          - \NETWORK SERVICE
+          - \LOCAL SERVICE
+        User|endswith:
+          - \SYSTEM
+          - \Système
+          - \СИСТЕМА
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this account do across the network around this time?
+  context: Tracking the acting account's activity across all hosts reveals whether the
+    elevation was a single event or part of activity spanning multiple endpoints. If
+    the same account drove similar activity on other hosts, the scope of the incident
+    is larger than one machine. Note that when the alert fires as SYSTEM this pivot
+    returns broad system-owned telemetry, so the launch-mechanism pivot is the more
+    precise companion view.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent process drive a service-account-to-SYSTEM transition
+    on other hosts in the same window, indicating coordinated activity rather than an
+    isolated host?
+  context: Under SYSTEM, asking what else the account did across the network returns
+    system-owned telemetry noise, since every host runs SYSTEM-owned processes
+    constantly. The meaningful question is whether the same launch mechanism - this
+    parent process producing a SYSTEM child from a service account - fired on other
+    hosts in the alert window. Multiple hosts in the same window points to a pushed or
+    scheduled escalation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        ParentUser|endswith:
+          - \NETWORK SERVICE
+          - \LOCAL SERVICE
+        User|endswith:
+          - \SYSTEM
+          - \Système
+          - \СИСТЕМА
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining the activity surrounding the
+    SYSTEM spawn reveals what led to it and what followed - the service-account process
+    that staged the elevation, reconnaissance, or follow-on execution at the new
+    privilege level. Novel parent-child pairs at low counts are what to scan for
+    against the high-count noise of routine system processes.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host - reconnaissance, credential access, or
+    other defense tampering - may reveal the attack stages that preceded the
+    elevation and help reconstruct the full timeline. Privilege escalation is usually
+    one step in a sequence, so prior alerts give the context for why the operator
+    needed SYSTEM.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1134.002
+      name: Create Process with Token
+      role: primary
+    - id: T1134
+      name: Access Token Manipulation
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: token_access
+      description: "A service-account process opens a handle to / duplicates a SYSTEM token (suspicious command/API plus privileged handle access against a SYSTEM-owned process)"
+      mapped_to: Q6
+      source: attack:T1134.002.token_access_on_sensitive_targets
+    - stage: 2
+      label: privileged_handle_or_token_duplication
+      description: "Sensitive privileges (SeImpersonatePrivilege / SeAssignPrimaryTokenPrivilege) are exercised to assign/duplicate the token used for the spawn"
+      mapped_to: Q7
+      source: attack:T1134.002.privilege_assignment
+    - stage: 3
+      label: new_child_as_system
+      description: "A new child process is created running as SYSTEM at System integrity, differing from its service-account parent - the act the rule detects"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 4
+      label: followon_privileged_actions
+      description: "Optional follow-on privileged or lateral actions performed under the newly obtained SYSTEM context"
+      mapped_to: Q8
+      source: attack:T1134.002.followon_privileged_actions
+  dimension_coverage:
+    - dimension: time_correlation
+      technique: T1134.002
+      covered_by: Q7
+      source: attack:T1134.002.privilege_assignment
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1134.002
+      covered_by: Q3
+      source: attack:T1134.002.child_process_identification
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1134
+      covered_by: Q5
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+  mutable_dispositions:
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "5-10 minutes correlation window"
+      disposition: query_injection
+      target_question: Q6
+      notes: "Token-access correlation window realized as the -10m range on the process_access question and the +/-10m range on the privilege-assignment (4672) question, both scoped to the alerting host so handle access and special-privilege use can be tied to the spawn."
+    - element: SensitiveTargets
+      dimension: tuning_parameter
+      specific_values: "lsass.exe, winlogon.exe, services.exe (plus csrss.exe, wininit.exe)"
+      disposition: query_injection
+      target_question: Q6
+      notes: "Injected as TargetImage|endswith list in the process_access token-access question."
+    - element: IntegrityEscalationDelta
+      dimension: tuning_parameter
+      specific_values: "Medium to System integrity jump"
+      disposition: context
+      target_question: Q1
+      notes: "The rule already fixes the delta to System integrity in its selection (IntegrityLevel: System / S-1-16-16384); verify_trigger_match reads IntegrityLevel of the alerting event. No separate query needed - the rule constrains the delta by construction."
+    - element: ParentChildUserMismatch
+      dimension: tuning_parameter
+      specific_values: "ParentUser is LOCAL/NETWORK SERVICE, User is SYSTEM"
+      disposition: context
+      target_question: Q1
+      notes: "The rule's selection IS the parent/child user mismatch (service-account parent, SYSTEM child). verify_trigger_match confirms ParentUser and User; baseline/baseline_svc carry the same parent-user/child-user literals into their selections."
+    - element: AllowedImpersonators
+      dimension: tuning_parameter
+      specific_values: "rationale only (PsExec service, SCCM, backup agents)"
+      disposition: context
+      target_question: Q2
+      notes: "Allow-list rationale, no concrete field values in the analytic. Realized as the host/service-account expectation judgment in host_user_context (Q2) and the binary-identity judgment in Q3, which ask whether the service account and child binary are an expected service-to-SYSTEM workflow."
+    - element: AllowedServiceAccounts
+      dimension: tuning_parameter
+      specific_values: "rationale only (whitelist of service accounts permitted to spawn SYSTEM)"
+      disposition: context
+      target_question: Q2
+      notes: "T1134 secondary allow-list rationale; no concrete values. Same realization as AllowedImpersonators - host_user_context and the baseline questions establish whether this service account routinely elevates."
+    - element: KnownAdminTools
+      dimension: tuning_parameter
+      specific_values: "rationale only (legitimate admin utilities that trigger token changes)"
+      disposition: context
+      target_question: Q3
+      notes: "T1134 secondary rationale; realized as the binary-identity judgment in the child_process_identification question."
+    - element: ParentProcessAnomalyThreshold
+      dimension: parent_process_analysis
+      specific_values: "rationale only (PPID mismatch deviation threshold via ETW)"
+      disposition: context
+      target_question: Q5
+      notes: "T1134 secondary tuning rationale; no concrete threshold. Realized as the parent-chain expectation judgment in process_chain and the parent-baseline questions."
+  dedup_decisions:
+    - dropped: cue_user_actor.baseline + cue_user_actor.baseline_svc
+      reason: "user_actor pair - non-deduplicable; both emitted (subject-pivot and launch-mechanism-pivot). User pivots degenerate under SYSTEM, so the parent-mechanism substitute is essential here; both adapted to carry the rule's service-account-to-SYSTEM user literals."
+      kept: both
+    - dropped: cue_user_actor.clustering + cue_user_actor.clustering_svc
+      reason: "user_actor pair - non-deduplicable; both emitted (subject-pivot and launch-mechanism-pivot). User pivot returns SYSTEM-owned telemetry noise; the parent-mechanism substitute is the precise companion."
+      kept: both
+    - dropped: cue_process_tool.baseline
+      reason: "Image|endswith host baseline depends on a rule Image that does not exist (this rule is user/integrity-scoped, no binary constraint). The historical baseline angle is carried by cue_user_actor.baseline / baseline_svc, which scope to the rule's actual service-account-to-SYSTEM firing pattern rather than a non-existent binary."
+      kept: cue_user_actor.baseline_svc
+  skipped_templates:
+    - template: cue_user_actor.follow_on
+      reason: "follow_on (and follow_on_svc) are tier-2 context patterns not in the brief's primary cue_user_actor pattern list (baseline, clustering, follow_on, scope). Post-elevation host activity is covered more directly by attack:T1134.002.followon_privileged_actions (+1h, scoped to SYSTEM children) and cue_host_context.clustering. Trimmed to stay within the 14-18 target."
+    - template: cue_user_actor.scope
+      reason: "scope (and scope_svc) tier-3 cross-host alert pivot is subsumed by cue_host_context.precursor (prior alerts on this host) plus cue_user_actor.clustering_svc (same elevation mechanism on other hosts in-window). Trimmed to stay within the 14-18 target."
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "logsource 'process_access' (recommended by techniques: T1134.002) is not covered and no template family exists - author a custom question with category: process_access"
+      disposition: acted_on
+      reason: >-
+        Acted on. Authored attack:T1134.002.token_access_on_sensitive_targets (Q6)
+        with category: process_access, surfacing handle opens against lsass.exe /
+        winlogon.exe / services.exe / csrss.exe / wininit.exe by the service-account
+        parent before the spawn - the token-acquisition step (chain stage 1) of the
+        service-to-SYSTEM elevation.
+    - hint: "logsource 'security' (recommended by techniques: T1134.002) is not covered and no template family exists - author a custom question with category: security"
+      disposition: acted_on
+      reason: >-
+        Acted on. Authored attack:T1134.002.privilege_assignment (Q7) with
+        service: security querying EventID 4672 (special privileges assigned) to
+        surface SeImpersonatePrivilege / SeAssignPrimaryTokenPrivilege use around
+        the spawn - the token-duplication/assignment step (chain stage 2).
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - cue_process_tool
+    - cue_user_actor
+    - cue_host_context
+  generation_stats:
+    total_questions: 15
+    source_counts:
+      template: 11
+      attack: 4
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 12
+    logsource_diversity:
+      process_creation: 12
+      process_access: 1
+      security: 1
+      sigma_alert: 1

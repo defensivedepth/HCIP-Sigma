@@ -1,0 +1,697 @@
+name: Deletion of Volume Shadow Copies via WMI with PowerShell
+id: fa961e08-4b29-43dc-898d-734f0637bcd1
+description: |
+  Detects deletion of Windows Volume Shadow Copies through PowerShell using the WMI/CIM
+  Win32_ShadowCopy class. The rule fires only when a command line contains all three
+  pieces together: a WMI/CIM retrieval cmdlet (Get-WmiObject, gwmi, Get-CimInstance, or
+  gcim), a reference to the Win32_ShadowCopy class, AND a deletion verb (.Delete(),
+  Remove-WmiObject, rwmi, Remove-CimInstance, or rcim). This WMI path is a common
+  alternative to vssadmin or wmic.exe because operators expect defenders to watch those
+  binaries, and shadow-copy deletion is the canonical pre-encryption step that inhibits
+  system recovery. The investigation should confirm the exact command, establish what
+  recovery destruction occurred on the host, determine the parent chain and operator
+  identity, and check whether encryption or network-wide execution followed.
+type: detection
+detection_id: 21ff4ca9-f13a-41ad-b828-0077b2af2e40
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line contain a WMI/CIM retrieval cmdlet, a Win32_ShadowCopy reference, and a deletion verb together?
+  context: The rule fires only when all three parts are present in the same command line. The
+    three parts are a retrieval cmdlet (Get-WmiObject, gwmi, Get-CimInstance, gcim), the
+    Win32_ShadowCopy class, and a deletion verb (.Delete(), Remove-WmiObject, rwmi,
+    Remove-CimInstance, rcim). Confirm the alert is a true positive by reading the exact command line and
+    checking that all three elements appear, then note which cmdlet and verb were used.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to delete volume shadow copies?
+  context: Shadow-copy deletion via WMI is rare in routine administration. Knowing whether the
+    user role and host function include legitimate recovery or backup maintenance is often
+    the fastest way to separate an authorized operation from ransomware preparation. A
+    workstation or a standard user account deleting shadow copies is far less expected than
+    a backup or recovery process on a designated server.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:powershell.encoded_command_decode
+  question: What exactly does the shadow-copy deletion command do, and is any part of it encoded or obfuscated?
+  context: The command line is the operation. Read it in full and decode any encoding,
+    backtick escaping, string concatenation, or variable substitution used to hide intent.
+    Determine whether the command enumerates and deletes every shadow copy (for example, a
+    pipeline of Win32_ShadowCopy into a delete verb) or targets specific copies, and confirm
+    the retrieval cmdlet and deletion verb that actually executed.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:powershell.script_block_logging
+  question: Did PowerShell script block logging capture the full deobfuscated script content?
+  context: Script block logging (Event ID 4104) records the deobfuscated script content
+    PowerShell actually executed, even when the command line is encoded or obfuscated,
+    giving ground truth about what ran. For this WMI shadow-copy pattern it can reveal a
+    larger surrounding script that the single command line does not. If PowerShell
+    operational logs are not ingested in this environment, treat the absence of results as a
+    visibility gap rather than evidence nothing ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- source: template:powershell.powershell_security_bypass
+  question: Were PowerShell security controls bypassed or weakened before this execution?
+  context: Operators often disable or bypass PowerShell controls before running their payload.
+    Common precursors include AMSI bypass (patching amsi.dll in memory), execution policy
+    changes (Set-ExecutionPolicy or the bypass flag), constrained language mode escape, and
+    downgrade to PowerShell v2 to evade logging. Finding these in the hour before shadow-copy
+    deletion strengthens the case that the activity is part of a hands-on-keyboard operation.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- source: template:ransomware_impact.recovery_options_assessment
+  question: What recovery-inhibiting commands were executed on this host?
+  context: 'Operators chain multiple recovery-inhibiting commands beyond WMI shadow-copy
+    deletion: removing shadow copies (vssadmin, wmic), disabling boot recovery (bcdedit),
+    deleting backups (wbadmin), and disabling the Windows Recovery Environment (reagentc).
+    This query surfaces all such commands on the host, revealing the full scope of recovery
+    destruction. The analyst should then verify whether each action succeeded by checking
+    system state (vssadmin list shadows, bcdedit /enum, reagentc /info).'
+  range: +24h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_recovery:
+        Image|endswith:
+          - '\vssadmin.exe'
+          - '\wmic.exe'
+          - '\bcdedit.exe'
+          - '\wbadmin.exe'
+          - '\reagentc.exe'
+          - '\diskshadow.exe'
+      selection_cmdline:
+        CommandLine|contains:
+          - 'delete shadows'
+          - 'shadowcopy delete'
+          - 'recoveryenabled'
+          - 'bootstatuspolicy'
+          - 'delete catalog'
+          - 'delete systemstatebackup'
+          - 'boot.ini'
+          - 'winre.wim'
+          - '/disable'
+      condition: selection and (selection_recovery or selection_cmdline)
+    fields:
+      - Image
+      - CommandLine
+- source: template:ransomware_impact.destruction_scope_on_host
+  question: What other destructive or recovery-inhibiting actions occurred on this host?
+  context: 'Recovery destruction is usually one step in a chain: deleting shadow copies AND
+    disabling recovery AND stopping security services AND clearing event logs, often launched
+    in rapid succession from a single parent. Finding the complete set of destructive commands
+    in a tight window around the alert distinguishes scripted ransomware preparation from an
+    isolated administrative action. A shared parent across these commands points to automated
+    execution.'
+  range: +/-30m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_destructive:
+        Image|endswith:
+          - '\vssadmin.exe'
+          - '\wmic.exe'
+          - '\bcdedit.exe'
+          - '\wbadmin.exe'
+          - '\cipher.exe'
+          - '\fsutil.exe'
+          - '\icacls.exe'
+          - '\takeown.exe'
+          - '\attrib.exe'
+          - '\sc.exe'
+          - '\net.exe'
+          - '\net1.exe'
+          - '\powershell.exe'
+          - '\taskkill.exe'
+      condition: selection and selection_destructive
+    fields:
+      - Image
+      - User
+- source: template:ransomware_impact.encryption_or_ransom_indicators
+  question: Are there signs of file encryption, ransom notes, or unknown binary execution on this host?
+  context: Shadow-copy deletion typically precedes file encryption by minutes. Checking for
+    new process execution from unexpected locations after the deletion determines whether the
+    encryption phase has started and how far it has progressed. Look for unknown binaries
+    running from temporary or user-writable paths, processes with heavy file activity, and
+    ransom-note creation; system processes are filtered out to surface the suspicious set.
+  range: +30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      filter_known:
+        Image|startswith:
+          - 'C:\Program Files'
+          - 'C:\Windows\System32\svchost'
+          - 'C:\Windows\System32\wbem'
+      condition: selection and not filter_known
+    fields:
+      - Image
+      - CommandLine
+      - CurrentDirectory
+- source: template:ransomware_impact.network_wide_impact
+  question: Is this same shadow-copy deletion alert firing on other hosts in the environment?
+  context: Recovery destruction is often executed across many hosts simultaneously or in rapid
+    succession. Finding the same alert on multiple hosts indicates network-wide execution and
+    determines the scope for containment. A first-to-last timeline across hosts reveals the
+    spread pattern; hits on many hosts warrant escalation.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        rule.uuid|expand: '%rule.uuid%'
+      condition: selection
+    fields:
+      - host.name
+      - rule.name
+      - event.severity_label
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in the hour before the alert?
+  context: Tampering typically precedes destructive action. The query surfaces direct attempts
+    to disable AV/EDR services, flip protection flags, add broad exclusions, clear logs, or
+    patch AMSI/ETW. Zero rows is a useful signal that protection looks healthy, though
+    kernel-level driver tampering and in-memory patches will not appear here. Populated rows
+    shift the disposition toward operator preparation; review the parent process and signing
+    chain to identify the writer.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+- source: attack:T1490.registry_set
+  question: Were recovery features disabled through the registry on this host around the time of the alert?
+  context: Beyond deleting shadow copies, inhibiting system recovery can be done by writing
+    registry values that disable System Restore or the Windows Recovery Environment. This
+    query looks at registry modifications touching SystemRestore, the recovery configuration,
+    and WinRE keys to catch recovery being turned off through a path that does not appear in
+    process command lines.
+  range: +/-30m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_keys:
+        TargetObject|contains:
+          - 'SystemRestore\DisableSR'
+          - 'SystemRestore\DisableConfig'
+          - 'WindowsBackup'
+          - 'WinRE'
+          - 'ReAgent'
+          - 'RecoveryEnabled'
+      condition: selection and selection_keys
+    fields:
+      - TargetObject
+      - Details
+      - Image
+- source: template:cue_process_tool.process_chain
+  question: What process spawned the PowerShell that deleted the shadow copies, and is that parent chain expected?
+  context: The parent process reveals how the deletion was invoked. A scripted ransomware
+    sequence often launches recovery destruction from a single parent such as cmd.exe running
+    a batch file, or a chain like powershell driving diskshadow. Legitimate maintenance
+    usually has a predictable parent (an interactive admin shell or a scheduling service);
+    parents such as Office applications, mshta, or wscript point to malicious invocation.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired this WMI shadow-copy deletion pattern, what parents and users normally drove it, and does the current alert fit?
+  context: Even legitimate recovery maintenance can match the rule. The query mirrors the
+    rule's selection scoped to this host, so the resulting parent and user distribution
+    reflects how this specific firing pattern has run here before, not generic PowerShell
+    usage. A new parent process, an unexpected account, or a first-ever occurrence is the
+    deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_get:
+        CommandLine|contains:
+        - Get-WmiObject
+        - gwmi
+        - Get-CimInstance
+        - gcim
+      selection_shadowcopy:
+        CommandLine|contains: Win32_ShadowCopy
+      selection_delete:
+        CommandLine|contains:
+        - .Delete()
+        - Remove-WmiObject
+        - rwmi
+        - Remove-CimInstance
+        - rcim
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired this WMI shadow-copy deletion pattern in the past week, and does the distribution look like automation or one-off activity?
+  context: The query mirrors the rule's selection with no host scope, giving a fleet-wide count
+    of this specific firing pattern rather than generic PowerShell usage. Many hosts running
+    the identical pattern points to scripted deployment or coordinated execution; a single
+    host or a small unrelated set points to manual operator activity. Use the host
+    distribution and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_get:
+        CommandLine|contains:
+        - Get-WmiObject
+        - gwmi
+        - Get-CimInstance
+        - gcim
+      selection_shadowcopy:
+        CommandLine|contains: Win32_ShadowCopy
+      selection_delete:
+        CommandLine|contains:
+        - .Delete()
+        - Remove-WmiObject
+        - rwmi
+        - Remove-CimInstance
+        - rcim
+      condition: all of selection*
+    fields:
+    - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or parallel
+    destruction on multiple endpoints. If the same account triggered similar activity on
+    several hosts, the scope of the operation may be larger than the single alert. When the
+    alert fires under a service or computer account, this view is dominated by routine agent
+    telemetry and the parent-and-binary view is the meaningful one.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did the same parent and PowerShell combination fire on other hosts in the same window, indicating a coordinated rollout?
+  context: Under a service or computer account, pivoting on the user returns agent-telemetry
+    noise because every host runs system-owned agents constantly. The meaningful question is
+    whether the same launch mechanism, the parent process spawning PowerShell, fired on other
+    hosts in the alert window. Multiple hosts in the same window points to scheduled or pushed
+    automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Recovery destruction is a late-stage action; earlier detections on the same host
+    often mark the stages that preceded it. Defense tampering, reconnaissance, credential
+    access, or privilege escalation in the hours before this alert help reconstruct the full
+    timeline and confirm whether this is an isolated event or one step in an active operation.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1490
+      name: Inhibit System Recovery
+      role: primary
+    - id: T1059.001
+      name: PowerShell
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: recovery_inhibiting_command
+      description: "PowerShell uses WMI/CIM Win32_ShadowCopy with a deletion verb to remove shadow copies (the rule's specific path within the broader native-utility recovery-destruction chain)"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 1b
+      label: command_decode
+      description: "Decode/parse the exact deletion command and confirm scope (all vs. specific shadow copies)"
+      mapped_to: Q3
+      source: template:powershell.encoded_command_decode
+    - stage: 2
+      label: recovery_destruction_scope
+      description: "Full set of recovery-inhibiting actions on the host (vssadmin/bcdedit/wbadmin/reagentc, plus registry recovery-disable)"
+      mapped_to: Q6
+      source: template:ransomware_impact.recovery_options_assessment
+    - stage: 2b
+      label: registry_recovery_disable
+      description: "Recovery features disabled via registry (SystemRestore/WinRE) — the registry_set arm of T1490 the analytic calls out"
+      mapped_to: Q11
+      source: attack:T1490.registry_set
+    - stage: 3
+      label: follow_on_encryption
+      description: "Encryption phase that typically follows recovery destruction by minutes"
+      mapped_to: Q8
+      source: template:ransomware_impact.encryption_or_ransom_indicators
+  dimension_coverage:
+    - dimension: command_analysis
+      technique: T1490
+      covered_by: Q3
+      source: template:powershell.encoded_command_decode
+      coverage_type: direct
+    - dimension: network_indicators
+      technique: T1490
+      covered_by: Q9
+      source: template:ransomware_impact.network_wide_impact
+      coverage_type: indirect
+    - dimension: time_correlation
+      technique: T1490
+      covered_by: Q7
+      source: template:ransomware_impact.destruction_scope_on_host
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1490
+      covered_by: Q12
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+  mutable_dispositions:
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only (rapid recovery-feature changes over short intervals)"
+      disposition: context
+      target_question: Q7
+      notes: "destruction_scope_on_host uses a tight +/-30m window; context frames the rapid-succession chaining the element describes."
+    - element: CommandLinePattern
+      dimension: command_analysis
+      specific_values: "destructive flag/verb variations (/all, /quiet, -delete; here Get-WmiObject/gwmi/Get-CimInstance/gcim, .Delete()/Remove-WmiObject/rwmi/Remove-CimInstance/rcim)"
+      disposition: query_injection
+      target_question: Q13
+      notes: "The rule's exact CommandLine variants are embedded verbatim in the reflected baseline_deviation (Q13) and scope (Q14) queries; verify_trigger_match (Q1) and encoded_command_decode (Q3) read the alerting command directly."
+    - element: ParentProcessContext
+      dimension: tuning_parameter
+      specific_values: "common parent-child chains (e.g., powershell -> diskshadow)"
+      disposition: new_question
+      target_question: Q12
+      notes: "process_chain question asks what spawned PowerShell and whether the chain is expected; baseline_deviation (Q13) projects ParentImage to show the historical parent distribution."
+  dedup_decisions:
+    - dropped: cue_process_tool.mechanism_decode
+      reason: "Phase 2 mechanism_decode superseded by the more specific powershell.encoded_command_decode (Q3). Cue version is Image|endswith %Image% scoped, which the CommandLine-only hint warns against for powershell.exe; the powershell technique-set version reads the alerting command directly."
+      kept: powershell.encoded_command_decode
+    - dropped: cue_process_tool.baseline
+      reason: "Image-based 90d 'does this host run powershell' baseline is dominated by routine PowerShell and ignores the rule's CommandLine-only firing pattern (CommandLine-only hint). The reflected baseline_deviation (Q14) provides a precise rule-pattern host baseline instead."
+      kept: cue_process_tool.baseline_deviation
+    - dropped: cue_process_tool.follow_on
+      reason: "Child-process follow-on (ParentImage|endswith %Image% over +4h) overlaps the forward-looking encryption_or_ransom_indicators (Q8, +30m) and destruction_scope_on_host (Q7); both already surface what executed after the deletion, with system-process filtering."
+      kept: ransomware_impact.encryption_or_ransom_indicators
+    - dropped: cue_host_context.clustering
+      reason: "Generic 'other activity on host' aggregation is covered by destruction_scope_on_host (Q7, destructive-tool inventory on host) plus precursor (Q18, prior alerts on host)."
+      kept: ransomware_impact.destruction_scope_on_host
+    - dropped: network_scope.same_action_other_hosts
+      reason: "Image|endswith %Image% cross-host count over powershell.exe returns generic fleet PowerShell, not this rule's pattern. The reflected scope (Q15) gives the precise rule-pattern cross-host count, and network_wide_impact (Q9) gives the rule.uuid cross-host alert spread."
+      kept: cue_process_tool.scope
+    - dropped: network_scope.actor_activity_network_wide
+      reason: "User|expand %User% across-network aggregation by host+Image is the same query intent as cue_user_actor.clustering (Q16); kept the user-actor variant so its non-deduplicable service-principal substitute (Q17) pairs with it."
+      kept: cue_user_actor.clustering
+    - dropped: cue_user_actor.baseline + cue_user_actor.baseline_svc
+      reason: "User-actor baseline pair is Image|endswith %Image% over powershell.exe across 90d — dominated by routine PowerShell and disconnected from the rule's CommandLine-only firing pattern (CommandLine-only hint). The reflected baseline_deviation (Q14) supplies the precise rule-pattern historical baseline (parent+user), and the clustering pair (Q16/Q17) supplies the user-pivot dimension, keeping the playbook within the 18-question cap. Both are always_include templates, so the drop is recorded here rather than left silent."
+      kept: cue_process_tool.baseline_deviation
+  skipped_templates: []
+  reflection_overrides: []
+  hint_dispositions: []
+  hints_acted_on:
+    - hint: "cmd.exe: too common for Image-based scoping — use CommandLine patterns for mechanism_decode"
+      manifested_as: >-
+        Phase 2 mechanism_decode uses powershell.encoded_command_decode (Q3, ProcessGuid-scoped,
+        reads the alerting CommandLine directly) instead of the Image|endswith %Image% cue
+        mechanism_decode; host/fleet historical scoping uses the reflected CommandLine-pattern
+        queries (Q13 baseline_deviation, Q14 scope). Recorded in dedup_decisions.
+    - hint: "powershell.encoded_command_decode replaces obfuscation.encoded_payload_decode"
+      manifested_as: >-
+        powershell.encoded_command_decode included as Q3 (Phase 2). No obfuscation.encoded_payload_decode
+        template existed in the brief to drop, so the replacement is satisfied by inclusion.
+    - hint: "CommandLine-only detection — no Image field in rule. Use CommandLine pattern matching for scoping, not Image-based queries"
+      manifested_as: >-
+        Rule-pattern historical/fleet scoping uses the reflected CommandLine queries (Q13, Q14)
+        rather than Image|endswith %Image%; Image-based cue baseline and cue mechanism_decode
+        were dropped (see dedup_decisions). Where Image|endswith persists it is a technique-set
+        destructive-tool inventory (vssadmin/bcdedit/etc.), not a scope on the alerting binary.
+    - hint: "logsource 'registry_set' (recommended by techniques: T1490) is not covered — pull in cue_registry_key.* or author a custom question with category: registry_set"
+      manifested_as: >-
+        Authored Q11 (attack:T1490.registry_set) querying registry_set for SystemRestore/WinRE/
+        recovery-disable keys, covering the registry arm of Inhibit System Recovery.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - powershell
+    - ransomware_impact
+    - network_scope
+    - cue_process_tool
+    - cue_user_actor
+    - cue_host_context
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 16
+      attack: 1
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 14
+    logsource_diversity:
+      process_creation: 13
+      powershell_script_block: 1
+      registry_set: 1
+      sigma_alert: 2

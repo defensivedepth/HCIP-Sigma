@@ -1,0 +1,698 @@
+name: Potentially Suspicious Rundll32.EXE Execution of UDL File
+id: a707d6b3-7480-4fda-af53-847c2f907df9
+description: |
+  Detects explorer.exe spawning rundll32.exe to invoke the oledb32.dll connection-dialog
+  handler against a Universal Data Link (.udl) file located under a user's Downloads
+  directory. The rule fires only when all of the following match together: the parent is
+  explorer.exe, the image is rundll32.exe (or carries that original filename), and the command
+  line contains oledb32.dll, the ,OpenDSLFile entrypoint, a path under \Users\*\Downloads\,
+  and ends in .udl. Opening a .udl presents a database-connection dialog whose Test Connection
+  action authenticates to the configured server, so this pattern can be abused to coerce
+  NTLM authentication to an attacker-controlled host or to socially harvest plaintext
+  database credentials. Determine whether the .udl file arrived as a delivered attachment,
+  what server the connection string points to, and whether any outbound authentication
+  followed.
+type: detection
+detection_id: 0ea52357-cd59-4340-9981-c46c7e900428
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-04
+questions:
+- source: template:universal.verify_trigger_match
+  question: Did explorer.exe launch rundll32.exe to open a .udl file from a Downloads path
+    using the oledb32.dll OpenDSLFile entrypoint?
+  context: Confirm the alert is a true positive by reviewing the triggering event against the
+    rule's criteria, which require all of these together — parent explorer.exe, image rundll32.exe,
+    and a command line that references oledb32.dll, the ,OpenDSLFile entrypoint, a \Users\*\Downloads\
+    path, and a .udl file ending. Verify each element is present before investing further.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - OriginalFileName
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to open database connection files from Downloads?
+  context: Universal Data Link files are a legitimate convenience for developers and administrators
+    testing database connections, so a database engineer or DBA opening a .udl may be routine.
+    For a general user with no database administration role, opening a .udl delivered to Downloads
+    is the more concerning pattern and the fastest way to separate routine activity from a
+    delivered lure.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What server and authentication mode does this .udl connection string point to?
+  context: The command line names the .udl path, but the connection string inside the file
+    determines where Test Connection authenticates and how. Decode the full command line and
+    inspect the referenced .udl to identify the target server name (including any comma-port
+    override such as servername,80 used to bypass default database-port egress filtering),
+    whether integrated Windows authentication or explicit credentials are configured, and
+    whether a username is pre-filled. A non-internal or attacker-controlled server name is the
+    decisive finding.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in the hour
+    before the alert?
+  context: Tampering with endpoint protection often precedes payload execution or credential
+    coercion. The query surfaces direct attempts to disable AV/EDR services, flip Defender
+    flags, add broad exclusions, clear logs, or patch AMSI/ETW. Zero rows is a useful signal
+    that protection looks healthy at this layer; populated rows shift the disposition toward
+    operator preparation, so review the parent process and signing chain to identify the writer.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+- source: template:parent_child.parent_process_legitimacy
+  question: Is explorer.exe expected to spawn rundll32.exe this way, and what started this
+    explorer.exe instance?
+  context: The explorer.exe-to-rundll32.exe relationship is the core signal here. Explorer
+    routinely shells out to rundll32 when a user double-clicks a file, so the discriminator is
+    what was double-clicked and how the explorer instance itself was started. Tracing explorer's
+    own origin distinguishes an interactive user session from an explorer spawned by another
+    process as part of an execution chain.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- source: template:parent_child.sibling_processes
+  question: What other child processes did this explorer.exe instance spawn around the same
+    time?
+  context: If this explorer instance is part of a malicious chain rather than a normal user
+    session, it likely spawned other processes too. Sibling processes from the same explorer
+    parent reveal whether the .udl open was an isolated user action or one of several launches,
+    such as additional rundll32 invocations or script interpreters.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_parent_process.baseline
+  question: Does explorer.exe on this host normally spawn rundll32.exe to open .udl files?
+  context: Explorer spawning rundll32 is common, but the specific pattern of rundll32 invoking
+    the OLE DB connection dialog against a .udl is rare in most environments. A near-zero
+    historical count for this parent-child-plus-pattern combination on the host indicates a
+    novel action worth deeper review.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+        CommandLine|contains: '.udl'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:cue_parent_process.scope
+  question: Did the same explorer-spawned rundll32 .udl open occur on other hosts recently?
+  context: Database connection-file lures are typically delivered to multiple recipients at
+    once, so the same pattern appearing on several hosts points to a delivery wave rather than
+    a single targeted action. A single occurrence is more likely isolated. The query omits the
+    host filter to compare enterprise-wide.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+        CommandLine|contains: '.udl'
+      condition: selection
+    fields:
+      - host.name
+      - CommandLine
+- source: attack:T1218.011.image_load
+  question: What DLLs did this rundll32.exe instance load, and was oledb32.dll among them?
+  context: Process creation shows the command line, but the image-load view confirms which
+    libraries rundll32 actually mapped into memory. Confirming oledb32.dll and its dependent
+    OLE DB provider DLLs were loaded corroborates that the connection-dialog handler ran, and
+    any additional unexpected modules loaded by the same instance broaden the picture of what
+    executed.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+- source: attack:T1218.011.file_event
+  question: Where did this .udl file come from, and what else was written to the same Downloads
+    directory?
+  context: The .udl living under Downloads suggests it was delivered rather than locally
+    authored. File events for this path reveal which process wrote the file and when, and
+    surrounding writes to the same directory may show the delivery vehicle or related staged
+    files. A file written shortly before the open by a browser or mail client points to a
+    delivered attachment.
+  range: -24h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains: '\Downloads\'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: attack:T1071.network_connection
+  question: Did rundll32.exe make any outbound network connections after opening the .udl file?
+  context: The harm from this technique occurs when the connection dialog authenticates to the
+    configured server, sending an NTLM challenge-response or plaintext credentials outbound,
+    often over an application-layer protocol on a non-default port to evade egress filtering.
+    Any outbound connection from this rundll32 instance, especially to an external or
+    non-domain host, indicates the authentication coercion succeeded and credentials may have
+    been exposed.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+- source: template:lolbin.technique_class_lateral
+  question: Were any other proxy-execution LOLBins used on this host recently?
+  context: Operators who abuse one signed proxy-execution binary often reach for others. If
+    rundll32 was used to invoke the OLE DB dialog, check whether regsvr32, mshta, msbuild, or
+    similar binaries were also used to execute code on this host. Multiple proxy-execution
+    LOLBins in a short window strengthens the case for deliberate activity.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_img:
+        Image|endswith:
+          - '\regsvr32.exe'
+          - '\mshta.exe'
+          - '\msbuild.exe'
+          - '\cmstp.exe'
+          - '\installutil.exe'
+          - '\msiexec.exe'
+          - '\forfiles.exe'
+          - '\pcalua.exe'
+          - '\presentationhost.exe'
+          - '\control.exe'
+          - '\infdefaultinstall.exe'
+          - '\msdt.exe'
+          - '\mavinject.exe'
+          - '\wmic.exe'
+          - '\xwizard.exe'
+          - '\ie4uinit.exe'
+      condition: selection and selection_img
+    fields:
+      - Image
+      - CommandLine
+- source: template:lolbin.renamed_binary_check
+  question: Was rundll32.exe executed from its expected System32 or SysWOW64 path?
+  context: A rundll32 running from a user-writable location outside System32 or SysWOW64 may
+    be a copied or renamed binary placed to evade path-based allowlists. Confirm the image
+    path and original filename match the genuine system binary location.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- source: template:lolbin.historical_lolbin_baseline
+  question: How often has this host fired this rundll32 .udl pattern over the past 90 days,
+    and what command-line shapes are typical?
+  context: A pattern with no prior history on a host is more suspicious than one seen regularly
+    under stable conditions. The query mirrors the rule's selection structure scoped to this
+    host, so the count reflects the rule's specific firing pattern rather than generic rundll32
+    usage. The command-line projection lets the analyst compare typical invocation shapes
+    against the alerting one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_parent:
+        ParentImage|endswith: \explorer.exe
+      selection_img:
+      - Image|endswith: \rundll32.exe
+      - OriginalFileName: RUNDLL32.EXE
+      selection_cli:
+        CommandLine|contains|all:
+        - oledb32.dll
+        - ',OpenDSLFile '
+        - \\Users\\*\\Downloads\\
+        CommandLine|endswith: .udl
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - CommandLine
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run rundll32.exe to open database connection files?
+  context: Compare this user's current action against their historical pattern across all
+    hosts. A user who has never invoked rundll32 against a .udl is more suspicious than one who
+    does so regularly as part of a database administration role. Zero or very low counts
+    indicate this is not part of their routine toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is the explorer.exe plus rundll32.exe launch combination historically routine on
+    this host or across the environment?
+  context: When the alert fires under a service or non-interactive principal, user identity
+    does not attribute the behavior; the meaningful pivot is the launch mechanism. A new or
+    rare explorer-to-rundll32 pairing on this host or environment-wide is the deviation worth
+    chasing, while a pairing that already accounts for many prior events is routine OS or shell
+    activity.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals whether the same identity
+    triggered related activity elsewhere. If the same user opened similar connection files or
+    ran other tools on multiple hosts in the same window, the scope is broader than a single
+    endpoint.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did the same explorer.exe plus rundll32.exe launch fire on other hosts in the same
+    window?
+  context: Under a service principal, a user-pivot returns agent-telemetry noise. The
+    meaningful question is whether the same launch mechanism fired on other hosts in the alert
+    window. Multiple hosts in the same window points to a delivery wave or pushed activity; a
+    single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1218.011
+      name: Rundll32
+      role: primary
+    - id: T1218
+      name: System Binary Proxy Execution
+      role: secondary
+    - id: T1071
+      name: Application Layer Protocol
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: lure_open
+      description: User double-clicks a delivered .udl; explorer spawns rundll32 to invoke the OLE DB connection dialog handler.
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: connection_string_decode
+      description: The .udl connection string configures the target server, port-override, and auth mode used by Test Connection.
+      mapped_to: Q3
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 3
+      label: dialog_handler_load
+      description: rundll32 maps oledb32.dll and OLE DB provider DLLs to render the connection dialog.
+      mapped_to: Q9
+      source: attack:T1218.011.image_load
+    - stage: 4
+      label: outbound_auth
+      description: Test Connection authenticates outbound to the configured server, leaking NTLMv2 or plaintext credentials, often on a port-override to bypass egress filtering.
+      mapped_to: Q11
+      source: attack:T1071.network_connection
+  dimension_coverage:
+    - dimension: parent_process_analysis
+      technique: T1218.011
+      covered_by: Q5
+      source: template:parent_child.parent_process_legitimacy
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1218.011
+      covered_by: Q11
+      source: attack:T1071.network_connection
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1218.011
+      covered_by: Q14
+      source: template:lolbin.historical_lolbin_baseline
+      coverage_type: direct
+    - dimension: command_analysis
+      technique: T1218
+      covered_by: Q3
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: direct
+  mutable_dispositions:
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: rationale only
+      disposition: context
+      target_question: Q11
+      notes: Correlation of rundll32 invocation with outbound network activity expressed as the +/-15m network_connection window rather than a queryable field.
+    - element: ParentProcessFilter
+      dimension: parent_process_analysis
+      specific_values: explorer.exe
+      disposition: query_injection
+      target_question: Q5
+      notes: Parent explorer.exe is the rule's fixed parent; parent legitimacy and origin chased via ParentProcessGuid lookup.
+    - element: AllowedDLLs
+      dimension: tuning_parameter
+      specific_values: rationale only
+      disposition: context
+      target_question: Q9
+      notes: Baseline of legitimate rundll32 DLL loads addressed by the image_load question that surfaces ImageLoaded/Signed for the alerting instance.
+    - element: ExternalIPRange
+      dimension: tuning_parameter
+      specific_values: rationale only
+      disposition: context
+      target_question: Q11
+      notes: External/non-domain destination scope described in context; analyst evaluates DestinationIp/DestinationHostname against internal ranges.
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: explorer.exe
+      disposition: query_injection
+      target_question: Q7
+      notes: Parent-child baseline pinned to explorer.exe + rundll32.exe with the .udl pattern.
+    - element: SignedBinaryList
+      dimension: tuning_parameter
+      specific_values: rundll32.exe
+      disposition: context
+      target_question: Q13
+      notes: Signed-binary legitimacy addressed via expected-path check on rundll32.
+    - element: CommandLineRegex
+      dimension: command_analysis
+      specific_values: 'oledb32.dll, ,OpenDSLFile , \Users\*\Downloads\, .udl'
+      disposition: query_injection
+      target_question: Q14
+      notes: Rule's exact CommandLine|contains|all and endswith pattern reflected verbatim in the historical baseline query.
+    - element: RemoteDomainAllowlist
+      dimension: tuning_parameter
+      specific_values: rationale only
+      disposition: context
+      target_question: Q11
+      notes: Enterprise-domain suppression described in the network question's context; analyst distinguishes domain vs non-domain destinations.
+    - element: ProtocolList
+      dimension: tuning_parameter
+      specific_values: 'HTTP, DNS, SSL, SMB'
+      disposition: context
+      target_question: Q11
+      notes: App-layer protocols of interest noted in context; the network query returns destination port to identify the protocol/port-override.
+    - element: DataVolumeThreshold
+      dimension: tuning_parameter
+      specific_values: rationale only
+      disposition: context
+      target_question: Q11
+      notes: Asymmetric-volume rationale informs context; not directly queryable in the connection-existence check.
+    - element: UnusualProcessList
+      dimension: tuning_parameter
+      specific_values: rundll32.exe
+      disposition: query_injection
+      target_question: Q11
+      notes: rundll32 is the unusual network-originating process; the network query scopes to this Image.
+  dedup_decisions:
+    - dropped: cue_process_tool.process_chain
+      reason: parent_process is primary cue — subsumes process_chain (per hint)
+      kept: parent_child.parent_process_legitimacy
+    - dropped: cue_parent_process.mechanism_decode
+      reason: parent_child technique set active — parent_process_legitimacy is more specific
+      kept: parent_child.parent_process_legitimacy
+    - dropped: cue_parent_process.follow_on
+      reason: overlaps parent_child.sibling_processes (children of same parent) — technique-set version kept
+      kept: parent_child.sibling_processes
+    - dropped: cue_parent_process.clustering
+      reason: parent same-time activity covered by sibling_processes (+/-15m) and image_load/network_connection pivots on the rundll32 instance
+      kept: parent_child.sibling_processes
+    - dropped: cue_process_tool.baseline
+      reason: rundll32 generic baseline subsumed by the rule-specific reflected historical baseline and the user/mechanism baselines
+      kept: lolbin.historical_lolbin_baseline
+    - dropped: cue_host_context.clustering
+      reason: host-wide same-time activity covered by sibling_processes and the +/-1h user/mechanism clustering pair
+      kept: parent_child.sibling_processes
+    - dropped: cue_host_context.precursor
+      reason: prior-detections timeline lower value than the four mandated logsource-coverage questions for an 18-question budget; preceding stages surfaced by sibling and historical-baseline questions
+      kept: ''
+    - dropped: ''
+      reason: user_actor pair — non-deduplicable (baseline + baseline_svc emitted as Q15/Q16)
+      kept: cue_user_actor.baseline + cue_user_actor.baseline_svc
+    - dropped: ''
+      reason: user_actor pair — non-deduplicable (clustering + clustering_svc emitted as Q17/Q18)
+      kept: cue_user_actor.clustering + cue_user_actor.clustering_svc
+  skipped_templates:
+    - template: cue_parent_process.mechanism_decode
+      reason: superseded by parent_child.parent_process_legitimacy (technique-set, more specific)
+  reflection_overrides: []
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - parent_child
+    - lolbin
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 15
+      attack: 3
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 15
+    logsource_diversity:
+      process_creation: 15
+      image_load: 1
+      file_event: 1
+      network_connection: 1

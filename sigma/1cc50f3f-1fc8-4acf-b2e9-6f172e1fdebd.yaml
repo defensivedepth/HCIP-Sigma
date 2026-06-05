@@ -1,0 +1,575 @@
+name: Suspicious Rundll32 Invoking Inline VBScript
+id: 014749ea-bc30-47c0-a725-598d207beae6
+description: |
+  Detects rundll32.exe invoked with an inline VBScript command line that calls
+  Execute, reads a value from the registry via RegRead, and terminates itself
+  with window.close. rundll32.exe legitimately loads DLL exports, but it does
+  not normally carry inline scripting on its command line, so this combination
+  is a strong fit for a script-based loader that pulls a staged payload out of
+  the registry, deobfuscates it in memory, and hands execution back to native
+  code. The rule fires only when the command line contains all four tokens
+  (rundll32.exe, Execute, RegRead, window.close) together. Investigation should
+  decode the inline script to recover the registry path and payload it reads,
+  identify the parent that launched it, and determine whether the loaded code
+  went on to inject into or load a DLL inside another process.
+type: detection
+detection_id: 1cc50f3f-1fc8-4acf-b2e9-6f172e1fdebd
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line carry inline VBScript that calls Execute, RegRead, and window.close through rundll32.exe?
+  context: Before investing investigation time, confirm the alert is a true positive by reading the full command line. All four
+    tokens must be present together — rundll32.exe, Execute, RegRead, and window.close. RegRead pulls a value out of the registry,
+    Execute runs it as script, and window.close terminates the host window once the payload is delivered. Confirm the inline
+    script is genuinely present and not a benign string that happens to contain these words.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run rundll32.exe with an inline scripting payload?
+  context: Legitimate administrative activity can trigger many detections. rundll32.exe is a normal Windows utility, but it
+    is invoked here with an embedded VBScript payload, which is not a routine administrative pattern. Knowing whether the user
+    role and host function involve any tooling that would legitimately call rundll32 with inline script helps separate a true
+    positive from an unusual but sanctioned workflow.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What does the inline VBScript actually do? Decode the registry path it reads and the payload it executes.
+  context: The full command line reveals the specific action taken. Recover the registry value RegRead targets, since that is
+    where the staged payload lives, and decode anything passed to Execute. Inline loaders of this shape typically read an obfuscated
+    blob from a registry sub-key, decode it in memory, and run it without ever touching disk, so the registry path is the pivot
+    to the next stage. The scope is every matching invocation on this host within a few minutes, in case the loader runs in
+    more than one step.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains|all:
+          - rundll32.exe
+          - Execute
+          - RegRead
+          - window.close
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:cue_process_tool.process_chain
+  question: What process spawned this rundll32 invocation, and is that parent chain expected?
+  context: The parent process reveals how the inline script was launched. A loader of this kind is often started by a scripting
+    host or a scheduled-task launcher rather than by direct user action, so an unusual parent such as mshta.exe, wscript.exe,
+    a task host, or an Office application points toward automated or staged execution. Walk up the chain to see what spawned
+    the parent and what else that parent launched.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.baseline
+  question: Has this host run rundll32 with this inline VBScript pattern before?
+  context: A command-line pattern that has never been seen on a host is more suspicious than one that recurs. Because rundll32.exe
+    runs constantly for legitimate DLL loads, the baseline is scoped to the rule's specific token combination rather than to
+    rundll32 generally — zero or very low counts indicate first-time or rare execution of this loader pattern here.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains|all:
+          - rundll32.exe
+          - Execute
+          - RegRead
+          - window.close
+      condition: selection
+    fields:
+      - User
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired the rule's pattern, what parents and users normally drive that activity, and
+    does the current alert fit that pattern?
+  context: Even common tools can be abused. The query mirrors the rule's selection structure scoped to this host — the resulting
+    parent/user distribution reflects how the rule's specific firing pattern (not generic rundll32 usage) has historically
+    run here. Deviations — a new parent process, an unexpected user account, an unusual command-line shape — are the anomaly
+    worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - rundll32.exe
+        - Execute
+        - RegRead
+        - window.close
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.follow_on
+  question: What child processes did this rundll32 invocation spawn afterward?
+  context: The processes spawned after the loader runs reveal its actual impact. Script-based loaders commonly hand off to
+    cmd.exe, powershell.exe, or another rundll32 to run the deobfuscated payload, or write and execute a second-stage file.
+    Unexpected children in the minutes after the alert are the operational next stage.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: attack:T1055.access_verification
+  question: Did the rundll32 process open a handle into another process with memory-write or thread-creation rights shortly after firing?
+  context: Process injection is verified by the access rights requested when one process opens another. Handle opens that carry
+    write-to-memory or create-thread rights (for example PROCESS_VM_WRITE, PROCESS_VM_OPERATION, or PROCESS_CREATE_THREAD,
+    masks such as 0x1F0FFF or 0x143A) are the signature of code being staged into a foreign process. If process-access telemetry
+    is not collected in this environment, treat zero results as a visibility gap rather than evidence nothing happened, and
+    fall back to the child-process and image-load evidence.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_access
+      product: windows
+    detection:
+      selection:
+        SourceProcessGUID|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - TargetImage
+      - GrantedAccess
+      - CallTrace
+- source: attack:T1055.tuning_parameter
+  question: Did any process on this host open or load code into a high-value target such as lsass.exe or explorer.exe around the alert time?
+  context: Injection campaigns favor a small set of long-lived, high-privilege, or user-facing hosts to blend in — lsass.exe,
+    explorer.exe, svchost.exe, and similar are the usual targets. A handle into one of these processes opened in the same window
+    as the inline-VBScript loader connects the loader to a concrete injection target. Cross-reference the source process against
+    the rundll32 invocation and its children.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_access
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetImage|endswith:
+          - \lsass.exe
+          - \explorer.exe
+          - \svchost.exe
+          - \winlogon.exe
+      condition: selection
+    fields:
+      - SourceImage
+      - TargetImage
+      - GrantedAccess
+- source: template:cue_process_tool.clustering
+  question: What other tools ran on this host around the same time as the loader?
+  context: Attacks typically involve multiple tools in sequence. Activity surrounding the loader may reveal the scheduled task
+    or scripting host that launched it, reconnaissance, persistence installation, or staging of the second-stage payload, all
+    of which provide broader context for the investigation.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run rundll32 with an inline scripting payload?
+  context: Compare this user's current action against their historical behavior pattern. A user who has never invoked rundll32
+    with inline script is more suspicious than one who does so regularly as part of a known workflow. The user role and typical
+    toolset should align with launching script-loading utilities.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        CommandLine|contains|all:
+          - rundll32.exe
+          - Execute
+          - RegRead
+          - window.close
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is the parent-plus-rundll32 launch mechanism historically routine on this host or environment, or is the parent unusual for it?
+  context: When the alert fires under a service principal, user identity does not attribute behavior. The meaningful pivot is
+    the launch mechanism — which parent process spawned rundll32 — and whether that pair is historically common. A new or rare
+    parent for this binary on this host or environment-wide is the deviation worth chasing; a pair that already accounts for
+    thousands of prior events is vendor or OS automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity across multiple endpoints. If
+    the same user triggered similar activity on multiple hosts, the scope of compromise may be larger than a single endpoint.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent-plus-rundll32 combination fire on other hosts in the same window, or is the activity isolated to this host?
+  context: Under a service principal, asking what else the user did across the network returns agent-telemetry noise, since
+    every host runs service-owned processes constantly. The meaningful question is whether the same launch mechanism — parent
+    process plus spawned rundll32 — fired on other hosts in the alert window. Multiple hosts in the same window points to scheduled
+    or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering, reconnaissance, credential
+    access — may reveal the attack stages that preceded the loader and help reconstruct the full timeline leading up to it.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in the hour before the alert?
+  context: Tampering typically precedes payload execution. The query surfaces direct attempts to disable AV/EDR services, flip
+    Defender flags, add broad exclusions, clear logs, or patch AMSI/ETW. Zero rows is a useful "protection looks healthy" signal
+    — kernel-level driver tampering and in-memory patches will not appear here. Populated rows shift the disposition toward
+    operator preparation; review the parent process and signing chain to identify the writer. On non-Windows alerts this query
+    returns 0 by construction.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1055
+      name: Process Injection
+      role: primary
+  attack_chain_coverage:
+    - stage: 1
+      label: inline_script_invocation
+      description: "rundll32 is invoked with an inline VBScript loader that reads a payload from the registry (RegRead) and executes it (Execute)"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: payload_decode
+      description: "Inline script decodes / executes the staged payload in memory — recover the registry path and decoded content"
+      mapped_to: Q3
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 3
+      label: memory_manipulation_handle_open
+      description: "Loaded code opens a handle into another process with memory-write / thread-creation rights (VirtualAllocEx, WriteProcessMemory, CreateRemoteThread surface)"
+      mapped_to: Q8
+      source: attack:T1055.access_verification
+    - stage: 4
+      label: injection_into_target
+      description: "Code is staged into a high-value target process (lsass.exe, explorer.exe, svchost.exe)"
+      mapped_to: Q9
+      source: attack:T1055.tuning_parameter
+  dimension_coverage:
+    - dimension: access_verification
+      technique: T1055
+      covered_by: Q8
+      source: attack:T1055.access_verification
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1055
+      covered_by: Q9
+      source: attack:T1055.tuning_parameter
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1055
+      covered_by: Q9
+      source: attack:T1055.tuning_parameter
+      coverage_type: direct
+  mutable_dispositions:
+    - element: AccessMask
+      dimension: access_verification
+      specific_values: "PROCESS_VM_WRITE, PROCESS_VM_OPERATION, PROCESS_CREATE_THREAD; masks 0x1F0FFF / 0x143A"
+      disposition: query_injection
+      target_question: Q8
+      notes: "GrantedAccess projected in Q8 fields; specific masks named in context for the analyst to match against process_access rows"
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only — correlation window between API calls and thread creation"
+      disposition: context
+      target_question: Q8
+      notes: "Expressed as the +/-15m range on the process_access correlation questions Q8 and Q9; no single numeric threshold in the analytic"
+    - element: InjectedProcessList
+      dimension: tuning_parameter
+      specific_values: "lsass.exe, explorer.exe (+ svchost.exe, winlogon.exe)"
+      disposition: query_injection
+      target_question: Q9
+      notes: "Injected into Q9 TargetImage|endswith selection"
+  dedup_decisions:
+    - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc pairing
+      reason: "user_actor pair — non-deduplicable (subject vs. mechanism identity pivots)"
+      kept: both
+    - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc pairing
+      reason: "user_actor pair — non-deduplicable (subject vs. mechanism identity pivots)"
+      kept: both
+  skipped_templates:
+    - template: cue_process_tool.scope
+      reason: "Dropped to stay within the 14-18 budget; fleet-wide rule-pattern distribution is partially covered by the user_actor clustering_svc cross-host question (Q14) and host clustering (Q10). Reflected detection block was not modified."
+    - template: cue_host_context.clustering
+      reason: "Redundant with cue_process_tool.clustering (Q10) — both aggregate process activity on the alerting host in a +/-15m window. Kept the process_tool variant; dropped to stay within budget."
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "CommandLine-only detection — no Image field in rule. Use CommandLine pattern matching for scoping, not Image-based queries"
+      disposition: acted_on
+      reason: >-
+        Acted on. mechanism_decode (Q3) and baseline (Q5) were rescoped from the
+        template default Image|endswith|expand:'%Image%' to
+        CommandLine|contains|all of the rule's four tokens plus host scope, so
+        the host baseline measures this loader pattern rather than all
+        rundll32 usage. cue_user_actor.baseline (Q11) likewise uses the
+        CommandLine token pattern. follow_on (Q7) uses ParentProcessGuid scope
+        (entity-exact) instead of Image.
+    - hint: "dimension 'access_verification' (techniques: T1055) is uncovered — author a custom attack:T1055.access_verification question"
+      disposition: acted_on
+      reason: >-
+        Acted on. Q8 (attack:T1055.access_verification) authored as a
+        process_access question scoped to the rundll32 SourceProcessGUID,
+        projecting GrantedAccess / TargetImage / CallTrace with the specific
+        memory-write and thread-creation access masks named in context.
+    - hint: "logsource 'image_load' (recommended by techniques: T1055) is not covered — author a custom question with category: image_load"
+      disposition: declined
+      reason: >-
+        The rule fires on a rundll32 inline-VBScript loader pattern whose
+        in-memory payload manifests as a process_access handle open into a
+        foreign process, not as a distinctive image_load on the rundll32 host
+        process itself (rundll32 loads DLLs constantly as its normal function,
+        so an image_load query on it returns volume without precision). The
+        injection surface this technique implies is covered by the
+        process_access questions Q8 (access_verification) and Q9 (injection
+        target). No compensating attack:T1055.image_load question authored.
+    - hint: "logsource 'process_access' (recommended by techniques: T1055) is not covered and no template family exists — author a custom question with category: process_access"
+      disposition: acted_on
+      reason: >-
+        Acted on. Two custom process_access questions authored: Q8
+        (attack:T1055.access_verification, source-scoped handle opens with
+        memory-write rights) and Q9 (attack:T1055.tuning_parameter, handle
+        opens into high-value target processes).
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+  generation_stats:
+    total_questions: 16
+    source_counts:
+      template: 14
+      attack: 2
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 13
+    logsource_diversity:
+      process_creation: 13
+      process_access: 2
+      sigma_alert: 1

@@ -1,0 +1,460 @@
+name: File Decryption Using Gpg4win
+id: 59f5d142-76e5-40d3-86bf-98a71a9ebf42
+description: |
+  Detects gpg.exe or gpg2.exe (the Gpg4win OpenPGP command-line tools) invoked
+  to decrypt a file, identified by a command line that carries the ` -d `
+  decrypt switch together with the literal `passphrase`. The rule fires only
+  when both the GnuPG binary metadata and that decrypt-with-passphrase
+  command-line shape match. Gpg4win is legitimate end-user encryption software,
+  so this can be routine handling of protected mail or files; it is also a
+  recurring step in loader chains, where a renamed or silently installed Gpg4win
+  is used to decrypt a staged, encrypted payload immediately before it is loaded
+  and executed. Investigation should establish what file was decrypted, where it
+  came from, what process invoked the decryption, and what ran afterward.
+type: detection
+detection_id: 037dcd71-33a8-4392-bb01-293c94663e5a
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-04
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line show gpg.exe or gpg2.exe decrypting a file with a passphrase?
+  context: Before investing investigation time, confirm the alert is a true positive. The rule fires when the GnuPG OpenPGP binary runs with both the decrypt switch (` -d `) and a passphrase reference in the command line. Read the exact Image, CommandLine, and Description and confirm both conditions are present.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - Description
+- source: template:universal.host_user_context
+  question: Is this user and host expected to decrypt files with command-line GnuPG?
+  context: Legitimate use of Gpg4win is common among users who handle encrypted mail or protected files, often through the graphical front end rather than the command line. A user or host with no encryption workflow running command-line GnuPG decryption is a stronger signal than a known encryption user doing routine work.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What file did gpg decrypt, and what input and output paths and switches were used?
+  context: The full command line reveals the operation. Identify the input ciphertext path (often a .gpg file), any output path set with -o, and batch or passphrase-handling switches such as --batch, --yes, or --passphrase. A decrypt that writes an executable or installer output, or reads from a user-writable staging directory, points to payload deobfuscation rather than routine file handling.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:data_staging_exfil.data_scope
+  question: What files did the GnuPG process touch on disk during the decryption?
+  context: 'The command line shows the requested input and output paths, but the file events show what was actually written. Look for the decrypted output: an executable, DLL, MSI, script, or archive landing in a user-writable directory is consistent with staged-payload decryption, while an ordinary document or mail attachment is consistent with routine encryption use.'
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - TargetFilename
+- source: template:data_staging_exfil.encryption_password
+  question: How was the passphrase supplied to the decryption?
+  context: The rule fires on a command line containing a passphrase reference, so review how the secret was passed. A passphrase given inline with --passphrase, or read from a config or batch file, is observable here; passphrases supplied over stdin will not appear in the command line. A hardcoded inline passphrase paired with --batch and --yes is characteristic of scripted, unattended decryption rather than interactive use.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:cue_process_tool.process_chain
+  question: What process spawned gpg, and is that parent chain expected for file decryption?
+  context: The parent process reveals how the decryption was invoked. Interactive use is typically launched from explorer.exe or a mail client. Script interpreters such as powershell.exe, wscript.exe, cmd.exe, or mshta.exe spawning GnuPG is consistent with automated payload decryption inside a loader chain.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.follow_on
+  question: What processes ran from the decrypted output shortly after the decryption?
+  context: The processes that execute after decryption reveal its purpose. Routine use ends at a readable file. A loader chain decrypts to an executable, DLL, MSI, or script and immediately loads it with rundll32.exe, regsvr32.exe, msiexec.exe, mshta.exe, or a script host. Look for new executions on this host in the minutes following the decryption.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.baseline
+  question: Does this host normally run gpg or gpg2 for file decryption?
+  context: A GnuPG binary that has never run on a host is more suspicious than one that runs regularly. Zero or very low historical counts over the baseline window indicate first-time or rare execution, which raises the priority of the other findings.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously matched the rule's decrypt-with-passphrase pattern, what parents and users normally drive it, and does the current alert fit?
+  context: Even legitimate tools can be abused. This query mirrors the rule's selection structure scoped to this host, so the resulting parent and user distribution reflects how this specific decrypt-with-passphrase pattern has historically run here rather than generic GnuPG usage. A new parent process, an unexpected user account, or an unusual command-line shape is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_metadata:
+      - Image|endswith:
+        - \gpg.exe
+        - \gpg2.exe
+      - Description: "GnuPG’s OpenPGP tool"
+      selection_cli:
+        CommandLine|contains|all:
+        - ' -d '
+        - passphrase
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.scope
+  question: Have other hosts matched the rule's decrypt-with-passphrase pattern in the past week, and does the distribution look like automation or one-off activity?
+  context: This query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of the decrypt-with-passphrase pattern rather than generic GnuPG usage. Many hosts matching the same pattern points to scripted deployment or vendor automation; a single host or a small unrelated set points to manual or targeted activity. Use the host distribution and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_metadata:
+      - Image|endswith:
+        - \gpg.exe
+        - \gpg2.exe
+      - Description: "GnuPG’s OpenPGP tool"
+      selection_cli:
+        CommandLine|contains|all:
+        - ' -d '
+        - passphrase
+      condition: all of selection_*
+    fields:
+    - host.name
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run command-line GnuPG decryption?
+  context: Compare this user's current action against their historical behavior. A user who has never run command-line GnuPG decryption is more suspicious than one who does so regularly. The user's role and typical toolset should align with handling encrypted files from the command line.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent-and-binary combination historically routine here, or is the parent unusual for GnuPG?
+  context: 'When the alert fires under a service or machine account, user identity does not attribute behavior. The meaningful pivot is the launch mechanism: which parent process spawned the GnuPG binary, and whether that pair is historically common on this host or across the environment. A new or rare parent for this binary is the deviation worth chasing; a pair that already accounts for many prior events is automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the environment around this time?
+  context: Tracking the user's activity across all hosts reveals whether the decryption is isolated or part of broader activity. If the same user triggered related actions on multiple hosts, the scope of the operation may be larger than a single endpoint.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent-and-binary combination fire on other hosts in the same window, indicating a coordinated rollout?
+  context: Under a service or machine account, asking what else the user did across the environment returns agent-telemetry noise, because every host runs account-owned agents constantly. The meaningful question is whether the same launch mechanism, parent process plus spawned binary, fired on other hosts in the alert window. Multiple hosts in the same window points to scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: 'Alerts rarely occur in isolation. Examining activity around the decryption reveals the immediate context: what led to it, what happened after, and whether it is part of a larger sequence. Look for the download or staging that delivered the encrypted input, and for follow-on loading, defense tampering, or persistence.'
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host, such as drive-by delivery, user execution of an installer, or defense tampering, may reveal the stages that preceded the decryption and help reconstruct the full timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in the hour before the alert?
+  context: Tampering typically precedes payload execution, and loader chains that use GnuPG to decrypt payloads frequently disable or exclude antivirus first. The query surfaces direct attempts to disable AV/EDR services, flip Defender flags, add broad exclusions, clear logs, or patch AMSI/ETW. Zero rows is a useful protection-looks-healthy signal; populated rows shift the disposition toward operator preparation, so review the parent process and signing chain to identify the writer.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+_generation_meta:
+  has_attack_brief: false
+  techniques: []
+  attack_chain_coverage: []
+  dimension_coverage: []
+  mutable_dispositions: []
+  dedup_decisions:
+    - dropped: cue_process_tool.clustering
+      reason: >-
+        Near-identical query to cue_host_context.clustering (both host.name-scoped,
+        +/-15m, process_creation aggregation of activity around the alert).
+        cue_host_context.clustering kept because it projects Image AND ParentImage,
+        giving the analyst parent-child pairs rather than Image alone.
+      kept: cue_host_context.clustering
+    - dropped: data_staging_exfil.archive_destination
+      reason: >-
+        Query is near-identical to data_staging_exfil.data_scope (both file_event,
+        host+Image scoped, TargetFilename) and the question is framed around an
+        archive/export destination, which does not fit a decrypt-only operation.
+        data_scope covers the file-output investigation; the post-decryption
+        movement and loading angle is covered by cue_process_tool.follow_on.
+      kept: data_staging_exfil.data_scope
+    - dropped: null
+      reason: "user_actor pair — non-deduplicable: cue_user_actor.baseline (user pivot) and cue_user_actor.baseline_svc (parent+binary substitute) both emitted. They pivot on subject identity vs. launch mechanism and degenerate under different conditions."
+      kept: cue_user_actor.baseline + cue_user_actor.baseline_svc
+    - dropped: null
+      reason: "user_actor pair — non-deduplicable: cue_user_actor.clustering (user pivot) and cue_user_actor.clustering_svc (parent+binary substitute) both emitted. The user-pivot returns agent noise under a service principal; the substitute answers the rollout question."
+      kept: cue_user_actor.clustering + cue_user_actor.clustering_svc
+  skipped_templates: []
+  reflection_overrides: []
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - data_staging_exfil
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 17
+      attack: 0
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 14
+    logsource_diversity:
+      process_creation: 15
+      file_event: 1
+      sigma_alert: 1

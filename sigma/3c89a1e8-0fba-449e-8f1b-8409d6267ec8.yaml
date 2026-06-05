@@ -1,0 +1,739 @@
+name: Suspicious Process Created Via Wmic.EXE
+id: 5e8c14ac-f9b2-405d-89ac-d8e5223a3e58
+description: |
+  Detects wmic.exe invoking "process call create" with a command line that also references a suspicious child program or
+  user-writable path (rundll32, regsvr32, bitsadmin, certutil, mshta, cscript, wscript, powershell/pwsh, a cmd.exe one-shot,
+  or a directory such as Users\Public, Windows\Temp, AppData\Local, %temp%, %ProgramData%). The rule fires when all of these
+  conditions are present together in the command line, so the alerting event combines the WMI process-create verb with a
+  proxy-execution or download payload. Legitimate administration occasionally uses "wmic process call create" for software
+  deployment, but the specific combination with these LOLBins and temp paths is characteristic of WMI-based local or remote
+  command execution. Determine what the child command actually does, whether the parent and user are expected to drive WMI
+  execution, and whether the activity is isolated or part of a broader sequence on the host or across the fleet.
+type: detection
+detection_id: 3c89a1e8-0fba-449e-8f1b-8409d6267ec8
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the wmic.exe command line contain "process call create" together with a suspicious child program or temp path?
+  context: Before investing investigation time, confirm the alert is a true positive by reviewing the exact command line. The
+    rule requires the WMI process-create verb ("process", "call", "create" all present) AND at least one suspicious token
+    such as rundll32, regsvr32, bitsadmin, certutil, mshta, cscript, wscript, powershell/pwsh, a cmd.exe one-shot, or a
+    user-writable path. Read the full command and confirm both halves are present, not an incidental substring.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run WMI process-creation commands?
+  context: Legitimate administrative deployment occasionally uses "wmic process call create", but it is normally driven by
+    a known management account or a software-distribution host. Knowing whether the user role and host function fit WMI-based
+    execution is often the fastest path to separating a real positive from routine operations. WMI execution running as SYSTEM
+    or a low-privileged interactive user changes the interpretation of the same command.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What exactly did the wmic command instruct the target to run? Decode the full command line.
+  context: The portion after "process call create" is the program WMI was told to launch. Decode it fully — identify the child
+    binary (rundll32, regsvr32, bitsadmin, certutil, mshta, a script host, powershell), any DLL export or URL it references,
+    and whether it carries a /node argument indicating remote execution against another host. Suspicious command shapes for
+    this technique include "wmic process call create" wrapping a download cradle or a proxy-execution DLL. This query returns
+    all wmic.exe executions on the host within the window, so a multi-step operation is visible as a single sequence.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:cue_process_tool.process_chain
+  question: What process spawned wmic.exe and is that parent chain expected?
+  context: The parent reveals how WMI execution was invoked. Legitimate usage has predictable parents (explorer.exe for an
+    interactive admin, a deployment agent, services.exe). Parents such as cmd.exe spawned by a script host, mshta.exe, an
+    Office application, or an unknown binary in a user-writable directory point to WMI being driven as part of an exploitation
+    or post-exploitation chain rather than routine administration.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.follow_on
+  question: What child processes did wmic.exe spawn afterward on this host?
+  context: The child the WMI command launches is the actual payload of this technique. Locally invoked "process call create"
+    spawns the named program as a child of WmiPrvSE.exe or wmic.exe; observed children such as rundll32.exe loading a DLL,
+    a download cradle, or a script host reveal what the operation accomplished. Unexpected children for routine administration
+    are the lead to follow.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired this WMI process-create pattern, what parents and users normally drive it, and
+    does the current alert fit?
+  context: Even routine tooling can be abused. This query mirrors the rule's selection scoped to this host, so the resulting
+    parent and user distribution reflects how the rule's specific firing pattern (not generic wmic usage) has historically
+    run here. A new parent process, an unexpected user account, or an unusual command shape relative to that history is the
+    anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - 'process '
+        - 'call '
+        - 'create '
+        CommandLine|contains:
+        - rundll32
+        - bitsadmin
+        - regsvr32
+        - 'cmd.exe /c '
+        - 'cmd.exe /k '
+        - 'cmd.exe /r '
+        - 'cmd /c '
+        - 'cmd /k '
+        - 'cmd /r '
+        - powershell
+        - pwsh
+        - certutil
+        - cscript
+        - wscript
+        - mshta
+        - \Users\Public\
+        - \Windows\Temp\
+        - \AppData\Local\
+        - '%temp%'
+        - '%tmp%'
+        - '%ProgramData%'
+        - '%appdata%'
+        - '%comspec%'
+        - '%localappdata%'
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: 'Alerts rarely occur in isolation. Examining process activity in the surrounding window reveals the immediate
+    context: what led to the WMI execution, what happened after, and whether it is part of a larger sequence. Look for
+    reconnaissance, credential access, persistence installation, or additional execution tooling near the alert.'
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired this WMI process-create pattern in the past week, and does the cross-host distribution look
+    like automation or one-off activity?
+  context: This query mirrors the rule's selection with no host scope, so the result is a fleet-wide count of the rule's
+    firing pattern (not generic wmic usage). Many hosts firing the same pattern points to scripted deployment or vendor
+    automation; one host or a small unrelated set points to manual operator activity. Use the host distribution and the
+    parent/command consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - 'process '
+        - 'call '
+        - 'create '
+        CommandLine|contains:
+        - rundll32
+        - bitsadmin
+        - regsvr32
+        - 'cmd.exe /c '
+        - 'cmd.exe /k '
+        - 'cmd.exe /r '
+        - 'cmd /c '
+        - 'cmd /k '
+        - 'cmd /r '
+        - powershell
+        - pwsh
+        - certutil
+        - cscript
+        - wscript
+        - mshta
+        - \Users\Public\
+        - \Windows\Temp\
+        - \AppData\Local\
+        - '%temp%'
+        - '%tmp%'
+        - '%ProgramData%'
+        - '%appdata%'
+        - '%comspec%'
+        - '%localappdata%'
+      condition: selection
+    fields:
+    - host.name
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run wmic.exe to create processes?
+  context: Compare this user's current action against their historical behavior. A user who has never driven WMI process
+    creation is more suspicious than one who does so regularly as part of a known administrative or deployment role. User
+    role and typical toolset should align with WMI-based execution.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is the parent+wmic.exe launch combination historically routine on this host or across the environment, or is the
+    parent unusual for wmic?
+  context: 'When the alert fires under a service principal, user identity does not attribute the behavior. The meaningful
+    pivot is the launch mechanism: which parent process spawned wmic.exe, and whether that pair is historically common. A
+    new or rare parent for wmic on this host (or environment-wide) is the deviation worth chasing; a pair that already
+    accounts for thousands of prior events is vendor or operating-system automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity across multiple endpoints.
+    WMI execution is frequently used to run commands against remote nodes, so if the same user triggered similar activity
+    on multiple hosts, the scope may extend beyond the alerting endpoint.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent+wmic.exe combination fire on other hosts in the same window — is this a coordinated automation
+    rollout or isolated to this host?
+  context: Under a service principal, "what else did this user do across the network" returns agent-telemetry noise, since
+    every host runs SYSTEM-owned agents constantly. The meaningful question is whether the same launch mechanism — parent
+    process plus wmic.exe — fired on other hosts in the alert window. Multiple hosts in the same window points to scheduled
+    or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: attack:T1047.network_connection
+  question: Did this host make outbound or remote-host network connections from WMI processes close in time to the alert?
+  context: Remote WMI execution (a /node argument, or Invoke-WmiMethod against another host) produces a network connection
+    correlated in time with the process creation, and download-style child commands reach external infrastructure. Look for
+    connections from wmic.exe or WmiPrvSE.exe within a few minutes of the alert, and note how many distinct remote hosts were
+    contacted — a single host suggests targeted lateral movement while several distinct destinations in a short window suggest
+    fan-out. The time window between the process creation and any connection is the correlation signal for whether the command
+    executed remotely.
+  range: +/-10m
+  query: |
+    aggregation: true
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - '\wmic.exe'
+          - '\WmiPrvSE.exe'
+      condition: selection
+    fields:
+      - Image
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+- source: attack:T1047.wmi
+  question: Do the WMI-Activity operational events on this host show process-create or subscription activity matching the alert
+    window?
+  context: WMI operational logging records the provider operations behind "process call create" and any event-subscription
+    setup (consumers/filters in namespaces such as root\cimv2 and root\subscription). Correlating these events with the
+    alerting command confirms whether WMI actually executed a command versus a benign query, and whether a persistent
+    subscription was also registered. If WMI operational logs are not collected in this environment, treat zero results as
+    a visibility gap rather than evidence nothing ran, and rely on the process-creation evidence instead.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: wmi
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - EventID
+      - Operation
+      - User
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in the hour before the alert?
+  context: Tampering typically precedes hands-on execution. The query surfaces direct attempts to disable AV/EDR services,
+    flip Defender flags, add broad exclusions, clear logs, or patch AMSI/ETW. Zero rows is a useful "protection looks healthy"
+    signal — kernel-level driver tampering and in-memory patches will not appear here. Populated rows shift the disposition
+    toward operator preparation; review the parent process and signing chain to identify the writer. Because WMI-based
+    execution is a common hands-on-keyboard step, prior tampering on the same host raises the priority of this alert.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+- source: template:lolbin.technique_class_lateral
+  question: Were any other proxy-execution or download LOLBins used on this host recently?
+  context: Operators who use one LOLBin often use several. WMI process-create is frequently paired with proxy-execution
+    binaries (rundll32, regsvr32, mshta) or download tools (certutil, bitsadmin, curl) to stage and run a payload. Finding
+    multiple LOLBins performing complementary steps on the same host strengthens the case for malicious activity.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_img:
+        Image|endswith:
+          - '\certutil.exe'
+          - '\bitsadmin.exe'
+          - '\curl.exe'
+          - '\rundll32.exe'
+          - '\regsvr32.exe'
+          - '\mshta.exe'
+          - '\msbuild.exe'
+          - '\cmstp.exe'
+          - '\msiexec.exe'
+          - '\forfiles.exe'
+          - '\pcalua.exe'
+          - '\presentationhost.exe'
+          - '\control.exe'
+          - '\hh.exe'
+          - '\ie4uinit.exe'
+          - '\infdefaultinstall.exe'
+          - '\installutil.exe'
+          - '\msdt.exe'
+          - '\mavinject.exe'
+          - '\diskshadow.exe'
+          - '\dnscmd.exe'
+          - '\esentutl.exe'
+          - '\expand.exe'
+          - '\extrac32.exe'
+          - '\makecab.exe'
+          - '\replace.exe'
+          - '\xwizard.exe'
+      condition: selection and selection_img
+    fields:
+      - Image
+      - CommandLine
+- source: template:lolbin.renamed_binary_check
+  question: Was wmic.exe executed from its expected System32 or SysWOW64 path?
+  context: A LOLBin executed from a non-standard path (outside System32 or SysWOW64) may have been copied or renamed to evade
+    path-based allowlists. wmic.exe running from a user's temp directory or another user-writable location is more suspicious
+    than the same binary in System32. Compare Image against OriginalFileName to confirm the on-disk name and path are
+    consistent with the genuine WMI client.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- source: template:lolbin.historical_lolbin_baseline
+  question: How often has this host fired this WMI process-create pattern over the past 90 days, and what command-line shapes
+    are typical?
+  context: A LOLBin pattern with no prior history on a host is more suspicious than one used daily under stable parents. This
+    query mirrors the rule's selection scoped to this host, so the count reflects the rule's specific firing pattern (not
+    generic wmic usage). The command-line projection lets the analyst compare typical invocation shapes against the alerting
+    one to judge whether this command fits an established routine.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - 'process '
+        - 'call '
+        - 'create '
+        CommandLine|contains:
+        - rundll32
+        - bitsadmin
+        - regsvr32
+        - 'cmd.exe /c '
+        - 'cmd.exe /k '
+        - 'cmd.exe /r '
+        - 'cmd /c '
+        - 'cmd /k '
+        - 'cmd /r '
+        - powershell
+        - pwsh
+        - certutil
+        - cscript
+        - wscript
+        - mshta
+        - \Users\Public\
+        - \Windows\Temp\
+        - \AppData\Local\
+        - '%temp%'
+        - '%tmp%'
+        - '%ProgramData%'
+        - '%appdata%'
+        - '%comspec%'
+        - '%localappdata%'
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - CommandLine
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1047
+      name: Windows Management Instrumentation
+      role: primary
+  attack_chain_coverage:
+    - stage: 1
+      label: process_creation
+      description: "WMI process-create invoked — wmic.exe runs 'process call create' to launch a program (local or remote)"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: command_execution
+      description: "The named child command executes (proxy-execution DLL, download cradle, script host, cmd one-shot)"
+      mapped_to: Q3
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 3
+      label: network_connection
+      description: "If remote, a corresponding network connection occurs (/node target or download infrastructure)"
+      mapped_to: Q13
+      source: attack:T1047.network_connection
+  dimension_coverage:
+    - dimension: time_correlation
+      technique: T1047
+      covered_by: Q13
+      source: attack:T1047.network_connection
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1047
+      covered_by: Q3
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1047
+      covered_by: Q2
+      source: template:universal.host_user_context
+      coverage_type: direct
+  mutable_dispositions:
+    - element: SuspiciousCommandPatterns
+      dimension: tuning_parameter
+      specific_values: "wmic process call create, powershell Invoke-WmiMethod"
+      disposition: query_injection
+      target_question: Q6
+      notes: "Rule's full CommandLine selection (process/call/create + suspicious tokens) is embedded verbatim in the REFLECTED
+        baseline_deviation, scope, and historical_lolbin_baseline queries; the 'wmic process call create' shape is decoded in
+        the mechanism_decode question (Q3) context. Invoke-WmiMethod is named in Q3 context as the remote-execution equivalent."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only (correlate process creation and remote connection)"
+      disposition: context
+      target_question: Q13
+      notes: "Time-window correlation between WMI process creation and any network connection is described in Q13 context; the
+        +/-10m range operationalizes the correlation window."
+    - element: UserContext
+      dimension: user_context
+      specific_values: "rationale only (interactive vs SYSTEM / low-privileged)"
+      disposition: context
+      target_question: Q2
+      notes: "Interactive-vs-SYSTEM distinction injected into Q2 (host_user_context) and Q9 (user baseline) context. The
+        service-principal substitute questions (Q10 baseline_svc, Q12 clustering_svc) explicitly handle the SYSTEM/service-account firing case."
+    - element: RemoteDestinationThreshold
+      dimension: tuning_parameter
+      specific_values: "rationale only (count of unique remote hosts in window)"
+      disposition: context
+      target_question: Q13
+      notes: "Q13 (network_connection) aggregates and directs the analyst to note how many distinct remote hosts were contacted
+        — single host (targeted lateral) vs several (fan-out)."
+    - element: WMIQueryScope
+      dimension: tuning_parameter
+      specific_values: "root\\cimv2, root\\subscription"
+      disposition: context
+      target_question: Q14
+      notes: "Suspicious WMI namespaces (root\\cimv2, root\\subscription) named in Q14 (wmi operational events) context for the
+        analyst to check for subscription/consumer setup. wmi logsource lacks a namespace placeholder, so values stay in context."
+  dedup_decisions:
+    - dropped: cue_process_tool.clustering
+      reason: "Subsumed by cue_host_context.clustering (Q7) — both are +/-15m host-scoped activity aggregations; host_context
+        groups by Image+ParentImage which surfaces novel parent-child pairs that the Image-only process_tool variant misses."
+      kept: cue_host_context.clustering
+    - dropped: cue_process_tool.baseline
+      reason: "Host history of the rule's firing pattern is covered more precisely by the REFLECTED baseline_deviation (Q6,
+        -14d parent/user distribution) and historical_lolbin_baseline (Q18, -90d command shapes); a generic Image|endswith
+        90d count would duplicate that coverage without adding signal."
+      kept: cue_process_tool.baseline_deviation, lolbin.historical_lolbin_baseline
+    - dropped: cue_user_actor.baseline + cue_user_actor.baseline_svc (pair) and cue_user_actor.clustering + cue_user_actor.clustering_svc (pair)
+      reason: "user_actor pair — non-deduplicable; emitted BOTH user-pivot and service-principal substitute per AGENTS.md
+        (Q9/Q10 baseline pair, Q11/Q12 clustering pair). Listed here only to record the intentional non-dedup."
+      kept: all four
+  skipped_templates:
+    - template: cue_host_context.precursor
+      reason: "Recommended-tier prior-alert sweep dropped to stay within the 18-question cap. The execution-rule tamper signal
+        it would carry is covered directly by endpoint_protection_health (Q15, -1h host tamper sweep), and broader host context
+        by cue_host_context.clustering (Q7). Not a universal must_include."
+    - template: persistence_scope.process_based_persistence
+      reason: "Recommended-tier; rule applicability.is_persistence_rule is false and the rule fires on execution, not
+        persistence installation. Dropped to stay within the cap. LOLBin/other-tool coverage (Q16) already surfaces nearby
+        persistence binaries (schtasks/sc/reg/bitsadmin/wmic) on the host."
+    - template: persistence_scope.file_based_persistence
+      reason: "Recommended-tier; rule is not a persistence rule and detects no file write. File-based Startup/Run-key drops are
+        out of scope for a WMI command-execution alert; dropped to stay within the cap."
+  reflection_overrides: []
+  hint_dispositions:
+    # All four hints were acted on; recorded here for audit completeness, none declined.
+    - hint: "LOLBin rule — check for renamed binary and other LOLBins achieving same objective"
+      disposition: acted_on
+      reason: "Other-LOLBin sweep at Q16 (technique_class_lateral), renamed-binary check at Q17 (renamed_binary_check), and
+        rule-pattern host history at Q18 (historical_lolbin_baseline) all included."
+    - hint: "CommandLine-only detection — no Image field in rule. Use CommandLine pattern matching for scoping, not Image-based queries"
+      disposition: acted_on
+      reason: "Host/fleet-history queries (Q6 baseline_deviation, Q8 scope, Q18 historical_lolbin_baseline) scope on the rule's
+        full CommandLine|contains pattern, not Image. Image|endswith scoping is used only where ProcessGuid/host pivots are
+        anchored to the alerting wmic.exe event itself (mechanism_decode, follow_on)."
+    - hint: "logsource 'network_connection' (recommended by T1047) is not covered — author a custom question with category network_connection"
+      disposition: acted_on
+      reason: "Authored attack:T1047.network_connection (Q13) — network_connection logsource scoped to wmic.exe/WmiPrvSE.exe
+        connections, covering the chain's remote-execution stage and the time_correlation + RemoteDestinationThreshold dimensions."
+    - hint: "logsource 'wmi' (recommended by T1047) is not covered and no template family exists — author a custom question with category wmi"
+      disposition: acted_on
+      reason: "Authored attack:T1047.wmi (Q14) — wmi logsource operational-event question covering WMI provider operations and
+        subscription namespaces (WMIQueryScope mutable element)."
+  contextual_sets:
+    included: []
+    excluded:
+      - id: ransomware_impact
+        confidence: low
+        reason: "Keyword match on 'ransomware' comes only from the reference intel, not the rule's detection logic. The rule
+          fires on a generic WMI process-create pattern, not impact behavior; ransomware-impact questions (shadow-copy delete,
+          encryption) would be technique-incidental and are kept out per technique-focused framing."
+      - id: network_scope
+        confidence: low
+        reason: "Triggered by the same 'ransomware' reference keyword. The relevant network angle for T1047 (remote WMI
+          execution) is covered specifically by the authored attack:T1047.network_connection question (Q13) scoped to WMI
+          processes; the generic network_scope set would add untargeted connection sweeps."
+  technique_sets_applied:
+    - universal
+    - lolbin
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 16
+      attack: 2
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 15
+    logsource_diversity:
+      process_creation: 15
+      network_connection: 1
+      wmi: 1

@@ -1,0 +1,774 @@
+name: PowerShell Base64 Encoded Reflective Assembly Load
+id: 5db17cd7-7e12-4d60-97c6-231093e6ea81
+description: |
+  Detects a PowerShell command line containing a base64-encoded form of
+  [Reflection.Assembly]::Load( (or the ::("Load")( variant) — the in-memory loading
+  of a .NET assembly straight from a byte array, with no file written to disk. The rule
+  fires when the command line matches any one of the known base64 fragment encodings of
+  that call. Reflective .NET loading is the fileless execution stage that PowerShell
+  loaders use to run .NET tooling (post-exploitation frameworks, credential-access
+  utilities) entirely in memory, frequently after an -EncodedCommand layer hides the
+  loader. Determine what assembly is being loaded, decode the surrounding command, and
+  establish whether the user, host, and parent chain make this expected.
+type: detection
+detection_id: 62b7ccc9-23b4-471e-aa15-6da3663c4d59
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: '2026-06-05'
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line contain a base64-encoded [Reflection.Assembly]::Load call?
+  context: Before investing investigation time, confirm the alert is a true positive. The
+    rule fires on a single selection — a command line carrying any one of the known base64
+    fragment encodings of [Reflection.Assembly]::Load( or [Reflection.Assembly]::("Load")(.
+    Read the full command line and confirm the encoded fragment is present and embedded in
+    a PowerShell invocation rather than a coincidental string.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run encoded PowerShell that reflectively loads .NET assemblies into memory?
+  context: Reflective .NET loading from PowerShell is rare in routine administration; it
+    appears mostly in developer tooling, a few packaged automation frameworks, and
+    offensive tooling. Knowing whether the user role and host function involve .NET
+    development or known automation is often the fastest way to separate a true positive
+    from sanctioned activity.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:powershell.encoded_command_decode
+  question: What does the encoded command decode to, and which .NET assembly is being reflectively loaded?
+  context: The alerting command line carries a base64 fragment of an Assembly.Load call,
+    and is often wrapped in an outer -EncodedCommand (-enc) layer. Decode every layer until
+    the script is readable, then identify the byte source feeding Assembly.Load — a literal
+    byte array, a registry value, a downloaded buffer, or a hex/XOR-decoded blob. A loader
+    that assembles bytes from an unusual source and runs them with no file on disk is the
+    fileless-execution payload the rule is built to surface.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:powershell.script_block_logging
+  question: Did PowerShell script block logging capture the deobfuscated reflective-load script?
+  context: Event ID 4104 records the deobfuscated script content PowerShell actually
+    executed, even when the command line was encoded. This is ground truth for what the
+    loader did — the assembled byte array, the Assembly.Load target, and any method invoked
+    on the loaded type. If PowerShell operational logs are not ingested in this environment,
+    treat zero results as a visibility gap rather than evidence nothing ran, and decode the
+    encoded command line directly.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- source: template:powershell.powershell_security_bypass
+  question: Were PowerShell security controls bypassed or weakened before this execution?
+  context: In-memory .NET loading is commonly preceded by steps that blind the
+    interpreter — patching AMSI so the assembled bytes are never scanned, setting an
+    execution-policy bypass, or downgrading to PowerShell v2 to avoid logging. Finding these
+    precursor events in the hour before the load strengthens the case that the reflective
+    load is operator activity rather than benign tooling.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- source: template:cue_process_tool.process_chain
+  question: What process spawned the PowerShell that performed the reflective load, and is that parent chain expected?
+  context: The parent process reveals how the loader was launched. A predictable chain
+    (explorer.exe for an interactive user, a known automation host) reads differently from
+    an Office application, mshta.exe, wscript.exe, or a freshly written binary spawning
+    PowerShell — the latter parents point at delivery via macro, script, or dropper. Walk up
+    to the parent of the parent if the immediate parent is itself a shell.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired this base64 reflective-load pattern, what parents and users drove it, and does the current alert fit?
+  context: The query mirrors the rule's selection scoped to this host, so the resulting
+    parent and user distribution reflects how this specific reflective-load pattern — not
+    generic PowerShell usage — has historically run here. A new parent process, an
+    unexpected account, or a first-ever appearance of the pattern on this host is the
+    deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains:
+        - WwBSAGUAZgBsAGUAYwB0AGkAbwBuAC4AQQBzAHMAZQBtAGIAbAB5AF0AOgA6AEwAbwBhAGQAKA
+        - sAUgBlAGYAbABlAGMAdABpAG8AbgAuAEEAcwBzAGUAbQBiAGwAeQBdADoAOgBMAG8AYQBkACgA
+        - bAFIAZQBmAGwAZQBjAHQAaQBvAG4ALgBBAHMAcwBlAG0AYgBsAHkAXQA6ADoATABvAGEAZAAoA
+        - AFsAcgBlAGYAbABlAGMAdABpAG8AbgAuAGEAcwBzAGUAbQBiAGwAeQBdADoAOgAoACIATABvAGEAZAAiAC
+        - BbAHIAZQBmAGwAZQBjAHQAaQBvAG4ALgBhAHMAcwBlAG0AYgBsAHkAXQA6ADoAKAAiAEwAbwBhAGQAIgAp
+        - AWwByAGUAZgBsAGUAYwB0AGkAbwBuAC4AYQBzAHMAZQBtAGIAbAB5AF0AOgA6ACgAIgBMAG8AYQBkACIAK
+        - WwBSAGUAZgBsAGUAYwB0AGkAbwBuAC4AQQBzAHMAZQBtAGIAbAB5AF0AOgA6ACgAIgBMAG8AYQBkACIAKQ
+        - sAUgBlAGYAbABlAGMAdABpAG8AbgAuAEEAcwBzAGUAbQBiAGwAeQBdADoAOgAoACIATABvAGEAZAAiACkA
+        - bAFIAZQBmAGwAZQBjAHQAaQBvAG4ALgBBAHMAcwBlAG0AYgBsAHkAXQA6ADoAKAAiAEwAbwBhAGQAIgApA
+        - WwByAGUAZgBsAGUAYwB0AGkAbwBuAC4AYQBzAHMAZQBtAGIAbAB5AF0AOgA6AEwAbwBhAGQAKA
+        - sAcgBlAGYAbABlAGMAdABpAG8AbgAuAGEAcwBzAGUAbQBiAGwAeQBdADoAOgBMAG8AYQBkACgA
+        - bAHIAZQBmAGwAZQBjAHQAaQBvAG4ALgBhAHMAcwBlAG0AYgBsAHkAXQA6ADoATABvAGEAZAAoA
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.follow_on
+  question: What child processes did this PowerShell instance spawn after the reflective load?
+  context: The processes spawned by the loader reveal its actual impact. A reflectively
+    loaded .NET tool may shell out to cmd.exe, certutil.exe, rundll32.exe, reconnaissance
+    utilities, or additional PowerShell. Scoping to children of this exact PowerShell
+    instance keeps the result tied to the alerting process rather than all activity on the
+    host.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired this base64 reflective-load pattern in the past week, and does the spread look like automation or one-off activity?
+  context: The query mirrors the rule's selection with no host scope, so the result is a
+    fleet-wide count of this reflective-load pattern rather than generic PowerShell usage.
+    Many hosts firing the identical encoded pattern points to scripted deployment or a
+    packaged tool; a single host or a small unrelated set points to manual operator
+    activity. Use the host distribution to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains:
+        - WwBSAGUAZgBsAGUAYwB0AGkAbwBuAC4AQQBzAHMAZQBtAGIAbAB5AF0AOgA6AEwAbwBhAGQAKA
+        - sAUgBlAGYAbABlAGMAdABpAG8AbgAuAEEAcwBzAGUAbQBiAGwAeQBdADoAOgBMAG8AYQBkACgA
+        - bAFIAZQBmAGwAZQBjAHQAaQBvAG4ALgBBAHMAcwBlAG0AYgBsAHkAXQA6ADoATABvAGEAZAAoA
+        - AFsAcgBlAGYAbABlAGMAdABpAG8AbgAuAGEAcwBzAGUAbQBiAGwAeQBdADoAOgAoACIATABvAGEAZAAiAC
+        - BbAHIAZQBmAGwAZQBjAHQAaQBvAG4ALgBhAHMAcwBlAG0AYgBsAHkAXQA6ADoAKAAiAEwAbwBhAGQAIgAp
+        - AWwByAGUAZgBsAGUAYwB0AGkAbwBuAC4AYQBzAHMAZQBtAGIAbAB5AF0AOgA6ACgAIgBMAG8AYQBkACIAK
+        - WwBSAGUAZgBsAGUAYwB0AGkAbwBuAC4AQQBzAHMAZQBtAGIAbAB5AF0AOgA6ACgAIgBMAG8AYQBkACIAKQ
+        - sAUgBlAGYAbABlAGMAdABpAG8AbgAuAEEAcwBzAGUAbQBiAGwAeQBdADoAOgAoACIATABvAGEAZAAiACkA
+        - bAFIAZQBmAGwAZQBjAHQAaQBvAG4ALgBBAHMAcwBlAG0AYgBsAHkAXQA6ADoAKAAiAEwAbwBhAGQAIgApA
+        - WwByAGUAZgBsAGUAYwB0AGkAbwBuAC4AYQBzAHMAZQBtAGIAbAB5AF0AOgA6AEwAbwBhAGQAKA
+        - sAcgBlAGYAbABlAGMAdABpAG8AbgAuAGEAcwBzAGUAbQBiAGwAeQBdADoAOgBMAG8AYQBkACgA
+        - bAHIAZQBmAGwAZQBjAHQAaQBvAG4ALgBhAHMAcwBlAG0AYgBsAHkAXQA6ADoATABvAGEAZAAoA
+      condition: selection
+    fields:
+    - host.name
+- source: template:cue_user_actor.baseline
+  question: Has this user run this base64 reflective-load pattern before, on any host?
+  context: Compare this user's current activity against their history. A user who has never
+    triggered this reflective-load pattern is more notable than one who runs it regularly as
+    part of a known development or automation role. The query counts prior firings of the
+    same encoded pattern attributed to this user across all hosts.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        CommandLine|contains:
+        - WwBSAGUAZgBsAGUAYwB0AGkAbwBuAC4AQQBzAHMAZQBtAGIAbAB5AF0AOgA6AEwAbwBhAGQAKA
+        - sAUgBlAGYAbABlAGMAdABpAG8AbgAuAEEAcwBzAGUAbQBiAGwAeQBdADoAOgBMAG8AYQBkACgA
+        - bAFIAZQBmAGwAZQBjAHQAaQBvAG4ALgBBAHMAcwBlAG0AYgBsAHkAXQA6ADoATABvAGEAZAAoA
+        - AFsAcgBlAGYAbABlAGMAdABpAG8AbgAuAGEAcwBzAGUAbQBiAGwAeQBdADoAOgAoACIATABvAGEAZAAiAC
+        - BbAHIAZQBmAGwAZQBjAHQAaQBvAG4ALgBhAHMAcwBlAG0AYgBsAHkAXQA6ADoAKAAiAEwAbwBhAGQAIgAp
+        - AWwByAGUAZgBsAGUAYwB0AGkAbwBuAC4AYQBzAHMAZQBtAGIAbAB5AF0AOgA6ACgAIgBMAG8AYQBkACIAK
+        - WwBSAGUAZgBsAGUAYwB0AGkAbwBuAC4AQQBzAHMAZQBtAGIAbAB5AF0AOgA6ACgAIgBMAG8AYQBkACIAKQ
+        - sAUgBlAGYAbABlAGMAdABpAG8AbgAuAEEAcwBzAGUAbQBiAGwAeQBdADoAOgAoACIATABvAGEAZAAiACkA
+        - bAFIAZQBmAGwAZQBjAHQAaQBvAG4ALgBBAHMAcwBlAG0AYgBsAHkAXQA6ADoAKAAiAEwAbwBhAGQAIgApA
+        - WwByAGUAZgBsAGUAYwB0AGkAbwBuAC4AYQBzAHMAZQBtAGIAbAB5AF0AOgA6AEwAbwBhAGQAKA
+        - sAcgBlAGYAbABlAGMAdABpAG8AbgAuAGEAcwBzAGUAbQBiAGwAeQBdADoAOgBMAG8AYQBkACgA
+        - bAHIAZQBmAGwAZQBjAHQAaQBvAG4ALgBhAHMAcwBlAG0AYgBsAHkAXQA6ADoATABvAGEAZAAoA
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this base64 reflective-load pattern historically routine on this host regardless of user, or is this the first appearance?
+  context: When the alert fires under a service principal (SYSTEM, LOCAL SERVICE, NETWORK
+    SERVICE, or a computer account), user identity does not attribute behavior, so the
+    meaningful pivot is the pattern itself on this host. A host that has already produced
+    many firings of this encoded pattern points to packaged automation; a first-ever
+    appearance is the deviation worth chasing. This is paired with the user-history question
+    and is not a duplicate — it answers whether the mechanism is routine, not whether the
+    user is.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains:
+        - WwBSAGUAZgBsAGUAYwB0AGkAbwBuAC4AQQBzAHMAZQBtAGIAbAB5AF0AOgA6AEwAbwBhAGQAKA
+        - sAUgBlAGYAbABlAGMAdABpAG8AbgAuAEEAcwBzAGUAbQBiAGwAeQBdADoAOgBMAG8AYQBkACgA
+        - bAFIAZQBmAGwAZQBjAHQAaQBvAG4ALgBBAHMAcwBlAG0AYgBsAHkAXQA6ADoATABvAGEAZAAoA
+        - AFsAcgBlAGYAbABlAGMAdABpAG8AbgAuAGEAcwBzAGUAbQBiAGwAeQBdADoAOgAoACIATABvAGEAZAAiAC
+        - BbAHIAZQBmAGwAZQBjAHQAaQBvAG4ALgBhAHMAcwBlAG0AYgBsAHkAXQA6ADoAKAAiAEwAbwBhAGQAIgAp
+        - AWwByAGUAZgBsAGUAYwB0AGkAbwBuAC4AYQBzAHMAZQBtAGIAbAB5AF0AOgA6ACgAIgBMAG8AYQBkACIAK
+        - WwBSAGUAZgBsAGUAYwB0AGkAbwBuAC4AQQBzAHMAZQBtAGIAbAB5AF0AOgA6ACgAIgBMAG8AYQBkACIAKQ
+        - sAUgBlAGYAbABlAGMAdABpAG8AbgAuAEEAcwBzAGUAbQBiAGwAeQBdADoAOgAoACIATABvAGEAZAAiACkA
+        - bAFIAZQBmAGwAZQBjAHQAaQBvAG4ALgBBAHMAcwBlAG0AYgBsAHkAXQA6ADoAKAAiAEwAbwBhAGQAIgApA
+        - WwByAGUAZgBsAGUAYwB0AGkAbwBuAC4AYQBzAHMAZQBtAGIAbAB5AF0AOgA6AEwAbwBhAGQAKA
+        - sAcgBlAGYAbABlAGMAdABpAG8AbgAuAGEAcwBzAGUAbQBiAGwAeQBdADoAOgBMAG8AYQBkACgA
+        - bAHIAZQBmAGwAZQBjAHQAaQBvAG4ALgBhAHMAcwBlAG0AYgBsAHkAXQA6ADoATABvAGEAZAAoA
+      condition: selection
+    fields:
+      - User
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around the time of the alert?
+  context: Tracking the user's activity across all hosts reveals lateral movement or
+    activity spanning multiple endpoints. If the same user triggered comparable activity on
+    several hosts in the window, the scope of the incident may be larger than the single
+    alerting host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this base64 reflective-load pattern fire on other hosts in the same window — a coordinated rollout, or isolated to this host?
+  context: Under a service principal, asking what else the user did returns agent-telemetry
+    noise. The meaningful question is whether the same encoded reflective-load pattern fired
+    on other hosts in the alert window. Multiple hosts in the same hour points to scheduled
+    or pushed automation; a single host points to a host-local trigger. This is paired with
+    the user-network-activity question and is not a duplicate.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains:
+        - WwBSAGUAZgBsAGUAYwB0AGkAbwBuAC4AQQBzAHMAZQBtAGIAbAB5AF0AOgA6AEwAbwBhAGQAKA
+        - sAUgBlAGYAbABlAGMAdABpAG8AbgAuAEEAcwBzAGUAbQBiAGwAeQBdADoAOgBMAG8AYQBkACgA
+        - bAFIAZQBmAGwAZQBjAHQAaQBvAG4ALgBBAHMAcwBlAG0AYgBsAHkAXQA6ADoATABvAGEAZAAoA
+        - AFsAcgBlAGYAbABlAGMAdABpAG8AbgAuAGEAcwBzAGUAbQBiAGwAeQBdADoAOgAoACIATABvAGEAZAAiAC
+        - BbAHIAZQBmAGwAZQBjAHQAaQBvAG4ALgBhAHMAcwBlAG0AYgBsAHkAXQA6ADoAKAAiAEwAbwBhAGQAIgAp
+        - AWwByAGUAZgBsAGUAYwB0AGkAbwBuAC4AYQBzAHMAZQBtAGIAbAB5AF0AOgA6ACgAIgBMAG8AYQBkACIAK
+        - WwBSAGUAZgBsAGUAYwB0AGkAbwBuAC4AQQBzAHMAZQBtAGIAbAB5AF0AOgA6ACgAIgBMAG8AYQBkACIAKQ
+        - sAUgBlAGYAbABlAGMAdABpAG8AbgAuAEEAcwBzAGUAbQBiAGwAeQBdADoAOgAoACIATABvAGEAZAAiACkA
+        - bAFIAZQBmAGwAZQBjAHQAaQBvAG4ALgBBAHMAcwBlAG0AYgBsAHkAXQA6ADoAKAAiAEwAbwBhAGQAIgApA
+        - WwByAGUAZgBsAGUAYwB0AGkAbwBuAC4AYQBzAHMAZQBtAGIAbAB5AF0AOgA6AEwAbwBhAGQAKA
+        - sAcgBlAGYAbABlAGMAdABpAG8AbgAuAGEAcwBzAGUAbQBiAGwAeQBdADoAOgBMAG8AYQBkACgA
+        - bAHIAZQBmAGwAZQBjAHQAaQBvAG4ALgBhAHMAcwBlAG0AYgBsAHkAXQA6ADoATABvAGEAZAAoA
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining the surrounding process activity
+    reveals what led to the reflective load and what happened after — reconnaissance,
+    privilege escalation, persistence installation, or data staging. Novel parent-child
+    pairs stand out at low counts against the high-count rows of routine agent telemetry.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host — defense tampering, reconnaissance,
+    credential access — may reveal the attack stages that preceded the reflective load and
+    help reconstruct the timeline. Loaders rarely run first; an alert sequence often tells
+    the broader story.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in the hour before the alert?
+  context: Tampering typically precedes payload execution. The query surfaces direct
+    attempts to disable AV/EDR services, flip Defender flags, add broad exclusions, clear
+    logs, or patch AMSI/ETW. Zero rows is a useful protection-looks-healthy signal —
+    kernel-level driver tampering and in-memory patches will not appear here. Populated rows
+    shift the disposition toward operator preparation; review the parent process and signing
+    chain to identify the writer.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+- source: attack:T1620.dotnet_runtime_image_load
+  question: Around the alert time, did this host load the .NET runtime and automation assemblies that in-memory Assembly.Load requires?
+  context: Reflective .NET loading from PowerShell needs the CLR and the automation engine
+    resident in the process — clr.dll, clrjit.dll, mscoree.dll, and
+    System.Management.Automation. Their appearance in image-load events on this host around
+    the alert corroborates that managed code was actually staged in memory, and the loading
+    process identifies which host process hosted the assembly. Absence may simply mean
+    image-load logging is not collected, so treat zero results as a visibility gap.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ImageLoaded|endswith:
+          - '\clr.dll'
+          - '\clrjit.dll'
+          - '\mscoree.dll'
+          - '\System.Management.Automation.dll'
+      condition: selection
+    fields:
+      - Image
+      - ImageLoaded
+- source: attack:T1620.in_process_memory_access
+  question: Did any process open a handle to itself with execute/write access rights around the alert time?
+  context: Unlike cross-process injection, reflective code loading stages and runs managed
+    code entirely inside the loading process's own PID — the suspicious memory operations
+    do not cross a process boundary. A process opening a handle to itself with rights
+    permitting memory write and execute is consistent with in-memory staging. If process-access
+    events are not collected in this environment, treat zero results as a visibility gap
+    rather than evidence the staging did not occur.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_access
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        GrantedAccess|contains:
+          - '0x1F0FFF'
+          - '0x1FFFFF'
+      condition: selection
+    fields:
+      - SourceImage
+      - TargetImage
+      - GrantedAccess
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1059.001
+      name: PowerShell
+      role: primary
+    - id: T1620
+      name: Reflective Code Loading
+      role: secondary
+    - id: T1027
+      name: Obfuscated Files or Information
+      role: secondary
+    - id: T1059
+      name: Command and Scripting Interpreter
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: encoded_powershell_launch
+      description: "PowerShell launched with an encoded/obfuscated command line carrying the reflective-load payload"
+      mapped_to: Q3
+      source: template:powershell.encoded_command_decode
+    - stage: 2
+      label: security_control_bypass
+      description: "AMSI/execution-policy/logging controls weakened so the assembled bytes are not scanned or logged"
+      mapped_to: Q5
+      source: template:powershell.powershell_security_bypass
+    - stage: 3
+      label: in_memory_assembly_load
+      description: "Reflective .NET Assembly.Load of a byte array with no file written to disk — managed code staged in-process"
+      mapped_to: Q17
+      source: attack:T1620.dotnet_runtime_image_load
+    - stage: 4
+      label: in_process_memory_staging
+      description: "VirtualAlloc/Protect-style memory operations within the loader's own PID context"
+      mapped_to: Q18
+      source: attack:T1620.in_process_memory_access
+    - stage: 5
+      label: post_load_execution
+      description: "Methods invoked on the loaded assembly / child processes spawned by the loader"
+      mapped_to: Q8
+      source: template:cue_process_tool.follow_on
+  dimension_coverage:
+    - dimension: command_analysis
+      technique: T1059.001
+      covered_by: Q3
+      source: template:powershell.encoded_command_decode
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1059.001
+      covered_by: Q6
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1059.001
+      covered_by: Q15
+      source: template:cue_host_context.precursor
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1059.001
+      covered_by: Q4
+      source: template:powershell.script_block_logging
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1059
+      covered_by: Q10
+      source: template:cue_user_actor.baseline
+      coverage_type: direct
+    - dimension: obfuscation_check
+      technique: T1027
+      covered_by: Q3
+      source: template:powershell.encoded_command_decode
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1620
+      covered_by: Q18
+      source: attack:T1620.in_process_memory_access
+      coverage_type: direct
+  mutable_dispositions:
+    - element: CommandLinePattern
+      dimension: command_analysis
+      specific_values: "-enc, -nop (encoded/hidden PowerShell flags)"
+      disposition: context
+      target_question: Q3
+      notes: >-
+        The rule's own selection already enforces the base64 reflective-load pattern; the
+        -enc/-nop flags are surfaced as the outer-layer hint to decode in the
+        encoded_command_decode context. The reflected baseline_deviation/scope/user-actor
+        queries carry the rule's exact CommandLine|contains fragments.
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "rationale only (Excel, WinWord, mshta — example abnormal parents)"
+      disposition: context
+      target_question: Q6
+      notes: "No parent in rule detection; example abnormal parents named in process_chain context."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only (off-hours / non-maintenance scoping)"
+      disposition: context
+      target_question: Q15
+      notes: "Temporal correlation handled by precursor-alert and clustering windows."
+    - element: LoadedModuleList
+      dimension: tuning_parameter
+      specific_values: ".NET runtime/automation assemblies (clr.dll, clrjit.dll, mscoree.dll, System.Management.Automation.dll)"
+      disposition: query_injection
+      target_question: Q17
+      notes: "Injected into attack:T1620.dotnet_runtime_image_load ImageLoaded|endswith selection."
+    - element: ScriptBlockLengthThreshold
+      dimension: tuning_parameter
+      specific_values: "rationale only (4104 script-block length tuning)"
+      disposition: context
+      target_question: Q4
+      notes: "Threshold not directly queryable; script-block-logging question retrieves 4104 content."
+    - element: PayloadEntropyThreshold
+      dimension: obfuscation_check
+      specific_values: "rationale only (entropy threshold)"
+      disposition: context
+      target_question: Q3
+      notes: "Entropy threshold is a tuning rationale; obfuscation handled by decode question."
+    - element: SuspiciousParentProcessList
+      dimension: tuning_parameter
+      specific_values: "rationale only (LOLBins/admin tools misused for obfuscation)"
+      disposition: context
+      target_question: Q6
+      notes: "Parent legitimacy assessed in process_chain question."
+    - element: ParentProcessWhitelist
+      dimension: tuning_parameter
+      specific_values: "rationale only (developer/admin tools that legitimately use Assembly.Load)"
+      disposition: context
+      target_question: Q2
+      notes: "Captured in host_user_context expectation question (dev/automation roles)."
+    - element: MemoryRegionPermissions
+      dimension: tuning_parameter
+      specific_values: "0x1F0FFF / 0x1FFFFF (RWX-bearing full-access GrantedAccess masks)"
+      disposition: query_injection
+      target_question: Q18
+      notes: "Injected into attack:T1620.in_process_memory_access GrantedAccess|contains selection."
+  dedup_decisions:
+    - dropped: cue_process_tool.mechanism_decode
+      reason: "within-phase analysis dedup — powershell.encoded_command_decode is the more specific Phase 2 question for PowerShell encoded payloads (and rule has no Image to scope the cue query)"
+      kept: powershell.encoded_command_decode
+    - dropped: cue_process_tool.baseline
+      reason: "reflected baseline_deviation covers host historical pattern with the rule's exact CommandLine selection; plain Image-based baseline cannot run (no Image in detection)"
+      kept: cue_process_tool.baseline_deviation
+    - dropped: cue_process_tool.clustering
+      reason: "near-identical host-scoped aggregation; cue_host_context.clustering is broader (Image+ParentImage) and covers same-time host activity"
+      kept: cue_host_context.clustering
+    - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable; both emitted (user-history vs host-mechanism-routine)"
+      kept: both
+    - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable; both emitted (user-network-activity vs pattern-on-other-hosts)"
+      kept: both
+  skipped_templates:
+    - template: obfuscation.encoded_payload_decode
+      reason: "replaced_by: powershell.encoded_command_decode"
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "powershell.encoded_command_decode replaces obfuscation.encoded_payload_decode"
+      disposition: acted_on
+      reason: >-
+        obfuscation.encoded_payload_decode skipped (see skipped_templates);
+        powershell.encoded_command_decode is included as Q3.
+    - hint: "CommandLine-only detection — no Image field in rule. Use CommandLine pattern matching for scoping, not Image-based queries"
+      disposition: acted_on
+      reason: >-
+        All cue queries that defaulted to Image|endswith|expand: '%Image%' were re-scoped
+        to the rule's CommandLine|contains base64 fragments (Q7 baseline_deviation reflected,
+        Q9 scope reflected, Q10 user-actor baseline, Q11 baseline_svc, Q13 clustering_svc) or
+        to ProcessGuid/ParentProcessGuid entity scoping (Q3, Q8 follow_on). No query uses %Image%.
+    - hint: "File paths derived from CommandLine — use %file_paths% placeholder"
+      disposition: declined
+      reason: >-
+        applicability.has_file_reference is true only because the decoded payload may name a
+        path, but the rule fires on purely in-memory Assembly.Load of a byte array with no
+        file written to disk (T1620 reflective code loading). universal.evidence_preservation
+        (the only %file_paths% template) would query file_event for an artifact that the
+        technique by design does not create; it would return 0 by construction. The file/path
+        angle is instead handled in Q3 (decode the byte source, which may be a path) without a
+        misleading empty file_event query.
+    - hint: "logsource 'image_load' (recommended by techniques: T1059.001,T1620) is not covered — pull in cue_image_load.* or author a custom question with `category: image_load`"
+      disposition: acted_on
+      reason: >-
+        Authored Q17 (attack:T1620.dotnet_runtime_image_load) with category: image_load,
+        querying the CLR/automation assemblies that in-memory Assembly.Load requires.
+    - hint: "logsource 'process_access' (recommended by techniques: T1620) is not covered and no template family exists — author a custom question with `category: process_access`"
+      disposition: acted_on
+      reason: >-
+        Authored Q18 (attack:T1620.in_process_memory_access) with category: process_access,
+        querying self-handle opens with execute/write GrantedAccess masks consistent with
+        in-process memory staging.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - powershell
+    - obfuscation
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 16
+      attack: 2
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 15
+    logsource_diversity:
+      process_creation: 13
+      powershell: 1
+      sigma_alert: 1
+      image_load: 1
+      process_access: 1

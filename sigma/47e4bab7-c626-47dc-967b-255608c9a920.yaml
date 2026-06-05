@@ -1,0 +1,577 @@
+name: Permission Misconfiguration Reconnaissance Via Findstr.EXE
+id: 78d30fd5-4173-46ce-81c5-0d4b5509f7a3
+description: |
+  Detects find.exe or findstr.exe being used to grep for Windows permission
+  principals such as "Everyone" or "BUILTIN\", a pattern used to spot files,
+  folders, or service binaries writable by low-privilege groups. The rule fires
+  when EITHER the binary is find/findstr AND its command line carries an
+  Everyone/BUILTIN permission keyword, OR a single command line chains icacls,
+  findstr, and Everyone together. This is the canonical findstr step of a
+  privilege-escalation enumeration sequence, where the output of icacls, reg
+  query, sc, or wmic is piped into findstr to surface permission, credential,
+  or autostart keywords. Some administrators and audit scripts run the same
+  check legitimately, so the investigation should determine which branch fired,
+  what the full command was grepping for, what process drove it, and whether
+  the activity is isolated or part of a broader enumeration sweep.
+type: detection
+detection_id: 47e4bab7-c626-47dc-967b-255608c9a920
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Did findstr run against an Everyone or BUILTIN permission keyword, or did
+    a single command line chain icacls, findstr, and Everyone together?
+  context: Before investing investigation time, confirm the alert is a true positive
+    and note which branch fired, because the branch changes what the downstream
+    questions weigh. The rule fires when EITHER find.exe or findstr.exe runs with a
+    command line containing an Everyone or BUILTIN permission token, OR a single
+    command line contains icacls, findstr, and Everyone together. Read the full
+    command line, confirm which condition matched, and record the exact keyword and
+    any piped-in command (icacls, reg, sc, wmic, dir) it was grepping.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to audit file, folder, or service
+    permissions with command-line tools?
+  context: Legitimate administrators, audit scripts, and software inventory tools run
+    icacls-into-findstr permission checks routinely. Most standard user accounts and
+    most endpoints never grep for Everyone or BUILTIN principals from the command
+    line. Knowing whether the acting account and host function involve permission
+    auditing or privilege management separates a sanctioned check from low-privilege
+    reconnaissance for a writable path to abuse.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:credential_access.credential_target_identification
+  question: What permission target was findstr grepping for, and what command produced
+    the data it filtered?
+  context: The recon value is in what the command line searched. icacls output filtered
+    for Everyone or BUILTIN\Users hunts for files or service binaries a low-privilege
+    group can overwrite; findstr against reg query or sc output hunts for stored
+    credentials, AlwaysInstallElevated, or unquoted service paths. Read the full
+    command line to identify the principal token, the source command feeding the
+    pipe, and the file or registry scope being enumerated, since that determines what
+    escalation path the operator was probing.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: attack:T1552.command_analysis
+  question: Did the same host run other permission or credential enumeration commands
+    chained into findstr around this time?
+  context: A single findstr permission check is rarely the whole activity. The same
+    enumeration sequence typically grep-chains multiple sources - icacls for writable
+    paths, reg query for stored passwords or AlwaysInstallElevated, sc and wmic for
+    unquoted or writable service binaries, dir for credential-bearing files. This
+    query surfaces other findstr or icacls invocations on the host so the analyst can
+    judge whether this was an isolated check or one step in a systematic privilege
+    enumeration sweep.
+  range: +/-30m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_recon:
+        CommandLine|contains:
+          - 'findstr '
+          - 'icacls '
+          - 'reg query '
+          - 'sc qc '
+          - 'sc queryex '
+          - 'wmic service '
+          - 'whoami /priv'
+          - 'whoami /all'
+      condition: selection_host and selection_recon
+    fields:
+      - Image
+      - CommandLine
+      - User
+- source: template:cue_process_tool.process_chain
+  question: What process spawned findstr, and is that parent chain expected for a
+    permission audit?
+  context: The parent reveals how findstr was driven. Interactive auditing usually
+    shows cmd.exe or an administrative console as the parent. A parent such as a
+    script host, mshta.exe, an Office application, or a remote-execution service
+    points to automated or operator-driven enumeration rather than a sanctioned
+    check, and walking up the parent chain shows what staged the activity.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: attack:T1552.006.sysvol_access
+  question: Did this host access XML files on a SYSVOL or domain share around the time
+    of the findstr activity?
+  context: Permission and credential enumeration on a domain-joined host frequently
+    extends to Group Policy Preference files on the SYSVOL share, where cpassword
+    values can be decrypted offline. File-share access events for XML files under a
+    domain SYSVOL path, correlated with the findstr recon, indicate the operator
+    moved from local permission checks to stored-credential hunting. Scope this to
+    the alerting host and the SYSVOL share; if Security file-share auditing is not
+    collected, treat zero results as a visibility gap rather than evidence nothing
+    occurred.
+  range: +/-30m
+  query: |
+    aggregation: true
+    logsource:
+      category: security
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 5145
+        ShareName|contains: 'SYSVOL'
+      filter_other:
+        RelativeTargetName|endswith: '.xml'
+      condition: selection and filter_other
+    fields:
+      - SubjectUserName
+      - RelativeTargetName
+      - ShareName
+- source: template:credential_access.credential_exposure_assessment
+  question: Which accounts or service binaries could be exposed by the permissions the
+    recon surfaced, and do any carry elevated privileges?
+  context: The severity depends on what the enumeration found. A world-writable service
+    binary running as SYSTEM, or a stored credential for a privileged or service
+    account, is a direct escalation path; a writable path with no privileged context
+    may only need monitoring. Cross-reference any account, service, or path named in
+    the command line against Active Directory and service configuration to judge what
+    a successful follow-on would grant.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:credential_access.post_access_lateral_movement
+  question: Did any new logon sessions, service changes, or remote connections follow
+    this enumeration on the host?
+  context: Permission and credential reconnaissance is a preparatory step; the payoff
+    is the follow-on action - replacing a writable service binary, scheduling a task,
+    creating a new service, or authenticating with a recovered credential. Follow-on
+    alerts on the same host shortly after the recon indicate the operator acted on
+    what they found rather than abandoning the check.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - rule.name
+      - rule.uuid
+      - event.severity_label
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run find or findstr to audit permissions?
+  context: Compare the acting account against its own history. A systems administrator
+    or auditor may run icacls-into-findstr permission checks regularly; an account
+    that has never grepped for permission principals doing so now is more notable. The
+    user role and typical toolset should align with permission management.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith:
+          - \find.exe
+          - \findstr.exe
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent process and find/findstr combination historically routine on
+    this host or across the environment, or is the parent unusual for it?
+  context: When the alert fires under a service principal, user identity does not
+    attribute the behavior; the meaningful pivot is which parent process launched
+    find or findstr and whether that pairing is historically common. A new or rare
+    parent for this binary on this host or environment-wide is the deviation worth
+    chasing, while a parent that already accounts for many prior events is more likely
+    an audit job or software inventory automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith:
+          - \find.exe
+          - \findstr.exe
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the acting account's activity across all hosts reveals whether the
+    permission reconnaissance was a single event or part of activity spanning multiple
+    endpoints. If the same user ran similar enumeration on other hosts, the scope of
+    the activity is larger than one machine.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent process and find/findstr combination fire on other
+    hosts in the same window, indicating a coordinated sweep rather than isolated
+    activity?
+  context: Under a service principal, asking what else the user did across the network
+    returns agent-telemetry noise, since every host runs system-owned agents
+    constantly. The meaningful question is whether the same launch mechanism - a
+    parent process spawning find or findstr - fired on other hosts in the alert
+    window. Multiple hosts in the same window points to scheduled or pushed audit
+    automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith:
+          - \find.exe
+          - \findstr.exe
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining the activity surrounding the
+    findstr recon reveals what led to it and what followed - the parent that staged
+    the enumeration, other discovery commands, or follow-on execution. Novel
+    parent-child pairs at low counts are what to scan for against the high-count noise
+    of routine system processes.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host - initial execution, reconnaissance, or
+    credential access - may reveal the attack stages that preceded the permission
+    enumeration and help reconstruct the timeline. Permission recon is typically a
+    mid-sequence step, so prior alerts give the context for why the operator was
+    hunting for a writable path or stored credential.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired the rule's find/findstr permission
+    pattern, what parents and users normally drive it, and does the current alert fit?
+  context: Even legitimate audit scripts run icacls-into-findstr permission checks.
+    This query mirrors the rule's selection structure scoped to this host, so the
+    resulting parent and user distribution reflects how this specific firing pattern
+    has historically run here, not generic findstr usage. A new parent process, an
+    unexpected account, or a first-ever occurrence is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_findstr_img:
+      - Image|endswith:
+        - \find.exe
+        - \findstr.exe
+      - OriginalFileName:
+        - FIND.EXE
+        - FINDSTR.EXE
+      selection_findstr_cli:
+        CommandLine|contains:
+        - '"Everyone"'
+        - '''Everyone'''
+        - '"BUILTIN\\"'
+        - '''BUILTIN\'''
+      selection_special:
+        CommandLine|contains|all:
+        - 'icacls '
+        - 'findstr '
+        - Everyone
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_findstr_* or selection_special) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired the rule's find/findstr permission pattern in the
+    past week, and does the cross-host distribution look like consistent automation or
+    one-off activity?
+  context: This query mirrors the rule's selection structure with no host scope, so the
+    result is a fleet-wide count of the find/findstr permission firing pattern rather
+    than generic findstr activity. Many hosts firing the same pattern points to an
+    audit job or software inventory routine that runs the check by design; one host or
+    a small unrelated set points to manual operator reconnaissance. Use the host
+    distribution to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_findstr_img:
+      - Image|endswith:
+        - \find.exe
+        - \findstr.exe
+      - OriginalFileName:
+        - FIND.EXE
+        - FINDSTR.EXE
+      selection_findstr_cli:
+        CommandLine|contains:
+        - '"Everyone"'
+        - '''Everyone'''
+        - '"BUILTIN\\"'
+        - '''BUILTIN\'''
+      selection_special:
+        CommandLine|contains|all:
+        - 'icacls '
+        - 'findstr '
+        - Everyone
+      condition: all of selection_findstr_* or selection_special
+    fields:
+    - host.name
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1552.006
+      name: Group Policy Preferences
+      role: primary
+    - id: T1552
+      name: Unsecured Credentials
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: permission_grep
+      description: "find/findstr is run against an Everyone or BUILTIN permission token, or an icacls+findstr+Everyone command line, the act the rule detects"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: target_identification
+      description: "Identify what the command grepped for - writable path, stored credential, unquoted service path - and the source command feeding the pipe"
+      mapped_to: Q3
+      source: template:credential_access.credential_target_identification
+    - stage: 3
+      label: enumeration_sweep
+      description: "Correlate the findstr check with other permission/credential enumeration commands on the host to judge isolated vs systematic recon"
+      mapped_to: Q4
+      source: attack:T1552.command_analysis
+    - stage: 4
+      label: stored_credential_access
+      description: "Recon extends to SYSVOL/share XML (GPP) access for offline credential decryption - the T1552.006 strategy"
+      mapped_to: Q6
+      source: attack:T1552.006.sysvol_access
+    - stage: 5
+      label: follow_on_action
+      description: "Operator acts on what the recon surfaced - logon, service change, or remote connection"
+      mapped_to: Q8
+      source: template:credential_access.post_access_lateral_movement
+  dimension_coverage:
+    - dimension: command_analysis
+      technique: T1552
+      covered_by: Q4
+      source: attack:T1552.command_analysis
+      coverage_type: direct
+    - dimension: process_identification
+      technique: T1552
+      covered_by: Q5
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1552.006
+      covered_by: Q4
+      source: attack:T1552.command_analysis
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1552.006
+      covered_by: Q15
+      source: template:cue_process_tool.baseline_deviation
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1552.006
+      covered_by: Q9
+      source: template:cue_user_actor.baseline
+      coverage_type: direct
+  mutable_dispositions:
+    - element: UserContext
+      dimension: user_context
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q2
+      notes: "Tune to exclude authorized admins/DCs accessing SYSVOL; no concrete values. Realized as the user/host role judgment in host_user_context and the user-pivot baseline (Q9)."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q4
+      notes: "Correlation timing between file access and script execution; no fixed threshold. Realized as the +/-30m enumeration-sweep window in the command_analysis question and the +/-30m SYSVOL-access correlation (Q6)."
+    - element: KnownToolsSignature
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q3
+      notes: "Extend to include known GPP parsing tool names/hashes; no concrete values in analytic. Realized as the source-command identification (icacls/reg/sc/wmic) in credential_target_identification."
+    - element: HostType
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q6
+      notes: "Distinguish DC vs workstation SYSVOL access; no concrete values. Realized as the SYSVOL-share-access question, where the analyst weighs whether the alerting host is a DC (expected) or a workstation (lateral)."
+    - element: SuspiciousProcessList
+      dimension: tuning_parameter
+      specific_values: "reg.exe, cmd.exe, powershell.exe (examples only)"
+      disposition: query_injection
+      target_question: Q4
+      notes: "Process names to monitor for credential search. Injected as the CommandLine|contains recon-command list (findstr, icacls, reg query, sc qc, wmic service, whoami) in the command_analysis enumeration-sweep query."
+  dedup_decisions:
+    - dropped: cue_user_actor.baseline + cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable; both emitted (subject-pivot Q9 and launch-mechanism-pivot Q10). Image-pivot adapted to the rule's find/findstr binary list."
+      kept: both
+    - dropped: cue_user_actor.clustering + cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable; both emitted (subject-pivot Q11 and launch-mechanism-pivot Q12). Image-pivot adapted to the rule's find/findstr binary list."
+      kept: both
+    - dropped: cue_process_tool.baseline
+      reason: "generic Image|endswith host baseline of find/findstr is subsumed by the REFLECTED host-pattern question (baseline_deviation, Q15), which scopes to the rule's actual permission-keyword firing pattern rather than all findstr usage"
+      kept: cue_process_tool.baseline_deviation
+    - dropped: cue_process_tool.clustering
+      reason: "Image-only host aggregation subsumed by cue_host_context.clustering (Q13), which projects Image+ParentImage and surfaces novel parent-child pairs"
+      kept: cue_host_context.clustering
+  skipped_templates:
+    - template: cue_process_tool.mechanism_decode
+      reason: "replaced_by: credential_access.credential_target_identification (hint 1). Phase 2 mechanism decode is provided by credential_target_identification (Q3), which directs the analyst to identify the permission target and the source command feeding the findstr pipe."
+    - template: cue_process_tool.follow_on
+      reason: "follow_on scopes children by ParentImage|endswith %Image% — findstr is a leaf recon tool that filters output and rarely spawns meaningful children. Post-recon activity is covered by credential_access.post_access_lateral_movement (Q8, +4h follow-on alerts) and cue_host_context.clustering (Q13). Trimmed to stay within the 14-18 target."
+    - template: universal.evidence_preservation
+      reason: "applicability has_file_reference is set because file paths are derived from the CommandLine, but findstr READS/greps existing files for keywords — it does not create a payload, decoded output, or downloaded file to preserve. The file/credential-store target dimension is instead covered by the SYSVOL-share-access question (Q6, EventID 5145 + .xml). Trimmed to stay within the 14-18 target."
+    - template: universal.endpoint_protection_health
+      reason: "RECOMMENDED, not must_include. This rule detects permission/credential reconnaissance, not payload execution or hands-on-keyboard impact that an operator would precede by disabling AV/EDR. The defense_tampering set is not confirmed for this rule, and prior-tamper-as-precursor context is already carried by cue_host_context.precursor (Q14). Trimmed to stay within the 14-18 target."
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "File paths derived from CommandLine — use %file_paths% placeholder"
+      disposition: declined
+      reason: >-
+        The only file-targeted question authored is the SYSVOL-share-access
+        question (Q6), which queries the Security log (EventID 5145) for
+        RelativeTargetName/ShareName, not a process_creation file_event, so the
+        %file_paths% process placeholder does not apply. No process_creation
+        file_event question (evidence_preservation) was included — findstr greps
+        existing files rather than dropping a payload to preserve — so there is
+        no query into which the %file_paths% placeholder would be injected. The
+        underlying file-target concern is satisfied by Q6 (XML files on SYSVOL)
+        and Q3 (the file/registry scope named in the command line).
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - credential_access
+    - cue_process_tool
+    - cue_user_actor
+    - cue_host_context
+  generation_stats:
+    total_questions: 16
+    source_counts:
+      template: 14
+      attack: 2
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 13
+    logsource_diversity:
+      process_creation: 13
+      sigma_alert: 2
+      security: 1

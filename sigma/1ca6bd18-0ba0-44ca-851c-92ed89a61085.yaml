@@ -1,0 +1,671 @@
+name: UAC Bypass Using Consent and Comctl32 - Process
+id: 9085a4ec-01a4-471d-9160-76302a9a2ca4
+description: |
+  Detects a User Account Control (UAC) bypass that abuses the auto-elevated
+  consent.exe to run code at high integrity through a planted comctl32.dll
+  (the UACMe method-22 pattern). The rule fires when consent.exe spawns
+  werfault.exe at High or System integrity — a parent-child pairing that does
+  not occur in normal operation and that lets a split-token administrator
+  escalate from Medium to High integrity silently. The investigation should
+  confirm the integrity level and parent-child pair, identify the elevated
+  action that followed, and determine whether a DLL plant or registry write set
+  up the bypass.
+type: detection
+detection_id: 1ca6bd18-0ba0-44ca-851c-92ed89a61085
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the alert match the rule — consent.exe spawning werfault.exe at High or System integrity?
+  context: Before investing investigation time, confirm the alert is a true positive. The
+    rule fires only when the parent Image ends in consent.exe, the child Image ends in
+    werfault.exe, and the IntegrityLevel is High or System. consent.exe is the legitimate
+    UAC consent prompt; it does not spawn werfault.exe in normal operation, so the
+    parent-child pair together with the elevated integrity level establishes the
+    true/false-positive call.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - IntegrityLevel
+- source: template:universal.host_user_context
+  question: Is this user and host expected to perform local privilege elevation?
+  context: A UAC bypass running under an administrator who routinely elevates on their own
+    workstation is far less concerning than the same pattern under a standard user or on a
+    server. Knowing whether the account is a local admin and whether the host's function
+    involves administrative tooling is often the fastest way to separate a true positive
+    from sanctioned activity.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What did the elevated werfault.exe do? Decode its command line and working directory.
+  context: werfault.exe is normally the Windows Error Reporting host launched by the OS when
+    a process crashes. When it runs as the child of consent.exe at high integrity, the
+    invocation is the side effect of a planted comctl32.dll loaded during the bypass, so its
+    own command line and working directory tell you whether it is behaving as a genuine
+    crash handler or was coerced into running operator code. Decode whatever it executed and
+    note the directory it ran from.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:parent_child.parent_process_legitimacy
+  question: Is consent.exe expected to spawn werfault.exe, and what started consent.exe itself?
+  context: The parent-child relationship is the core signal. consent.exe is launched by the
+    Application Information service when an elevation prompt is requested, and it does not
+    spawn werfault.exe in normal operation. Tracing what started consent.exe — and what
+    requested the elevation — shows whether a user approved a genuine prompt or a loader
+    drove the auto-elevation to trigger the bypass.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- source: template:parent_child.sibling_processes
+  question: What other child processes did the same consent.exe instance spawn?
+  context: If this consent.exe instance launched the detected werfault.exe, it may have
+    launched other elevated children too. Multiple children from the same parent instance
+    points to deliberate orchestration — recon, credential access, or persistence staged
+    through one bypass — rather than an isolated event. The query scopes to the exact parent
+    instance and falls back to host scope where the parent identifier is unavailable.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in the hour before the alert?
+  context: Operators frequently disable or weaken protection before or right after gaining
+    elevation. This surfaces direct attempts to stop AV/EDR services, flip Defender flags,
+    add exclusions, clear logs, or patch AMSI/ETW. Zero rows is a useful "protection looks
+    healthy" signal; populated rows shift the disposition toward deliberate operator
+    preparation — review the writer's parent process and signing chain.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+- source: template:uac_bypass.elevated_action_after_bypass
+  question: What action was performed with elevated privileges after the bypass?
+  context: UAC bypass is a means to an end — operators elevate to install persistence, dump
+    credentials, tamper with security tools, or reach protected resources. Examine processes
+    spawned at High or System integrity shortly after the bypass; the detection analytics
+    call for correlating the elevation with follow-on activity within a tight window
+    (roughly 30 seconds is a common tuning) to separate the operator's objective from
+    unrelated admin work.
+  range: +30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        IntegrityLevel:
+          - 'High'
+          - 'System'
+          - 'S-1-16-16384'
+          - 'S-1-16-12288'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - IntegrityLevel
+- source: template:uac_bypass.bypass_technique_registry_artifacts
+  question: Were registry modifications made to set up this UAC bypass?
+  context: Many UAC bypasses write a command into a registry key that an auto-elevated
+    process reads and executes. Common targets are HKCU\Software\Classes\ms-settings\Shell,
+    HKCU\Software\Classes\mscfile\shell, and DelegateExecute values, and the auto-elevate
+    proxies attackers reach for most often include sdclt.exe, fodhelper.exe,
+    computerdefaults.exe, and eventvwr.exe. Finding the write in the minutes before the
+    elevation confirms the mechanism and reveals the exact payload run with high integrity.
+    This query catches writes performed through reg.exe, cmd, or PowerShell.
+  range: -15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - '\reg.exe'
+          - '\powershell.exe'
+          - '\cmd.exe'
+        CommandLine|contains:
+          - 'ms-settings'
+          - 'mscfile'
+          - 'Classes\exefile'
+          - 'Classes\Folder'
+          - 'Environment'
+          - 'Shell\Open\command'
+          - 'DelegateExecute'
+      condition: selection
+    fields:
+      - CommandLine
+      - Image
+- source: attack:T1548.002.registry_set
+  question: Did a registry-set event write a shell-handler or DelegateExecute key used by UAC bypasses on this host?
+  context: When a bypass key is written programmatically (PowerShell .NET calls,
+    IFileOperation COM) rather than through reg.exe, the process-creation view misses it. A
+    registry-set event records the write directly. Look for handler keys an auto-elevated
+    binary reads — mscfile and ms-settings shell\open\command, other Classes shell handlers,
+    and DelegateExecute values — written shortly before the elevation fired.
+  range: -15m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|contains:
+          - '\mscfile\shell\open\command'
+          - '\ms-settings\shell\open\command'
+          - '\ms-settings\Shell\Open\command'
+          - 'Shell\Open\command'
+          - 'DelegateExecute'
+      condition: selection
+    fields:
+      - TargetObject
+      - Image
+- source: attack:T1548.002.image_load
+  question: What DLLs did the elevated werfault.exe load, and were any unsigned or loaded from a non-standard path?
+  context: This bypass is a search-order DLL hijack — the auto-elevated path loads a planted
+    comctl32.dll that runs the operator's code at high integrity. Reviewing the modules the
+    elevated werfault.exe loaded distinguishes a clean system binary from one that
+    side-loaded an attacker DLL. A comctl32.dll, or any module, loaded from a user-writable
+    or non-System32 path, or an unsigned module, is the artifact of the hijack.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - ImageLoaded
+- source: template:uac_bypass.other_escalation_attempts
+  question: Were other privilege-escalation or UAC-bypass detections raised on this host around the same time?
+  context: Operators who try one UAC bypass often try several until one works, especially
+    when the OS version blocks a given technique. Multiple bypass or escalation alerts in
+    rapid succession from the same host or user confirms deliberate privilege-escalation
+    activity rather than a one-off false positive.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - rule.name
+      - rule.uuid
+      - event.severity_label
+- source: template:cue_parent_process.baseline
+  question: Does consent.exe normally spawn werfault.exe on this host?
+  context: Some parent-child pairs are routine and some do not occur in normal operation.
+    consent.exe spawning werfault.exe is the discriminator here — it is not a pairing the OS
+    produces, so any prior history is itself informative. Zero or very low counts confirm a
+    novel spawning relationship; a non-trivial history would point to a recurring local
+    condition worth understanding.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:cue_process_tool.baseline
+  question: Does this host normally run werfault.exe, and how often at high integrity?
+  context: werfault.exe runs routinely as the Windows Error Reporting host, so raw execution
+    counts are high on most systems. The discriminator is not whether it runs but whether it
+    runs as a child of consent.exe at High or System integrity, which is the rare condition
+    this rule keys on. Use the historical baseline to gauge how unusual the alerting
+    invocation is against this host's normal werfault.exe activity.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- source: template:cue_user_actor.baseline
+  question: Does this user normally perform local elevation or run these binaries?
+  context: Compare the account's current action against its history. A user who has never
+    elevated this way or run this binary is more suspicious than one who does so as part of
+    their role. Align the result with what is known about the account — administrator,
+    standard user, or service principal.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is the consent.exe-werfault.exe combination historically routine on this host or across the environment, or is the parent unusual for this binary?
+  context: When the alert fires under a service principal (SYSTEM, LOCAL SERVICE, NETWORK
+    SERVICE, or a computer account), user identity does not attribute the behavior. The
+    meaningful pivot is the launch mechanism — whether consent.exe spawning werfault.exe is
+    historically common anywhere. Because this pair does not occur in normal operation, any
+    prior occurrence concentrated on a single host is itself the deviation worth chasing.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the environment around this time?
+  context: Tracking the account's activity across all hosts in the surrounding window
+    reveals lateral movement or coordinated activity on multiple endpoints. If the same user
+    triggered similar elevation activity elsewhere, the scope is larger than this one host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did the consent.exe-werfault.exe combination fire on other hosts in the same window, or is it isolated to this host?
+  context: Under a service principal, "what else did this user do" returns agent-telemetry
+    noise because every host runs SYSTEM-owned agents constantly. The meaningful question is
+    whether the same launch mechanism — consent.exe spawning werfault.exe — fired on other
+    hosts in the alert window. Multiple hosts point to scheduled or pushed automation; a
+    single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Surveying activity around the alert reveals what
+    led to the elevation and what followed — reconnaissance, persistence, or further
+    escalation. Aggregating by process and parent collapses repetitive agent telemetry into
+    high-count rows while novel parent-child pairs stand out at low counts.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1548.002
+      name: Abuse Elevation Control Mechanism - Bypass User Account Control
+      role: primary
+    - id: T1548
+      name: Abuse Elevation Control Mechanism
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: bypass_setup
+      description: "Operator stages the bypass — plants comctl32.dll for a search-order hijack of the auto-elevated path, or writes a shell-handler/DelegateExecute registry key on sibling techniques"
+      mapped_to: Q10
+      source: attack:T1548.002.image_load
+    - stage: 2
+      label: auto_elevated_invocation
+      description: "Auto-elevated consent.exe is invoked and loads the planted comctl32.dll, spawning werfault.exe at high integrity"
+      mapped_to: Q4
+      source: template:parent_child.parent_process_legitimacy
+    - stage: 3
+      label: elevated_process_execution
+      description: "High/System integrity werfault.exe executes under consent.exe — the detection point"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 4
+      label: elevated_action
+      description: "Operator performs the high-integrity objective after the bypass"
+      mapped_to: Q7
+      source: template:uac_bypass.elevated_action_after_bypass
+  dimension_coverage:
+    - dimension: parent_process_analysis
+      technique: T1548.002
+      covered_by: Q4
+      source: template:parent_child.parent_process_legitimacy
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1548.002
+      covered_by: Q7
+      source: template:uac_bypass.elevated_action_after_bypass
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1548.002
+      covered_by: Q8
+      source: template:uac_bypass.bypass_technique_registry_artifacts
+      coverage_type: partial
+    - dimension: user_context
+      technique: T1548
+      covered_by: Q14
+      source: template:cue_user_actor.baseline
+      coverage_type: direct
+  mutable_dispositions:
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "~30s correlation between bypass setup and elevation"
+      disposition: context
+      target_question: Q7
+      notes: "Folded the ~30s correlation guidance into elevated_action_after_bypass context (KEEP_EXACT query unchanged); the registry_set (Q9) and registry_artifacts (Q8) queries bracket the bypass setup in the -15m window."
+    - element: ElevatedProcessNameList
+      dimension: tuning_parameter
+      specific_values: "sdclt.exe, eventvwr.exe, computerdefaults.exe, fodhelper.exe"
+      disposition: context
+      target_question: Q8
+      notes: "registry_artifacts and elevated_action are KEEP_EXACT; the known auto-elevate proxy list is named in Q8 context rather than mutating the template queries. No separate sweep authored to stay within the 14-18 budget — registry_set (Q9) and registry_artifacts (Q8) already key on the handler keys these proxies use."
+    - element: ParentProcessAnomalyThreshold
+      dimension: parent_process_analysis
+      specific_values: "rationale only (non-elevated process spawning auto-elevated one)"
+      disposition: context
+      target_question: Q4
+      notes: "parent_process_legitimacy traces what started consent.exe and asks whether the consent.exe->werfault.exe elevation path is expected — the parent-anomaly logic this element describes; cue_parent_process.baseline (Q12) quantifies how rare the pair is."
+    - element: ElevatedProcessPath
+      dimension: tuning_parameter
+      specific_values: "rationale only (paths for unsigned/unexpected elevated binaries)"
+      disposition: context
+      target_question: Q10
+      notes: "T1548 secondary element. image_load (Q10) inspects the modules loaded by the elevated werfault.exe and flags user-writable / non-System32 / unsigned paths — the unsigned-elevated-path concern this element describes."
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "rationale only (suspicious parent-child execution chains)"
+      disposition: context
+      target_question: Q4
+      notes: "T1548 secondary element; same coverage as ParentProcessAnomalyThreshold — parent_process_legitimacy (Q4) and cue_parent_process.baseline (Q12) characterize the consent.exe->werfault.exe chain."
+  dedup_decisions:
+    - dropped: cue_parent_process.mechanism_decode
+      reason: "parent_child technique set active — parent_process_legitimacy is the more specific parent lookup (per AGENTS.md dedup rule)"
+      kept: parent_child.parent_process_legitimacy
+    - dropped: cue_parent_process.follow_on
+      reason: "near-duplicate of parent_child.sibling_processes (children of the same parent); sibling_processes scopes by exact ParentProcessGuid instance"
+      kept: parent_child.sibling_processes
+    - dropped: cue_parent_process.clustering
+      reason: "near-duplicate of cue_host_context.clustering and parent_child.sibling_processes — host-scoped parent activity is already covered by sibling_processes (exact instance) and host clustering"
+      kept: cue_host_context.clustering
+    - dropped: cue_parent_process.scope
+      reason: "near-identical query to cue_user_actor.clustering_svc (process.parent.name + Image|endswith, cross-host aggregation by host.name); clustering_svc is a mandatory service-principal pair"
+      kept: cue_user_actor.clustering_svc
+    - dropped: cue_host_context.precursor
+      reason: "near-duplicate of uac_bypass.other_escalation_attempts (both query event.module:sigma host-scoped); other_escalation_attempts is must_include and UAC-framed"
+      kept: uac_bypass.other_escalation_attempts
+    - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc / cue_user_actor.clustering / cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable; both user-pivot and service-principal-substitute variants emitted per AGENTS.md"
+      kept: all four (Q14-Q17)
+  skipped_templates:
+    - template: cue_process_tool.process_chain
+      reason: "hint: parent_process is primary — drop cue_process_tool:process_chain; the parent lookup is covered by parent_child.parent_process_legitimacy (Q4)"
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "parent_process is primary — drop cue_process_tool:process_chain"
+      disposition: acted_on
+      reason: >-
+        cue_process_tool.process_chain dropped; parent_child.parent_process_legitimacy
+        (Q4) is the more specific parent lookup. Recorded in skipped_templates.
+    - hint: "logsource 'image_load' (recommended by techniques: T1548.002) is not covered — pull in cue_image_load.* or author a custom question with `category: image_load`"
+      disposition: acted_on
+      reason: >-
+        Authored attack:T1548.002.image_load (Q10), a category: image_load question that
+        inspects the modules werfault.exe loaded and flags the planted comctl32.dll or any
+        unsigned / non-System32 module — the search-order-hijack mechanism this bypass uses.
+    - hint: "logsource 'registry_set' (recommended by techniques: T1548.002) is not covered — pull in cue_registry_key.* or author a custom question with `category: registry_set`"
+      disposition: acted_on
+      reason: >-
+        Authored attack:T1548.002.registry_set (Q9), a category: registry_set question that
+        catches shell-handler / DelegateExecute key writes performed programmatically that
+        the process_creation registry_artifacts question (Q8) misses.
+    - hint: "logsource 'process_access' (recommended by techniques: T1548.002) is not covered and no template family exists — author a custom question with `category: process_access`"
+      disposition: declined
+      reason: >-
+        This rule's bypass is a DLL search-order hijack of the auto-elevated path
+        (consent.exe loading a planted comctl32.dll, spawning werfault.exe). It does not
+        obtain its token by opening a handle into an already-elevated process, which is the
+        cross-process token-theft pattern process_access (Sysmon EID10) surfaces. A
+        handle-open query would add volume without discriminating this rule's mechanism; the
+        actual planting mechanism is covered by the image_load question (Q10).
+    - hint: "logsource 'security' (recommended by techniques: T1548.002) is not covered and no template family exists — author a custom question with `category: security`"
+      disposition: declined
+      reason: >-
+        The 'security' analytic keys on EID 4672 (special privileges assigned to a new
+        logon), which marks the elevation event itself. That elevation IS the rule's trigger
+        — the High/System IntegrityLevel process_creation the rule fires on corresponds to
+        the same 4672 token assignment, and IntegrityLevel is already projected in
+        verify_trigger_match (Q1) and elevated_action_after_bypass (Q7). A separate 4672
+        query would re-surface the elevation without adding investigative discrimination.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - uac_bypass
+    - parent_child
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 16
+      attack: 2
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 15
+    logsource_diversity:
+      process_creation: 15
+      sigma_alert: 1
+      registry_set: 1
+      image_load: 1

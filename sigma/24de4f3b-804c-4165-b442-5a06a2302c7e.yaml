@@ -1,0 +1,608 @@
+name: Arbitrary Shell Command Execution Via Settingcontent-Ms
+id: e9766a56-ab19-41cc-8fdf-e2bf21759c0a
+description: |
+  Detects a command line referencing a .SettingContent-ms file, excluding the legitimate
+  immersivecontrolpanel reference. The .SettingContent-ms format is an XML "shortcut" to a Windows
+  settings page whose DeepLink element accepts an arbitrary binary path and arguments; an attacker
+  replaces the canonical control.exe target with cmd.exe, powershell.exe, or regsvr32.exe and the
+  file runs the substituted command immediately on double-click, with no Open prompt and no
+  Mark-of-the-Web warning even when delivered from the internet. The file can also be OLE-embedded in
+  an Office document. The rule fires when a command line contains the .SettingContent-ms reference AND
+  the immersivecontrolpanel filter does not match. The investigation should establish what binary and
+  arguments the DeepLink actually invoked, how the file was delivered and opened, what parent
+  application launched it, and whether outbound network activity or additional recipients followed.
+type: detection
+detection_id: 24de4f3b-804c-4165-b442-5a06a2302c7e
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line reference a .SettingContent-ms file without matching the immersivecontrolpanel filter?
+  context: >-
+    Before investing investigation time, confirm the alert is a true positive by reviewing the exact
+    command line against the detection criteria. The rule fires when a command line contains the
+    .SettingContent-ms substring AND does not contain immersivecontrolpanel (the benign reference used
+    by the built-in Settings app). Verify the .SettingContent-ms token is present and that the
+    invocation is not the legitimate immersivecontrolpanel path.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to open Windows settings shortcut files via the command line?
+  context: >-
+    Legitimate administrative activity rarely involves .SettingContent-ms files outside the built-in
+    Settings app, so knowing whether the user role and host function are consistent with this behavior
+    is often the fastest path to separating a routine action from an attacker-crafted file. A standard
+    workstation user double-clicking a settings shortcut received as an attachment is far less expected
+    than a known administrative or scripted workflow that references these files.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What binary and arguments did the .SettingContent-ms DeepLink actually invoke?
+  context: >-
+    The DeepLink element of a .SettingContent-ms file takes any binary path plus arguments. The
+    canonical legitimate target is control.exe; an attacker substitutes cmd.exe /c, powershell.exe
+    -Command, or regsvr32 /s /n /u /i:<URL> scrobj.dll. Read the full command line to identify the
+    substituted binary, decode any encoded or obfuscated arguments, and extract any file paths or
+    network endpoints the command references. This is the operational payload of the detection.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains: .SettingContent-ms
+      filter:
+        CommandLine|contains: immersivecontrolpanel
+      condition: selection and not filter
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:initial_access.delivery_vector
+  question: What email, document, or downloaded file delivered the .SettingContent-ms file?
+  context: >-
+    Initial access via this technique typically begins with a phishing email carrying the
+    .SettingContent-ms attachment directly, or an Office document with the file OLE-embedded so it
+    fires when the user opens the package contents. Identify the parent application and its command
+    line to determine the delivery vector -- an Office parent (winword.exe, excel.exe, powerpnt.exe)
+    points to an embedded file, while explorer.exe points to a directly double-clicked attachment.
+    The parent command line often carries the document or file path; full delivery analysis requires
+    reviewing email and download records.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+- source: template:cue_process_tool.process_chain
+  question: What process opened the .SettingContent-ms file, and is that parent chain expected?
+  context: >-
+    The parent process reveals how the file was launched. A direct double-click runs under
+    explorer.exe; an OLE-embedded file fires under an Office application (winword.exe, excel.exe,
+    powerpnt.exe). An Office application as the immediate parent of a settings shortcut is the high-risk
+    lineage this technique relies on, because Office spawning a settings-page handler that in turn runs
+    a shell command is not a normal document workflow. Walk up from the parent to see what spawned it.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:universal.evidence_preservation
+  question: Is the .SettingContent-ms file still on disk for analysis?
+  context: >-
+    The detected command references a .SettingContent-ms file, so checking whether it still exists on
+    disk enables deeper analysis -- reading the DeepLink target, hashing the file, or submitting it for
+    review. These files are typically written to user-writable paths such as the Downloads folder,
+    %TEMP%, or %APPDATA% when delivered as an attachment, and a Mark-of-the-Web zone identifier on the
+    file confirms it arrived from the internet.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: attack:T1204.network_egress
+  question: Did outbound network activity follow this execution from the same host?
+  context: >-
+    The user-execution chain commonly ends in immediate outbound HTTP, HTTPS, DNS, or SMB from the same
+    lineage -- the DeepLink command (for example regsvr32 /i:<URL> scrobj.dll or a powershell download
+    cradle) reaches out to retrieve or stage a second-stage payload. Outbound connections from this host
+    in the minutes after the alert, especially to newly seen or non-corporate destinations, indicate the
+    command was not benign. Compare destinations against expected corporate update and CDN endpoints.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'true'
+      filter:
+        Image|endswith:
+          - '\svchost.exe'
+          - '\OneDrive.exe'
+      condition: selection and not filter
+    fields:
+      - Image
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+- source: attack:T1204.application_open
+  question: Did the user-facing application that launched this command record an abnormal open or crash event?
+  context: >-
+    The first stage of the user-execution chain is a user-facing application (an Office app, PDF reader,
+    archiver, or browser) recording an open or click immediately before the OS utility runs. An
+    application error or hang event from the launching parent around the alert time corroborates that a
+    document or attachment was opened and that handling it spawned a child process, which is consistent
+    with an OLE-embedded or attachment-delivered .SettingContent-ms file rather than a deliberate
+    administrative action.
+  range: -15m
+  query: |
+    aggregation: false
+    logsource:
+      category: application
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Provider_Name
+      - source.name
+      - Data
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired this .SettingContent-ms pattern, what parents and users drove it, and does the current alert fit?
+  context: >-
+    Even files that reference settings pages can be legitimate in narrow workflows. The query mirrors
+    the rule's selection scoped to this host, so the resulting parent and user distribution reflects how
+    this specific firing pattern -- not generic activity -- has historically run here. A new parent
+    process, an unexpected user account, or an unusual command-line shape relative to that history is the
+    anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains: .SettingContent-ms
+      filter:
+        CommandLine|contains: immersivecontrolpanel
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection and not filter) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired this .SettingContent-ms pattern in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: >-
+    The query mirrors the rule's selection with no host scope, so the result is a fleet-wide count of
+    this firing pattern. Many hosts firing the same pattern points to a broad delivery -- a phishing run
+    that reached multiple recipients, or scripted/vendor automation that legitimately references these
+    files. One host or a small unrelated set points to a targeted or manual trigger. Use the host
+    distribution and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains: .SettingContent-ms
+      filter:
+        CommandLine|contains: immersivecontrolpanel
+      condition: selection and not filter
+    fields:
+    - host.name
+- source: template:cue_user_actor.baseline
+  question: Does this user normally open settings shortcut files or run command interpreters this way?
+  context: >-
+    Compare this user's current action against their historical behavior. A user who has never opened a
+    .SettingContent-ms file or rarely launches command interpreters is more suspicious than one who does
+    so as part of a known role. User role and typical toolset should align with the detected behavior;
+    a standard end user with no scripting remit is a stronger signal than an administrator with a known
+    automation footprint.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        CommandLine|contains: .SettingContent-ms
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent-plus-pattern combination historically routine on this host or across the environment?
+  context: >-
+    When the alert fires under a service principal, user identity does not attribute the behavior. The
+    meaningful pivot is the launch mechanism -- which parent process produced this command line, and
+    whether that pairing is historically common. A new or rare parent for this pattern on this host or
+    environment-wide is the deviation worth chasing; a parent that already accounts for many prior events
+    is more consistent with automation or an OS workflow.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith|expand: '%ParentName%'
+        CommandLine|contains: .SettingContent-ms
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: >-
+    Tracking the user's activity across all hosts reveals whether the same account triggered related
+    activity on multiple endpoints, which would widen the scope of the investigation. If the same user
+    opened files or ran interpreters on several hosts in this window, the delivery may have reached more
+    than one system under that identity.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did the same parent-plus-pattern fire on other hosts in this window, or is the activity isolated to this host?
+  context: >-
+    Under a service principal, tracking "what else this user did" returns agent-telemetry noise because
+    every host runs service-owned processes constantly. The meaningful question is whether the same
+    launch mechanism -- parent process plus this command-line pattern -- fired on other hosts in the
+    alert window. Multiple hosts in the same window points to a pushed or scheduled rollout or a
+    multi-recipient delivery; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith|expand: '%ParentName%'
+        CommandLine|contains: .SettingContent-ms
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: >-
+    Alerts rarely occur in isolation. Examining the surrounding activity reveals what led to this event
+    and what happened after -- whether a document or archive was opened just before, and whether
+    reconnaissance, additional execution, or staging followed. Novel parent-child pairs at low counts
+    are what to scan for against the background of repetitive routine processes.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Earlier detections on the same host -- reconnaissance, defense tampering, or other execution -- may
+    reveal the stages that preceded this event and help reconstruct the timeline. A delivery that landed
+    a .SettingContent-ms file is often one step in a sequence, and prior alerts can show how the user or
+    host was first reached.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:initial_access.campaign_scope
+  question: Were other users or systems targeted by the same .SettingContent-ms delivery?
+  context: >-
+    Phishing deliveries rarely target a single user. If one recipient received a malicious settings
+    shortcut, others likely did too. Searching for the same rule firing across other hosts reveals the
+    breadth of the delivery and identifies additional systems that need investigation and possible
+    containment.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        rule.uuid|expand: '%rule.uuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:initial_access.application_patch_status
+  question: Is the application that opened the file, and the host's defenses, configured to block this technique?
+  context: >-
+    This technique was mitigated over time by adding .SettingContent-ms to the OLE block list and by the
+    Attack Surface Reduction rule that blocks Office applications from creating child processes. Checking
+    whether the launching application is current and whether that surface-reduction control is enabled
+    indicates whether the execution should have been blocked and whether other similarly configured hosts
+    remain exposed. Files installed from the application store may not be covered by that control.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1204
+      name: User Execution
+      role: primary
+    - id: T1566.001
+      name: Spearphishing Attachment
+      role: secondary
+    - id: T1566
+      name: Phishing
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: application_open
+      description: "User-facing app (Office/PDF/archiver/browser) records an open/click or abnormal event"
+      mapped_to: Q8
+      source: attack:T1204.application_open
+    - stage: 2
+      label: file_on_disk
+      description: "Downloaded file created in a user-writable path and/or decompressed"
+      mapped_to: Q6
+      source: template:universal.evidence_preservation
+    - stage: 3
+      label: lolbin_child
+      description: "Parent user app spawns a living-off-the-land binary (powershell/cmd/regsvr32/etc.) via the DeepLink"
+      mapped_to: Q3
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 4
+      label: network_egress
+      description: "Immediate outbound HTTP(S)/DNS/SMB from the same lineage"
+      mapped_to: Q7
+      source: attack:T1204.network_egress
+    - stage: spearphishing_delivery
+      label: attachment_delivery
+      description: "T1566.001: inbound email metadata -> attachment stored on disk -> process execution"
+      mapped_to: Q4
+      source: template:initial_access.delivery_vector
+  dimension_coverage:
+    - dimension: file_path_analysis
+      technique: T1204
+      covered_by: Q6
+      source: template:universal.evidence_preservation
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1204
+      covered_by: Q7
+      source: attack:T1204.network_egress
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1204
+      covered_by: Q5
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1204
+      covered_by: Q2
+      source: template:universal.host_user_context
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1566.001
+      covered_by: Q8
+      source: attack:T1204.application_open
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1566.001
+      covered_by: Q5
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1566
+      covered_by: Q5
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+  mutable_dispositions:
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "15-minute correlation window from document open to child/egress"
+      disposition: query_injection
+      target_question: Q7
+      notes: "+/-15m network egress window and -15m application-open window encode the correlation window"
+    - element: HighRiskParents
+      dimension: tuning_parameter
+      specific_values: "winword.exe, excel.exe, powerpnt.exe, acrord32.exe, browsers, 7zFM.exe, winrar.exe, explorer.exe"
+      disposition: context
+      target_question: Q5
+      notes: "Office/explorer parents named in process_chain and delivery_vector context; rule is CommandLine-only so parent values stay in context, not query selection"
+    - element: HighRiskChildren
+      dimension: tuning_parameter
+      specific_values: "powershell.exe, cmd.exe, regsvr32.exe, wscript.exe, mshta.exe, rundll32.exe, msiexec.exe"
+      disposition: context
+      target_question: Q3
+      notes: "DeepLink substitution targets (cmd/powershell/regsvr32) named in mechanism_decode context; the child binary is the decoded command, not a separate query selection here"
+    - element: UserPaths
+      dimension: file_path_analysis
+      specific_values: "%USERPROFILE%\\Downloads, %TEMP%, %APPDATA%, OneDrive/Teams cache"
+      disposition: context
+      target_question: Q6
+      notes: "Writable delivery paths named in evidence_preservation context; query uses %file_paths% placeholder which expands to the rule-derived path"
+    - element: EgressAllowList
+      dimension: tuning_parameter
+      specific_values: "corporate update/CDN domains and proxy egress CIDRs"
+      disposition: query_injection
+      target_question: Q7
+      notes: "svchost.exe and OneDrive.exe excluded as benign updaters in the network egress filter; further allowlisting is environment-specific and left to the analyst per context"
+    - element: AttachmentExtensions
+      dimension: tuning_parameter
+      specific_values: ".exe, .js, .vbs, .docm, .xlsm (T1566.001 generic list)"
+      disposition: context
+      target_question: Q4
+      notes: "Rule is specific to .SettingContent-ms; the generic high-risk extension list is a tuning rationale, recorded as delivery-vector context not query injection"
+    - element: SuspiciousParentChildPairs
+      dimension: tuning_parameter
+      specific_values: "winword.exe -> powershell.exe and similar Office-to-LOLBIN lineages"
+      disposition: context
+      target_question: Q5
+      notes: "Office-to-shell lineage described in process_chain context as the high-risk parent chain for this file type"
+    - element: AllowedSenders
+      dimension: tuning_parameter
+      specific_values: "rationale only - trusted-sender whitelist"
+      disposition: context
+      target_question: Q4
+      notes: "Sender allowlisting is an email-side tuning rationale with no queryable value at the process_creation layer; noted as part of delivery-vector review"
+    - element: SuspiciousFileTypes
+      dimension: tuning_parameter
+      specific_values: "rationale only - high-risk attachment types (T1566)"
+      disposition: context
+      target_question: Q4
+      notes: "Duplicate of AttachmentExtensions rationale; rule constrains the file type to .SettingContent-ms, generic list stays as delivery context"
+  dedup_decisions:
+    - dropped: cue_process_tool.clustering
+      reason: "cue_host_context.clustering covers the same 'what other activity on this host around this time' question with the same aggregation shape; host_context version kept to avoid a near-identical query"
+      kept: cue_host_context.clustering
+    - dropped: cue_user_actor.baseline (user-pivot) vs baseline_svc pairing
+      reason: "user_actor pair - non-deduplicable; both baseline (user identity) and baseline_svc (launch mechanism) emitted per AGENTS.md"
+      kept: both
+    - dropped: cue_user_actor.clustering (user-pivot) vs clustering_svc pairing
+      reason: "user_actor pair - non-deduplicable; both clustering (user identity) and clustering_svc (launch mechanism) emitted per AGENTS.md"
+      kept: both
+  skipped_templates:
+    - template: cue_process_tool.baseline
+      reason: "Recommended tier-2 baseline frequency is subsumed by baseline_deviation (REFLECTED, rule-pattern-scoped to host over -14d) and user_actor.baseline; the generic Image-based 90d baseline adds little for a CommandLine-only rule with no fixed binary, and slots are needed for the must_include initial_access and always_include user-actor questions to stay within the 18-question cap."
+    - template: cue_process_tool.follow_on
+      reason: "The DeepLink-spawned child IS the operational payload, already decoded by mechanism_decode and shown in verify_trigger_match; a separate ParentImage|endswith|expand:%Image% follow_on query has no %Image% value to bind (CommandLine-only rule, primary_binary null) and would be malformed. Dropped to stay within the 18-question cap."
+    - template: universal.endpoint_protection_health
+      reason: "Recommended (not must_include). This is a user-execution / initial-access rule whose disposition turns on delivery and the DeepLink payload, not on whether AV/EDR was disabled first; tamper-as-precursor is not the live question here. cue_host_context.precursor already surfaces any prior tamper alerts on the host. Dropped to keep the must_include initial_access set and the always_include user-actor pairs within the 18-question cap."
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "CommandLine-only detection — no Image field in rule. Use CommandLine pattern matching for scoping, not Image-based queries"
+      disposition: acted_on
+      reason: >-
+        Acted on. mechanism_decode (Q3), baseline_deviation (Q10, reflected), scope (Q11, reflected),
+        user_actor.baseline (Q12), and user_actor.clustering_svc/baseline_svc (Q13/Q15) all scope on
+        CommandLine|contains: .SettingContent-ms instead of %Image%. The Image-based cue_process_tool.baseline
+        and follow_on templates were skipped (see skipped_templates) because they have no binary to bind.
+    - hint: "File paths derived from CommandLine — use %file_paths% placeholder"
+      disposition: acted_on
+      reason: >-
+        Acted on. evidence_preservation (Q6) uses TargetFilename|contains|expand: '%file_paths%' to locate the
+        .SettingContent-ms file on disk; %file_paths% derives from the CommandLine reference per the brief.
+    - hint: "logsource 'application' (recommended by techniques: T1204) is not covered and no template family exists — author a custom question with `category: application`"
+      disposition: acted_on
+      reason: >-
+        Acted on. Q8 (attack:T1204.application_open) is a custom question with logsource category: application,
+        covering chain stage 1 (user-facing app records an abnormal open/crash event from the launching parent).
+    - hint: "logsource 'network_connection' (recommended by techniques: T1204,T1566.001) is not covered — pull in cue_network_endpoint.* or author a custom question with `category: network_connection`"
+      disposition: acted_on
+      reason: >-
+        Acted on. Q7 (attack:T1204.network_egress) is a custom network_connection question covering chain stage 4
+        (immediate outbound HTTP(S)/DNS/SMB from the same lineage), with benign-updater exclusions for svchost.exe
+        and OneDrive.exe.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - initial_access
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 16
+      attack: 2
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 15
+    logsource_diversity:
+      process_creation: 14
+      file_event: 1
+      network_connection: 1
+      application: 1
+      sigma_alert: 1

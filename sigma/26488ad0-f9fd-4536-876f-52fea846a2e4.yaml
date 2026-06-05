@@ -1,0 +1,563 @@
+name: HackTool - SharPersist Execution
+id: aabbd861-130f-49c1-b19a-e5b9f1b5051f
+description: |
+  Detects execution of SharPersist, a C# Windows persistence toolkit that deploys
+  triggers such as scheduled tasks, services, registry Run keys, and startup-folder
+  shortcuts. The rule fires when the process image or product name identifies the
+  tool, OR when the command line carries one of the toolkit's persistence-install
+  patterns (a schtask/startupfolder create, or a reg/service/schtask add) -- any one
+  of these branches matching is sufficient. Legitimate hits are limited to authorized
+  penetration tests or red-team engagements; otherwise this indicates an operator
+  establishing persistence, often staged after initial access. Investigation should
+  confirm the firing branch, decode the persistence technique and payload that was
+  installed, determine whether the persistence is still active, and look for parallel
+  mechanisms or earlier stages on the host.
+type: detection
+detection_id: 26488ad0-f9fd-4536-876f-52fea846a2e4
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: '2026-06-05'
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the alerting event match SharPersist by its image/product name, or by a persistence-install command-line pattern?
+  context: >-
+    The rule fires when EITHER the image name or product is SharPersist, OR the command
+    line carries one of its install patterns -- ' -t schtask -c ', ' -t startupfolder -c ',
+    or ' -t reg -c ' / ' -t service -c ' / ' -t schtask -c ' combined with ' -m add'.
+    Confirm which branch matched: a name/product match identifies the binary directly,
+    while a command-line-only match can fire on a renamed binary, so note which one
+    you see. Review the full Image, Product, and CommandLine on the triggering event.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - Product
+- source: template:universal.host_user_context
+  question: Is this user and host expected to install persistence mechanisms such as scheduled tasks, services, or registry run keys?
+  context: >-
+    Persistence installation is rarely routine end-user activity. Knowing whether the
+    account and host normally perform administrative persistence changes -- and whether
+    the user role matches that -- is often the fastest way to separate an authorized
+    operator or admin from an intrusion. SYSTEM or a service account firing this on a
+    workstation is a stronger anomaly than an admin account on a managed server.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:hacking_tool.authorized_engagement
+  question: Is this SharPersist execution part of an authorized penetration test or red team engagement?
+  context: >-
+    SharPersist is an offensive persistence toolkit used in authorized security
+    assessments. Before investing analysis time, check whether a pentest or red-team
+    exercise is currently active on this host or network segment. An authorized
+    engagement with matching tool usage and timing resolves the alert without further
+    work; absence of one moves the disposition toward unauthorized persistence.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:scheduled_task.task_configuration
+  question: What persistence technique and payload did this command install? Decode the -t technique, -m method, and the -c command it runs.
+  context: >-
+    The SharPersist command line follows the shape ' -t <technique> -m <method> [args]'.
+    The -t value names the trigger (schtask, startupfolder, reg, service, schtaskbackdoor,
+    keepass, tortoisesvn), -m is the action (add installs it; check is a dry run; list/remove
+    are inventory/cleanup), -c is the command the persistence will execute, -a its
+    arguments, and -k/-v/-n/-f name the registry key, value, task, or file. Decode these
+    to identify exactly what payload was made persistent and through which mechanism.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:hacking_tool.tool_capability_used
+  question: Which SharPersist trigger technique and method were invoked, and does the method indicate a committed install or a dry run?
+  context: >-
+    SharPersist is multi-purpose: -t selects the persistence trigger and -m selects the
+    action. ' -m add' commits the persistence; ' -m check' is a dry-run that validates
+    arguments without writing; ' -m list'/' -m remove' inventory or clean up. The -t value
+    determines scope and privilege -- reg/startupfolder/schtask can run in user context,
+    while service and the hklm/userinit registry hives require admin. The combination tells
+    you whether persistence was actually established and how privileged it is.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:scheduled_task.task_trigger_and_timing
+  question: If a scheduled task was installed, when is it set to run and has the scheduler already executed its payload?
+  context: >-
+    The trigger schedule determines when the persistence activates. Tasks set to run at
+    boot or logon fire on the next restart or sign-in; recurring tasks (hourly, daily) may
+    have already executed multiple times. Scheduled tasks run as children of the Task
+    Scheduler service, so process-creation events spawned by svchost.exe running the
+    Schedule service after task creation reveal whether the payload has fired.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith: '\svchost.exe'
+        ParentCommandLine|contains: 'Schedule'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:scheduled_task.task_still_present
+  question: Is the installed persistence (scheduled task, service, registry value, or startup shortcut) still present on the system?
+  context: >-
+    Persistence is only effective if the artifact still exists, and some operators remove
+    it after use to reduce forensic traces. Confirm the specific artifact named in the
+    command line is still registered -- query the scheduled task, the created service, the
+    registry value, or the startup-folder shortcut on the host or via endpoint tooling.
+    Its presence determines whether an active persistence mechanism still requires removal.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: attack:T1053.execution_context
+  question: Does a scheduled-task creation event in the security log confirm a new task was registered, and under what author and account?
+  context: >-
+    SharPersist's schtask techniques register a task through the Task Scheduler, which
+    emits a task-creation record in the security log independent of the process command
+    line. That record names the task author and the account context the task was created
+    under -- an unexpected author or account is the deviation worth chasing. If a creation
+    event is absent, the alert may have fired on a check/list dry run, a non-task technique
+    (reg, service, startupfolder), or a renamed binary that never reached the scheduler.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: security
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4698
+      condition: selection
+    fields:
+      - TaskName
+      - SubjectUserName
+      - TaskContent
+- source: template:hacking_tool.tool_specific_artifacts
+  question: What files did the SharPersist process create on this host?
+  context: >-
+    The toolkit's persistence techniques leave artifacts on disk: startup-folder LNK
+    shortcuts, dropped payload binaries or scripts, and modified config files such as a
+    KeePass configuration. The tool can also time-stomp dropped files so they inherit a
+    benign timestamp. File-creation events tied to the tool's process surface these
+    artifacts even after the original process exits, and reveal payloads the command line
+    alone may not fully spell out.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: template:cue_process_tool.process_chain
+  question: What process spawned SharPersist, and is that parent chain expected?
+  context: >-
+    The parent process reveals how the tool was launched. This toolkit is built for
+    reflective in-memory loading, so the parent is frequently not a SharPersist.exe on
+    disk but a host process the operator injected into or a script host. A parent such as
+    an interactive shell, a remote-execution service, or an unexpected application points
+    to operator-driven execution; walk up the parent's own chain to see what initiated it.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired the rule's pattern, what parents and users normally drive that activity, and does the current alert fit?
+  context: >-
+    Even a tool with legitimate engagement use leaves a baseline. This query mirrors the
+    rule's selection structure scoped to this host, so the resulting parent and user
+    distribution reflects how the rule's specific firing pattern has historically run here
+    -- not generic binary usage. A new parent process, an unexpected account, or a first-time
+    firing on this host is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \SharPersist.exe
+      - Product: SharPersist
+      selection_cli_1:
+        CommandLine|contains:
+        - ' -t schtask -c '
+        - ' -t startupfolder -c '
+      selection_cli_2:
+        CommandLine|contains|all:
+        - ' -t reg -c '
+        - ' -m add'
+      selection_cli_3:
+        CommandLine|contains|all:
+        - ' -t service -c '
+        - ' -m add'
+      selection_cli_4:
+        CommandLine|contains|all:
+        - ' -t schtask -c '
+        - ' -m add'
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (1 of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run SharPersist or install persistence across the environment?
+  context: >-
+    Compare this user's current action against their historical behavior. A user who has
+    never run this tool is more suspicious than one who does so as part of a known
+    assessment role. User role and typical toolset should align with persistence-installation
+    activity. Low or zero historical counts indicate first-time use by this account.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent+binary launch combination historically routine on this host or across the environment, or is the parent unusual for this binary?
+  context: >-
+    When the alert fires under a service principal, user identity does not attribute the
+    behavior -- the meaningful pivot is the launch mechanism. Which parent process spawned
+    this binary, and is that pair historically common. A new or rare parent for this binary
+    is the deviation worth chasing; a pair that already accounts for many prior events is
+    more likely automation. This is paired with the user-identity baseline and is not a
+    duplicate of it.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: >-
+    Tracking the user's activity across all hosts reveals lateral movement or persistence
+    installed on multiple endpoints. If the same account triggered similar activity on
+    several hosts in this window, the scope of the operation is larger than a single host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent+binary combination fire on other hosts in the same window -- a coordinated rollout, or activity isolated to this host?
+  context: >-
+    Under a service principal, asking what else the user did across the network returns
+    agent-telemetry noise, because every host runs SYSTEM-owned agents constantly. The
+    meaningful question is whether the same launch mechanism -- parent process plus spawned
+    binary -- fired on other hosts in the alert window. Multiple hosts points to scheduled
+    or pushed automation; a single host points to a host-local trigger. This is paired with
+    the user-identity clustering and is not a duplicate of it.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired the rule's pattern in the past week, and does the cross-host distribution look like consistent automation or one-off activity?
+  context: >-
+    This query mirrors the rule's selection structure with no host scope, so the result is
+    a fleet-wide count of the rule's firing pattern rather than generic usage of the binary.
+    Many hosts firing the same pattern points to scripted deployment or assessment
+    automation; one host or a small unrelated set points to manual operator activity. Use
+    the host distribution and parent/binary consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \SharPersist.exe
+      - Product: SharPersist
+      selection_cli_1:
+        CommandLine|contains:
+        - ' -t schtask -c '
+        - ' -t startupfolder -c '
+      selection_cli_2:
+        CommandLine|contains|all:
+        - ' -t reg -c '
+        - ' -m add'
+      selection_cli_3:
+        CommandLine|contains|all:
+        - ' -t service -c '
+        - ' -m add'
+      selection_cli_4:
+        CommandLine|contains|all:
+        - ' -t schtask -c '
+        - ' -m add'
+      condition: 1 of selection_*
+    fields:
+    - host.name
+- source: template:persistence_scope.process_based_persistence
+  question: Were other process-based persistence mechanisms installed on this host in the same timeframe?
+  context: >-
+    Operators rarely rely on a single persistence mechanism. After establishing one
+    foothold, they commonly install backups using different techniques -- scheduled tasks,
+    services, registry Run keys, BITS jobs, or WMI subscriptions, sometimes via standard
+    tools rather than the same toolkit. Multiple persistence installations from the same
+    timeframe indicate intentional stacking rather than isolated administrative action.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Persistence installation usually sits in the middle of an intrusion, after initial
+    access and often after defense evasion or credential access. Earlier detections on the
+    same host -- reconnaissance, defense tampering, credential access -- may reveal the
+    stages that preceded this event and help reconstruct the timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1053
+      name: Scheduled Task/Job
+      role: primary
+  attack_chain_coverage:
+    - stage: 1
+      label: task_or_trigger_creation
+      description: "Actor invokes SharPersist to create or modify a persistence trigger (scheduled task, service, registry key, startup shortcut)"
+      mapped_to: Q4
+      source: template:scheduled_task.task_configuration
+    - stage: 2
+      label: scheduler_registration
+      description: "Scheduled-task creation is registered with the Task Scheduler and emits a security-log task-creation record"
+      mapped_to: Q8
+      source: attack:T1053.execution_context
+    - stage: 3
+      label: payload_execution
+      description: "Trigger fires and the scheduler launches the persistence payload as an outlier process"
+      mapped_to: Q6
+      source: template:scheduled_task.task_trigger_and_timing
+  dimension_coverage:
+    - dimension: command_analysis
+      technique: T1053
+      covered_by: Q4
+      source: template:scheduled_task.task_configuration
+      coverage_type: direct
+    - dimension: execution_context
+      technique: T1053
+      covered_by: Q8
+      source: attack:T1053.execution_context
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1053
+      covered_by: Q6
+      source: template:scheduled_task.task_trigger_and_timing
+      coverage_type: direct
+  mutable_dispositions:
+    - element: TaskAuthor
+      dimension: tuning_parameter
+      specific_values: "rationale only (unexpected user/account context initiating the task)"
+      disposition: query_injection
+      target_question: Q8
+      notes: "Surfaced via SubjectUserName field on the security-log 4698 event; also reflected in the baseline_deviation User distribution (Q12)."
+    - element: CommandLineRegex
+      dimension: command_analysis
+      specific_values: "rationale only (suspicious binaries/script usage tied to scheduled tasks)"
+      disposition: context
+      target_question: Q4
+      notes: "The rule's own -t/-m/-c command-line patterns are decoded in Q4 and Q5; the analytic's generic CommandLineRegex has no concrete values to inject."
+    - element: ExecutionWindow
+      dimension: tuning_parameter
+      specific_values: "rationale only (lookback window to correlate execution after task registration)"
+      disposition: context
+      target_question: Q6
+      notes: "Realized as the +4h range on task_trigger_and_timing (Q6) and the +4h security-log window (Q8), correlating payload execution after task creation."
+  dedup_decisions:
+    - dropped: cue_process_tool.clustering
+      reason: "host-wide clustering of other tools is superseded by cue_host_context.precursor (prior sigma alerts on host) and user-actor clustering; avoids a redundant broad host sweep"
+      kept: cue_host_context.precursor
+    - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc
+      reason: "user_actor pair -- non-deduplicable; emitted BOTH (subject vs. launch-mechanism pivot) per AGENTS.md service-principal handling"
+      kept: both
+    - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc
+      reason: "user_actor pair -- non-deduplicable; emitted BOTH (subject vs. launch-mechanism pivot) per AGENTS.md service-principal handling"
+      kept: both
+  skipped_templates:
+    - template: cue_process_tool.mechanism_decode
+      reason: "replaced_by: scheduled_task.task_configuration (hint 1) -- the technique-set version is more specific to the persistence command line"
+    - template: cue_process_tool.baseline
+      reason: "generic Image-only 90d frequency is superseded by the REFLECTED baseline_deviation (Q12), which counts the rule's actual firing pattern on this host rather than generic binary usage"
+    - template: cue_process_tool.follow_on
+      reason: "child-process spawn of the tool is low-value for a reflectively-loaded persistence installer that does not spawn the payload itself; payload execution is covered topically by task_trigger_and_timing (Q6) and process_based_persistence (Q17)"
+    - template: cue_host_context.clustering
+      reason: "host-wide process clustering overlaps with cue_host_context.precursor (Q18) and the persistence-scope sweep (Q17); dropped to stay within the 18-question cap without losing host-context coverage"
+    - template: universal.endpoint_protection_health
+      reason: "RECOMMENDED tier. This is a persistence-installation rule, not an execution/credential-access rule where the disposition turns on whether protection was disabled first; cue_host_context.precursor (Q18) already surfaces any prior defense-tampering alerts on the host in the lead-up window. Dropped to keep the set at 18 within cap."
+    - template: organizational_context.change_ticket
+      reason: "RECOMMENDED tier. Template notes_to_llm says skip change-ticket framing for hktl-prefixed detections -- a change ticket for a named offensive persistence toolkit is not a meaningful disposition path; hacking_tool.authorized_engagement (Q3) is the relevant authorization check."
+    - template: organizational_context.human_recall
+      reason: "RECOMMENDED tier. For a named hacktool the relevant authorization path is the engagement check (Q3), not generic user recall; dropped to stay within cap."
+    - template: organizational_context.timing_alignment
+      reason: "RECOMMENDED tier. Work-hours framing is weak for a hacktool detection; timing is covered more specifically by the engagement check (Q3) and the baseline_deviation history (Q12). Dropped to stay within cap."
+    - template: organizational_context.procedural_consistency
+      reason: "RECOMMENDED tier. Standard-procedure framing presumes the action might be routine IT change; for a named offensive persistence toolkit it is not. Dropped to stay within cap."
+    - template: persistence_scope.file_based_persistence
+      reason: "RECOMMENDED tier. File-drop persistence locations (startup LNK, Run-key paths) are already covered for this tool's own process by hacking_tool.tool_specific_artifacts (Q9, file_event scoped to the tool image); the generic host-wide file sweep is dropped to stay within the 18-question cap."
+  reflection_overrides: []
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - scheduled_task
+    - hacking_tool
+    - persistence_scope
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 17
+      attack: 1
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 15
+    logsource_diversity:
+      process_creation: 14
+      security: 1
+      file_event: 1
+      sigma_alert: 1

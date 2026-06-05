@@ -1,0 +1,591 @@
+name: HackTool - Jlaive In-Memory Assembly Execution
+id: fdc803ba-33e9-455b-8a99-3aad6012b21d
+description: |
+  Detects the batch-file launch sequence produced by Jlaive, an assembly-packing utility that smuggles a .NET payload inside a .bat file and runs it in memory. The rule fires when cmd.exe runs a .bat file AND that batch spawns EITHER an xcopy.exe whose command line contains both 'powershell.exe' (or 'pwsh.exe') and '.bat.exe' OR an attrib.exe whose command line contains '+s', '+h', and '.bat.exe'. The behavior is the batch cloning the real PowerShell binary to a sibling file named <basename>.bat.exe, hiding it with system and hidden attributes, then relaunching that renamed PowerShell to AES/GZip-decrypt and reflectively load the inlined assembly. Legitimate use is essentially nonexistent; investigation should confirm which branch fired, recover the source batch and the renamed PowerShell copy, and scope the in-memory payload that ran.
+type: detection
+detection_id: 0a99eb3e-1617-41bd-b095-13dc767f3def
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-04
+questions:
+- source: template:universal.verify_trigger_match
+  question: Did cmd.exe run a .bat file that spawned EITHER an xcopy cloning PowerShell to a .bat.exe name OR an attrib hiding a .bat.exe file?
+  context: >-
+    Before investing investigation time, confirm the alert is a true positive by reviewing the exact parent and child
+    command lines against the rule's two-branch logic. The parent must be cmd.exe with a command line ending in .bat. The
+    child is EITHER xcopy.exe whose command line contains both a PowerShell binary name (powershell.exe or pwsh.exe) and
+    .bat.exe, OR attrib.exe whose command line contains +s, +h, and .bat.exe. Note which branch fired: the xcopy branch is
+    the binary-cloning step and the attrib branch is the hide-attributes step of the same sequence, so the other branch
+    usually also occurred around the same time even if only one tripped the rule.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+      - Image
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run a batch file that copies and hides a PowerShell binary?
+  context: >-
+    Legitimate administrative activity can trigger many detections, but the cloning of powershell.exe to a renamed .exe with
+    system and hidden attributes has no normal administrative purpose. Knowing whether the user role and host function are
+    consistent with running this batch file is the fastest path to distinguishing a deliberate evasion attempt from a
+    sanctioned test.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:hacking_tool.authorized_engagement
+  question: Is this Jlaive batch execution part of an authorized penetration test or red team engagement?
+  context: >-
+    Assembly-packing and AV-evasion tooling is used in authorized security assessments. Before investing investigation time,
+    check whether a penetration test or red team exercise is currently active on this host or network segment. An authorized
+    engagement with matching tool usage and timing resolves the alert without further analysis.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:hacking_tool.tool_capability_used
+  question: Which stage of the Jlaive sequence does this event represent, and what is the name of the source batch and the renamed PowerShell copy?
+  context: >-
+    The packing sequence has distinct stages: an xcopy that clones the real PowerShell binary to a sibling file named
+    <basename>.bat.exe, an attrib that sets system and hidden attributes on that copy, and a relaunch of the renamed copy
+    that decrypts and loads the payload. Reading the command line identifies which stage fired and recovers the basename,
+    which is the same as the source .bat and the resulting .bat.exe. Those filenames are the pivot for recovering the
+    payload and finding the relaunch.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:hacking_tool.tool_specific_artifacts
+  question: Are the renamed PowerShell copy and the inline-compilation artifacts present on the host?
+  context: >-
+    This sequence leaves characteristic files: the renamed PowerShell binary <basename>.bat.exe, the source <basename>.bat,
+    and the temporary inline C# compilation artifacts that PowerShell produces when it builds the AES/GZip helper class via
+    Add-Type (a generated .cmdline, a .0.cs source, a compiled .dll, plus CSC and RES temporary files). Finding these files
+    confirms execution and the on-disk footprint even after the original processes have exited.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: template:parent_child.parent_process_legitimacy
+  question: Is cmd.exe expected to run this batch file, and what started the cmd.exe that launched it?
+  context: >-
+    The parent-child relationship is the core signal: cmd.exe executing a .bat that in turn spawns xcopy or attrib against a
+    PowerShell copy. Tracing the cmd.exe's own origin reveals whether the batch ran from a user double-clicking a downloaded
+    file, an email attachment handler, an installer, or another process delivering the payload. The batch file path in the
+    parent command line shows where it was staged.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- source: template:parent_child.sibling_processes
+  question: What other child processes did the same cmd.exe spawn?
+  context: >-
+    The full sequence spawns several children from the same batch-running cmd.exe: the xcopy clone, the attrib hide step, and
+    the relaunched renamed PowerShell copy. Examining all children of that parent confirms the complete chain even when only
+    one branch tripped the rule, and reveals the renamed-PowerShell process that performs the in-memory load.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in the hour before the alert?
+  context: >-
+    This tool exists specifically to evade antivirus by renaming the PowerShell host so signature matching on powershell.exe
+    fails. Operators sometimes pair that evasion with direct attempts to disable or blind protection. The query surfaces
+    attempts to disable AV/EDR services, flip Defender flags, add broad exclusions, clear logs, or patch AMSI/ETW. Zero rows
+    is a useful protection-looks-healthy signal; populated rows shift the disposition toward operator preparation, so review
+    the parent process and signing chain to identify the writer.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+- source: template:cue_process_tool.mechanism_decode
+  question: Decode the full xcopy or attrib command line - what source PowerShell path is cloned, and to what destination name?
+  context: >-
+    The full command line reveals the exact operation: for the xcopy branch, the source is typically the real
+    powershell.exe under WindowsPowerShell\v1.0 and the destination is a sibling file with the batch basename plus a
+    .bat.exe extension; for the attrib branch, the +s +h flags are applied to that same .bat.exe path. Decoding the paths
+    recovers the staging directory and the exact renamed-binary name, which are needed to locate the relaunch and the
+    payload.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:cue_parent_process.mechanism_decode
+  question: What is the cmd.exe that ran the batch, and what is the full path of the .bat it executed?
+  context: >-
+    The parent cmd.exe command line shows the full path of the batch file it ran, which is the origin of the whole sequence.
+    That path indicates how the payload arrived and where it was staged, and its basename matches the renamed PowerShell
+    copy. Retrieving the parent's own process event also lets the investigation walk upward to whatever launched the cmd.exe.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+- source: attack:T1059.003.image_load
+  question: Did the renamed PowerShell copy load the PowerShell automation and scripting modules that indicate in-memory assembly execution?
+  context: >-
+    The renamed PowerShell binary behaves exactly like powershell.exe despite its disguised name, so it loads the same core
+    modules - the .NET runtime and System.Management.Automation - and, when it compiles the inline AES/GZip helper via
+    Add-Type, the C# compiler and its support libraries. Module-load events on a process whose image name ends in .bat.exe
+    are strong evidence that a renamed interpreter ran in memory. If image-load telemetry is not collected in this
+    environment, treat zero results as a visibility gap rather than evidence nothing loaded.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith: '.bat.exe'
+      condition: selection
+    fields:
+      - Image
+      - ImageLoaded
+- source: template:cue_parent_process.baseline
+  question: Has cmd.exe on this host previously spawned xcopy or attrib in this way?
+  context: >-
+    Some parent-child relationships are routine, but cmd.exe spawning xcopy to clone a PowerShell binary or attrib to hide
+    one is not. Historical frequency of this specific pairing on the host distinguishes a novel spawning relationship from
+    something already established. Zero or very low counts indicate first-time activity.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run this binary?
+  context: >-
+    Compare this user's current action against their historical behavior. A user who has never run xcopy or attrib in this
+    context is more suspicious than one who does so regularly as part of a known role. User role and typical toolset should
+    align with the detected activity.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this cmd.exe-plus-binary launch combination historically routine on this host or across the environment, or is the parent unusual for this binary?
+  context: >-
+    When the alert fires under a service principal, user identity does not attribute behavior; the meaningful pivot is the
+    launch mechanism. A new or rare cmd.exe parent for xcopy or attrib on this host or across the environment is the
+    deviation worth chasing, whereas a pairing that already accounts for thousands of prior events is most likely vendor or
+    operating-system automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: >-
+    Tracking the user's activity across all hosts reveals whether the same actor triggered similar staging on multiple
+    endpoints. If the same user ran comparable batch-launched activity elsewhere, the scope of the compromise may be larger
+    than this single host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same cmd.exe-plus-binary combination fire on other hosts in the same window, indicating a coordinated rollout rather than host-local activity?
+  context: >-
+    Under a service principal, asking what else the user did returns agent-telemetry noise. The meaningful question is
+    whether the same launch mechanism - cmd.exe spawning xcopy or attrib in this pattern - fired on other hosts in the alert
+    window. Multiple hosts in the same window points to pushed or scheduled automation; a single host points to a host-local
+    trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Alerts rarely happen in isolation. Earlier detections on the same host, such as initial access, reconnaissance, or
+    defense tampering, may reveal the stages that delivered and staged this batch file and help reconstruct the full
+    timeline leading to the in-memory execution.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1059.003
+      name: Windows Command Shell
+      role: primary
+    - id: T1059
+      name: Command and Scripting Interpreter
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: batch_invocation
+      description: cmd.exe runs the Jlaive-generated .bat file, initiating the smuggle-and-execute sequence.
+      mapped_to: Q10
+      source: template:cue_parent_process.mechanism_decode
+    - stage: 2
+      label: powershell_clone
+      description: xcopy clones the real PowerShell binary to a sibling <basename>.bat.exe, masquerading the interpreter.
+      mapped_to: Q9
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 3
+      label: hide_attributes
+      description: attrib sets +s +h on the renamed PowerShell copy to hide the artifact.
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 4
+      label: in_memory_load
+      description: The renamed PowerShell relaunches and reflectively loads the AES/GZip-decrypted assembly in memory.
+      mapped_to: Q11
+      source: attack:T1059.003.image_load
+  dimension_coverage:
+    - dimension: command_analysis
+      technique: T1059.003
+      covered_by: Q9
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1059.003
+      covered_by: Q6
+      source: template:parent_child.parent_process_legitimacy
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1059.003
+      covered_by: Q17
+      source: template:cue_host_context.precursor
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1059.003
+      covered_by: Q4
+      source: template:hacking_tool.tool_capability_used
+      coverage_type: indirect
+    - dimension: user_context
+      technique: T1059.003
+      covered_by: Q2
+      source: template:universal.host_user_context
+      coverage_type: direct
+  mutable_dispositions:
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: cmd.exe (rule-constrained ParentImage|endswith \cmd.exe)
+      disposition: context
+      target_question: Q6
+      notes: Parent is fixed to cmd.exe by the rule; parent legitimacy and origin covered in Q6/Q10. Baseline pairing in Q12.
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: rationale only (non-working-hours automation indicator)
+      disposition: context
+      target_question: Q17
+      notes: No queryable value; timeline reconstruction handled by precursor alert correlation in Q17 and +/-15m sibling/host windows.
+    - element: CommandLinePattern
+      dimension: command_analysis
+      specific_values: powershell.exe/pwsh.exe + .bat.exe (xcopy), +s +h + .bat.exe (attrib)
+      disposition: query_injection
+      target_question: Q11
+      notes: >-
+        Rule's own CommandLine|contains values are entity-scoped in Q1 (ProcessGuid). The distinctive .bat.exe renamed-binary
+        pattern is injected as Image|endswith '.bat.exe' into the image_load query Q11.
+    - element: ScriptStoragePath
+      dimension: tuning_parameter
+      specific_values: '%TEMP%, C:\Users\Public, external drives'
+      disposition: context
+      target_question: Q4
+      notes: Batch staging path recovered by decoding the parent .bat path (Q10) and naming the basename (Q4); flagged as a staging-location signal in context.
+    - element: UserContext
+      dimension: user_context
+      specific_values: rationale only (admin users outside baseline)
+      disposition: context
+      target_question: Q2
+      notes: User expectation in Q2; user historical baseline in Q13.
+  dedup_decisions:
+    - dropped: cue_process_tool.process_chain
+      reason: parent_process is primary cue (per hint) and parent_child technique set active — process_chain subsumed by parent-process and parent_process_legitimacy questions.
+      kept: template:parent_child.parent_process_legitimacy
+    - dropped: cue_parent_process.mechanism_decode (as the sole Phase 2)
+      reason: kept as analysis question Q10 alongside cue_process_tool.mechanism_decode Q9 — they decode different processes (parent cmd/.bat vs child xcopy/attrib), not duplicates.
+      kept: template:cue_parent_process.mechanism_decode
+    - dropped: cue_user_actor user-pivot vs service-principal substitute
+      reason: user_actor pair — non-deduplicable (Q13/Q14 baseline pair, Q15/Q16 clustering pair).
+      kept: both variants
+  skipped_templates:
+    - template: cue_parent_process.follow_on
+      reason: Subsumed by parent_child.sibling_processes (Q7) which covers all children of the same parent instance via ParentProcessGuid.
+    - template: cue_parent_process.clustering
+      reason: Same-time other-activity from the parent is covered by host_context and sibling_processes; cross-logsource pivot covered by image_load Q11.
+    - template: cue_parent_process.scope
+      reason: Cross-host parent-child scope covered by cue_user_actor.clustering_svc (Q16), which checks the same parent+binary across hosts in-window.
+    - template: cue_process_tool.baseline
+      reason: Host-binary baseline covered by cue_parent_process.baseline (Q12) which adds the parent dimension; user/mechanism baselines in Q13/Q14.
+    - template: cue_host_context.clustering
+      reason: Per-host activity at alert time covered by sibling_processes (Q7) and the precursor alert timeline (Q17); avoided to stay within 14-18.
+  reflection_overrides: []
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - hacking_tool
+    - parent_child
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 16
+      attack: 1
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 2
+      context: 13
+    logsource_diversity:
+      process_creation: 14
+      file_event: 1
+      image_load: 1
+      sigma_alert: 1

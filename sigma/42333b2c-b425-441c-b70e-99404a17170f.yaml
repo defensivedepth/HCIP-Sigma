@@ -1,0 +1,497 @@
+name: HackTool - Sliver C2 Implant Activity Pattern
+id: 83fceb74-a5f5-4935-b734-61423b1306b3
+description: |
+  Detects a process command line containing the fixed Sliver C2 implant shell pattern `-NoExit -Command [Console]::OutputEncoding=[Text.UTF8Encoding]::UTF8`, emitted when a Sliver implant opens an interactive operator shell session. The rule fires when the command line contains that exact string. Sliver is a cross-platform command-and-control framework that operators adopt as a Cobalt Strike replacement; the implant spawns a PowerShell session and sets UTF-8 console encoding as part of its shell handler, which is the artifact this rule keys on. Because the pattern is specific to the implant's own code, a true match is high-confidence operator activity, so the investigation should decode the full command and any spawned children, confirm the parent chain and user and host context, check whether the same pattern fired elsewhere in the fleet, and reconstruct what ran before and after on the host.
+type: detection
+detection_id: 42333b2c-b425-441c-b70e-99404a17170f
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line contain the Sliver implant shell pattern this rule detects?
+  context: Before investing investigation time, confirm the alert is a true positive. The rule fires when the command line contains the exact string `-NoExit -Command [Console]::OutputEncoding=[Text.UTF8Encoding]::UTF8`. Read the full command line and confirm the marker is present verbatim rather than a coincidental fragment, and note what process carries it and any arguments that follow, since that surrounding content is the real subject of the investigation.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run an interactive PowerShell session that sets UTF-8 console encoding this way?
+  context: This command-line shape is specific to an implant's shell handler, not a normal administrative pattern. Knowing whether this account and host have any legitimate reason to launch PowerShell with this exact `-NoExit -Command` encoding setup — a developer tool, a known automation, or nothing of the sort — is often the fastest way to separate a true implant session from an unlikely benign coincidence.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:hacking_tool.authorized_engagement
+  question: Is this Sliver implant activity part of an authorized penetration test or red team engagement?
+  context: Sliver is openly available and routinely used in authorized security assessments. Before investing investigation time, check whether a penetration test or red team exercise is currently active on this host or network segment. An authorized engagement with matching tooling, timing, and scope resolves the alert without further analysis; absence of any sanctioned exercise makes the implant pattern far more concerning.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:hacking_tool.tool_capability_used
+  question: What was the implant doing in this shell session — read the full command line for the operator action carried alongside the marker.
+  context: The encoding-setup marker is the implant's shell handshake; the operator action is whatever else rides on the command line or follows in the session. Recover any commands, file paths, downloads, or further encoding passed in the same invocation. A bare shell open reads differently from one that immediately runs reconnaissance, credential access, or staging, and the specific action determines the scope of potential compromise and the required response.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:cue_process_tool.mechanism_decode
+  question: Decode the full command line and any sibling invocations of this implant pattern on the host in the window.
+  context: A single operator session can span several sequential process creations that together form one logical operation. Scoping to the implant pattern on this host in the window captures the full sequence — the shell open, follow-up commands, and any encoded payloads — rather than only the one event that tripped the rule. Decode any flags, base64 or other encoding, file paths, and downloads to understand what the session actually did.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains: -NoExit -Command [Console]::OutputEncoding=[Text.UTF8Encoding]::UTF8
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:cue_process_tool.process_chain
+  question: What process spawned this implant session, and is that parent chain expected?
+  context: The parent process reveals how the implant shell was launched. A session spawned by a loader, a script host such as wscript.exe or mshta.exe, an Office application, rundll32.exe, or an unsigned binary in a user-writable directory points to a delivery chain that handed off to PowerShell. The parent's own command line shows whether a loader or document drove the activity, and walking up from there reconstructs how the implant started.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired this implant pattern, what parents and users drove it, and does the current alert fit that pattern?
+  context: This command-line shape is specific enough that on most hosts it should have no history at all. The query mirrors the rule's selection scoped to this host, so the resulting parent and user distribution reflects how this exact pattern has run here. Zero prior history is itself a strong signal of first-time activity; a sudden new parent, an unexpected user account, or an unusual command shape against any prior baseline is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains: -NoExit -Command [Console]::OutputEncoding=[Text.UTF8Encoding]::UTF8
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.follow_on
+  question: What child processes did this implant session spawn afterward?
+  context: The processes spawned from the implant shell reveal its actual impact. Operator activity through this session often spawns cmd.exe, additional powershell.exe instances, certutil.exe, reconnaissance binaries, or credential-access tooling. A quiet session that spawns nothing reads very differently from one that immediately launches post-exploitation tooling.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run this implant command-line pattern across the environment?
+  context: Compare this user's current action against their historical pattern. A user who has never run this exact `-NoExit -Command` encoding setup is far more suspicious than one with a recurring, explainable history of it. This pivot is meaningful only when a real user account fired the alert; the launch-mechanism baseline alongside it carries the answer when the actor is a service or computer account.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        CommandLine|contains: -NoExit -Command [Console]::OutputEncoding=[Text.UTF8Encoding]::UTF8
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent-and-binary combination historically routine on this host or across the environment?
+  context: When the alert fires under a service or computer account, user identity does not attribute behavior, so the meaningful baseline is the launch mechanism — which parent process spawned this binary, and whether that pairing is historically common. A new or rare parent for this binary (a script host or Office application where none was seen before) is the deviation worth chasing; a pairing that already accounts for thousands of prior events is vendor or OS automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts in a tight window reveals lateral movement or activity spanning multiple endpoints. If the same user ran this implant pattern or other tooling on other hosts in the same window, the scope of compromise is larger than a single machine. This pivot is meaningful only when a real user account fired the alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent-and-binary combination fire on other hosts in the same window?
+  context: Under a service or computer account, asking what else the user did returns agent-telemetry noise. The meaningful question is whether the same launch mechanism — this parent spawning this binary — fired on other hosts in the alert window. Multiple hosts at once points to a coordinated automation or pushed deployment; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired this implant pattern in the past week, and does the cross-host distribution look like consistent automation or one-off activity?
+  context: The query mirrors the rule's selection with no host scope, giving a fleet-wide count of where this exact implant pattern fired. Several hosts firing the same pattern in a short span points to a multi-host operation spreading across the environment; one host or a small unrelated set points to isolated operator activity. Use the host distribution to calibrate how widespread the activity is.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains: -NoExit -Command [Console]::OutputEncoding=[Text.UTF8Encoding]::UTF8
+      condition: selection
+    fields:
+    - host.name
+- source: template:hacking_tool.tool_specific_artifacts
+  question: What files did this implant process write to the host after it ran?
+  context: A Go-compiled implant and the operator session it drives leave host artifacts — staged payloads or tooling dropped into user-writable or temp directories, output files from reconnaissance or collection, and downloaded binaries. Checking files created by this process confirms what the session staged even after the original process has exited, and the locations and names of those files help separate operator staging from routine activity.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in the hour before the alert?
+  context: Operators frequently weaken protection before running an implant session and its follow-on tooling. This surfaces direct attempts to disable AV/EDR services, flip Defender settings, add broad exclusions, clear logs, or patch AMSI/ETW. Zero rows is a useful "protection looks healthy" signal — kernel-level driver tampering and in-memory patches will not appear here. Populated rows shift the disposition toward operator preparation; review the writing process and its signing chain to identify who made the change.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — a macro-spawned shell, a download cradle, defense tampering, reconnaissance, or credential access — may reveal the stages that preceded the implant session and help reconstruct the timeline. An interactive implant shell is usually a mid-chain milestone, so what came just before and just after is what tells the story.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1059
+      name: Command and Scripting Interpreter
+      role: primary
+  attack_chain_coverage:
+    - stage: 1
+      label: implant_shell_open
+      description: "Implant opens an interactive PowerShell session, setting UTF-8 console encoding via the fixed -NoExit -Command marker — the rule trigger"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: command_decode
+      description: "Decode the operator action carried alongside the marker and any sibling invocations in the window (encoded/obfuscated arguments, secondary execution)"
+      mapped_to: Q5
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 3
+      label: parent_context
+      description: "Identify what spawned the session — abnormal parent / loader / script host (the analytic's abnormal-user-context and parent-process angle)"
+      mapped_to: Q6
+      source: template:cue_process_tool.process_chain
+    - stage: 4
+      label: follow_on_execution
+      description: "Secondary execution events spawned from the session — the analytic's 'followed by secondary execution events'"
+      mapped_to: Q8
+      source: template:cue_process_tool.follow_on
+  dimension_coverage:
+    - dimension: command_analysis
+      technique: T1059
+      covered_by: Q5
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1059
+      covered_by: Q6
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1059
+      covered_by: Q16
+      source: template:cue_host_context.precursor
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1059
+      covered_by: Q7
+      source: template:cue_process_tool.baseline_deviation
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1059
+      covered_by: Q9
+      source: template:cue_user_actor.baseline
+      coverage_type: direct
+  mutable_dispositions:
+    - element: CommandLinePattern
+      dimension: command_analysis
+      specific_values: "rationale only — tunable to environment-specific encoded/uncommon script patterns; no enumerable values in brief"
+      disposition: context
+      target_question: Q5
+      notes: "The rule's own fixed pattern (-NoExit -Command [Console]::OutputEncoding=[Text.UTF8Encoding]::UTF8) is the queryable command-line pattern; it is injected into mechanism_decode (Q5), baseline_deviation (Q7), user baseline (Q9), and fleet scope (Q13) as CommandLine|contains. The mutable element itself is a tuning rationale, not a discrete value list."
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "rationale only — varies across managed/unmanaged workstations and user-driven script activity"
+      disposition: context
+      target_question: Q6
+      notes: "process_chain (Q6) recovers the actual parent for this alert; baseline_deviation (Q7) and the launch-mechanism baseline (Q10) judge whether that parent is historically routine. No fixed parent name to inject."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only — restricts analysis to work hours / admin maintenance windows; no discrete threshold"
+      disposition: context
+      target_question: Q16
+      notes: "Correlation framing carried by the precursor alert timeline (Q16) and the +/-1h user/launch clustering questions (Q11, Q12). No queryable threshold value."
+  dedup_decisions:
+    - dropped: cue_process_tool.baseline
+      reason: "Rule is CommandLine-only with no fixed Image; a generic host+Image baseline cannot be scoped to the rule's pattern and would count unrelated binary usage. baseline_deviation (Q7) reflects the rule's actual command-line pattern scoped to the host and is the load-bearing 'is this normal here' signal."
+      kept: cue_process_tool.baseline_deviation
+    - dropped: cue_process_tool.clustering
+      reason: "Host-wide tool clustering (+/-15m, aggregated by Image) overlaps the follow_on children (Q8) and the precursor alert timeline (Q16) without adding a distinct angle for this single-pattern rule."
+      kept: cue_host_context.precursor
+    - dropped: cue_host_context.clustering
+      reason: "Surrounding host activity is reached via the precursor alert question (Q16) and follow_on (Q8); avoided a near-duplicate broad host-scope process aggregation."
+      kept: cue_host_context.precursor
+    - dropped: "none — user_actor pair retained"
+      reason: "user_actor pair — non-deduplicable (baseline): Q9 pivots on user identity, Q10 on launch mechanism (parent+binary)."
+      kept: cue_user_actor.baseline + cue_user_actor.baseline_svc
+    - dropped: "none — user_actor pair retained"
+      reason: "user_actor pair — non-deduplicable (clustering): Q11 pivots on user identity, Q12 on launch mechanism (parent+binary)."
+      kept: cue_user_actor.clustering + cue_user_actor.clustering_svc
+  skipped_templates: []
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: >-
+        CommandLine-only detection — no Image field in rule. Use CommandLine pattern matching for scoping, not Image-based queries
+      disposition: acted_on
+      reason: >-
+        mechanism_decode (Q5), baseline_deviation (Q7), the user-pivot baseline (Q9),
+        and the fleet scope (Q13) are all scoped with CommandLine|contains on the
+        rule's fixed marker (-NoExit -Command [Console]::OutputEncoding=[Text.UTF8Encoding]::UTF8)
+        rather than an Image|endswith baseline, because the rule has no fixed binary.
+        The generic host+Image baseline template (cue_process_tool.baseline) was
+        dropped for the same reason (see dedup_decisions). The launch-mechanism
+        service-principal queries (Q10, Q12) and the file-artifact and follow_on
+        queries (Q14, Q8) retain %Image%/%ProcessGuid% runtime placeholders, which
+        resolve to the actual alerting process at hydration — these pivot on the
+        process that fired, not on a fixed value from the rule, so they are correct
+        despite the rule having no Image selection.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - hacking_tool
+  user_actor_pairs:
+    - reason: "user_actor pair — non-deduplicable (baseline): Q9 pivots on user identity, Q10 on launch mechanism (parent+binary)"
+    - reason: "user_actor pair — non-deduplicable (clustering): Q11 pivots on user identity, Q12 on launch mechanism (parent+binary)"
+  generation_stats:
+    total_questions: 16
+    source_counts:
+      template: 16
+      attack: 0
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 13
+    logsource_diversity:
+      process_creation: 14
+      file_event: 1
+      sigma_alert: 1

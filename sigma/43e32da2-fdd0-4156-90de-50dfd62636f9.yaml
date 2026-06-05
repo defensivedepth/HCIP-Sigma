@@ -1,0 +1,563 @@
+name: Dism Remove Online Package
+id: cdb5c4a5-fabf-48d9-b017-3806dee75fec
+description: |
+  Detects use of the Deployment Image Servicing and Management tool (DISM) to
+  disable a Windows feature on the live operating system. The rule fires when
+  EITHER dism.exe runs with both /Online and /Disable-Feature on its own command
+  line, OR DismHost.exe (the worker process DISM spawns) runs while its parent
+  command line contains both /Online and /Disable-Feature. DISM legitimately
+  enumerates, installs, and removes Windows features and packages during imaging
+  and administrative maintenance, so the behavior is routine on imaging servers
+  and deployment hosts. It is also a known defense-evasion primitive: disabling
+  the Windows Defender feature or removing on-disk recovery components weakens
+  protection or recovery before follow-on activity. The investigation should
+  determine which feature was disabled, whether it is a security or recovery
+  feature, what spawned the DISM invocation, and whether the host or fleet shows
+  the pattern as routine imaging or as a one-off operator action.
+type: detection
+detection_id: 43e32da2-fdd0-4156-90de-50dfd62636f9
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Did dism.exe run with /Online and /Disable-Feature on its own command
+    line, or did DismHost.exe run under a parent command line carrying those flags?
+  context: Before investing investigation time, confirm the alert is a true positive.
+    The rule fires on EITHER of two branches - dism.exe whose own command line
+    contains both /Online and /Disable-Feature, or DismHost.exe (the worker DISM
+    spawns) whose parent command line contains both flags. Read the exact command
+    line and parent command line and note which branch fired, because the operative
+    /Disable-Feature command lives on the command line in the dism.exe branch and on
+    the parent command line in the DismHost.exe branch. The feature name that follows
+    /Disable-Feature determines whether this is benign servicing or defense evasion.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentCommandLine
+      - Image
+      - CommandLine
+- source: template:parent_child.parent_process_legitimacy
+  question: What spawned this DISM invocation, and is that parent chain expected for
+    feature servicing on this host?
+  context: The parent-child relationship is the core signal for this detection.
+    Legitimate DISM feature changes are typically driven interactively by an
+    administrator from a console shell, or by a deployment or patch-management process
+    during imaging. Tracing the parent's own origin reveals whether the chain is
+    routine maintenance or whether a script host, a logon batch script, or an
+    unexpected process drove the disable. In the DismHost.exe branch the immediate
+    parent is dism.exe and carries the operative command line, so the meaningful
+    pivot is what spawned dism.exe itself.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to disable Windows features with DISM?
+  context: Disabling Windows features with DISM is normal on imaging servers,
+    deployment hosts, and during administrative maintenance by IT staff. Most
+    endpoints and most user accounts never run it. Knowing whether the acting account
+    and the host function involve image servicing is often the fastest path to
+    separating routine maintenance from a deliberate weakening of host defenses.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: attack:T1562.process_identification
+  question: Which binary carried the /Disable-Feature command, and is that binary and
+    its path expected to service Windows features?
+  context: The disable command can appear on dism.exe directly or on the parent
+    command line of DismHost.exe. Identify which executable ran the operation and
+    where it lives. A signed dism.exe running from System32 driven by a known
+    deployment workflow is a different finding than dism.exe invoked by a logon batch
+    script or an unexpected parent that disables a security feature before doing other
+    work. The image and command line together identify what was actually launched.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- source: template:defense_tampering.what_was_disabled
+  question: Which Windows feature was disabled, and is it a security or recovery
+    feature?
+  context: DISM /Disable-Feature can target any optional Windows feature, but only
+    some choices weaken host defenses. Read the feature name that follows
+    /Disable-Feature in the command line. Disabling the Windows Defender feature
+    removes endpoint protection; disabling Windows Recovery components or the recovery
+    environment inhibits restore after impact; disabling an unrelated feature such as
+    a legacy protocol or a print component is more likely routine servicing.
+    Identifying the specific feature determines investigation priority and
+    remediation.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:defense_tampering.protection_status
+  question: Is the disabled feature still disabled on the host, or has it been
+    restored?
+  context: A DISM /Disable-Feature operation persists until the feature is re-enabled.
+    If a security feature such as Windows Defender was disabled, the host stays
+    unprotected until it is restored. Check the current state of the targeted feature
+    so the loss of protection or recovery capability is understood as still active or
+    already remediated; if a security or recovery feature remains disabled it should
+    be re-enabled before further investigation proceeds.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:defense_tampering.activity_after_tampering
+  question: What activity occurred on this host after the feature was disabled?
+  context: Disabling a security or recovery feature is often a preparatory step that
+    lets follow-on activity run without being blocked, scanned, or recoverable.
+    Examining what ran in the window immediately after the DISM invocation reveals
+    what the disable was meant to enable - payload execution, service tampering, log
+    clearing, or recovery removal. A burst of process creation right after the disable
+    points to the activity the tampering was clearing a path for.
+  range: +1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - User
+- source: template:defense_tampering.other_tampering_activity
+  question: Were other defense tampering or recovery-inhibition actions performed on
+    this host around the same time?
+  context: An actor who disables a Windows feature to weaken defenses often pairs it
+    with other evasion or recovery-removal steps - stopping security services,
+    clearing event logs, deleting shadow copies, disabling the recovery environment,
+    or weakening firewall rules. Finding several such actions from the same user or
+    parent process within a short window indicates a coordinated effort to blind and
+    de-fortify the host rather than an isolated servicing change.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_tamper:
+        Image|endswith:
+          - '\wevtutil.exe'
+          - '\vssadmin.exe'
+          - '\bcdedit.exe'
+          - '\wbadmin.exe'
+          - '\netsh.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\powershell.exe'
+        CommandLine|contains:
+          - 'cl '
+          - 'clear-log'
+          - 'delete shadows'
+          - 'recoveryenabled'
+          - 'DisableRealtimeMonitoring'
+          - 'advfirewall'
+          - 'stop'
+          - 'delete'
+      condition: selection and selection_tamper
+    fields:
+      - Image
+      - User
+- source: template:parent_child.sibling_processes
+  question: What other child processes did the same parent spawn around the time of
+    the DISM invocation?
+  context: If the DISM invocation was driven by a malicious or scripted parent, that
+    parent likely spawned other processes too. Examining siblings of the alerting
+    process from the same parent instance reveals the full scope of activity from that
+    execution chain - reconnaissance, service tampering, or payload staging launched
+    alongside the feature disable point to orchestration rather than a single
+    administrative command.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_user_actor.baseline
+  question: Does this user normally disable Windows features with DISM?
+  context: Compare the acting account against its own history. A deployment engineer
+    or IT administrator may run DISM feature changes routinely as part of imaging or
+    maintenance; an account that has never done so disabling a feature is more
+    notable. The user role and typical toolset should align with image servicing
+    rather than ad hoc defense changes.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        CommandLine|contains|all:
+          - /Online
+          - /Disable-Feature
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is the parent process that drove this DISM /Disable-Feature pattern
+    historically routine on this host or across the environment, or is it unusual?
+  context: When the alert fires under a service principal, user identity does not
+    attribute the behavior; the meaningful pivot is which parent process drove the
+    DISM /Online /Disable-Feature operation and whether that parent is historically
+    common for it. A new or rare parent for this pattern on this host or
+    environment-wide is the deviation worth chasing, while a parent that already
+    accounts for many prior events is more likely a deployment or patch-management
+    pipeline.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        CommandLine|contains|all:
+          - /Online
+          - /Disable-Feature
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the acting account's activity across all hosts reveals whether the
+    feature disable was a single event or part of activity spanning multiple
+    endpoints. If the same user triggered similar activity on other hosts, the scope
+    of the incident is larger than one machine and may indicate a coordinated rollout.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did the same parent process and DISM /Disable-Feature pattern fire on
+    other hosts in the same window, indicating a coordinated rollout rather than
+    isolated activity?
+  context: Under a service principal, asking what else the user did across the network
+    returns agent-telemetry noise, since every host runs system-owned agents
+    constantly. The meaningful question is whether the same launch mechanism - a
+    parent process driving the DISM /Online /Disable-Feature operation - fired on
+    other hosts in the alert window. Multiple hosts in the same window points to
+    scheduled or pushed automation such as a logon script or patch deployment; a
+    single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        CommandLine|contains|all:
+          - /Online
+          - /Disable-Feature
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining the activity surrounding the
+    DISM invocation reveals what led to it and what followed - the parent that staged
+    it, reconnaissance, or follow-on execution the disabled feature was meant to allow.
+    Novel parent-child pairs at low counts are what to scan for against the high-count
+    noise of routine system processes.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host - reconnaissance, credential access, or
+    other defense tampering - may reveal the attack stages that preceded the feature
+    disable and help reconstruct the full timeline. Weakening a defense is often one
+    step in a sequence, so prior alerts give the context for why a feature was
+    disabled here.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:cue_parent_process.scope
+  question: Have other hosts run the DISM /Online /Disable-Feature pattern in the past
+    week, and does the cross-host distribution look like consistent imaging automation
+    or one-off activity?
+  context: This query counts the DISM /Online /Disable-Feature pattern fleet-wide with
+    no host scope. Many hosts running the same pattern points to a deployment or
+    patch-management workflow that disables features by design; one host or a small
+    unrelated set points to manual operator activity. Use the host distribution to
+    calibrate severity and decide whether this fits an imaging baseline or stands out
+    as an isolated defense change.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+          - /Online
+          - /Disable-Feature
+      condition: selection
+    fields:
+      - host.name
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1562.001
+      name: Disable or Modify Tools
+      role: primary
+    - id: T1562
+      name: Impair Defenses
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: tamper_invocation
+      description: "DISM is launched with /Online /Disable-Feature (on dism.exe's command line, or on DismHost.exe's parent command line) - the disable act the rule detects"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: control_targeted
+      description: "The specific Windows feature disabled is identified and classified as a security/recovery feature or an unrelated component"
+      mapped_to: Q5
+      source: template:defense_tampering.what_was_disabled
+    - stage: 3
+      label: followon_enabled
+      description: "Correlate process creation after the disable with the activity the weakened defense or removed recovery component was meant to enable"
+      mapped_to: Q7
+      source: template:defense_tampering.activity_after_tampering
+  dimension_coverage:
+    - dimension: process_identification
+      technique: T1562
+      covered_by: Q4
+      source: attack:T1562.process_identification
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1562.001
+      covered_by: Q7
+      source: template:defense_tampering.activity_after_tampering
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1562.001
+      covered_by: Q8
+      source: template:defense_tampering.other_tampering_activity
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1562.001
+      covered_by: Q3
+      source: template:universal.host_user_context
+      coverage_type: direct
+  mutable_dispositions:
+    - element: ProcessNameExclusions
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q3
+      notes: "Tuning rationale for excluding expected administrative tools; no concrete values in the analytic. Realized as the user/host-expectation judgment in host_user_context, which asks whether the account and host function involve image servicing."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q7
+      notes: "Defines the correlation window linking the disable to follow-on activity; no concrete value in the analytic. Realized as the +1h forward scope on activity_after_tampering and the +/-1h scope on other_tampering_activity."
+    - element: ServiceNames
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q8
+      notes: "Customizable list of security service names; no concrete values in the analytic. Realized as the tamper-class Image/CommandLine list in other_tampering_activity, which surfaces stop/delete/disable actions against security and recovery components."
+    - element: ProcessWhitelist
+      dimension: process_identification
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q4
+      notes: "Excludes authorized administrative tools; no concrete values in the analytic. Realized as the binary-identity judgment in attack:T1562.process_identification, which asks whether the binary that carried /Disable-Feature is an expected servicing tool on an expected path."
+    - element: ServiceNamePatterns
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q5
+      notes: "Refines which controls are security-critical; no concrete values in the analytic. Realized as the feature-classification judgment in what_was_disabled, which asks whether the disabled feature is a security/recovery feature."
+  dedup_decisions:
+    - dropped: cue_user_actor.baseline + cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable; both emitted (subject-pivot and launch-mechanism-pivot). Image-pivot adapted to the rule's CommandLine|contains|all /Online + /Disable-Feature pattern, since the rule's discriminating signal is the command-line flags, not a single Image."
+      kept: both
+    - dropped: cue_user_actor.clustering + cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable; both emitted (subject-pivot and launch-mechanism-pivot). Image-pivot adapted to the rule's CommandLine|contains|all /Online + /Disable-Feature pattern."
+      kept: both
+    - dropped: cue_process_tool.process_chain
+      reason: "parent_process is primary cue (hint 3) — parent_child.parent_process_legitimacy subsumes it with a more specific ParentProcessGuid lookup and grandparent context."
+      kept: template:parent_child.parent_process_legitimacy
+    - dropped: cue_parent_process.clustering + cue_parent_process.follow_on
+      reason: "Parent-scoped host activity is covered by parent_child.sibling_processes (exact ParentProcessGuid instance) and cue_host_context.clustering (Image+ParentImage host aggregation); the parent-binary-name versions would duplicate that coverage at coarser scope."
+      kept: template:parent_child.sibling_processes + template:cue_host_context.clustering
+    - dropped: cue_parent_process.baseline + cue_process_tool.baseline
+      reason: "Parent-child and host baselines are subsumed by the cue_user_actor.baseline_svc launch-mechanism baseline (parent process driving the /Disable-Feature pattern, -90d) and cue_parent_process.scope fleet baseline, both of which constrain to the rule's actual command-line pattern rather than a generic Image."
+      kept: template:cue_user_actor.baseline_svc + template:cue_parent_process.scope
+  skipped_templates:
+    - template: cue_process_tool.mechanism_decode
+      reason: "replaced_by: defense_tampering.what_was_disabled (hint 1). Phase 2 mechanism decode is provided by what_was_disabled, which directs the analyst to identify which Windows feature was disabled and whether it is security/recovery-relevant."
+    - template: persistence_scope.process_based_persistence
+      reason: "recommended priority; cascaded from defense_tampering (hint 2). This rule detects a feature-disable defense-evasion primitive, not persistence installation. Disabling a Windows feature does not establish a foothold. Trimmed to stay within the 14-18 target."
+    - template: persistence_scope.file_based_persistence
+      reason: "recommended priority; cascaded from defense_tampering (hint 2). File-drop persistence is orthogonal to disabling a Windows feature via DISM. Trimmed to stay within the 14-18 target."
+    - template: universal.endpoint_protection_health
+      reason: "recommended priority. The defense_tampering set is confirmed for this rule (T1562.001), and its other_tampering_activity question is the more specific superseding host-tamper sweep; the generic endpoint_protection_health sweep would duplicate that coverage. Per the template's own notes_to_llm, it is safe to drop when defense_tampering is confirmed. Trimmed to stay within the 14-18 target."
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "defense_tampering → persistence_scope cascade activated"
+      disposition: declined
+      reason: >-
+        The cascade made the two persistence_scope templates available, but both are
+        recommended-tier and not load-bearing for this rule. DISM /Online
+        /Disable-Feature suppresses or removes a Windows feature (defense evasion /
+        inhibit recovery); it does not install persistence. process_based_persistence
+        and file_based_persistence are recorded as skipped_templates with specific
+        reasons. The defense_tampering set (what_was_disabled, protection_status,
+        activity_after_tampering, other_tampering_activity) is the load-bearing
+        context here and is fully included.
+    - hint: "logsource 'registry_set' (recommended by techniques: T1562.001) is not covered — pull in cue_registry_key.* or author a custom question with `category: registry_set`"
+      disposition: declined
+      reason: >-
+        The registry_set analytic for T1562.001 targets direct edits to Sysmon /
+        Defender registry keys (Sysmon EID 13/14) as a distinct disable mechanism.
+        This rule's detection is strictly process_creation and fires only on DISM
+        /Online /Disable-Feature, which operates on Windows optional features in the
+        running image, not on those registry keys — DISM feature-disable does not
+        write the Sysmon/Defender registry values the registry_set analytic hunts.
+        The investigation is therefore genuinely constrained to process_creation
+        evidence (which feature, which parent, follow-on activity). other_tampering
+        _activity (Q8) already surfaces reg.exe-driven tampering on the host if a
+        separate registry edit accompanied the disable. No compensating
+        attack:T1562.001.registry_set question authored.
+  contextual_sets:
+    included: []
+    excluded:
+      - id: ransomware_impact
+        confidence: low
+        reason: "Reference content mentions ransomware, but the rule fires on a generic DISM feature-disable primitive, not on encryption or impact behavior. Including ransomware-specific questions would over-narrow a technique-focused rule to one historical chain."
+      - id: network_scope
+        confidence: low
+        reason: "Network-scope keyword match is incidental — the rule detects a local process_creation feature-disable with no network indicator. Fleet/cross-host scope is already covered by cue_parent_process.scope and the user/launch clustering questions."
+  technique_sets_applied:
+    - universal
+    - defense_tampering
+    - parent_child
+    - cue_parent_process
+    - cue_user_actor
+    - cue_host_context
+  generation_stats:
+    total_questions: 16
+    source_counts:
+      template: 15
+      attack: 1
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 13
+    logsource_diversity:
+      process_creation: 15
+      sigma_alert: 1

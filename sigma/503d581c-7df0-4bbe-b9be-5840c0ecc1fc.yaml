@@ -1,0 +1,653 @@
+name: UAC Bypass Using ChangePK and SLUI
+id: 6acc556e-f0fc-4c1c-888e-b2585dd3bb2a
+description: |
+  Detects a UAC bypass in which the auto-elevated Windows Activation launcher (slui.exe)
+  spawns changepk.exe at High or System integrity. slui.exe is Microsoft-signed and marked
+  auto-elevating, so when it follows a user-controlled HKCU shell-handler key it launches the
+  attacker's command with an elevated token and no consent prompt. Legitimate Windows Activation
+  ("Change product key") can produce slui.exe spawning changepk.exe, but rarely at High integrity
+  from a user-initiated, elevated context. The investigation should confirm the parent-child chain
+  and integrity level, look for the HKCU registry hijack that set up the bypass, and identify what
+  ran with elevated privileges afterward.
+type: detection
+detection_id: 503d581c-7df0-4bbe-b9be-5840c0ecc1fc
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Did slui.exe spawn changepk.exe at High or System integrity as the rule detects?
+  context: Before investing investigation time, confirm the alert is a true positive. The rule fires
+    only when the parent Image ends in slui.exe, the child Image ends in changepk.exe, and the child
+    runs at High, System, or the equivalent integrity SIDs. Review the full event to verify all three
+    conditions held together.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - IntegrityLevel
+- source: template:parent_child.parent_process_legitimacy
+  question: What started slui.exe, and is that origin consistent with legitimate Windows Activation?
+  context: slui.exe is normally launched by the Windows Activation flow (the Settings "Change product
+    key" path) under the user's interactive session. An auto-elevated slui.exe started from a script
+    host, a command interpreter, or "start-process -verb runas" rather than the Activation UI is the
+    deviation that distinguishes a deliberate bypass from a user changing their product key. Trace the
+    grandparent to see what invoked slui.exe.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to change the Windows product key or run elevation flows?
+  context: Legitimate activation activity is rare and usually performed by IT during provisioning, not
+    by ordinary users on production hosts. Knowing whether the user role and host function make a product
+    key change plausible is often the fastest way to separate a routine activation from a privilege
+    escalation attempt.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:parent_child.sibling_processes
+  question: What other child processes did this slui.exe instance spawn?
+  context: An auto-elevated slui.exe used to bypass UAC may spawn more than changepk.exe — the registry
+    hijack can route slui to any attacker-chosen command, and changepk itself may launch a further child.
+    Examining all children of the same parent instance reveals whether the elevated launch produced a
+    command interpreter, script host, or other tool beyond the one that triggered the alert.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_parent_process.baseline
+  question: Does slui.exe normally spawn changepk.exe at elevated integrity on this host?
+  context: A genuine activation flow does pair slui.exe with changepk.exe, but the High-integrity,
+    user-triggered variant this rule detects should be rare or absent on a normal host. Zero or very low
+    historical counts for this specific parent-child pairing indicate a novel elevation path rather than
+    routine activation maintenance.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in the hour before the alert?
+  context: UAC bypass is a precursor to actions that require high integrity, and disabling AV/EDR is a
+    common early step. The query surfaces direct attempts to disable AV/EDR services, flip Defender flags,
+    add broad exclusions, clear logs, or patch AMSI/ETW. Zero rows is a useful "protection looks healthy"
+    signal; populated rows shift the disposition toward operator preparation, so review the parent process
+    and signing chain to identify the writer.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+- source: attack:T1548.002.registry_set
+  question: Was an HKCU shell-handler key created or modified on this host that would redirect slui.exe?
+  context: This bypass works by planting a command under a user-writable HKCU shell-handler key that the
+    auto-elevated launcher follows. The documented hijack paths are under
+    HKCU\Software\Classes\launcher.Systemsettings\Shell and HKCU\Software\Classes\exefile\shell; these
+    keys should never be populated on a normal user system. Finding the registry write confirms the bypass
+    mechanism and reveals the payload that was set to run with elevated privileges.
+  range: -15m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_keys:
+        TargetObject|contains:
+          - 'Software\Classes\launcher.Systemsettings\Shell'
+          - 'Software\Classes\exefile\shell'
+          - 'Software\Classes\Folder\shell\open\command'
+          - 'Shell\Open\command'
+          - 'DelegateExecute'
+      condition: selection_host and selection_keys
+    fields:
+      - TargetObject
+      - Details
+      - Image
+- source: template:uac_bypass.bypass_technique_registry_artifacts
+  question: Were registry modifications made via reg.exe, cmd.exe, or PowerShell to set up this UAC bypass?
+  context: Beyond direct registry events, the command interpreter that wrote the hijack key is often
+    visible in process_creation. The detected variant uses an HKCU shell-handler key, but related UAC
+    bypass families also target ms-settings, mscfile, exefile, and Folder shell keys. Finding the writing
+    command line confirms the bypass mechanism and shows the exact payload set to execute at elevation.
+  range: -15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - '\reg.exe'
+          - '\powershell.exe'
+          - '\cmd.exe'
+        CommandLine|contains:
+          - 'ms-settings'
+          - 'mscfile'
+          - 'Classes\exefile'
+          - 'Classes\Folder'
+          - 'Environment'
+          - 'Shell\Open\command'
+          - 'DelegateExecute'
+      condition: selection
+    fields:
+      - CommandLine
+      - Image
+- source: template:uac_bypass.elevated_action_after_bypass
+  question: What action was performed with elevated privileges after the UAC bypass?
+  context: UAC bypass is a means to an end -- attackers elevate to install persistence, dump credentials,
+    tamper with security tools, or access protected resources. Examining processes spawned at High or
+    System integrity shortly after the bypass reveals the objective. Correlate by timing -- elevated
+    children appearing within a short window of the slui-changepk chain are the load-bearing follow-on.
+  range: +30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        IntegrityLevel:
+          - 'High'
+          - 'System'
+          - 'S-1-16-16384'
+          - 'S-1-16-12288'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - IntegrityLevel
+- source: template:uac_bypass.other_escalation_attempts
+  question: Were other privilege escalation techniques attempted on this host?
+  context: Attackers who attempt one UAC bypass often try multiple methods until one succeeds, especially
+    if the OS version or configuration blocks certain techniques. Finding multiple bypass or escalation
+    detections from the same user or process confirms deliberate privilege escalation activity rather than
+    a false positive.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - rule.name
+      - rule.uuid
+      - event.severity_label
+- source: template:cue_user_actor.baseline
+  question: Does this user normally trigger Windows Activation or run changepk.exe?
+  context: Compare this user's current action against their historical behavior. A user who has never run
+    changepk.exe or initiated activation is more suspicious than one who does so routinely. User role and
+    typical toolset should align with a product key change.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is the slui.exe to changepk.exe pairing historically routine on this host or environment-wide?
+  context: When the alert fires under a service principal, user identity does not attribute behavior. The
+    meaningful pivot is the launch mechanism -- whether slui.exe spawning changepk.exe is historically
+    common on this host or across the environment. A new or rare occurrence is the deviation worth chasing;
+    a pairing that already accounts for many prior events is more likely activation maintenance.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around the time of this alert?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning
+    multiple endpoints. If the same user triggered similar elevation activity on multiple hosts, the scope
+    of compromise may be larger than this single alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did the slui.exe to changepk.exe chain fire on other hosts in the same window?
+  context: Under a service principal, asking what the user did network-wide returns agent-telemetry noise.
+    The meaningful question is whether the same launch mechanism -- slui.exe spawning changepk.exe -- fired
+    on other hosts in the alert window. Multiple hosts in the same window points to scheduled or pushed
+    automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining activity around the alert reveals what led to this
+    event and what happened after. Look for reconnaissance, registry tampering, or persistence mechanisms
+    that accompany the elevation.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host -- defense tampering,
+    reconnaissance, credential access -- may reveal the attack stages that preceded the elevation and help
+    reconstruct the full timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1548.002
+      name: Bypass User Account Control
+      role: primary
+    - id: T1548
+      name: Abuse Elevation Control Mechanism
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: bypass_setup_registry
+      description: "Actor plants a command under a user-writable HKCU shell-handler key the auto-elevated launcher will follow"
+      mapped_to: Q7
+      source: attack:T1548.002.registry_set
+    - stage: 2
+      label: auto_elevated_launch
+      description: "Auto-elevated slui.exe follows the hijacked key and spawns changepk.exe at High/System integrity (the alerting event)"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 3
+      label: elevation_origin
+      description: "Establish what invoked slui.exe and whether the parent-child lineage matches legitimate activation"
+      mapped_to: Q2
+      source: template:parent_child.parent_process_legitimacy
+    - stage: 4
+      label: elevated_action
+      description: "Anomalous process execution with elevated privileges following the bypass"
+      mapped_to: Q9
+      source: template:uac_bypass.elevated_action_after_bypass
+  dimension_coverage:
+    - dimension: parent_process_analysis
+      technique: T1548.002
+      covered_by: Q2
+      source: template:parent_child.parent_process_legitimacy
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1548.002
+      covered_by: Q9
+      source: template:uac_bypass.elevated_action_after_bypass
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1548.002
+      covered_by: Q7
+      source: attack:T1548.002.registry_set
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1548
+      covered_by: Q5
+      source: cue_parent_process.baseline
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1548
+      covered_by: Q8
+      source: template:uac_bypass.bypass_technique_registry_artifacts
+      coverage_type: indirect
+    - dimension: tuning_parameter
+      technique: T1548
+      covered_by: Q8
+      source: template:uac_bypass.bypass_technique_registry_artifacts
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1548
+      covered_by: Q3
+      source: template:universal.host_user_context
+      coverage_type: direct
+  mutable_dispositions:
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only (~30s correlation window between registry tampering and elevation)"
+      disposition: context
+      target_question: Q9
+      notes: "Threshold is a tuning rationale, not a queryable value. Q9 uses a forward +30m window to capture post-elevation activity and its context directs the analyst to correlate elevated children by timing to the slui-changepk chain."
+    - element: ElevatedProcessNameList
+      dimension: tuning_parameter
+      specific_values: "sdclt.exe, eventvwr.exe, computerdefaults.exe (and the rule's slui.exe/changepk.exe)"
+      disposition: context
+      target_question: Q10
+      notes: "Q9 already enumerates High/System integrity children generically; Q10 (other_escalation_attempts) surfaces sibling UAC-bypass detections for these auto-elevated binaries via the sigma alert correlation. The list is a tuning hint for adjacent bypass families, not values to inject into this rule's slui/changepk chain."
+    - element: ParentProcessAnomalyThreshold
+      dimension: parent_process_analysis
+      specific_values: "rationale only (non-elevated process spawning auto-elevated one)"
+      disposition: context
+      target_question: Q2
+      notes: "Parent-child mismatch logic is a rationale; Q2 (parent_process_legitimacy) and Q5 (parent-child baseline) operationalize it by tracing slui.exe's origin and the historical rarity of the slui->changepk elevated pairing."
+    - element: ElevatedProcessPath
+      dimension: tuning_parameter
+      specific_values: "rationale only (paths for unsigned/unexpected elevated binaries)"
+      disposition: context
+      target_question: Q9
+      notes: "Tuning rationale without concrete paths. Q9 returns Image and IntegrityLevel for all elevated children so the analyst can spot unexpected binary paths."
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "rationale only (suspicious parent-child chains in the local environment)"
+      disposition: context
+      target_question: Q5
+      notes: "Rationale; Q5 baselines the specific slui.exe->changepk.exe parent-child chain against host history."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only (time between registry modification and elevated process spawn)"
+      disposition: context
+      target_question: Q7
+      notes: "Q7 (registry_set) uses a -15m backward window for the hijack write and Q9 a +30m forward window for the elevated spawn, bracketing the registry-to-elevation interval the rationale describes."
+  dedup_decisions:
+    - dropped: cue_process_tool.process_chain
+      reason: "parent_process is primary cue (hint 1) — drop cue_process_tool:process_chain; parent origin covered by parent_child.parent_process_legitimacy"
+      kept: parent_child.parent_process_legitimacy
+    - dropped: cue_process_tool.mechanism_decode
+      reason: "rule has no CommandLine values (changepk.exe takes none in this detection); mechanism decode would re-display the same triggering event with nothing to decode. Parent_child technique set carries the load-bearing analysis."
+      kept: template:parent_child.parent_process_legitimacy
+    - dropped: cue_process_tool.baseline
+      reason: "within-phase duplicate of cue_parent_process.baseline — the parent-child pairing baseline is more specific than a binary-only baseline for this rule"
+      kept: cue_parent_process.baseline
+    - dropped: cue_parent_process.mechanism_decode
+      reason: "within-phase duplicate of parent_child.parent_process_legitimacy (technique set more specific — same ParentProcessGuid lookup of parent origin)"
+      kept: template:parent_child.parent_process_legitimacy
+    - dropped: cue_parent_process.follow_on
+      reason: "within-phase duplicate of parent_child.sibling_processes (children of the same parent)"
+      kept: template:parent_child.sibling_processes
+    - dropped: cue_parent_process.clustering
+      reason: "within-phase duplicate of cue_host_context.clustering (host activity around the alert)"
+      kept: cue_host_context.clustering
+    - dropped: cue_parent_process.scope
+      reason: "cross-host parent+binary scope covered by cue_user_actor.clustering_svc (slui->changepk on other hosts in window)"
+      kept: cue_user_actor.clustering_svc
+    - dropped: none
+      reason: "user_actor pair — non-deduplicable: cue_user_actor.baseline (Q11, user identity pivot) and cue_user_actor.baseline_svc (Q12, parent+binary launch-mechanism pivot) emitted as separate questions"
+      kept: both
+    - dropped: none
+      reason: "user_actor pair — non-deduplicable: cue_user_actor.clustering (Q13, user identity pivot) and cue_user_actor.clustering_svc (Q14, parent+binary launch-mechanism pivot) emitted as separate questions"
+      kept: both
+  skipped_templates: []
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "parent_process is primary — drop cue_process_tool:process_chain"
+      disposition: acted_on
+      reason: >-
+        Dropped cue_process_tool.process_chain; parent origin is covered by Q2
+        (parent_child.parent_process_legitimacy). Recorded in dedup_decisions.
+    - hint: "logsource 'registry_set' (recommended by techniques: T1548.002) is not covered — pull in cue_registry_key.* or author a custom question with `category: registry_set`"
+      disposition: acted_on
+      reason: >-
+        Authored Q7 (attack:T1548.002.registry_set) with category: registry_set,
+        querying the HKCU shell-handler hijack paths
+        (launcher.Systemsettings\Shell, exefile\shell, Folder\shell\open\command,
+        DelegateExecute) on this host. This is the precise cross-logsource pivot
+        for this bypass — the registry write that redirects auto-elevated slui.exe
+        is the smoking gun and is invisible to the process_creation rule.
+    - hint: "logsource 'image_load' (recommended by techniques: T1548.002) is not covered — pull in cue_image_load.* or author a custom question with `category: image_load`"
+      disposition: declined
+      reason: >-
+        The image_load analytic for T1548.002 targets DLL-side-load / COM-surrogate
+        bypass families (e.g., dllhost.exe loading cmstplua.dll). This rule's bypass
+        is registry-handler based: slui.exe follows an HKCU key and spawns
+        changepk.exe — no anomalous module load is part of the mechanism. image_load
+        on slui/changepk would return baseline OS module noise with no precision for
+        this chain. The mechanism is covered at registry granularity by Q7
+        (attack:T1548.002.registry_set) and at process granularity by Q1/Q2. No
+        compensating attack:T1548.002.image_load question authored.
+    - hint: "logsource 'process_access' (recommended by techniques: T1548.002) is not covered and no template family exists — author a custom question with `category: process_access`"
+      disposition: declined
+      reason: >-
+        The process_access analytic (Sysmon EID 10) targets handle-injection /
+        token-manipulation bypass variants where one process opens another to steal
+        or duplicate an elevated token. This bypass obtains elevation purely through
+        the auto-elevated slui.exe launching changepk.exe via a registry handler —
+        no cross-process handle open is part of the chain. The elevated outcome is
+        covered by Q1 (integrity verification) and Q9 (elevated children). No
+        compensating attack:T1548.002.process_access question authored.
+    - hint: "logsource 'security' (recommended by techniques: T1548.002) is not covered and no template family exists — author a custom question with `category: security`"
+      disposition: declined
+      reason: >-
+        The security analytic relies on EventCode 4672 (special privileges assigned
+        to a new logon) to flag elevated tokens. The same elevated-execution signal
+        is already captured from process_creation telemetry by Q1 (IntegrityLevel of
+        the alerting event) and Q9 (uac_bypass.elevated_action_after_bypass, which
+        enumerates High/System integrity children on the host). Authoring a parallel
+        4672 question would duplicate that integrity-level coverage without adding a
+        distinct investigative pivot for this registry-handler bypass. No
+        compensating attack:T1548.002.security question authored.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - uac_bypass
+    - parent_child
+  generation_stats:
+    total_questions: 16
+    source_counts:
+      template: 15
+      attack: 1
+      llm_generated: 0
+    phase_distribution:
+      triage: 1
+      analysis: 0
+      context: 15
+    logsource_diversity:
+      process_creation: 13
+      registry_set: 1
+      sigma_alert: 2

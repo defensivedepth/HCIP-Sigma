@@ -1,0 +1,668 @@
+name: Powershell Executed From Headless ConHost Process
+id: 307d2f00-03d9-4c99-825c-e2acfb565663
+description: |
+  Detects a conhost.exe process (matched by image name or OriginalFileName CONHOST.EXE) whose command line
+  contains both --headless and powershell. The --headless flag suppresses the console window so the PowerShell
+  session runs without any visible UI, which combines hidden-window execution with command-and-scripting-interpreter
+  abuse. Legitimate use is rare in interactive environments; the pattern is associated with loaders that read an
+  obfuscated payload from disk and pass it to PowerShell for in-memory execution. The investigation should decode
+  the full command line, determine what the launched PowerShell did, identify the parent that invoked conhost,
+  and establish whether this user, host, and launch mechanism are expected.
+type: detection
+detection_id: 056c7317-9a09-4bd4-9067-d051312752ea
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: '2026-06-04'
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the conhost.exe command line contain both --headless and powershell as the rule detects?
+  context: Before investing investigation time, confirm the alert is a true positive by reviewing the exact command
+    line and process details. The rule fires when the process is conhost.exe (by image name or OriginalFileName
+    CONHOST.EXE) AND the command line contains both --headless and powershell, so verify both the binary identity
+    and that the command line carries both tokens.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to launch headless PowerShell sessions through conhost.exe?
+  context: Legitimate administrative or developer activity can trigger this detection, but a headless PowerShell
+    session through conhost is uncommon in interactive use. Knowing whether the user role and host function are
+    consistent with this behavior is often the fastest path to distinguishing a true positive from routine operations.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What is the full conhost.exe command line, and what does the PowerShell portion after --headless actually do?
+  context: The full command line reveals the specific action taken. Decode any flags, encoded or character-arithmetic
+    obfuscation, file paths, and URLs that follow --headless. Loaders using this pattern frequently invoke an
+    obfuscated form of Invoke-Expression to read a payload from a .log or other staging file under a user-writable
+    directory and execute it in memory, so identify the staged file path and the cmdlet being reconstructed.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+        CommandLine|contains|all:
+          - '--headless'
+          - 'powershell'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:powershell.encoded_command_decode
+  question: Was the launched command encoded or obfuscated? What does it decode to?
+  context: Attackers frequently hide intent using character-arithmetic reconstruction of IEX/Invoke-Expression,
+    base64 with the -EncodedCommand parameter, string concatenation, or backtick escaping. Decoding reveals the
+    actual payload — download cradles, reverse shells, or in-memory execution of .NET assemblies. For this pattern,
+    look for a reconstructed iex reading a staged file from a user-writable path and executing its contents.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: attack:T1059.001.image_load
+  question: What modules did conhost.exe or the spawned PowerShell load around the time of the alert?
+  context: PowerShell can be hosted in-memory through .NET automation rather than a visible powershell.exe process,
+    and the loaded-module view shows which assemblies were pulled in. Loads of System.Management.Automation,
+    amsi.dll, or unusual .NET assemblies tied to the alerting host help confirm that a PowerShell runtime was
+    actually instantiated and whether the load set looks like routine tooling or an in-memory cradle.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ImageLoaded|contains:
+          - '\System.Management.Automation'
+          - '\amsi.dll'
+          - '\clr.dll'
+          - '\clrjit.dll'
+      condition: selection
+    fields:
+      - Image
+      - ImageLoaded
+      - User
+- source: template:powershell.script_block_logging
+  question: Did PowerShell script block logging capture the deobfuscated script content?
+  context: Script block logging (Event ID 4104) records the deobfuscated script content that PowerShell actually
+    executed, even when the command line is obfuscated through character arithmetic or encoding. This provides
+    ground truth about what ran. If PowerShell operational logs are not ingested in this environment, treat zero
+    results as a visibility gap rather than evidence nothing ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- source: template:powershell.powershell_security_bypass
+  question: Were PowerShell security controls bypassed or weakened on this host before this execution?
+  context: Loaders commonly disable or bypass PowerShell protections before running a payload — AMSI bypass
+    (patching amsi.dll in memory), execution policy changes (Set-ExecutionPolicy or -ep bypass), and PowerShell
+    downgrade to v2 which lacks logging. Finding these precursor events on the host strengthens the case for
+    malicious activity.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- source: template:cue_process_tool.process_chain
+  question: What process spawned this conhost.exe, and is that parent chain expected?
+  context: The parent process reveals how the headless PowerShell session was invoked. Routine conhost activity
+    is launched by interactive console hosts or known automation; parents such as wscript.exe, mshta.exe, a
+    scheduled-task host, or an Office application point toward script-driven or persistence-driven invocation.
+    Walk up the tree to see what spawned the parent and what else it spawned.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: attack:T1564.003.registry_set
+  question: Were registry values written on this host that hide artifacts or flag the host as compromised around this time?
+  context: Hidden-window execution often pairs with registry edits that conceal artifacts or mark the host. Loaders
+    in this family drop a registry breadcrumb under a user-writable hive (for example a value written beneath
+    HKCU\Software\Microsoft) to flag the host as infected, and some hidden-window tradecraft pushes window
+    positions off screen via registry. Review registry writes from script hosts on this host in the surrounding
+    window for values that do not match known software.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+- source: template:cue_process_tool.follow_on
+  question: What child processes did this conhost.exe or its PowerShell session spawn afterward?
+  context: The processes spawned after the headless session reveal its actual impact. This family commonly chains
+    into scheduled-task creation (schtasks.exe), discovery commands (net.exe localgroup), firewall changes
+    (netsh.exe), or additional download steps. Unexpected children are the actions the loader was setting up.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.baseline
+  question: Does this host normally run conhost.exe with the headless PowerShell pattern?
+  context: A firing pattern that has never been seen on a host is more suspicious than one that runs regularly.
+    The aggregation shows how often this host has produced the headless-conhost-PowerShell pattern over the
+    trailing window; zero or very low counts indicate first-time or rare execution.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+        CommandLine|contains|all:
+          - '--headless'
+          - 'powershell'
+      condition: selection
+    fields:
+      - User
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired the rule's pattern, what parents and users normally drive it, and
+    does the current alert fit that pattern?
+  context: Even common tools can be abused. The query mirrors the rule's selection structure scoped to this host —
+    the resulting parent/user distribution reflects how the rule's specific firing pattern has historically run
+    here. A new parent process, an unexpected user account, or an unusual command-line shape is the anomaly worth
+    chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \conhost.exe
+      - OriginalFileName: CONHOST.EXE
+      selection_cli:
+        CommandLine|contains|all:
+        - --headless
+        - powershell
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_user_actor.baseline
+  question: Does this user normally launch headless PowerShell through conhost.exe?
+  context: Compare this user's current action against their historical behavior. A user who has never produced this
+    pattern is more suspicious than one who does so regularly, and the user's role should align with running
+    hidden PowerShell sessions. Combine the historical count with what the user's job is expected to involve.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+        CommandLine|contains|all:
+          - '--headless'
+          - 'powershell'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent and binary combination historically routine on this host or environment-wide, or is the
+    parent unusual for conhost.exe?
+  context: When the alert fires under a service principal, user identity does not attribute behavior. The meaningful
+    pivot is the launch mechanism — which parent process spawned conhost.exe, and whether that pair is historically
+    common. A new or rare parent for this binary is the deviation worth chasing; a pair that already accounts for
+    thousands of prior events is vendor or OS automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple
+    endpoints. If the same user triggered similar activity on several hosts, the scope of the activity may be
+    larger than the single alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent and binary combination fire on other hosts in the same window — is this a
+    coordinated automation rollout or isolated to this host?
+  context: Under a service principal, asking what else the user did across the network returns agent-telemetry
+    noise. The meaningful question is whether the same launch mechanism — parent process plus spawned binary —
+    fired on other hosts in the alert window. Multiple hosts in the same window points to scheduled or pushed
+    automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired the rule's pattern in the past week, and does the cross-host distribution look
+    like consistent automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count
+    of the firing pattern rather than generic conhost usage. Many hosts firing the same pattern points to scripted
+    deployment or vendor automation; one host or a small unrelated set points to manual operator activity. Use the
+    host distribution and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \conhost.exe
+      - OriginalFileName: CONHOST.EXE
+      selection_cli:
+        CommandLine|contains|all:
+        - --headless
+        - powershell
+      condition: all of selection_*
+    fields:
+    - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering,
+    reconnaissance, or credential access — may reveal the stages that preceded this event and help reconstruct
+    the full timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+  - id: T1059.001
+    name: PowerShell
+    role: primary
+  - id: T1059.003
+    name: Windows Command Shell
+    role: secondary
+  - id: T1564.003
+    name: Hidden Window
+    role: secondary
+  - id: T1059
+    name: Command and Scripting Interpreter
+    role: secondary
+  - id: T1564
+    name: Hide Artifacts
+    role: secondary
+  attack_chain_coverage:
+  - stage: 1
+    label: hidden_window_invocation
+    description: conhost.exe launched with --headless to suppress the console window (Hidden Window defense evasion)
+    mapped_to: Q1
+    source: template:universal.verify_trigger_match
+  - stage: 2
+    label: powershell_execution
+    description: PowerShell launched through the headless conhost session, often via obfuscated IEX
+    mapped_to: Q3
+    source: template:cue_process_tool.mechanism_decode
+  - stage: 3
+    label: payload_deobfuscation
+    description: Encoded/character-arithmetic command decodes to a download cradle or staged-file IEX
+    mapped_to: Q4
+    source: template:powershell.encoded_command_decode
+  - stage: 4
+    label: in_memory_runtime
+    description: .NET/PowerShell automation assemblies loaded to host execution in memory
+    mapped_to: Q5
+    source: attack:T1059.001.image_load
+  - stage: 5
+    label: parent_invocation
+    description: Parent process that invoked the headless conhost (script host, scheduled task, Office)
+    mapped_to: Q8
+    source: template:cue_process_tool.process_chain
+  - stage: 6
+    label: follow_on_actions
+    description: Child processes spawned afterward (schtasks, net, netsh, further download)
+    mapped_to: Q10
+    source: template:cue_process_tool.follow_on
+  dimension_coverage:
+  - dimension: command_analysis
+    technique: T1059.001
+    covered_by: Q3
+    source: template:cue_process_tool.mechanism_decode
+    coverage_type: direct
+  - dimension: parent_process_analysis
+    technique: T1059.001
+    covered_by: Q8
+    source: template:cue_process_tool.process_chain
+    coverage_type: direct
+  - dimension: time_correlation
+    technique: T1059.001
+    covered_by: Q12
+    source: template:cue_process_tool.baseline_deviation
+    coverage_type: direct
+  - dimension: tuning_parameter
+    technique: T1059.001
+    covered_by: Q4
+    source: template:powershell.encoded_command_decode
+    coverage_type: direct
+  - dimension: command_analysis
+    technique: T1059
+    covered_by: Q3
+    source: template:cue_process_tool.mechanism_decode
+    coverage_type: direct
+  - dimension: parent_process_analysis
+    technique: T1059
+    covered_by: Q8
+    source: template:cue_process_tool.process_chain
+    coverage_type: direct
+  - dimension: time_correlation
+    technique: T1059
+    covered_by: Q12
+    source: template:cue_process_tool.baseline_deviation
+    coverage_type: direct
+  - dimension: tuning_parameter
+    technique: T1059
+    covered_by: Q4
+    source: template:powershell.encoded_command_decode
+    coverage_type: direct
+  - dimension: user_context
+    technique: T1059
+    covered_by: Q2
+    source: template:universal.host_user_context
+    coverage_type: direct
+  - dimension: command_analysis
+    technique: T1059.003
+    covered_by: Q3
+    source: template:cue_process_tool.mechanism_decode
+    coverage_type: direct
+  - dimension: parent_process_analysis
+    technique: T1059.003
+    covered_by: Q8
+    source: template:cue_process_tool.process_chain
+    coverage_type: direct
+  - dimension: time_correlation
+    technique: T1059.003
+    covered_by: Q12
+    source: template:cue_process_tool.baseline_deviation
+    coverage_type: direct
+  - dimension: tuning_parameter
+    technique: T1059.003
+    covered_by: Q4
+    source: template:powershell.encoded_command_decode
+    coverage_type: direct
+  - dimension: user_context
+    technique: T1059.003
+    covered_by: Q13
+    source: template:cue_user_actor.baseline
+    coverage_type: direct
+  - dimension: tuning_parameter
+    technique: T1564.003
+    covered_by: Q1
+    source: template:universal.verify_trigger_match
+    coverage_type: direct
+  - dimension: user_context
+    technique: T1564.003
+    covered_by: Q2
+    source: template:universal.host_user_context
+    coverage_type: direct
+  - dimension: tuning_parameter
+    technique: T1564
+    covered_by: Q9
+    source: attack:T1564.003.registry_set
+    coverage_type: direct
+  mutable_dispositions:
+  - element: CommandLinePattern
+    dimension: command_analysis
+    specific_values: "'-enc', '-nop', --headless, powershell, obfuscated iex reconstruction"
+    disposition: query_injection
+    target_question: Q3
+    notes: "mechanism_decode query carries CommandLine|contains|all of the rule's --headless/powershell tokens;
+      encoded_command_decode (Q4) decodes the obfuscated remainder via ProcessGuid scope."
+  - element: ParentProcessName
+    dimension: parent_process_analysis
+    specific_values: "abnormal parents (wscript, mshta, Office, scheduled-task host)"
+    disposition: new_question
+    target_question: Q8
+    notes: "process_chain question resolves the parent via ParentProcessGuid; baseline_svc/clustering_svc pivot
+      on parent.name for routine-vs-anomalous and rollout scoping."
+  - element: TimeWindow
+    dimension: time_correlation
+    specific_values: "off-hours / non-maintenance windows"
+    disposition: context
+    target_question: Q12
+    notes: "baseline_deviation over -14d surfaces the historical parent/user distribution for the firing pattern;
+      off-hours framing is a context judgment, not directly queryable."
+  - element: LoadedModuleList
+    dimension: tuning_parameter
+    specific_values: "rare/never-before-seen .NET assemblies tied to PowerShell abuse"
+    disposition: query_injection
+    target_question: Q5
+    notes: "image_load question filters ImageLoaded to System.Management.Automation/amsi/clr to confirm in-memory
+      .NET-hosted PowerShell runtime."
+  - element: ScriptBlockLengthThreshold
+    dimension: tuning_parameter
+    specific_values: "rationale only (4104 length threshold for noise filtering)"
+    disposition: context
+    target_question: Q6
+    notes: "script_block_logging question retrieves 4104 content; threshold is a tuning rationale, not embedded as
+      a query constraint."
+  - element: ScriptStoragePath
+    dimension: tuning_parameter
+    specific_values: "%TEMP%, C:\\Users\\Public, staged .log under %LocalAppData%/%AppData%"
+    disposition: context
+    target_question: Q3
+    notes: "mechanism_decode context directs the analyst to identify the staged-file path the headless PowerShell
+      reads; T1059.003 ScriptStoragePath."
+  - element: UserContext
+    dimension: user_context
+    specific_values: "admin-level users running interpreters outside baseline"
+    disposition: new_question
+    target_question: Q13
+    notes: "user-actor baseline and host_user_context cover user role alignment."
+  - element: HiddenProcessScope
+    dimension: tuning_parameter
+    specific_values: "restrict hidden execution to interpreters (PowerShell/cmd/wscript)"
+    disposition: context
+    target_question: Q1
+    notes: "rule already constrains hidden execution to the conhost+powershell --headless scope; verify_trigger_match
+      confirms the hidden-window flag fired."
+  - element: ParentProcessCorrelation
+    dimension: tuning_parameter
+    specific_values: "rationale only (correlate hidden execution with suspicious parents)"
+    disposition: context
+    target_question: Q8
+    notes: "process_chain correlates the hidden execution with its parent lineage."
+  - element: FileExtensions
+    dimension: tuning_parameter
+    specific_values: "rationale only (T1564 file-hiding extensions)"
+    disposition: context
+    target_question: Q9
+    notes: "T1564 file-hiding is not the rule's mechanism; registry_set question covers the registry-hiding arm of
+      T1564 instead."
+  - element: ADSDetection
+    dimension: tuning_parameter
+    specific_values: "rationale only (Alternate Data Stream toggle)"
+    disposition: context
+    target_question: Q9
+    notes: "ADS detection is out of the rule's command-line mechanism; registry artifact question is the in-scope
+      T1564 coverage."
+  dedup_decisions:
+  - dropped: cue_process_tool.clustering
+    reason: "host-wide clustering subsumed by cue_host_context — but here host_context.clustering was itself
+      dropped; clustering coverage is provided by user-actor clustering (network-wide) and scope (fleet pattern)."
+    kept: template:cue_user_actor.clustering
+  - dropped: cue_host_context.clustering
+    reason: "broad host-wide process aggregation overlaps cue_process_tool.clustering and the user-actor network
+      clustering; precursor (sigma-alert) retained for host-level cross-detection context instead."
+    kept: template:cue_host_context.precursor
+  - dropped: null
+    reason: "user_actor pair — non-deduplicable: cue_user_actor.baseline + baseline_svc and clustering +
+      clustering_svc are emitted as pairs (subject-pivot vs launch-mechanism pivot)."
+    kept: template:cue_user_actor.baseline_svc, template:cue_user_actor.clustering_svc
+  skipped_templates:
+  - template: cue_process_tool.clustering
+    reason: "Same-time host-wide tool aggregation overlaps user-actor clustering and host precursor; slot used for
+      higher-signal fleet scope and registry artifact questions."
+  - template: cue_host_context.clustering
+    reason: "Host-wide process aggregation overlaps cue_process_tool.clustering; precursor retained for host
+      cross-detection timeline instead."
+  - template: universal.endpoint_protection_health
+    reason: "PowerShell security-control bypass (powershell.powershell_security_bypass, Q7) already covers the
+      pre-execution tamper/bypass angle most relevant to this loader pattern; the broad AV/EDR-service tamper
+      query would duplicate that angle without adding signal specific to headless-conhost PowerShell."
+  reflection_overrides: []
+  hint_dispositions: []
+  # All three brief hints were acted on (no declines):
+  #   1. "powershell.encoded_command_decode replaces obfuscation.encoded_payload_decode"
+  #      -> acted on: encoded_command_decode is Q4; obfuscation template not emitted.
+  #   2. "logsource 'image_load' (T1059.001,T1059.003) not covered"
+  #      -> acted on: Q5 (attack:T1059.001.image_load) added with category: image_load.
+  #   3. "logsource 'registry_set' (T1564.003) not covered"
+  #      -> acted on: Q9 (attack:T1564.003.registry_set) added with category: registry_set.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+  - universal
+  - powershell
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 16
+      attack: 2
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 2
+      context: 14
+    logsource_diversity:
+      process_creation: 14
+      image_load: 1
+      registry_set: 1
+      powershell_script_block: 1
+      sigma_alert: 1

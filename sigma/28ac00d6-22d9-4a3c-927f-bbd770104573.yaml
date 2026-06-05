@@ -1,0 +1,625 @@
+name: RestrictedAdminMode Registry Value Tampering - ProcCreation
+id: 7d2c9f3a-4e6b-4c1a-9f8d-2a1b3c4d5e6f
+description: |
+  Detects a command line that references both the LSA registry path
+  \System\CurrentControlSet\Control\Lsa AND the DisableRestrictedAdmin value,
+  the registry write that turns Remote Desktop RestrictedAdmin mode on or off.
+  The rule fires only when both tokens appear on the same command line.
+  Setting DisableRestrictedAdmin to 0 enables RestrictedAdmin mode, which lets
+  an RDP connection authenticate without sending reusable credentials to the
+  destination - useful for hardening, but also the precondition for
+  Pass-the-Hash over RDP once an actor holds an administrator's hash. The change
+  takes effect immediately with no reboot. Legitimate hardening and Group Policy
+  rollouts also touch this value, so the investigation should determine which
+  way the value was flipped, who and what process performed the write, and
+  whether the change lines up with a documented change window or with nearby
+  credential-access and lateral-movement activity.
+type: detection
+detection_id: 28ac00d6-22d9-4a3c-927f-bbd770104573
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line reference both the LSA control path and the DisableRestrictedAdmin
+    value, matching what this rule detects?
+  context: Before investing investigation time, confirm the alert is a true positive.
+    The rule fires only when one command line contains both \System\CurrentControlSet\Control\Lsa
+    and DisableRestrictedAdmin. Read the exact command line and note which way the
+    value was set - REG_DWORD 0 enables RestrictedAdmin mode (the Pass-the-Hash-enabling
+    direction), while 1 disables it.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to change RestrictedAdmin mode on this machine?
+  context: Flipping the DisableRestrictedAdmin value is an uncommon administrative
+    action. Hardening teams and a small number of IT operators set it deliberately;
+    most users and most endpoints never touch it. Knowing whether the acting account
+    and the host function are consistent with credential-delegation configuration is
+    often the fastest path to separating a sanctioned hardening change from an actor
+    preparing RDP-based credential reuse.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:registry.registry_key_context
+  question: What value was written to DisableRestrictedAdmin, and was RestrictedAdmin
+    mode enabled or disabled?
+  context: The data written determines intent. DisableRestrictedAdmin under
+    HKLM\System\CurrentControlSet\Control\Lsa set to REG_DWORD 0 enables RestrictedAdmin
+    mode, which removes reusable credentials from the RDP session and is the value an
+    actor flips to enable Pass-the-Hash over RDP; set to 1 it disables the mode. The
+    change applies immediately with no reboot. Read the actual registry path and value
+    data as structured fields rather than parsing them from the command line.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+- source: template:parent_child.parent_process_legitimacy
+  question: What process performed this registry write, and what started that parent?
+  context: The registry value can be set by reg.exe, by PowerShell, or via a remote
+    mechanism such as WMI. Tracing the writing process and its own origin shows whether
+    the change came from interactive administration (a user-launched console) or from
+    an automated or remote execution chain. A script host, a remotely spawned process,
+    or an unsigned binary in the lineage points to operator-driven tampering rather
+    than routine maintenance.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- source: template:parent_child.sibling_processes
+  question: What other child processes did the same parent spawn?
+  context: If the process that wrote the registry value was launched by a suspicious
+    parent, that parent likely spawned other processes too. Examining siblings reveals
+    the full scope of activity from that parent - for example a credential-dumping
+    tool, an RDP client invocation, or other registry edits launched alongside the
+    DisableRestrictedAdmin change strongly suggests an orchestrated sequence rather
+    than a one-off configuration tweak.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:registry.registry_related_modifications
+  question: Were other registry modifications made on this host in the same window?
+  context: An actor enabling RestrictedAdmin mode for Pass-the-Hash often makes other
+    registry edits around it - weakening other LSA or credential-delegation settings,
+    or adding persistence. Finding a cluster of reg.exe add, delete, or import
+    operations from the same user within a short window reveals the full scope of the
+    configuration changes and whether multiple objectives were pursued alongside the
+    DisableRestrictedAdmin write.
+  range: +/-30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_reg:
+        Image|endswith:
+          - '\reg.exe'
+          - '\regedit.exe'
+        CommandLine|contains:
+          - ' add '
+          - ' delete '
+          - ' import '
+          - '/s '
+      condition: selection and selection_reg
+    fields:
+      - CommandLine
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in
+    the hour before the alert?
+  context: Enabling RestrictedAdmin mode is a defense-evasion and credential-reuse
+    enabler, and operators often weaken endpoint protection on the same host first.
+    The query surfaces direct attempts to disable AV/EDR services, flip Defender flags,
+    add broad exclusions, clear logs, or patch AMSI/ETW. Zero rows is a useful signal
+    that protection looks healthy; populated rows shift the disposition toward operator
+    preparation, so review the parent process and signing chain to identify the writer.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+- source: template:cue_user_actor.baseline
+  question: Does this user normally make this RestrictedAdmin registry change?
+  context: Compare the acting account against its own history. A hardening operator
+    may set DisableRestrictedAdmin as part of routine configuration; an account that
+    has never made this change is more suspicious. The user role and typical toolset
+    should align with credential-delegation configuration work.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        CommandLine|contains|all:
+          - \System\CurrentControlSet\Control\Lsa
+          - DisableRestrictedAdmin
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent and DisableRestrictedAdmin command-line pattern historically
+    routine on this host or across the environment, or is the parent unusual?
+  context: When the alert fires under a service principal, user identity does not
+    attribute the behavior; the meaningful pivot is which parent process issued this
+    registry change and whether that pairing is historically common. A new or rare
+    parent for the DisableRestrictedAdmin pattern on this host or environment-wide is
+    the deviation worth chasing, while a parent that already accounts for many prior
+    events is more likely a hardening tool or imaging automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        CommandLine|contains|all:
+          - \System\CurrentControlSet\Control\Lsa
+          - DisableRestrictedAdmin
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the acting account's activity across all hosts reveals whether the
+    RestrictedAdmin change was a single event or part of activity spanning multiple
+    endpoints. If the same user triggered similar registry or RDP-related operations
+    on other hosts, the scope of the incident is larger than one machine.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent and DisableRestrictedAdmin pattern fire on other hosts
+    in the same window, indicating a coordinated rollout rather than isolated activity?
+  context: Under a service principal, asking what else the user did across the network
+    returns agent-telemetry noise, since every host runs system-owned agents
+    constantly. The meaningful question is whether the same launch mechanism - the
+    parent process issuing this registry change - fired on other hosts in the alert
+    window. Multiple hosts in the same window points to scheduled or pushed automation,
+    which can include a hardening rollout; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        CommandLine|contains|all:
+          - \System\CurrentControlSet\Control\Lsa
+          - DisableRestrictedAdmin
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining the activity surrounding the
+    registry change reveals what led to it and what followed - credential access, an
+    RDP client launch, or reconnaissance that the RestrictedAdmin tweak was meant to
+    support. Novel parent-child pairs at low counts are what to scan for against the
+    high-count noise of routine system processes.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired the rule's DisableRestrictedAdmin
+    pattern, what parents and users normally drive it, and does the current alert fit?
+  context: Even legitimate hardening can set this value. The query mirrors the rule's
+    selection structure scoped to this host, so the resulting parent and user
+    distribution reflects how this specific firing pattern - a command line touching
+    the LSA path and DisableRestrictedAdmin - has historically run here, not generic
+    registry usage. A new parent process, an unexpected account, or a first-ever
+    occurrence is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - \System\CurrentControlSet\Control\Lsa
+        - DisableRestrictedAdmin
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired the rule's DisableRestrictedAdmin pattern in the
+    past week, and does the cross-host distribution look like automation or one-off
+    activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the
+    result is a fleet-wide count of this firing pattern rather than generic registry
+    usage. Many hosts touching DisableRestrictedAdmin in the same period points to a
+    scripted hardening deployment or vendor automation; one host or a small unrelated
+    set points to manual operator activity. Use the host distribution and parent
+    consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - \System\CurrentControlSet\Control\Lsa
+        - DisableRestrictedAdmin
+      condition: selection
+    fields:
+    - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host -
+    credential access, reconnaissance, or defense tampering - may reveal the stages
+    that preceded the RestrictedAdmin change. Enabling RestrictedAdmin mode for
+    Pass-the-Hash typically follows credential harvesting, so a prior credential-access
+    alert reframes this event as a lateral-movement preparation step.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:organizational_context.change_ticket
+  question: Was there a change ticket, maintenance window, or documented approval for
+    this RestrictedAdmin change?
+  context: Credential-delegation settings are often governed by hardening policy, so a
+    deliberate change to DisableRestrictedAdmin may map to an approved request or a
+    Group Policy rollout. A corresponding ticket suggests authorized activity; absence
+    of one when policy requires it suggests the change was unauthorized. This check can
+    quickly close a hardening false positive or escalate a true positive.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1112
+      name: Modify Registry
+      role: primary
+  attack_chain_coverage:
+    - stage: 1
+      label: registry_modification_via_cli
+      description: "A command line (reg.exe, PowerShell, or a remote mechanism such as WMI) writes the DisableRestrictedAdmin value under the LSA control key — a defense-evasion / credential-reuse-enabling registry change"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: key_value_identification
+      description: "The specific value written is identified (REG_DWORD 0 enables RestrictedAdmin / PtH path, 1 disables it) via the structured registry event"
+      mapped_to: Q3
+      source: template:registry.registry_key_context
+    - stage: 3
+      label: writer_attribution
+      description: "The process that performed the write and its parent lineage are attributed, distinguishing interactive administration from automated/remote tampering"
+      mapped_to: Q4
+      source: template:parent_child.parent_process_legitimacy
+    - stage: 4
+      label: followon_correlation
+      description: "Process/service execution near the registry change is correlated within a time window — the RestrictedAdmin tweak is followed by RDP / credential-reuse activity"
+      mapped_to: Q12
+      source: template:cue_host_context.clustering
+  dimension_coverage:
+    - dimension: parent_process_analysis
+      technique: T1112
+      covered_by: Q4
+      source: template:parent_child.parent_process_legitimacy
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1112
+      covered_by: Q12
+      source: template:cue_host_context.clustering
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1112
+      covered_by: Q3
+      source: template:registry.registry_key_context
+      coverage_type: direct
+  mutable_dispositions:
+    - element: RegistryKeyPathPatterns
+      dimension: tuning_parameter
+      specific_values: "HKLM\\System\\CurrentControlSet\\Control\\Lsa value DisableRestrictedAdmin (the concrete monitored key for this rule)"
+      disposition: context
+      target_question: Q3
+      notes: "The rule's two CommandLine tokens ARE the concrete realization of this mutable element. The exact LSA path and DisableRestrictedAdmin value, and the 0-enable / 1-disable semantics, are named in registry_key_context context (Q3) and verify_trigger_match (Q1). The reflected host/fleet pattern queries (Q13, Q14) carry both tokens in their detection blocks as concrete query criteria."
+    - element: ParentProcessAllowList
+      dimension: parent_process_analysis
+      specific_values: "regedit.exe, msiexec.exe (rationale-level allowlist of legitimate registry tools)"
+      disposition: context
+      target_question: Q4
+      notes: "Allowlist concept realized as the parent-legitimacy judgment in parent_process_legitimacy (Q4) and the launch-mechanism baseline (Q9). The analyst calibrates which parents are expected (reg.exe/regedit.exe under an interactive console, or a hardening tool) versus a script host or remote spawner."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only (correlate registry change with nearby process/service execution)"
+      disposition: context
+      target_question: Q12
+      notes: "Correlation-window concept, not a queryable field value. Realized as the +/-15m host clustering window (Q12) and the +/-15m sibling window (Q5)."
+    - element: SignatureCheck
+      dimension: tuning_parameter
+      specific_values: "rationale only (flag unsigned executables or abnormal parent-child lineage)"
+      disposition: context
+      target_question: Q4
+      notes: "No queryable value in the analytic. Realized as the parent-lineage and signing-chain judgment directed in parent_process_legitimacy (Q4) and endpoint_protection_health (Q7, which directs review of the writer's signing chain)."
+  dedup_decisions:
+    - dropped: cue_process_tool.mechanism_decode
+      reason: "replaced_by: registry.registry_key_context — Phase 2 mechanism decode is provided by the registry_key_context technique-set question, which returns the structured TargetObject/Details (actual key path and value) instead of parsing reg.exe's CommandLine. Also directed by hint 1."
+      kept: registry.registry_key_context
+    - dropped: cue_process_tool.process_chain
+      reason: "parent_child technique set active — parent_process_legitimacy (Q4) is the more specific parent-attribution question and subsumes the generic process_chain cue per AGENTS.md dedup rule."
+      kept: parent_child.parent_process_legitimacy
+    - dropped: cue_process_tool.baseline
+      reason: "generic Image|endswith host baseline requires %Image%, which is null for this CommandLine-only rule (no Image in detection). Subsumed by the REFLECTED host-pattern question baseline_deviation (Q13), which scopes to the rule's actual DisableRestrictedAdmin firing pattern rather than all usage of a binary."
+      kept: cue_process_tool.baseline_deviation
+    - dropped: cue_process_tool.clustering
+      reason: "Image-only host aggregation subsumed by cue_host_context.clustering (Q12), which projects Image+ParentImage and surfaces novel parent-child pairs."
+      kept: cue_host_context.clustering
+    - dropped: cue_user_actor.baseline + cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable; both emitted (subject-pivot Q8 and launch-mechanism-pivot Q9)."
+      kept: both
+    - dropped: cue_user_actor.clustering + cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable; both emitted (subject-pivot Q10 and launch-mechanism-pivot Q11)."
+      kept: both
+  skipped_templates:
+    - template: cue_process_tool.mechanism_decode
+      reason: "replaced_by: registry.registry_key_context (hint 1)."
+    - template: cue_process_tool.follow_on
+      reason: "ParentImage|endswith|expand requires %Image%, which is null for this CommandLine-only rule. reg.exe / the registry writer is not a process launcher in this pattern; follow-on host activity is covered by cue_host_context.clustering (Q12) and parent_child.sibling_processes (Q5). Trimmed to stay within the 14-18 target."
+    - template: registry.registry_value_persistence_check
+      reason: "must_include priority, but its notes_to_llm directs skipping for security-setting tampering rules where no executable path is written. This rule flips a credential-delegation setting (DisableRestrictedAdmin); no executable path is written to a Run key, so the 'is the referenced payload present on disk' check has no target. is_persistence_rule is true at the tactic level (persistence tag), but the concrete behavior is setting tamper, not payload-path persistence."
+    - template: persistence_scope.process_based_persistence
+      reason: "recommended priority. This rule detects a defense-evasion / credential-reuse setting change, not installation of an autostart payload. The load-bearing context here is the registry-set technique set plus user/parent attribution; a persistence-tool sweep adds little. Trimmed to stay within the 14-18 target."
+    - template: persistence_scope.file_based_persistence
+      reason: "recommended priority. File-drop persistence (Startup folder, Run-key paths) is orthogonal to a DisableRestrictedAdmin registry tweak that writes no file. Trimmed to stay within the 14-18 target."
+    - template: organizational_context.human_recall
+      reason: "recommended priority. change_ticket (Q16) already covers the organizational-legitimacy check, which is the most decisive for a policy-governed hardening setting. Trimmed to stay within the 14-18 target; human_recall is a near-duplicate angle (ask the operator) and was the lower-value of the organizational pair for this setting-change rule."
+    - template: organizational_context.timing_alignment
+      reason: "recommended priority. Near-duplicate organizational angle; the maintenance-window aspect is folded into change_ticket (Q16) context. Trimmed to stay within the 14-18 target."
+    - template: organizational_context.procedural_consistency
+      reason: "recommended priority. Whether registry changes are normally pushed via Group Policy is folded into change_ticket (Q16) and the fleet-distribution read in scope (Q14, which flags scripted/GPO-style rollouts). Trimmed to stay within the 14-18 target."
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "registry.registry_key_context replaces cue_process_tool.mechanism_decode"
+      disposition: acted-on
+      reason: >-
+        Acted on: cue_process_tool.mechanism_decode is skipped (see
+        skipped_templates and dedup_decisions); Phase 2 mechanism decode is
+        provided by registry.registry_key_context (Q3), which returns the
+        structured registry key path and value data.
+    - hint: "CommandLine-only detection — no Image field in rule. Use CommandLine pattern matching for scoping, not Image-based queries"
+      disposition: acted-on
+      reason: >-
+        Acted on: the rule has no Image / primary_binary (CommandLine-only), so
+        every cue query that would have scoped on %Image% was either dropped
+        (cue_process_tool.baseline, cue_process_tool.follow_on — both require a
+        null %Image%) or re-scoped onto the rule's CommandLine|contains|all
+        tokens. cue_user_actor.baseline (Q8), baseline_svc (Q9), and
+        clustering_svc (Q11) all carry the two LSA/DisableRestrictedAdmin tokens
+        in their detection blocks instead of an Image filter. The two REFLECTED
+        questions (Q13, Q14) already embed the CommandLine pattern verbatim.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - registry
+    - organizational_context
+    - parent_child
+  generation_stats:
+    total_questions: 16
+    source_counts:
+      template: 16
+      attack: 0
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 13
+    logsource_diversity:
+      process_creation: 14
+      registry_set: 1
+      sigma_alert: 1

@@ -1,0 +1,798 @@
+name: Suspicious PowerShell Parameter Substring
+id: 5ec250b5-acce-4326-9c44-454984faf8af
+description: |
+  Detects powershell.exe or pwsh.exe launched with a parameter written as an
+  unusual mid-length abbreviation of a common switch — for example -NoPr / -NoPro
+  / -NoProf for -NoProfile, -encod / -enco for -EncodedCommand, -ex bypass /
+  -ep bypass for -ExecutionPolicy, or -win hidd / -windows h for -WindowStyle
+  Hidden. PowerShell's parameter binder accepts any unique prefix of a switch
+  name, so these in-between substrings are functionally identical to the full
+  flags; the canonical short and long forms are common in legitimate admin
+  scripts, but these intermediate abbreviations are almost never typed by hand
+  and are a characteristic product of automated command-line obfuscation.
+  Investigation should decode the full command line, confirm what the launcher
+  was actually trying to do (hide a window, suppress the profile, bypass
+  execution policy, run an encoded payload), establish the parent and user
+  context, and determine whether the same firing pattern is isolated or recurs
+  across the host and fleet.
+type: detection
+detection_id: 36210e0d-5b19-485d-a087-c096088885f0
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line match what this rule detects — an obfuscated PowerShell switch substring?
+  context: Before investing investigation time, confirm the alert is a true positive by reading the exact command line and process details. The rule fires when an Image ending in powershell.exe or pwsh.exe AND a CommandLine containing an abbreviated switch substring (e.g. -NoPr, -encod, -ec, -ep bypass, -win hidd) both match. Identify which abbreviation triggered it, since that tells you what the launcher was abbreviating.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run PowerShell with abbreviated, machine-generated switches?
+  context: Legitimate administrative activity can trigger many detections, but human operators and well-formed admin scripts normally use the canonical switch forms (-NoProfile, -ExecutionPolicy Bypass), not mid-length abbreviations. Knowing whether this user role and host function involve packaged installers, management agents, or automation that emits shortened switches is often the fastest path to distinguishing routine tooling from obfuscated execution.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:powershell.encoded_command_decode
+  question: Was the command encoded or obfuscated, and what does it decode to?
+  context: The abbreviated switch forms this rule catches are themselves a marker of command-line obfuscation, and they frequently accompany an -encod/-ec encoded payload. If an -EncodedCommand variant is present, base64-decode it and read the resulting script; look for download cradles, reverse shells, or in-memory loading of .NET assemblies. If the abbreviated flags only hide a window or suppress the profile, identify the visible script or scriptblock that ran instead.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:cue_process_tool.mechanism_decode
+  question: What did the full PowerShell invocation actually do across the abbreviated switches it used?
+  context: The full command line reveals the operational intent behind the abbreviations. Expand each shortened switch to its canonical meaning (-NoPr → -NoProfile, -nonin → -NonInteractive, -ex bypass / -ep bypass → -ExecutionPolicy Bypass, -win hidd → -WindowStyle Hidden, -ec / -encod → -EncodedCommand) and read them together — a non-interactive, profile-less, hidden-window, policy-bypassing PowerShell is a classic unattended-payload launch shape. This query scopes to obfuscated-switch PowerShell launches on this host within the window so multi-step launchers are visible together.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+        CommandLine|contains:
+          - ' -NoPr '
+          - ' -NoPro '
+          - ' -NoProf '
+          - ' -nonin '
+          - ' -noninte '
+          - ' -enco '
+          - ' -encod '
+          - ' -encoded '
+          - ' -ec '
+          - ' -ep bypass'
+          - ' -exec bypass'
+          - ' -win hidd '
+          - ' -win hidde '
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:powershell.script_block_logging
+  question: Did PowerShell script block logging capture the full deobfuscated script content?
+  context: Script block logging records the deobfuscated script content PowerShell actually executed, even when the launch arguments were abbreviated or the payload was encoded. This provides ground truth about what ran, bypassing the command-line obfuscation this rule keys on. If PowerShell operational logs are not ingested in this environment, treat zero results as a visibility gap rather than evidence that nothing ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- source: template:powershell.powershell_security_bypass
+  question: Were PowerShell security controls bypassed or weakened before this execution?
+  context: Obfuscated launch arguments often travel with explicit control-weakening — execution-policy bypass, AMSI patching, real-time monitoring disable, or a downgrade to PowerShell v2 which lacks scriptblock logging. Note that setting an execution-policy bypass alongside -EncodedCommand is redundant because encoded commands already bypass execution policy, so the presence of both is itself a sign of a packaged obfuscation launcher rather than hand-authored administration. Finding these precursor events strengthens the case for malicious activity.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- source: template:cue_process_tool.process_chain
+  question: What process spawned this PowerShell instance and is that parent chain expected?
+  context: The parent process reveals how PowerShell was invoked. Legitimate usage often has predictable parents (explorer.exe for interactive use, services.exe or a management agent for scheduled work). Office applications, mshta.exe, wscript.exe, or a browser spawning an obfuscated PowerShell launch points to a macro, scriptlet, or exploitation chain rather than administration. Walk one level higher if the immediate parent is itself a generic interpreter.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: attack:T1059.001.image_load
+  question: What .NET and automation assemblies did this PowerShell process load, and are any rare for this host?
+  context: PowerShell abuse is frequently carried out through in-memory .NET execution rather than visible child processes, so the modules loaded by the process expose activity the command line alone hides. System.Management.Automation and the core PowerShell runtime are expected, but reflectively loaded or rarely seen assemblies tied to the same process — especially alongside an encoded launch — indicate a fileless cradle. This crosses into the image-load log source because the launch arguments cannot reveal what was loaded after the process started.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+- source: template:cue_process_tool.follow_on
+  question: What child processes did this PowerShell instance spawn afterward?
+  context: The processes spawned after the obfuscated launch reveal its actual impact and timeline. Encoded or hidden PowerShell that goes on to spawn cmd.exe, certutil.exe, rundll32.exe, additional powershell.exe instances, or network utilities is doing post-exploitation; a launch that spawns nothing is more consistent with an in-memory-only action or a benign packaged task.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in the hour before the alert?
+  context: Tampering typically precedes payload execution, and obfuscated PowerShell is a common execution vehicle that an operator would precede by weakening defenses. The query surfaces direct attempts to disable AV/EDR services, flip Defender flags, add broad exclusions, clear logs, or patch AMSI/ETW. Zero rows is a useful "protection looks healthy" signal — kernel-level driver tampering and in-memory patches will not appear here. Populated rows shift the disposition toward operator preparation; review the parent process and signing chain to identify the writer.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering, reconnaissance, credential access — may reveal the attack stages that preceded an obfuscated PowerShell launch and help reconstruct the timeline. Defense tampering and credential access often precede execution, so a preceding cluster of alerts changes the disposition of this one.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:cue_process_tool.baseline
+  question: Does this host normally run powershell.exe or pwsh.exe?
+  context: A process that has never been seen on a host is more suspicious than one that runs regularly. Many endpoints run PowerShell constantly for management, so a high count is unremarkable on its own — but a host where PowerShell is rare or absent firing an obfuscated launch is a stronger first-time-execution signal.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired this obfuscated-switch pattern, what parents and users normally drive it, and does the current alert fit?
+  context: Even common tools can be abused. The query mirrors the rule's selection structure scoped to this host — the resulting parent/user distribution reflects how the rule's specific firing pattern (not generic PowerShell usage) has historically run here. A new parent process, an unexpected user account, or an unusual command-line shape relative to that history is the anomaly worth chasing; a pattern that already accounts for prior events on this host points to a recurring packaged launcher.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+        CommandLine|contains:
+        - ' -windowstyle h '
+        - ' -windowstyl h'
+        - ' -windowsty h'
+        - ' -windowst h'
+        - ' -windows h'
+        - ' -windo h'
+        - ' -wind h'
+        - ' -win h'
+        - ' -wi h'
+        - ' -win h '
+        - ' -win hi '
+        - ' -win hid '
+        - ' -win hidd '
+        - ' -win hidde '
+        - ' -NoPr '
+        - ' -NoPro '
+        - ' -NoProf '
+        - ' -NoProfi '
+        - ' -NoProfil '
+        - ' -nonin '
+        - ' -nonint '
+        - ' -noninte '
+        - ' -noninter '
+        - ' -nonintera '
+        - ' -noninterac '
+        - ' -noninteract '
+        - ' -noninteracti '
+        - ' -noninteractiv '
+        - ' -ec '
+        - ' -encodedComman '
+        - ' -encodedComma '
+        - ' -encodedComm '
+        - ' -encodedCom '
+        - ' -encodedCo '
+        - ' -encodedC '
+        - ' -encoded '
+        - ' -encode '
+        - ' -encod '
+        - ' -enco '
+        - ' -en '
+        - ' -executionpolic '
+        - ' -executionpoli '
+        - ' -executionpol '
+        - ' -executionpo '
+        - ' -executionp '
+        - ' -execution bypass'
+        - ' -executio bypass'
+        - ' -executi bypass'
+        - ' -execut bypass'
+        - ' -execu bypass'
+        - ' -exec bypass'
+        - ' -exe bypass'
+        - ' -ex bypass'
+        - ' -ep bypass'
+        - ' /windowstyle h '
+        - ' /windowstyl h'
+        - ' /windowsty h'
+        - ' /windowst h'
+        - ' /windows h'
+        - ' /windo h'
+        - ' /wind h'
+        - ' /win h'
+        - ' /wi h'
+        - ' /win h '
+        - ' /win hi '
+        - ' /win hid '
+        - ' /win hidd '
+        - ' /win hidde '
+        - ' /NoPr '
+        - ' /NoPro '
+        - ' /NoProf '
+        - ' /NoProfi '
+        - ' /NoProfil '
+        - ' /nonin '
+        - ' /nonint '
+        - ' /noninte '
+        - ' /noninter '
+        - ' /nonintera '
+        - ' /noninterac '
+        - ' /noninteract '
+        - ' /noninteracti '
+        - ' /noninteractiv '
+        - ' /ec '
+        - ' /encodedComman '
+        - ' /encodedComma '
+        - ' /encodedComm '
+        - ' /encodedCom '
+        - ' /encodedCo '
+        - ' /encodedC '
+        - ' /encoded '
+        - ' /encode '
+        - ' /encod '
+        - ' /enco '
+        - ' /en '
+        - ' /executionpolic '
+        - ' /executionpoli '
+        - ' /executionpol '
+        - ' /executionpo '
+        - ' /executionp '
+        - ' /execution bypass'
+        - ' /executio bypass'
+        - ' /executi bypass'
+        - ' /execut bypass'
+        - ' /execu bypass'
+        - ' /exec bypass'
+        - ' /exe bypass'
+        - ' /ex bypass'
+        - ' /ep bypass'
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run PowerShell with these kinds of arguments?
+  context: Compare this user's current action against their historical behavior. A user who has never run PowerShell, or never with obfuscated switch forms, is more suspicious than an administrator who does so routinely. User role and typical toolset should align with the detected behavior; a standard user account driving machine-generated PowerShell switches is a deviation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent-plus-PowerShell combination historically routine on this host or across the environment, or is the parent unusual for PowerShell?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior. The meaningful pivot is the launch mechanism: which parent process spawned PowerShell, and is that pair historically common. A new or rare parent for PowerShell on this host or env-wide is the deviation worth chasing; a pair that already accounts for thousands of prior events is vendor or OS automation emitting packaged switch strings.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints. If the same user triggered similar PowerShell activity on multiple hosts in a short window, the scope of compromise may be larger than the single alerting host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent-plus-PowerShell combination fire on other hosts in the same window — a coordinated rollout, or isolated to this host?
+  context: Under a service principal, asking what else the user did across the network returns agent-telemetry noise because every host runs SYSTEM-owned agents constantly. The meaningful question is whether the same launch mechanism — parent process plus PowerShell — fired on other hosts in the alert window. Multiple hosts in the same window points to scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired this obfuscated-switch pattern in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of the rule's firing pattern (not generic PowerShell usage). Many hosts firing the same abbreviated-switch pattern points to scripted deployment or vendor automation that happens to emit shortened switches; one host or a small unrelated set points to manual operator activity. Use the host distribution and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+        CommandLine|contains:
+        - ' -windowstyle h '
+        - ' -windowstyl h'
+        - ' -windowsty h'
+        - ' -windowst h'
+        - ' -windows h'
+        - ' -windo h'
+        - ' -wind h'
+        - ' -win h'
+        - ' -wi h'
+        - ' -win h '
+        - ' -win hi '
+        - ' -win hid '
+        - ' -win hidd '
+        - ' -win hidde '
+        - ' -NoPr '
+        - ' -NoPro '
+        - ' -NoProf '
+        - ' -NoProfi '
+        - ' -NoProfil '
+        - ' -nonin '
+        - ' -nonint '
+        - ' -noninte '
+        - ' -noninter '
+        - ' -nonintera '
+        - ' -noninterac '
+        - ' -noninteract '
+        - ' -noninteracti '
+        - ' -noninteractiv '
+        - ' -ec '
+        - ' -encodedComman '
+        - ' -encodedComma '
+        - ' -encodedComm '
+        - ' -encodedCom '
+        - ' -encodedCo '
+        - ' -encodedC '
+        - ' -encoded '
+        - ' -encode '
+        - ' -encod '
+        - ' -enco '
+        - ' -en '
+        - ' -executionpolic '
+        - ' -executionpoli '
+        - ' -executionpol '
+        - ' -executionpo '
+        - ' -executionp '
+        - ' -execution bypass'
+        - ' -executio bypass'
+        - ' -executi bypass'
+        - ' -execut bypass'
+        - ' -execu bypass'
+        - ' -exec bypass'
+        - ' -exe bypass'
+        - ' -ex bypass'
+        - ' -ep bypass'
+        - ' /windowstyle h '
+        - ' /windowstyl h'
+        - ' /windowsty h'
+        - ' /windowst h'
+        - ' /windows h'
+        - ' /windo h'
+        - ' /wind h'
+        - ' /win h'
+        - ' /wi h'
+        - ' /win h '
+        - ' /win hi '
+        - ' /win hid '
+        - ' /win hidd '
+        - ' /win hidde '
+        - ' /NoPr '
+        - ' /NoPro '
+        - ' /NoProf '
+        - ' /NoProfi '
+        - ' /NoProfil '
+        - ' /nonin '
+        - ' /nonint '
+        - ' /noninte '
+        - ' /noninter '
+        - ' /nonintera '
+        - ' /noninterac '
+        - ' /noninteract '
+        - ' /noninteracti '
+        - ' /noninteractiv '
+        - ' /ec '
+        - ' /encodedComman '
+        - ' /encodedComma '
+        - ' /encodedComm '
+        - ' /encodedCom '
+        - ' /encodedCo '
+        - ' /encodedC '
+        - ' /encoded '
+        - ' /encode '
+        - ' /encod '
+        - ' /enco '
+        - ' /en '
+        - ' /executionpolic '
+        - ' /executionpoli '
+        - ' /executionpol '
+        - ' /executionpo '
+        - ' /executionp '
+        - ' /execution bypass'
+        - ' /executio bypass'
+        - ' /executi bypass'
+        - ' /execut bypass'
+        - ' /execu bypass'
+        - ' /exec bypass'
+        - ' /exe bypass'
+        - ' /ex bypass'
+        - ' /ep bypass'
+      condition: selection
+    fields:
+    - host.name
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1059.001
+      name: PowerShell
+      role: primary
+    - id: T1059
+      name: Command and Scripting Interpreter
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: obfuscated_launch
+      description: "PowerShell launched with encoded/obfuscated/hidden command-line arguments"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: command_decode
+      description: "Decode the abbreviated/encoded arguments to recover operational intent"
+      mapped_to: Q3
+      source: template:powershell.encoded_command_decode
+    - stage: 3
+      label: unusual_parent
+      description: "Abnormal parent process (Office, mshta, wscript, browser) spawning PowerShell"
+      mapped_to: Q7
+      source: template:cue_process_tool.process_chain
+    - stage: 4
+      label: suspicious_modules
+      description: "Suspicious/rare .NET assemblies or modules loaded into the PowerShell process"
+      mapped_to: Q8
+      source: attack:T1059.001.image_load
+    - stage: 5
+      label: follow_on_execution
+      description: "Network connections or child process spawning following the PowerShell launch"
+      mapped_to: Q9
+      source: template:cue_process_tool.follow_on
+  dimension_coverage:
+    - dimension: command_analysis
+      technique: T1059.001
+      covered_by: Q3
+      source: template:powershell.encoded_command_decode
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1059.001
+      covered_by: Q7
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1059.001
+      covered_by: Q9
+      source: template:cue_process_tool.follow_on
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1059.001
+      covered_by: Q8
+      source: attack:T1059.001.image_load
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1059
+      covered_by: Q14
+      source: template:cue_user_actor.baseline
+      coverage_type: direct
+  mutable_dispositions:
+    - element: CommandLinePattern
+      dimension: command_analysis
+      specific_values: "-enc, -nop (and the rule's full abbreviated-substring list: -NoPr/-NoPro/-NoProf, -enco/-encod/-encoded/-ec, -ep bypass/-ex bypass, -win hidd/-windows h, -nonin)"
+      disposition: query_injection
+      target_question: Q4
+      notes: "Injected a representative subset of the rule's abbreviated switches into cue_process_tool.mechanism_decode CommandLine|contains per hint 'powershell.exe too common for Image-based scoping'. Full verbatim list is embedded in the REFLECTED Q13 (baseline_deviation) and Q18 (scope) queries."
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "Excel, WinWord, mshta (abnormal parents)"
+      disposition: context
+      target_question: Q7
+      notes: "Abnormal-parent examples described in Q7 context; parent is not a detection field on this rule so no query injection. Parent+binary pairing also drives Q15/Q16 service-principal substitutes."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only (off-hours / maintenance-window scoping)"
+      disposition: context
+      target_question: Q9
+      notes: "Tuning rationale without concrete values; follow_on (+4h) and precursor (-6h) carry the temporal scope."
+    - element: LoadedModuleList
+      dimension: tuning_parameter
+      specific_values: "rationale only (rare/never-before-seen .NET assemblies)"
+      disposition: new_question
+      target_question: Q8
+      notes: "Drove the authored image_load question (attack:T1059.001.image_load); no fixed assembly list exists, so the question asks for rare loads rather than matching literals."
+    - element: ScriptBlockLengthThreshold
+      dimension: tuning_parameter
+      specific_values: "rationale only (Event 4104 scriptblock length threshold)"
+      disposition: context
+      target_question: Q5
+      notes: "Threshold is a tuning knob, not directly queryable; scriptblock-logging question (Q5) surfaces 4104 content for manual review."
+  dedup_decisions:
+    - dropped: cue_process_tool.clustering
+      reason: "Near-identical to cue_host_context.precursor / cue_host_context.clustering as a generic 'what else ran on this host' sweep; precursor (cross-detection timeline) chosen as the more distinct host-context question."
+      kept: cue_host_context.precursor
+    - dropped: cue_host_context.clustering
+      reason: "Generic host-activity aggregation overlaps cue_process_tool.clustering and cue_host_context.precursor; precursor retained for the distinct sigma-alert timeline view, generic process clustering dropped to stay at the 18-question cap."
+      kept: cue_host_context.precursor
+    - dropped: ''
+      reason: "user_actor pair — non-deduplicable: cue_user_actor.baseline (Q14) + cue_user_actor.baseline_svc (Q15) emitted as a pair; user-pivot answers 'is THIS USER routine', svc substitute answers 'is THIS LAUNCH MECHANISM routine'."
+      kept: cue_user_actor.baseline + cue_user_actor.baseline_svc
+    - dropped: ''
+      reason: "user_actor pair — non-deduplicable: cue_user_actor.clustering (Q16) + cue_user_actor.clustering_svc (Q17) emitted as a pair; user-pivot degenerates to agent-telemetry noise under service principals, svc substitute pivots on parent+binary."
+      kept: cue_user_actor.clustering + cue_user_actor.clustering_svc
+  skipped_templates: []
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "powershell.encoded_command_decode replaces obfuscation.encoded_payload_decode"
+      disposition: acted_on
+      reason: >-
+        Acted on — powershell.encoded_command_decode is included as Q3 (the
+        Phase 2 mechanism_decode equivalent). Recorded here for completeness;
+        no obfuscation.encoded_payload_decode template was emitted.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - powershell
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 17
+      attack: 1
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 2
+      context: 14
+    logsource_diversity:
+      process_creation: 15
+      powershell_script_block: 1
+      image_load: 1
+      sigma_alert: 1

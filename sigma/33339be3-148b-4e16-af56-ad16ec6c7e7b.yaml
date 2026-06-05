@@ -1,0 +1,603 @@
+name: Findstr Launching .lnk File
+id: c99345e3-3f0c-4663-b788-12a592ed0c5f
+description: |
+  Detects find.exe or findstr.exe (by Image name or by PE OriginalFileName FIND.EXE / FINDSTR.EXE) running with a command
+  line that ends in a .lnk path. The rule fires when both conditions hold: the process is the find/findstr utility AND the
+  command line references a shortcut file. A text-search utility resolving and launching a shortcut is an indirect-execution
+  pattern -- the LOLBIN acts as a launcher so the real payload (the .lnk target, often cmd or a script host that unpacks an
+  obfuscated downloader) does not appear as a direct child of the delivery process. Legitimate use is rare; investigate the
+  parent that invoked findstr, decode the full command line and the .lnk it points to, and determine what the shortcut target
+  ran and pulled down.
+type: detection
+detection_id: 33339be3-148b-4e16-af56-ad16ec6c7e7b
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Is this process find.exe or findstr.exe, and does its command line end in a .lnk path?
+  context: Before investing investigation time, confirm the alert is a true positive. The rule fires only when both conditions
+    hold together -- the Image ends in find.exe or findstr.exe (or its PE OriginalFileName is FIND.EXE / FINDSTR.EXE) AND the
+    command line ends in a .lnk, .lnk", or .lnk' path. Read the exact Image, OriginalFileName, and CommandLine and confirm
+    the shortcut path the utility was pointed at.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run a text-search utility that resolves and launches a shortcut file?
+  context: Legitimate administrative activity can trigger many detections. A text-search tool like findstr launching a .lnk
+    is not a normal workflow on most endpoints, so knowing whether this user role and host function ever involve scripted
+    shortcut handling is often the fastest way to separate a true positive from a rare-but-benign automation.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What exactly did findstr do? Decode the full command line and identify the .lnk path it resolved.
+  context: The full command line reveals the specific action taken. Decode the switches passed to findstr, the search string,
+    and -- most importantly -- the full path to the .lnk file at the end of the line. Note where the shortcut lives (Downloads,
+    Temp, AppData are user-writable staging spots) and whether its name uses a double-extension masquerade such as name.doc.lnk
+    or name.pdf.lnk that renders as a document when file extensions are hidden.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:masquerading.true_identity
+  question: What is the actual identity of this binary based on its metadata and hash?
+  context: The rule matches both the on-disk name (find.exe / findstr.exe) and the PE OriginalFileName (FIND.EXE / FINDSTR.EXE).
+    Compare the Image path against OriginalFileName -- a mismatch means a renamed binary masquerading as the search utility,
+    while a match from a non-standard directory means a copy placed outside the expected system path. Confirm the signing party
+    and signature status (a genuine utility is Microsoft-signed and lives under System32 or SysWOW64), and submit the hash for
+    reputation checking to tell a stock utility from a planted look-alike.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - Hashes
+- source: template:masquerading.binary_origin
+  question: How did this binary arrive on the host, and what process created it?
+  context: A find/findstr binary running from a non-standard path did not appear spontaneously -- it was copied, downloaded,
+    or dropped by a parent process. Tracing the file-creation event for the binary by basename over a long window reveals how
+    it was delivered, whether by a download tool, an archive extraction, a manual copy via remote access, or a dropper. If the
+    binary lives in a user-writable location it was likely downloaded or extracted; if in a system directory it may be a routine
+    OS update -- the creating process in the file event disambiguates.
+  range: -30d
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains|expand: '%file_name%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: template:masquerading.renamed_binary_activity
+  question: What child processes did this binary spawn after execution, and is the same binary active on other hosts?
+  context: The point of indirect execution through a search utility is to hide the real payload from the delivery chain. Examining
+    the processes spawned after findstr runs reveals the actual objective -- a script host, command interpreter, or downloader
+    launched by way of the shortcut target. The same binary or shortcut-launch pattern appearing on multiple hosts suggests
+    deliberate distribution rather than an isolated event.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.process_chain
+  question: What process spawned findstr and is that parent chain expected?
+  context: The parent process reveals how the utility was invoked. The parent is not part of the rule's detection, so identifying
+    it is load-bearing. Legitimate search usage is typically launched from a console or a script the user started; parents
+    such as a mail client, browser, Office application, wscript.exe, mshta.exe, or an unpacked shortcut handler point to a
+    delivery chain that placed and ran the .lnk.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: attack:T1202.spawned_payload_network
+  question: Did findstr, its parent, or any child process make an outbound network connection around the alert time?
+  context: Indirect-launch chains commonly end in an ingress tool transfer -- the shortcut target unpacks a script that reaches
+    out over http or https to pull a second-stage payload. Correlating outbound connections from the launcher and its descendants
+    in the window around the alert surfaces the download leg of the chain and the remote address it contacted, which becomes
+    a pivot for scoping other affected hosts.
+  range: +/-30m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: true
+      filter_known_good:
+        Image|startswith:
+          - 'C:\Windows\System32\'
+          - 'C:\Windows\SysWOW64\'
+      condition: selection and not filter_known_good
+    fields:
+      - Image
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+- source: template:obfuscation.encoded_payload_decode
+  question: Is the .lnk target or any spawned command line encoded or obfuscated? What does it decode to, and what operation
+    does it perform?
+  context: 'Shortcut-delivery chains routinely stage an obfuscated payload behind the .lnk: the target launches a script host
+    that reconstructs a downloader from character concatenation (VBScript Chr() chains, JavaScript String.fromCharCode), base64,
+    hex, or environment-variable substitution. Decode the shortcut target and any descendant command line to reveal the actual
+    intent -- a download cradle, an in-memory loader, or a drop-and-execute of a second-stage binary. For multi-layer encoding,
+    iterate until the payload is readable.'
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:universal.evidence_preservation
+  question: Is the referenced .lnk file (and any payload it dropped) still on disk for analysis?
+  context: The command line references a shortcut path, and the chain it triggers often drops a second-stage file. Checking
+    whether these artifacts still exist on disk enables deeper analysis -- parsing the .lnk target and arguments, hashing the
+    dropped payload, sandbox submission, or content review. The file-creation events for these paths also show which process
+    wrote them.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired the rule's pattern, what parents and users normally drive that activity, and
+    does the current alert fit that pattern?
+  context: Even common utilities can be abused. The query mirrors the rule's selection -- find/findstr launching a .lnk --
+    scoped to this host, so the resulting parent and user distribution reflects how this specific firing pattern has historically
+    run here, not generic findstr usage. A new parent process, an unexpected user account, or an unusual shortcut path is the
+    deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \find.exe
+        - \findstr.exe
+      - OriginalFileName:
+        - FIND.EXE
+        - FINDSTR.EXE
+      selection_cli:
+        CommandLine|endswith:
+        - .lnk
+        - .lnk"
+        - .lnk'
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired the rule's pattern in the past week, and does the cross-host distribution look like consistent
+    automation or one-off activity?
+  context: The query mirrors the rule's selection with no host scope, giving a fleet-wide count of find/findstr launching a
+    .lnk (not generic usage of the binary). Many hosts firing the same pattern points to scripted deployment or a benign vendor
+    automation that wraps shortcut handling; one host or a small unrelated set points to manual or targeted delivery. Use the
+    host spread and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \find.exe
+        - \findstr.exe
+      - OriginalFileName:
+        - FIND.EXE
+        - FINDSTR.EXE
+      selection_cli:
+        CommandLine|endswith:
+        - .lnk
+        - .lnk"
+        - .lnk'
+      condition: all of selection_*
+    fields:
+    - host.name
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run find or findstr against shortcut files?
+  context: Compare this user's current action against their historical behavior. A user who has never run a search utility
+    over a .lnk path is more suspicious than one who does so regularly as part of a known scripted workflow. The user's role
+    and typical toolset should align with command-line shortcut handling.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent+binary combination historically routine on this host or across the environment, or is the parent
+    unusual for this binary?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior. The meaningful pivot
+    is the launch mechanism: which parent process spawned find/findstr, and whether that pair is historically common. A new
+    or rare parent for this binary on this host or environment-wide is the deviation worth chasing; a pair that already accounts
+    for thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints.
+    If the same user triggered similar shortcut-launch or downloader activity on other hosts, the scope of the incident may
+    be larger than this single alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent+binary combination fire on other hosts in the same window -- is this a coordinated automation
+    rollout, or activity isolated to this host?
+  context: Under a service principal, asking what else this user did across the network returns agent-telemetry noise, since
+    every host runs service-owned processes constantly. The meaningful question is whether the same launch mechanism -- parent
+    process plus spawned find/findstr -- fired on other hosts in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: 'Alerts rarely occur in isolation. Examining activity around the alert reveals the immediate context: what led to
+    the shortcut launch, what the chain spawned afterward, and whether this is part of a larger sequence. Look for the delivery
+    parent, reconnaissance, privilege escalation, or persistence mechanisms appearing as novel parent-child pairs.'
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host -- phishing-delivery indicators, defense
+    tampering, or reconnaissance -- may reveal the stages that preceded this shortcut launch and help reconstruct the full
+    timeline, including how the .lnk arrived on the host.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+  - id: T1202
+    name: Indirect Command Execution
+    role: primary
+  - id: T1036
+    name: Masquerading
+    role: secondary
+  - id: T1027.003
+    name: Steganography
+    role: secondary
+  - id: T1027
+    name: Obfuscated Files or Information
+    role: secondary
+  attack_chain_coverage:
+  - stage: 1
+    label: indirection_utility_launch
+    description: A user or service launches the indirection utility (find/findstr) which is the alerting event.
+    mapped_to: Q1
+    source: template:universal.verify_trigger_match
+  - stage: 2
+    label: secondary_program_spawn
+    description: The indirection utility resolves the .lnk and the shortcut target spawns a secondary program (script host,
+      cmd, downloader).
+    mapped_to: Q6
+    source: template:masquerading.renamed_binary_activity
+  - stage: 3
+    label: outbound_network_transfer
+    description: The spawned child or its descendants open outbound network connections to fetch a second stage.
+    mapped_to: Q8
+    source: attack:T1202.spawned_payload_network
+  - stage: 4
+    label: payload_obfuscation_decode
+    description: The shortcut target or spawned command line carries an encoded/obfuscated payload that must be decoded to
+      reveal intent (T1027 / T1027.003 stage).
+    mapped_to: Q9
+    source: template:obfuscation.encoded_payload_decode
+  - stage: 5
+    label: precursor_ssh_config_or_delivery
+    description: Optional precursor modification (SSH config LocalCommand/ProxyCommand for T1202; phishing/LNK delivery for
+      this rule). Covered as prior-host activity rather than the SSH-specific artifact, which does not apply to a findstr/.lnk
+      chain.
+    mapped_to: Q18
+    source: template:cue_host_context.precursor
+  dimension_coverage:
+  - dimension: execution_context
+    technique: T1036
+    covered_by: Q4
+    source: template:masquerading.true_identity
+    coverage_type: direct
+  - dimension: time_correlation
+    technique: T1036
+    covered_by: Q8
+    source: attack:T1202.spawned_payload_network
+    coverage_type: direct
+  - dimension: tuning_parameter
+    technique: T1036
+    covered_by: Q4
+    source: template:masquerading.true_identity
+    coverage_type: direct
+  - dimension: user_context
+    technique: T1202
+    covered_by: Q2
+    source: template:universal.host_user_context
+    coverage_type: direct
+  - dimension: obfuscation_check
+    technique: T1027
+    covered_by: Q9
+    source: template:obfuscation.encoded_payload_decode
+    coverage_type: direct
+  mutable_dispositions:
+  - element: OriginalFilenameMismatch
+    dimension: tuning_parameter
+    specific_values: rationale only (compare Image name vs PE OriginalFilename)
+    disposition: query_injection
+    target_question: Q4
+    notes: true_identity query projects Image, OriginalFileName, Hashes so the analyst can read the mismatch directly.
+  - element: KnownSystemUtilityPaths
+    dimension: tuning_parameter
+    specific_values: rationale only (expected install dirs for signed binaries)
+    disposition: context
+    target_question: Q4
+    notes: Context names System32 / SysWOW64 as the expected location; non-standard path is the anomaly. No fixed value list
+      to inject.
+  - element: TimeWindow
+    dimension: time_correlation
+    specific_values: 10-30 minutes (T1202 correlation window)
+    disposition: query_injection
+    target_question: Q8
+    notes: network correlation query uses +/-30m to match the T1202 launcher-to-network correlation window.
+  - element: AllowedUtilities
+    dimension: tuning_parameter
+    specific_values: 'forfiles, wsl, ssh (permitted indirection utils)'
+    disposition: context
+    target_question: Q13
+    notes: Baseline/scope questions let the analyst judge whether find/findstr launching a .lnk is an expected automation on
+      this host; no allowlist injected since the rule already constrains to find/findstr.
+  - element: HighRiskChildren
+    dimension: tuning_parameter
+    specific_values: 'powershell.exe, cmd.exe, rundll32.exe, regsvr32.exe, mshta.exe, msiexec.exe, curl.exe, bitsadmin.exe'
+    disposition: context
+    target_question: Q6
+    notes: renamed_binary_activity returns all children of the launcher; context for process_chain and decode questions names
+      script hosts / interpreters / downloaders as the abuse-indicating children. Not injected as a child filter so a child
+      not on the list is still surfaced.
+  - element: UserContext
+    dimension: user_context
+    specific_values: rationale only (raise severity for standard interactive user on a workstation)
+    disposition: context
+    target_question: Q2
+    notes: host_user_context asks whether this user/host is expected to run the operation; user baseline reinforces it.
+  - element: DestCIDRs
+    dimension: tuning_parameter
+    specific_values: rationale only (known-good egress networks)
+    disposition: context
+    target_question: Q8
+    notes: network query excludes System32/SysWOW64-resident processes as known-good; egress CIDR tuning is environment-coupled
+      and left to the analyst.
+  - element: ParentProcessImage
+    dimension: tuning_parameter
+    specific_values: 'rationale only (e.g. mspaint.exe > powershell.exe image-viewer to interpreter)'
+    disposition: context
+    target_question: Q7
+    notes: process_chain surfaces the parent so the analyst can spot an unexpected launcher (image viewer, Office, mail client)
+      for the find/findstr utility.
+  - element: MimeHeaderMismatchTolerance
+    dimension: tuning_parameter
+    specific_values: rationale only (image-header vs extension mismatch tolerance)
+    disposition: context
+    target_question: Q9
+    notes: Steganography MIME-mismatch tuning is not directly queryable from process_creation; encoded_payload_decode covers
+      the decode-the-hidden-payload intent.
+  - element: PayloadEntropyThreshold
+    dimension: obfuscation_check
+    specific_values: rationale only (entropy threshold to distinguish obfuscation from compression)
+    disposition: context
+    target_question: Q9
+    notes: Entropy thresholding is not queryable from these logsources; the decode question is the actionable substitute.
+  - element: SuspiciousParentProcessList
+    dimension: tuning_parameter
+    specific_values: 'rationale only (LOLBins / admin tools misused for obfuscation)'
+    disposition: context
+    target_question: Q7
+    notes: process_chain and baseline_deviation surface the parent distribution so a suspicious launcher stands out.
+  dedup_decisions:
+  - dropped: cue_process_tool.follow_on
+    reason: Identical query to masquerading.renamed_binary_activity (host.name + ParentImage|endswith %Image%, fields Image/CommandLine).
+      Technique-set version is more specific and adds the cross-host scope thread.
+    kept: masquerading.renamed_binary_activity
+  - dropped: cue_process_tool.clustering
+    reason: Host-wide around-the-alert clustering is covered by cue_host_context.clustering with the same aggregation shape.
+    kept: cue_host_context.clustering
+  - dropped: cue_process_tool.baseline
+    reason: Generic host-binary frequency is subsumed by the rule-pattern-specific baseline_deviation (reflected host_pattern),
+      which counts find/findstr-launching-.lnk rather than all findstr usage.
+    kept: cue_process_tool.baseline_deviation
+  - dropped: cue_user_actor.baseline pair
+    reason: user_actor pair -- non-deduplicable. Both cue_user_actor.baseline (Q14, user pivot) and cue_user_actor.baseline_svc
+      (Q15, parent+binary pivot) emitted per service-principal handling.
+    kept: both
+  - dropped: cue_user_actor.clustering pair
+    reason: user_actor pair -- non-deduplicable. Both cue_user_actor.clustering (Q16, user pivot) and cue_user_actor.clustering_svc
+      (Q17, parent+binary pivot) emitted.
+    kept: both
+  skipped_templates:
+  - template: universal.endpoint_protection_health
+    reason: 'RECOMMENDED-tier, not must_include. This rule fires on an indirect-execution / delivery pattern (findstr resolving
+      a .lnk), not on a hands-on-keyboard payload-execution or credential-access action where the disposition turns on whether
+      AV/EDR was weakened first. Prior-host tamper-as-precursor context is already carried by cue_host_context.precursor (Q18),
+      which surfaces any tamper alerts in the hours before. Dropped to stay within the 18-question cap; recorded here to avoid
+      a silent drop of a universal question.'
+  reflection_overrides: []
+  hint_dispositions:
+  - hint: File paths derived from CommandLine -- use %file_paths% placeholder
+    disposition: acted-on
+    note: evidence_preservation (Q11) uses TargetFilename|endswith|expand %file_paths% to check whether the .lnk and any dropped
+      payload remain on disk. (Recorded here for the audit trail; this is an acted-on hint, not a decline.)
+  - hint: 'logsource ''network_connection'' (recommended by techniques: T1202,T1027.003) is not covered -- pull in cue_network_endpoint.*
+      or author a custom question with category: network_connection'
+    disposition: acted-on
+    note: Authored attack:T1202.spawned_payload_network (Q8), a network_connection question correlating outbound connections
+      from the launcher and its descendants over +/-30m. This covers the ingress-tool-transfer leg both techniques call for.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+  - universal
+  - masquerading
+  - obfuscation
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 17
+      attack: 1
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 15
+    logsource_diversity:
+      process_creation: 14
+      file_event: 2
+      network_connection: 1
+      sigma_alert: 1

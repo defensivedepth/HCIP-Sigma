@@ -1,0 +1,550 @@
+name: PUA - Fast Reverse Proxy (FRP) Execution
+id: 37e6064c-f4ce-4e0b-813d-2261ef5edb7b
+description: |
+  Detects execution of Fast Reverse Proxy (frp), an open-source reverse-proxy
+  toolkit that exposes a service behind a NAT or firewall to an external relay.
+  The rule fires when ANY of three independent conditions match: the process
+  image ends in frpc.exe or frps.exe, OR the command line references an frpc.ini
+  configuration file, OR the binary hash matches a known frp sample. Legitimately,
+  developers and IT teams sometimes use frp for remote access or service exposure;
+  malicious use repurposes it as a covert tunnel to bridge internal services
+  (commonly RDP on 3389) back to an attacker-controlled relay over an arbitrary
+  outbound port. Investigation should confirm which condition fired, decode the
+  tunnel configuration, identify the external relay and the local service being
+  exposed, and establish whether the tool is authorized on this host.
+type: detection
+detection_id: 32410e29-5f94-4568-b6a3-d91a8adad863
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Did this alert fire on the frp binary name, an frpc.ini reference on the command line, or a known frp file hash?
+  context: >-
+    The rule fires when EITHER the Image ends in frpc.exe or frps.exe, OR the
+    command line contains \frpc.ini, OR the file hash matches a known frp sample
+    — any one branch is sufficient. Review the Image, CommandLine, and Hashes
+    of the triggering event and note which branch matched, because the branch
+    determines which downstream questions carry weight: a config-reference or
+    hash match on a renamed binary makes the masquerade and tunnel-config
+    questions load-bearing, while a clean binary-name match makes the
+    authorization and destination questions the priority.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - Hashes
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run a reverse-proxy or tunneling tool?
+  context: >-
+    Legitimate frp usage is concentrated on developer workstations, lab hosts,
+    or specific IT-managed systems with a documented remote-access need. A
+    reverse proxy running on a server, a general-purpose endpoint, or under an
+    account with no tunneling responsibility is harder to explain and shifts the
+    disposition toward unauthorized or attacker-deployed tunneling.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What does the full frp command line and configuration specify — server address, ports, and which local service is exposed?
+  context: >-
+    The command line and the referenced frpc.ini (or .toml) config define the
+    tunnel: the relay server address and control port (frp defaults to 7000),
+    the local service and port being exposed, and the remote port opened on the
+    relay. RDP (local 3389) bridged to an external relay is a common pivot
+    pattern. Decode every argument and, where the config is named on the command
+    line, pull its contents to identify the destination and the exposed service.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:remote_access_tool.tool_authorization
+  question: Is frp on the organization's approved software list for this host?
+  context: >-
+    Organizations typically sanction a specific set of remote-access and
+    tunneling tools for IT support. frp is a general-purpose reverse proxy that
+    bypasses firewall ingress rules; unless it is explicitly approved for this
+    host's role, its presence may represent shadow IT or attacker-deployed
+    persistence regardless of the tool's open-source reputation.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+- source: template:remote_access_tool.active_session_context
+  question: Is there an approved development, support, or maintenance use case that explains this tunnel?
+  context: >-
+    Legitimate tunneling usually maps to an active ticket, a scheduled
+    maintenance window, or a documented development need. If no support or
+    business context exists for this frp session, the tunnel may have been
+    established by an attacker for covert access or by a user circumventing
+    network controls.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:remote_access_tool.connection_destination
+  question: What external relay endpoint is the frp client connecting to?
+  context: >-
+    frp clients dial outbound to a relay server (frp's control channel defaults
+    to port 7000) and multiplex proxied traffic back over that connection. The
+    destination distinguishes a sanctioned relay from an unknown or
+    attacker-controlled host. A connection to an unfamiliar external IP — or one
+    geolocated inconsistently with the organization — alongside a non-standard
+    destination port is the signal to chase.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationHostname
+      - DestinationPort
+- source: attack:T1090.tuning_parameter
+  question: Did this host make outbound connections on common proxy ports or unusual high-numbered ports around the alert time?
+  context: >-
+    Reverse-proxy and tunneling traffic frequently targets well-known proxy
+    ports such as 1080, 8080, and 4444, the frp control port 7000, or arbitrary
+    high-numbered ports chosen to evade egress filtering. Connections on these
+    ports that do not correspond to known applications, and especially a spike
+    of outbound connections over a short window, indicate active tunnel traffic
+    rather than a one-off process launch.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        DestinationPort:
+          - 1080
+          - 8080
+          - 4444
+          - 7000
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Image
+- source: template:cue_process_tool.process_chain
+  question: What process spawned the frp client, and is that parent chain expected?
+  context: >-
+    The parent process reveals how frp was launched. A user double-clicking from
+    explorer.exe or a documented deployment script looks different from a web
+    server worker process, a shell spawned by a web shell, or an Office
+    application launching the proxy — the latter point to exploitation of an
+    exposed service rather than sanctioned use.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.baseline
+  question: Has this host run frp before?
+  context: >-
+    A reverse proxy that has never executed on a host is more suspicious than
+    one that runs regularly as part of a sanctioned workflow. Zero or very low
+    historical counts indicate first-time or rare execution and raise the
+    likelihood that the tool was newly introduced.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired the rule's pattern, what parents and users normally drive that activity, and does the current alert fit that pattern?
+  context: >-
+    Even sanctioned tools can be abused. This query mirrors the rule's selection
+    structure scoped to this host, so the resulting parent/user distribution
+    reflects how this specific firing pattern — frp binary, frpc.ini reference,
+    or matching hash — has historically run here. A new parent process, an
+    unexpected account, or an unusual command-line shape relative to that history
+    is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+        Image|endswith:
+        - \frpc.exe
+        - \frps.exe
+      selection_cli:
+        CommandLine|contains: \frpc.ini
+      selection_hashes:
+        Hashes|contains:
+        - MD5=7D9C233B8C9E3F0EA290D2B84593C842
+        - SHA1=06DDC9280E1F1810677935A2477012960905942F
+        - SHA256=57B0936B8D336D8E981C169466A15A5FD21A7D5A2C7DAF62D5E142EE860E387C
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (1 of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.follow_on
+  question: What child processes did frp spawn afterward?
+  context: >-
+    The processes spawned by frp reveal its operational impact. A standalone
+    proxy typically spawns nothing; unexpected children such as cmd.exe,
+    powershell.exe, or remote-service binaries suggest the tunnel was paired with
+    hands-on-keyboard activity or post-exploitation staging.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.clustering
+  question: What other tools ran on this host around the same time?
+  context: >-
+    Tunneling rarely stands alone. Activity surrounding the frp execution may
+    reveal the reconnaissance, privilege escalation, credential access, or
+    remote-service usage that the tunnel was set up to support, providing
+    broader context for the investigation.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired the rule's pattern in the past week, and does the cross-host distribution look like consistent automation or one-off activity?
+  context: >-
+    This query mirrors the rule's selection structure with no host scope, so the
+    result is a fleet-wide count of the firing pattern rather than generic frp
+    usage. Many hosts firing the same pattern points to scripted deployment or
+    sanctioned automation; a single host or a small unrelated set points to
+    manual operator activity. Use the host distribution and parent/binary
+    consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+        Image|endswith:
+        - \frpc.exe
+        - \frps.exe
+      selection_cli:
+        CommandLine|contains: \frpc.ini
+      selection_hashes:
+        Hashes|contains:
+        - MD5=7D9C233B8C9E3F0EA290D2B84593C842
+        - SHA1=06DDC9280E1F1810677935A2477012960905942F
+        - SHA256=57B0936B8D336D8E981C169466A15A5FD21A7D5A2C7DAF62D5E142EE860E387C
+      condition: 1 of selection_*
+    fields:
+    - host.name
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run reverse-proxy or tunneling tools?
+  context: >-
+    Compare this user's current action against their historical behavior across
+    the environment. A user who has never run frp is more suspicious than one
+    who does so as part of a documented role. The user's typical toolset and
+    job function should align with operating a reverse proxy.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent+frp combination historically routine on this host or across the environment, or is the parent unusual for this binary?
+  context: >-
+    When the alert fires under a service principal, user identity does not
+    attribute the behavior; the meaningful pivot is the launch mechanism. A
+    parent process that has spawned frp many times before reflects sanctioned
+    automation or OS behavior, while a new or rare parent for this binary — on
+    this host or across the environment — is the deviation worth chasing.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: >-
+    Tracking the user's activity across all hosts reveals lateral movement or
+    activity spanning multiple endpoints. If the same account triggered similar
+    proxy or tunneling activity on other hosts, the scope of the operation may
+    be larger than this single alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent+frp combination fire on other hosts in the same window — is this a coordinated automation rollout, or is the activity isolated to this host?
+  context: >-
+    Under a service principal, asking what else the user did across the network
+    returns agent-telemetry noise. The meaningful question is whether the same
+    launch mechanism — parent process plus spawned frp binary — fired on other
+    hosts in the alert window. Multiple hosts in the same window points to
+    scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Tunneling is usually a means to an end, set up after an initial foothold.
+    Earlier detections on the same host — exploitation of an exposed service,
+    privilege escalation, web-shell activity, or credential access — may reveal
+    the attack stages that preceded the proxy and help reconstruct the full
+    timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1090
+      name: Proxy
+      role: primary
+  attack_chain_coverage:
+    - stage: 1
+      label: proxy_process_execution
+      description: "Suspicious process spawning (frp client/server) is launched on the host."
+      mapped_to: Q3
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 2
+      label: network_bridge_creation
+      description: "The proxy creates network connections to internal hosts or uncommon external endpoints on high or non-standard ports."
+      mapped_to: Q6
+      source: template:remote_access_tool.connection_destination
+    - stage: 2b
+      label: nonstandard_port_traffic
+      description: "Outbound connections concentrate on well-known proxy ports or unusual high-numbered ports (1080, 8080, 4444, 7000)."
+      mapped_to: Q7
+      source: attack:T1090.tuning_parameter
+  dimension_coverage:
+    - dimension: command_analysis
+      technique: T1090
+      covered_by: Q3
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: direct
+    - dimension: network_destination
+      technique: T1090
+      covered_by: Q6
+      source: template:remote_access_tool.connection_destination
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1090
+      covered_by: Q8
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1090
+      covered_by: Q7
+      source: attack:T1090.tuning_parameter
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1090
+      covered_by: Q7
+      source: attack:T1090.tuning_parameter
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1090
+      covered_by: Q14
+      source: template:cue_user_actor.baseline
+      coverage_type: direct
+  mutable_dispositions:
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "rationale only (rundll32, svchost — examples, not rule constraints)"
+      disposition: context
+      target_question: Q8
+      notes: "Parent-chain question and the parent+binary baseline/clustering substitutes cover legitimacy of the spawning parent; no fixed parent value to inject for frp."
+    - element: DestinationPort
+      dimension: tuning_parameter
+      specific_values: "1080, 8080, 4444 (plus frp control port 7000)"
+      disposition: query_injection
+      target_question: Q7
+      notes: "Injected as DestinationPort selection list into the attack:T1090.tuning_parameter network_connection query. connection_destination (Q6) is KEEP_EXACT, so the specific ports went into the new attack question per the mutable-injection-vs-KEEP_EXACT rule."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only (spikes over a short period — no fixed threshold)"
+      disposition: context
+      target_question: Q7
+      notes: "Spike framing recorded in Q7 context and covered structurally by the +/-15m aggregation; clustering (Q12) and precursor (Q18) add temporal context. Not directly queryable as a threshold."
+  dedup_decisions:
+    - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc pairing
+      reason: "user_actor pair — non-deduplicable. user-pivot (Q14) answers 'is THIS USER routine'; parent+binary substitute (Q15) answers 'is THIS LAUNCH MECHANISM routine'. Both emitted per AGENTS.md (degenerates under service principals)."
+      kept: both
+    - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc pairing
+      reason: "user_actor pair — non-deduplicable. user-pivot (Q16) answers network-wide user activity; parent+binary substitute (Q17) answers coordinated-rollout. Both emitted per AGENTS.md."
+      kept: both
+    - dropped: cue_host_context.clustering
+      reason: "Surrounding-activity coverage already provided by cue_process_tool.clustering (Q12, +/-15m host-wide process activity) and cue_host_context.precursor (Q18, prior-alert context). Dropped to keep total at the 18-question cap; the attack:T1090.tuning_parameter network question earns the higher-value slot."
+      kept: cue_process_tool.clustering
+  skipped_templates:
+    - template: universal.endpoint_protection_health
+      reason: >-
+        RECOMMENDED tier, not must_include. This is a C2/proxy-tunneling rule
+        (T1090), not an execution or credential-access rule whose disposition
+        turns on whether AV/EDR was weakened first, and cue_host_context.precursor
+        (Q18) is present to surface any prior tamper alerts on the host. Per the
+        template notes_to_llm drop-condition (b) — precursor present AND rule not
+        execution/credential-centric — the generic host-tamper sweep does not earn
+        its slot here against the network-destination and tuning_parameter coverage
+        the proxy chain requires. Dropped to stay within the 18-question cap.
+  reflection_overrides: []
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - remote_access_tool
+    - cue_process_tool
+    - cue_user_actor
+    - cue_host_context
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 17
+      attack: 1
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 15
+    logsource_diversity:
+      process_creation: 14
+      network_connection: 2
+      sigma_alert: 1

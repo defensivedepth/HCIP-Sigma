@@ -1,0 +1,618 @@
+name: Potential SSH Tunnel Persistence Install Using A Scheduled Task
+id: 2dc68eff-2fdb-4c1e-8973-82163b4c5607
+description: |
+  Detects schtasks.exe creating a scheduled task whose command references OpenSSH client or server binaries in a
+  reverse-tunnel form. The rule fires when a schtasks process matches its image AND its command line matches EITHER
+  the sshd server pattern (' /create ', sshd.exe, -f) OR the ssh client pattern (' /create ', ssh.exe, -i). Legitimate
+  use is possible where administrators run OpenSSH as a service via a task, but the combination of schtasks-based
+  persistence with ssh -i key auth or sshd -f config most often represents an operator installing a recurring reverse
+  SSH tunnel that survives reboot and provides command-and-control. Investigation should decode the task command,
+  determine the schedule and run-as account, confirm whether the task is still registered, and establish whether the
+  user, host, and parent chain make this expected.
+type: detection
+detection_id: 2daa93a0-a5fb-41c5-8cd8-3c11294bfd1f
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the schtasks command create a task that calls OpenSSH in either the sshd server form or the ssh client form?
+  context: Before investing investigation time, confirm the alert is a true positive. The rule fires on schtasks.exe (by
+    image or original file name) when the command line matches EITHER the server branch (' /create ' with sshd.exe and -f)
+    OR the client branch (' /create ' with ssh.exe and -i). Read the full command line and note which branch fired -- the
+    sshd -f branch points to a local SSH listener, while the ssh -i branch (typically with -N -R) points to an outbound
+    reverse tunnel. The branch determines which downstream questions carry the most weight.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to create scheduled tasks that run OpenSSH?
+  context: Legitimate administrative activity can trigger this detection -- a sysadmin may register OpenSSH as a recurring
+    task. Knowing whether the user role and host function are consistent with installing SSH-based persistence is often the
+    fastest path to distinguishing routine operations from operator activity. A reverse-tunnel task created by a non-admin
+    account or on a host with no SSH role is a strong escalation signal.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:scheduled_task.task_configuration
+  question: What scheduled task was created -- what is the task name (/TN), the command it runs (/TR), the schedule (/SC), and the run-as account (/RU)?
+  context: The schtasks command line carries the full persistence configuration. Identify the task name, the schedule type
+    (a /sc minute /mo 1 recurring trigger keeps a tunnel alive; ONLOGON or ONSTART fires at boot), and the /TR command --
+    a /TR pointing at sshd.exe -f <config> stands up a listener, while ssh.exe -i <key> -N -R <remote>:127.0.0.1:<local>
+    is a reverse tunnel to an external host. A /RU of SYSTEM or highest run level is higher risk. Record the remote host
+    and ports if the reverse-tunnel form is present.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:obfuscation.encoded_payload_decode
+  question: Is the task command line encoded or obfuscated, and if so what does it decode to?
+  context: Operators sometimes hide the task payload behind encoding so the /TR value does not read as ssh or sshd on casual
+    inspection. Look for base64 in the command, certutil -decode chains, hex strings, character concatenation, environment-variable
+    substitution, or a /TR that launches a script which in turn invokes OpenSSH. Decode any encoded content to confirm the
+    actual operation -- a reverse tunnel, a download cradle, or a credential operation -- rather than assuming the literal
+    command is the whole story.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:scheduled_task.task_trigger_and_timing
+  question: When is the task scheduled to run, and has the OpenSSH payload already executed?
+  context: The trigger schedule determines when the persistence activates. A recurring trigger (every minute, daily) may
+    have already launched ssh or sshd multiple times; a boot or logon trigger fires on next restart. Scheduled tasks run
+    as children of the Task Scheduler service, so processes spawned by svchost running the Schedule service after task
+    creation reveal whether the SSH payload ran and connected.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith: '\svchost.exe'
+        ParentCommandLine|contains: 'Schedule'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:scheduled_task.task_still_present
+  question: Is the SSH scheduled task still registered on the host?
+  context: Persistence is only effective if the task still exists. Some operators delete the task after the tunnel is
+    established to reduce forensic artifacts. Confirming the task is still present (via schtasks /query /tn <taskname> /v
+    or the Task Scheduler view) determines whether the persistence is active and requires removal. Use the task name from
+    the creation command to query for it directly.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: attack:T1053.005.security_task_creation
+  question: Does a task-creation security event corroborate this scheduled task, and what task name and content does it record?
+  context: Task creation and modification are logged independently of process creation as security events (4698 for creation,
+    4702 for update). These events record the task name and the task definition the scheduler stored, which corroborates the
+    command-line evidence and catches task creation paths that do not go through a visible schtasks.exe process (API, COM,
+    or PowerShell ScheduledTasks). If security task-creation events are not collected in this environment, treat zero results
+    as a visibility gap rather than evidence the task does not exist.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: security
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID:
+          - 4698
+          - 4702
+      condition: selection
+    fields:
+      - TaskName
+      - TaskContent
+      - SubjectUserName
+- source: attack:T1053.005.registry_task_artifact
+  question: Were the registry artifacts that back this scheduled task written on the host?
+  context: Every scheduled task is materialized under the Task Scheduler registry tree, so a task registration leaves writes
+    under the TaskCache Tree and Tasks keys in addition to the XML definition on disk. These registry artifacts confirm the
+    task was actually registered (not just attempted) and can surface tasks that were created and then deleted from the
+    visible task list. If registry-set events are not ingested here, this returns nothing by construction.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|contains:
+          - '\Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Tree\'
+          - '\Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Tasks\'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+- source: template:cue_process_tool.process_chain
+  question: What process spawned schtasks.exe, and is that parent chain expected for task creation?
+  context: The parent process reveals how the task was created. Interactive admin work typically descends from explorer.exe
+    or a console shell; deployment tooling has its own predictable parents. A schtasks invocation launched from a script
+    interpreter, an Office application, a download cradle, or an unexpected installer (for example install.bat-style
+    automation) points to operator activity rather than routine administration. Walk up to the parent's own parent if the
+    immediate parent is itself a generic shell.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired this rule's SSH-task pattern, what parents and users normally drive it, and does the current alert fit?
+  context: Even legitimate OpenSSH task installs leave a baseline. This query mirrors the rule's selection structure scoped
+    to this host, so the parent and user distribution it returns reflects how this specific firing pattern has run here
+    historically -- not generic schtasks usage. A new parent process, an unexpected user account, or a first-ever occurrence
+    is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_img:
+      - Image|endswith: \schtasks.exe
+      - OriginalFileName: schtasks.exe
+      selection_cli_sshd:
+        CommandLine|contains|all:
+        - ' /create '
+        - sshd.exe
+        - -f
+      selection_cli_ssh:
+        CommandLine|contains|all:
+        - ' /create '
+        - ssh.exe
+        - -i
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection_img and 1 of selection_cli_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_user_actor.baseline
+  question: Does this user normally create scheduled tasks that run OpenSSH?
+  context: Compare this user's current action against their historical behavior. A user who has never created an SSH-related
+    scheduled task is more suspicious than one who does so as part of a documented role. User role and typical toolset should
+    align with installing recurring OpenSSH persistence.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is the parent+schtasks.exe launch mechanism historically routine on this host or across the environment, or is the parent unusual for this binary?
+  context: When the alert fires under a service principal, user identity does not attribute behavior. The meaningful pivot
+    is the launch mechanism -- which parent process spawned schtasks.exe, and whether that pair is historically common. A
+    new or rare parent for schtasks on this host (or environment-wide) is the deviation worth chasing; a pair that already
+    accounts for thousands of prior events is vendor or OS automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around the time of the alert?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints.
+    SSH-tunnel persistence is frequently installed as part of a broader hands-on operation; if the same user triggered
+    similar task creation or tool execution on multiple hosts, the scope of compromise may be larger than this single host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent+schtasks.exe combination fire on other hosts in the same window -- is this a coordinated automation rollout or isolated to this host?
+  context: Under a service principal, asking what else the user did across the network returns agent-telemetry noise, since
+    every host runs SYSTEM-owned agents constantly. The meaningful question is whether the same launch mechanism -- the
+    parent process spawning schtasks.exe -- fired on other hosts in the alert window. Multiple hosts in the same window
+    points to scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:lolbin.technique_class_lateral
+  question: Were other tunneling or remote-access tools used on this host recently to achieve the same objective?
+  context: Operators who establish one covert channel often deploy several. Alongside an SSH reverse tunnel, check for other
+    proxy and tunneling utilities that provide the same outbound command-and-control or pivot capability. Finding multiple
+    tools building tunnels or SOCKS proxies in the same timeframe strengthens the case that this is deliberate
+    command-and-control infrastructure rather than an isolated admin task.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_img:
+        Image|endswith:
+          - '\plink.exe'
+          - '\chisel.exe'
+          - '\ngrok.exe'
+          - '\frpc.exe'
+          - '\frps.exe'
+          - '\socat.exe'
+          - '\stunnel.exe'
+          - '\netsh.exe'
+          - '\rclone.exe'
+          - '\wmic.exe'
+          - '\rundll32.exe'
+          - '\regsvr32.exe'
+          - '\mshta.exe'
+      condition: selection and selection_img
+    fields:
+      - Image
+      - CommandLine
+- source: template:lolbin.renamed_binary_check
+  question: Was schtasks.exe executed from its expected System32 path, or from an unusual location?
+  context: schtasks.exe run from outside System32 or SysWOW64 may indicate the binary was copied or renamed to evade
+    path-based allowlists. Confirm the alerting image path and original file name -- a schtasks executing from a user temp
+    directory or a dropped-tooling folder is more suspicious than one in System32, and a mismatch between image name and
+    original file name points to a renamed binary.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- source: template:lolbin.historical_lolbin_baseline
+  question: How often has this host fired this rule's SSH-task pattern over the past 90 days, and what command-line shapes are typical?
+  context: An SSH-task pattern with no prior history on a host is more suspicious than one used routinely under stable
+    parents. This query mirrors the rule's selection structure scoped to this host, so the count reflects the rule's
+    specific firing pattern -- not generic schtasks usage. The command-line projection lets you compare typical invocation
+    shapes against the alerting one to spot a one-off install.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_img:
+      - Image|endswith: \schtasks.exe
+      - OriginalFileName: schtasks.exe
+      selection_cli_sshd:
+        CommandLine|contains|all:
+        - ' /create '
+        - sshd.exe
+        - -f
+      selection_cli_ssh:
+        CommandLine|contains|all:
+        - ' /create '
+        - ssh.exe
+        - -i
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection_img and 1 of selection_cli_*) and _pb_scope
+    fields:
+    - CommandLine
+- source: template:persistence_scope.process_based_persistence
+  question: Were other process-based persistence mechanisms installed on this host around the same time?
+  context: Attackers rarely rely on a single persistence mechanism. After establishing one foothold, they commonly install
+    backups using different techniques -- additional scheduled tasks, services, registry Run keys, BITS jobs, or WMI
+    subscriptions. Multiple persistence installations in the same timeframe indicate intentional stacking rather than an
+    isolated administrative action. Pair this with the SSH-task finding to map the full set of footholds requiring removal.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1053.005
+      name: Scheduled Task
+      role: primary
+    - id: T1053
+      name: Scheduled Task/Job
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: task_creation_and_parameters
+      description: "Actor creates a scheduled task via schtasks.exe configuring name, schedule, run-as, and the OpenSSH command"
+      mapped_to: Q3
+      source: template:scheduled_task.task_configuration
+    - stage: 2
+      label: task_trigger_and_execution
+      description: "The task's trigger fires and the scheduler (svchost -s Schedule) launches the SSH payload"
+      mapped_to: Q5
+      source: template:scheduled_task.task_trigger_and_timing
+    - stage: 3
+      label: task_registration_persistence
+      description: "Task remains registered (registry TaskCache + security 4698) providing reboot-surviving persistence"
+      mapped_to: Q6
+      source: template:scheduled_task.task_still_present
+  dimension_coverage:
+    - dimension: obfuscation_check
+      technique: T1053.005
+      covered_by: Q4
+      source: template:obfuscation.encoded_payload_decode
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1053.005
+      covered_by: Q5
+      source: template:scheduled_task.task_trigger_and_timing
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1053.005
+      covered_by: Q3
+      source: template:scheduled_task.task_configuration
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1053.005
+      covered_by: Q2
+      source: template:universal.host_user_context
+      coverage_type: direct
+    - dimension: command_analysis
+      technique: T1053
+      covered_by: Q3
+      source: template:scheduled_task.task_configuration
+      coverage_type: direct
+    - dimension: execution_context
+      technique: T1053
+      covered_by: Q9
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1053
+      covered_by: Q3
+      source: template:scheduled_task.task_configuration
+      coverage_type: direct
+  mutable_dispositions:
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only (grouping threshold for task creation vs execution proximity)"
+      disposition: context
+      target_question: Q5
+      notes: "task_trigger_and_timing correlates task creation with execution via the +4h scheduler-child query"
+    - element: UserContext
+      dimension: user_context
+      specific_values: "rationale only (non-standard / SYSTEM account scoping)"
+      disposition: context
+      target_question: Q2
+      notes: "host_user_context and the user-actor baseline pair address whether the firing account is expected; svc substitute handles SYSTEM/service-principal degeneration"
+    - element: TaskNamePattern
+      dimension: tuning_parameter
+      specific_values: "rationale only (obfuscated/random task names)"
+      disposition: context
+      target_question: Q3
+      notes: "task_configuration directs the analyst to read /TN; security/registry artifact questions surface the stored task name independently"
+    - element: CommandLineEntropyThreshold
+      dimension: obfuscation_check
+      specific_values: "rationale only (base64/encoded blob threshold)"
+      disposition: context
+      target_question: Q4
+      notes: "encoded_payload_decode covers encoded /TR payloads"
+    - element: TaskAuthor
+      dimension: tuning_parameter
+      specific_values: "rationale only (unexpected account initiating the task)"
+      disposition: context
+      target_question: Q7
+      notes: "security 4698 SubjectUserName surfaces the recorded task author independent of process User"
+    - element: CommandLineRegex
+      dimension: command_analysis
+      specific_values: "rule already enforces sshd.exe/-f and ssh.exe/-i patterns"
+      disposition: context
+      target_question: Q3
+      notes: "the rule's own selection_cli_* blocks are the command regex; task_configuration decodes the matched command"
+    - element: ExecutionWindow
+      dimension: tuning_parameter
+      specific_values: "rationale only (lookback to correlate execution after registration)"
+      disposition: context
+      target_question: Q5
+      notes: "the +4h range on task_trigger_and_timing is the execution-correlation window"
+  dedup_decisions:
+    - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable (subject-identity pivot vs launch-mechanism pivot); emit both per AGENTS.md"
+      kept: both (Q11, Q12)
+    - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable; user-pivot degenerates under SYSTEM/service principals, svc substitute is the meaningful answer"
+      kept: both (Q13, Q14)
+  skipped_templates:
+    - template: cue_process_tool.mechanism_decode
+      reason: "replaced_by: scheduled_task.task_configuration (acted-on hint #1); Phase 2 mechanism_decode is superseded by the more specific task_configuration question (Q3)"
+    - template: universal.endpoint_protection_health
+      reason: "recommended-tier. Dropped under the 18-question cap. This is a persistence-install rule (SSH scheduled task), not an execution/credential-access rule whose disposition turns on whether AV/EDR was weakened first; defense_tampering technique set is not confirmed for this rule. Recorded here per the no-silent-drop requirement for universal questions."
+    - template: cue_host_context.precursor
+      reason: "recommended cue. Dropped under the 18-question cap to retain the must_include scheduled_task, lolbin, obfuscation templates and the non-deduplicable user_actor pairs. Prior-alert timeline context is lower priority than the persistence-specific task/registry/security coverage for this rule."
+    - template: cue_host_context.clustering
+      reason: "Dropped under the 18-question cap; host-wide clustering overlaps the user-actor clustering and persistence-scope questions already present."
+    - template: cue_process_tool.baseline
+      reason: "Dropped under cap; cue_process_tool.baseline_deviation (REFLECTED, rule-pattern-scoped) and lolbin.historical_lolbin_baseline give a more precise host baseline of the rule's specific firing pattern."
+    - template: cue_process_tool.follow_on
+      reason: "Dropped under cap; scheduled_task.task_trigger_and_timing already captures what the scheduler spawns after task creation, which is the load-bearing follow-on for this rule."
+    - template: cue_process_tool.clustering
+      reason: "Dropped under cap; cue_user_actor.clustering and persistence_scope.process_based_persistence cover surrounding activity."
+    - template: cue_process_tool.scope
+      reason: "Dropped under cap; lolbin.historical_lolbin_baseline (host) and cue_user_actor.clustering_svc (cross-host same-window) already provide rule-pattern fleet/host distribution."
+    - template: organizational_context.change_ticket
+      reason: "recommended-tier organizational question dropped under cap; the rule is not malware-prefixed but the SSH-tunnel install is operator-shaped and the human-recall/timing angle is lower priority than persistence-mechanism coverage."
+    - template: organizational_context.human_recall
+      reason: "recommended-tier; dropped under cap, see change_ticket."
+    - template: organizational_context.timing_alignment
+      reason: "recommended-tier; dropped under cap."
+    - template: organizational_context.procedural_consistency
+      reason: "recommended-tier; dropped under cap."
+    - template: persistence_scope.file_based_persistence
+      reason: "recommended-tier; dropped under cap. The registry_task_artifact custom question (Q8) and process_based_persistence (Q18) already cover the task's own persistence artifacts; Startup-folder file drops are a less-likely parallel mechanism for an SSH-tunnel install."
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "scheduled_task.task_configuration replaces cue_process_tool.mechanism_decode"
+      disposition: acted_on
+      reason: >-
+        Acted on — cue_process_tool.mechanism_decode skipped (see skipped_templates);
+        Phase 2 is carried by scheduled_task.task_configuration (Q3).
+    - hint: "LOLBin rule — check for renamed binary and other LOLBins achieving same objective"
+      disposition: acted_on
+      reason: >-
+        Acted on — lolbin.renamed_binary_check (Q16) and lolbin.technique_class_lateral
+        (Q15, adapted to tunneling/remote-access tools for the same C2 objective) and
+        lolbin.historical_lolbin_baseline (Q17) all included.
+    - hint: "logsource 'registry_set' (recommended by techniques: T1053.005) is not covered — pull in cue_registry_key.* or author a custom question with category: registry_set"
+      disposition: acted_on
+      reason: >-
+        Acted on — authored Q8 (attack:T1053.005.registry_task_artifact) querying
+        registry_set writes under the Task Scheduler TaskCache Tree/Tasks keys, the
+        registry artifacts a task registration leaves.
+    - hint: "logsource 'security' (recommended by techniques: T1053.005) is not covered and no template family exists — author a custom question with `category: security`"
+      disposition: acted_on
+      reason: >-
+        Acted on — authored Q7 (attack:T1053.005.security_task_creation) querying
+        security EventID 4698/4702 task-creation/modification events.
+    - hint: "Condition uses OR among selection groups: (selection_cli_sshd OR selection_cli_ssh). Q1 and the playbook description must frame this as EITHER ... OR ..., not X AND Y AND Z."
+      disposition: acted_on
+      reason: >-
+        Acted on — description and Q1 (verify_trigger_match) use disjunctive framing
+        (EITHER the sshd -f branch OR the ssh -i branch); Q1 context tells the analyst
+        to note which branch fired because it steers downstream weighting.
+  contextual_sets:
+    included: []
+    excluded:
+      - id: ransomware_impact
+        confidence: low
+        reason: "Keyword match on 'ransomware' comes from the reference intel, not the rule's detection logic. The rule fires on SSH-tunnel persistence install — a foothold-stage behavior. Encryption/impact questions would be speculative for an alert that fires at install time, well before any impact stage. Persistence and tunneling coverage is the correct investigative focus."
+      - id: network_scope
+        confidence: low
+        reason: "Same incidental 'ransomware' keyword origin. The rule has no network-connection detection fields; the SSH reverse-tunnel destination is investigated via the task command (Q3) and tunneling-tool sweep (Q15) rather than a generic network-scope set whose connection-clustering queries do not map to this process_creation rule's evidence."
+  technique_sets_applied:
+    - universal
+    - scheduled_task
+    - obfuscation
+    - persistence_scope
+    - lolbin
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 16
+      attack: 2
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 15
+    logsource_diversity:
+      process_creation: 16
+      security: 1
+      registry_set: 1

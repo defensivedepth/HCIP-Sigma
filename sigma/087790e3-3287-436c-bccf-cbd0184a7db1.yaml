@@ -1,0 +1,601 @@
+name: Potential CommandLine Path Traversal Via Cmd.EXE
+id: 777b87bf-a9a5-404d-b874-8dc07b55b484
+description: |
+  Detects cmd.exe invoked with an execution flag (/c, /k, or /r) where the command line also
+  contains a /../../ path-traversal sequence. cmd.exe first tries to resolve the whole argument
+  string as a single path; the ../ segments cancel out the leading command token, so the file the
+  traversal resolves to runs instead of the intended program. This lets an attacker who controls part
+  of a cmd.exe argument execute an arbitrary file anywhere on the same volume, regardless of extension
+  or PATH. Legitimate hits are rare and usually come from vendor tooling that builds relative paths
+  through ../ segments; investigation should establish what the traversal resolves to, what spawned
+  cmd.exe, and whether the activity fits the host's normal pattern.
+type: detection
+detection_id: 087790e3-3287-436c-bccf-cbd0184a7db1
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-04
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line show cmd.exe run with /c, /k, or /r and a /../../ path-traversal sequence?
+  context: Before investing investigation time, confirm the alert is a true positive. Review the parent
+    and child command lines for cmd.exe invoked with an execution flag (/c, /k, or /r) alongside a
+    /../../ sequence, and trace where the traversal resolves. The file the ../ segments resolve to is
+    what actually executes, not the command token before it.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+      - Image
+      - OriginalFileName
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run cmd.exe with relative path-traversal arguments?
+  context: Legitimate administrative or build activity can construct command lines with ../ segments.
+    Knowing whether the user role and host function normally involve cmd.exe wrappers that build
+    relative paths is often the fastest way to separate vendor tooling from argument hijacking.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What file does the path-traversal sequence actually resolve to, and what arguments wrap it?
+  context: The full command line reveals the resolved target. Walk the ../ segments back from the tail
+    of the string to determine the absolute path that cmd.exe will execute, then note any arguments
+    inserted between the leading command token and that path. The traversal can resolve to a file with
+    any extension, including one disguised as a non-executable, so the resolved path matters more than
+    the leading token.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains: '/../../'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+      - Image
+      - ParentImage
+- source: template:parent_child.parent_process_legitimacy
+  question: Is this parent expected to spawn cmd.exe with these arguments, and what started the parent?
+  context: The parent-child relationship is the core signal here. cmd.exe built with a traversal argument
+    is frequently assembled by an application that passes user-controlled input straight into a shell
+    string. Tracing the parent's own origin reveals whether the chain is a legitimate wrapper or an
+    application relaying attacker-influenced input into cmd.exe.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- source: template:parent_child.sibling_processes
+  question: What other child processes did the same parent spawn?
+  context: If the parent assembled one traversal command, it may have assembled others or spawned the
+    resolved payload directly. Examining sibling processes from the same parent reveals the full scope
+    of activity from that parent and whether multiple shell invocations were orchestrated together.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.follow_on
+  question: What child processes did this cmd.exe invocation spawn afterward?
+  context: The processes spawned after the traversal resolves reveal its actual impact. cmd.exe running
+    the path-traversed file may launch the resolved payload, which in turn spawns discovery, credential
+    access, or download tooling. Unexpected children are the clearest evidence the hijack executed
+    something other than the leading command token.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired this rule's pattern, what parents and users normally drive
+    it, and does the current alert fit?
+  context: Even routine tooling can build relative paths. The query mirrors the rule's selection structure
+    scoped to this host, so the resulting parent and user distribution reflects how this specific firing
+    pattern has historically run here. A new parent process, an unexpected user account, or an unusual
+    command-line shape is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - ParentImage|endswith: \cmd.exe
+      - Image|endswith: \cmd.exe
+      - OriginalFileName: cmd.exe
+      selection_flags:
+      - ParentCommandLine|contains:
+        - /c
+        - /k
+        - /r
+      - CommandLine|contains:
+        - /c
+        - /k
+        - /r
+      selection_path_traversal:
+      - ParentCommandLine: /../../
+      - CommandLine|contains: /../../
+      filter_java:
+        CommandLine|contains: \Tasktop\keycloak\bin\/../../jre\bin\java
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_* and not 1 of filter_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired this rule's pattern in the past week, and does the cross-host distribution
+    look like consistent automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the result is a
+    fleet-wide count of this firing pattern rather than generic cmd.exe usage. Many hosts firing the same
+    traversal pattern points to a shared application or vendor wrapper that builds relative paths; a
+    single host or a small unrelated set points to manual operator activity. Use the host distribution to
+    calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - ParentImage|endswith: \cmd.exe
+      - Image|endswith: \cmd.exe
+      - OriginalFileName: cmd.exe
+      selection_flags:
+      - ParentCommandLine|contains:
+        - /c
+        - /k
+        - /r
+      - CommandLine|contains:
+        - /c
+        - /k
+        - /r
+      selection_path_traversal:
+      - ParentCommandLine: /../../
+      - CommandLine|contains: /../../
+      filter_java:
+        CommandLine|contains: \Tasktop\keycloak\bin\/../../jre\bin\java
+      condition: all of selection_* and not 1 of filter_*
+    fields:
+    - host.name
+- source: template:cue_process_tool.baseline
+  question: Does this host normally run cmd.exe at all, and how often?
+  context: A baseline of cmd.exe execution on this host frames the traversal event. Zero or very low
+    historical counts indicate cmd.exe is itself unusual here, which raises the weight of any abnormal
+    argument shape. High counts mean the discriminator is the traversal pattern rather than the binary.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run cmd.exe across the environment?
+  context: Compare this user's current action against their historical behavior. A user who has never
+    driven cmd.exe execution is more suspicious than one who does so regularly. User role and typical
+    toolset should align with command-shell usage.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent and cmd.exe combination historically routine on this host or across the
+    environment, or is the parent unusual for cmd.exe?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: which parent process spawned cmd.exe, and whether that
+    pair is historically common. A new or rare parent for cmd.exe on this host or environment-wide is the
+    deviation worth chasing; a pair that already accounts for thousands of prior events is vendor or OS
+    automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity across
+    multiple endpoints. If the same user triggered similar shell activity on multiple hosts, the scope of
+    the activity may be larger than this single alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent and cmd.exe combination fire on other hosts in the same window?
+  context: Under a service principal, the user-pivot returns agent-telemetry noise because every host
+    runs service-owned processes constantly. The meaningful question is whether the same launch mechanism
+    fired elsewhere in the alert window. Multiple hosts in the same window points to scheduled or pushed
+    automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: 'Alerts rarely occur in isolation. Examining activity around the alert reveals the immediate
+    context: what led to this event, what happened after, and whether it is part of a larger sequence.
+    Look for reconnaissance, privilege escalation, or persistence mechanisms surrounding the cmd.exe
+    invocation.'
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in the hour before the
+    alert?
+  context: Tampering typically precedes payload execution. The query surfaces direct attempts to disable
+    AV/EDR services, flip Defender flags, add broad exclusions, clear logs, or patch AMSI/ETW. Zero rows
+    is a useful signal that protection looks healthy; populated rows shift the disposition toward operator
+    preparation, so review the parent process and signing chain to identify the writer.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host such as defense
+    tampering, reconnaissance, or credential access may reveal the attack stages that preceded this event
+    and help reconstruct the timeline leading up to the cmd.exe invocation.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1059.003
+      name: Windows Command Shell
+      role: primary
+    - id: T1059
+      name: Command and Scripting Interpreter
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: shell_invocation
+      description: cmd.exe invoked with an execution flag (/c, /k, /r) carrying a path-traversal argument
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: argument_confusion_decode
+      description: The /../../ segments cancel the leading command token so the resolved path executes instead
+      mapped_to: Q3
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 3
+      label: parent_invocation
+      description: Parent application assembles cmd.exe command line, often relaying user-controlled input
+      mapped_to: Q4
+      source: template:parent_child.parent_process_legitimacy
+    - stage: 4
+      label: payload_execution
+      description: cmd.exe runs the path-traversed file, which may spawn follow-on tooling
+      mapped_to: Q6
+      source: template:cue_process_tool.follow_on
+  dimension_coverage:
+    - dimension: command_analysis
+      technique: T1059.003
+      covered_by: Q3
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1059.003
+      covered_by: Q4
+      source: template:parent_child.parent_process_legitimacy
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1059.003
+      covered_by: Q13
+      source: template:cue_host_context.clustering
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1059.003
+      covered_by: Q3
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: partial
+    - dimension: user_context
+      technique: T1059.003
+      covered_by: Q10
+      source: template:cue_user_actor.baseline
+      coverage_type: direct
+  mutable_dispositions:
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: rationale only
+      disposition: new_question
+      target_question: Q4
+      notes: Parent legitimacy and origin chain covered by parent_child.parent_process_legitimacy; baseline_svc/clustering_svc pivot on the parent+binary pair.
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: rationale only
+      disposition: context
+      target_question: Q13
+      notes: Non-working-hours framing carried in host-context clustering and precursor; not directly queryable.
+    - element: CommandLinePattern
+      dimension: command_analysis
+      specific_values: "/c, /k, /r flags and /../../ traversal"
+      disposition: query_injection
+      target_question: Q3
+      notes: mechanism_decode scoped with CommandLine|contains '/../../' to surface every traversal invocation on the host; verify_trigger_match (Q1) shows the exact flags.
+    - element: ScriptStoragePath
+      dimension: tuning_parameter
+      specific_values: "%TEMP%, C:\\Users\\Public, external drives"
+      disposition: context
+      target_question: Q3
+      notes: Resolved-path analysis in mechanism_decode directs the analyst to the absolute path the traversal resolves to; no batch-file selection in this rule.
+    - element: UserContext
+      dimension: user_context
+      specific_values: rationale only
+      disposition: new_question
+      target_question: Q10
+      notes: Admin-vs-baseline framing in user_actor baseline (Q10) and host_user_context (Q2).
+  dedup_decisions:
+    - dropped: cue_process_tool.process_chain
+      reason: "parent_process cue active and brief hint directs dropping it — parent_child.parent_process_legitimacy subsumes parent lookup"
+      kept: parent_child.parent_process_legitimacy
+    - dropped: cue_parent_process.mechanism_decode
+      reason: "parent_child technique set active — parent_process_legitimacy is the more specific parent question"
+      kept: parent_child.parent_process_legitimacy
+    - dropped: cue_parent_process.baseline
+      reason: "redundant with cue_user_actor.baseline_svc parent+binary baseline and parent_child.parent_process_legitimacy"
+      kept: cue_user_actor.baseline_svc
+    - dropped: none
+      reason: "user_actor pair — non-deduplicable (baseline + baseline_svc, clustering + clustering_svc emitted as distinct identity/mechanism pivots)"
+      kept: cue_user_actor.baseline / cue_user_actor.baseline_svc / cue_user_actor.clustering / cue_user_actor.clustering_svc
+  skipped_templates:
+    - template: cue_process_tool.clustering
+      reason: "host-wide tool clustering duplicates cue_host_context.clustering (same host+window process_creation aggregation); host_context version kept"
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "logsource 'image_load' (recommended by techniques: T1059.003) is not covered — pull in cue_image_load.* or author a custom question with `category: image_load`"
+      disposition: declined
+      reason: >-
+        This rule's entire detection is a command-line string property: cmd.exe
+        with /c|/k|/r plus a /../../ traversal sequence. The argument-confusion
+        behavior leaves no distinguishing image_load artifact — cmd.exe loads its
+        normal DLLs whether or not the argument string contains a traversal, and
+        the hijacked target executes as a child process_creation event, not as a
+        module load into cmd.exe. image_load on cmd.exe would return volume with
+        no traversal-specific signal. The investigative pivot for the resolved
+        payload is the follow-on child process (Q6, process_creation), not a
+        module load. No compensating attack:T1059.003.image_load question authored.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - parent_child
+  generation_stats:
+    total_questions: 16
+    source_counts:
+      template: 16
+      attack: 0
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 13
+    logsource_diversity:
+      process_creation: 15
+      sigma_alert: 1

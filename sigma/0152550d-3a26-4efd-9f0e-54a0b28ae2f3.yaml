@@ -1,0 +1,665 @@
+name: Detection of PowerShell Execution via Sqlps.exe
+id: ae0907e1-d257-4005-8c40-f864c704af3b
+description: |
+  Detects use of sqlps.exe, the Microsoft-signed SQL Server PowerShell host, as a
+  living-off-the-land PowerShell interpreter. The rule fires when EITHER a process is
+  spawned by sqlps.exe, OR sqlps.exe itself runs under a parent other than the SQL Server
+  Agent (sqlagent.exe) — the SQL Agent path being the one legitimate automation excluded
+  by the rule. Because sqlps.exe is a pre-v5 PowerShell mini-shell, it runs PowerShell
+  without Script Block or Module Logging and is missed by detections that key on
+  powershell.exe, which makes it useful for evading PowerShell-specific controls. The
+  binary is present only where SQL Server tooling is installed, so its appearance on a
+  non-DBA host is itself notable. Investigation should confirm which branch fired, decode
+  any PowerShell the host ran, and check for the engine-assembly load, payload drops, child
+  tools, and outbound connections that separate abuse from a DBA's interactive session.
+type: detection
+detection_id: 0152550d-3a26-4efd-9f0e-54a0b28ae2f3
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-04
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the alert match the rule — either a process spawned by sqlps.exe, or sqlps.exe itself running under a parent other than sqlagent.exe?
+  context: The rule has two branches, and which one fired shapes the rest of the
+    investigation. Confirm the details. A ParentImage ending in sqlps.exe means the alert
+    is a child that sqlps.exe launched. An Image (or OriginalFileName) of sqlps.exe with a
+    parent that is not sqlagent.exe means sqlps.exe ran directly outside the legitimate SQL
+    Agent path. The SQL Server Agent launching sqlps.exe is the excluded benign case, so a
+    different parent is the discriminating signal.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - OriginalFileName
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run SQL Server PowerShell tooling?
+  context: sqlps.exe ships only with SQL Server components, and legitimate use is almost
+    always a DBA running PowerShell against a SQL Server instance. On a server managed by a
+    database administrator, this can be routine; on a general workstation or under an
+    account with no DBA role, it is hard to explain. Aligning the user role and host
+    function with database administration is often the fastest triage step.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:powershell.encoded_command_decode
+  question: Was the PowerShell command encoded or obfuscated, and what does it decode to?
+  context: sqlps.exe runs arbitrary PowerShell through its -Command argument, the same
+    primitive as powershell.exe. Look for -EncodedCommand / -enc base64 blobs, string
+    concatenation, backtick escaping, and download cradles (IEX, Invoke-Expression,
+    Net.WebClient.DownloadString, Invoke-WebRequest, Reflection.Assembly.Load). Decoding
+    reveals the actual payload — a download cradle, reverse shell, or in-memory .NET
+    execution. Plain interactive use with no script argument points away from abuse.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:parent_child.parent_process_legitimacy
+  question: What started sqlps.exe, and is that parent expected to launch it?
+  context: The rule already excludes the one routine launcher, sqlagent.exe. Tracing what
+    actually spawned sqlps.exe (and what spawned that) shows whether this came from an
+    interactive DBA session, a scheduled job, or an unexpected chain such as a script host,
+    Office application, or remote-execution tool. A parent that is itself a scripting or
+    proxy binary moves this toward deliberate LOLBin use.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- source: template:parent_child.sibling_processes
+  question: What other child processes did the same parent spawn around this time?
+  context: If the parent that launched this process also launched others, those siblings
+    reveal the wider activity from that parent. Multiple unrelated tools spawned by the
+    same parent in a short window points to orchestration rather than a single benign
+    action.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in the hour before the alert?
+  context: A PowerShell host chosen specifically to evade logging is often paired with
+    attempts to weaken other protection. This surfaces direct attempts to disable AV/EDR
+    services, flip Defender flags, add exclusions, clear logs, or patch AMSI/ETW. Zero rows
+    is a useful "protection looks healthy" signal; populated rows shift the disposition
+    toward deliberate operator preparation — review the writer's parent process and signing
+    chain.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+- source: template:powershell.script_block_logging
+  question: Did PowerShell script block logging capture any script content for this session?
+  context: Script block logging (Event ID 4104) records the deobfuscated script PowerShell
+    actually ran. The reason sqlps.exe is abused is that its pre-v5 mini-shell predates the
+    4104 logging surface, so a genuine sqlps-hosted session frequently produces no 4104
+    events at all. Treat an empty result here as expected for this binary and a visibility
+    gap, not as evidence nothing ran; any 4104 content that does appear is ground truth
+    worth reading closely.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- source: template:powershell.powershell_security_bypass
+  question: Were PowerShell or AV controls bypassed or weakened shortly before this execution?
+  context: Operators often weaken controls just before running a payload — AMSI bypass,
+    an execution-policy change (-ExecutionPolicy Bypass or -ep bypass), or a downgrade to
+    PowerShell v2 which lacks logging. sqlps already sidesteps script-block logging, so a
+    paired AMSI or policy bypass in the preceding window strengthens the case that the
+    session was chosen for evasion rather than administration.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- source: attack:T1059.001.image_load
+  question: Did sqlps.exe load the PowerShell engine assembly, confirming it hosted a PowerShell session?
+  context: sqlps.exe runs PowerShell by loading System.Management.Automation.dll, the
+    PowerShell engine, into a process that is not powershell.exe — the load pattern that
+    companion detections key on. Confirming the engine assembly loaded establishes that
+    PowerShell actually executed through sqlps even when no 4104 script-block events were
+    written. A module loaded from a user-writable or non-standard path alongside it would
+    additionally suggest DLL side-loading.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith: '\sqlps.exe'
+        ImageLoaded|endswith: '\System.Management.Automation.dll'
+      condition: selection
+    fields:
+      - ImageLoaded
+- source: attack:T1127.network_connection
+  question: Did sqlps.exe make outbound network connections around the time of the alert?
+  context: A signed-utility PowerShell host is commonly used to pull a second-stage payload
+    or reach command-and-control. Outbound connections from sqlps.exe — especially to a
+    rare or newly seen external destination — corroborate a download-cradle or C2 reading.
+    A DBA session against a local SQL Server instance typically talks only to internal
+    database endpoints, so external egress is the notable case.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith: '\sqlps.exe'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+- source: attack:T1127.file_event
+  question: Did sqlps.exe write any executable or script files to user-writable paths?
+  context: One T1127 chain stage is a signed utility writing and then running a new payload
+    from a user-writable location. Files dropped by sqlps.exe — particularly under TEMP,
+    APPDATA, ProgramData, or the public profile, or with executable or script extensions —
+    are the artifact of a download or staging step. A DBA session normally writes only SQL
+    output or scripts to expected working directories.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith: '\sqlps.exe'
+      condition: selection
+    fields:
+      - TargetFilename
+- source: template:cue_parent_process.follow_on
+  question: What child processes did sqlps.exe spawn, and are any of them non-SQL tools?
+  context: When sqlps.exe is abused, the PowerShell it hosts frequently spawns other
+    binaries — cmd.exe, powershell.exe, rundll32.exe, regsvr32.exe, wscript.exe, mshta.exe,
+    or reconnaissance tools like nslookup.exe. Any of these as a child of sqlps.exe is hard
+    to attribute to routine database administration and points to the host being used as an
+    execution launchpad.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        process.parent.name|endswith: sqlps.exe
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.baseline
+  question: Does this host normally run sqlps.exe?
+  context: sqlps.exe is present only where SQL Server tooling is installed and is normally
+    run only by database administrators. A host with little or no history of sqlps.exe
+    execution — especially one not expected to carry SQL Server components — makes this
+    execution stand out. Zero or very low historical counts indicate first-time or rare use.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run SQL Server PowerShell tooling?
+  context: Compare the account's current action against its history. A database
+    administrator who routinely runs sqlps.exe across managed servers is a different
+    picture from an account that has never touched SQL Server tooling. Zero or very low
+    counts, combined with what is known about the user's role, indicate the activity is out
+    of pattern for this account.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent-and-binary combination historically routine on this host or across the environment, or is the parent unusual for this binary?
+  context: When the alert fires under a service principal (SYSTEM, LOCAL SERVICE, NETWORK
+    SERVICE, or a computer account), user identity does not attribute the behavior. The
+    meaningful pivot is the launch mechanism — which parent spawned this binary and whether
+    that pair is historically common. A new or rare parent for this binary is the deviation
+    worth chasing; a pair that already accounts for thousands of events is established
+    automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the environment around this time?
+  context: Tracking the account's activity across all hosts in the surrounding window
+    reveals lateral movement or coordinated activity on multiple endpoints. If the same
+    user triggered similar tooling elsewhere, the scope is larger than this one host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent-and-binary combination fire on other hosts in the same window, or is it isolated to this host?
+  context: Under a service principal, "what else did this user do" returns agent-telemetry
+    noise because every host runs SYSTEM-owned agents constantly. The meaningful question is
+    whether the same launch mechanism — parent process plus spawned binary — fired on other
+    hosts in the alert window. Multiple hosts point to scheduled or pushed automation; a
+    single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host —
+    reconnaissance, defense tampering, or credential access — may reveal the stages that
+    preceded this execution and help reconstruct the timeline. A LOLBin PowerShell host is
+    often a mid-chain step rather than the start.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1059.001
+      name: Command and Scripting Interpreter - PowerShell
+      role: primary
+    - id: T1127
+      name: Trusted Developer Utilities Proxy Execution
+      role: secondary
+    - id: T1059
+      name: Command and Scripting Interpreter
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: lolbin_invocation
+      description: "sqlps.exe is invoked as a PowerShell host outside the legitimate SQL Agent path (or spawns a child) — the detection point"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: command_decode
+      description: "Decode the PowerShell the host ran — encoded command, obfuscation, or download cradle"
+      mapped_to: Q3
+      source: template:powershell.encoded_command_decode
+    - stage: 3
+      label: engine_assembly_load
+      description: "System.Management.Automation.dll loads into sqlps.exe, confirming PowerShell hosting even when 4104 is absent"
+      mapped_to: Q9
+      source: attack:T1059.001.image_load
+    - stage: 4
+      label: follow_on_execution
+      description: "Follow-on activity — child tools spawned, payload files written, outbound connections"
+      mapped_to: Q12
+      source: template:cue_parent_process.follow_on
+  dimension_coverage:
+    - dimension: command_analysis
+      technique: T1059.001
+      covered_by: Q3
+      source: template:powershell.encoded_command_decode
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1059.001
+      covered_by: Q4
+      source: template:parent_child.parent_process_legitimacy
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1127
+      covered_by: Q8
+      source: template:powershell.powershell_security_bypass
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1059.001
+      covered_by: Q9
+      source: attack:T1059.001.image_load
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1059
+      covered_by: Q14
+      source: template:cue_user_actor.baseline
+      coverage_type: direct
+  mutable_dispositions:
+    - element: CommandLinePattern
+      dimension: command_analysis
+      specific_values: "-enc, -nop, IEX, Invoke-Expression, Net.WebClient.DownloadString"
+      disposition: context
+      target_question: Q3
+      notes: "Cradle/encoding indicators named in encoded_command_decode context; query is the KEEP_EXACT ProcessGuid lookup that returns the full CommandLine for decoding."
+    - element: LoadedModuleList
+      dimension: tuning_parameter
+      specific_values: "System.Management.Automation.dll (PowerShell engine into non-powershell.exe host)"
+      disposition: new_question
+      target_question: Q9
+      notes: "Authored attack:T1059.001.image_load with ImageLoaded|endswith System.Management.Automation.dll — the canonical sqlps companion signature (act-on for the image_load logsource hint)."
+    - element: ScriptBlockLengthThreshold
+      dimension: tuning_parameter
+      specific_values: "EID 4104 script-block content"
+      disposition: context
+      target_question: Q7
+      notes: "script_block_logging (KEEP_EXACT) covers 4104; context adapted to warn that sqlps's pre-v5 shell often produces no 4104 at all, so empty is expected."
+    - element: SuspiciousChildList
+      dimension: parent_process_analysis
+      specific_values: "powershell.exe, cmd.exe, rundll32.exe, regsvr32.exe, wscript.exe, mshta.exe, nslookup.exe"
+      disposition: context
+      target_question: Q12
+      notes: "follow_on adapted to scope process.parent.name to sqlps.exe; the suspicious-child list is named in context to direct the analyst."
+    - element: RarePathRegex
+      dimension: tuning_parameter
+      specific_values: "%TEMP%, %APPDATA%, ProgramData, public profile"
+      disposition: context
+      target_question: Q11
+      notes: "Named in attack:T1127.file_event context as the user-writable drop locations to weigh."
+    - element: NetworkReputationThreshold
+      dimension: tuning_parameter
+      specific_values: "rare/newly-seen external destination"
+      disposition: context
+      target_question: Q10
+      notes: "Reflected in attack:T1127.network_connection context (external/rare destination is the notable case)."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "0-30m util->payload->egress; off-hours"
+      disposition: context
+      target_question: Q8
+      notes: "The -1h/+/-15m windows on the bypass, file_event, and network questions bracket the utility->payload->egress sequence."
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "rationale only (abnormal parents)"
+      disposition: context
+      target_question: Q4
+      notes: "parent_process_legitimacy traces the launcher and contrasts it with the excluded sqlagent.exe path."
+  dedup_decisions:
+    - dropped: cue_parent_process.mechanism_decode
+      reason: "parent_child technique set active — parent_process_legitimacy is the more specific parent lookup (per AGENTS.md dedup rule)"
+      kept: parent_child.parent_process_legitimacy
+    - dropped: cue_process_tool.mechanism_decode
+      reason: "within-phase dedup — powershell.encoded_command_decode is the more specific Phase 2 decode for a PowerShell host (technique set preferred over cue)"
+      kept: powershell.encoded_command_decode
+    - dropped: cue_parent_process.clustering
+      reason: "near-duplicate of cue_parent_process.follow_on (parent-scoped activity on host); follow_on retained and adapted to sqlps.exe children"
+      kept: cue_parent_process.follow_on
+    - dropped: cue_parent_process.scope
+      reason: "near-identical query to cue_user_actor.clustering_svc (process.parent.name + Image|endswith, cross-host aggregation by host.name)"
+      kept: cue_user_actor.clustering_svc
+    - dropped: cue_parent_process.baseline
+      reason: "near-identical query to cue_user_actor.baseline_svc (process.parent.name + Image|endswith historical aggregation); baseline_svc is a mandatory service-principal pair"
+      kept: cue_user_actor.baseline_svc
+    - dropped: cue_host_context.clustering
+      reason: "trimmed to stay within the 14-18 budget; host situational awareness covered by follow_on (sqlps children) and precursor (prior alerts)"
+      kept: cue_host_context.precursor
+  skipped_templates:
+    - template: obfuscation.encoded_payload_decode
+      reason: "hint: powershell.encoded_command_decode replaces obfuscation.encoded_payload_decode for PowerShell rules"
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "Condition has nested structure that the topology decomposer could not fully flatten. Read rule.detection.condition by hand and verify Q1 framing reflects the actual logical shape — see rule.condition_topology.raw"
+      disposition: declined
+      reason: >-
+        Not declined as in "ignored" — acted on, recorded here because there is no
+        separate query/template change to point to. Read the raw condition by hand:
+        selection_parent OR (selection_image AND NOT filter_image). Q1 and the
+        description use disjunctive framing — "either a process spawned by sqlps.exe, or
+        sqlps.exe itself under a parent other than sqlagent.exe" — and Q4 builds on the
+        sqlagent.exe exclusion explicitly. No flat-AND misframing.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - powershell
+    - parent_child
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 15
+      attack: 3
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 15
+    logsource_diversity:
+      process_creation: 13
+      powershell: 1
+      image_load: 1
+      network_connection: 1
+      file_event: 1
+      sigma_alert: 1

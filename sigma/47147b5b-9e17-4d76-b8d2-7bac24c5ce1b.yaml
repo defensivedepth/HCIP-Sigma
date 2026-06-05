@@ -1,0 +1,667 @@
+name: Potential Browser Data Stealing
+id: af7da3c7-58ae-4247-842c-7745149255eb
+description: |
+  Detects a copy or move operation that targets a web browser's User Data
+  directory, where browsers store saved credentials in an encrypted credential
+  store. The rule fires only when a single process matches all of two
+  conditions: the command line contains a copy or move verb (copy-item, copy,
+  cpi, cp, move, move-item, mi, mv) OR the image is esentutl.exe, xcopy.exe, or
+  robocopy.exe by name or OriginalFileName, AND the command line references a
+  known browser profile path such as Google\Chrome\User Data,
+  Microsoft\Edge\User Data, or Mozilla\Firefox\Profiles. Copying the locked
+  credential SQLite database (often via esentutl /y to bypass the file lock) is
+  a common precursor to offline credential extraction. Some backup, migration,
+  and profile-sync workflows legitimately copy these files, so the investigation
+  should confirm which browser store was targeted, which tool performed the
+  copy and from where, what happened to the copied database, and whether the
+  same pattern appears on the host or across the fleet.
+type: detection
+detection_id: 47147b5b-9e17-4d76-b8d2-7bac24c5ce1b
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line contain both a copy or move verb and a browser
+    User Data path, matching what this rule detects?
+  context: Before investing investigation time, confirm the alert is a true positive.
+    The rule fires only when both conditions hold together - the command line carries
+    a copy or move verb (copy-item, copy, cpi, cp, move, move-item, mi, mv) or runs
+    esentutl.exe, xcopy.exe, or robocopy.exe, AND the command line references a known
+    browser profile directory such as Google\Chrome\User Data, Microsoft\Edge\User
+    Data, or Mozilla\Firefox\Profiles. Read the exact command line and confirm both
+    halves are present, and note which browser store and which destination path were
+    specified.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to copy browser profile databases?
+  context: Copying a browser User Data directory is normal for a narrow set of backup,
+    profile-migration, and IT-imaging workflows. Most users and most endpoints never
+    copy another process's credential store. Knowing whether the acting account and
+    the host function involve profile management or endpoint provisioning is often
+    the fastest path to separating a benign migration from credential theft staging.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:credential_access.credential_target_identification
+  question: Which browser credential store was targeted, and which profile and file
+    were copied?
+  context: Different browsers store credentials in different files - Chromium-family
+    browsers (Chrome, Edge, Brave, Opera, Vivaldi) keep saved logins in the Login
+    Data SQLite database under User Data, while Firefox uses key4.db and logins.json
+    under its Profiles directory. Read the full command line to identify which browser
+    profile path was referenced and which specific file was copied. The targeted store
+    determines which saved website credentials may now be exposed and whose accounts
+    should be reset.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:cue_artifact.mechanism_decode
+  question: Confirm the copied file is a browser credential database - decode the source
+    and destination paths in the command line.
+  context: The command line references both the browser store being read and the
+    destination the copy is written to. Decode both paths to confirm the source is a
+    credential file (Login Data, key4.db, logins.json) rather than an unrelated profile
+    artifact, and note where the copy landed - a staging directory such as a temp
+    folder, a user profile, or a removable drive. esentutl /y is frequently used here
+    because it copies files that are locked by a running browser, so its presence
+    indicates an attempt to read a credential store while the browser is open.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: attack:T1555.003.process_access
+  question: Did any non-browser process open a handle to a browser process or its
+    credential files around the time of the alert?
+  context: Some credential-theft tooling reads the browser credential store directly
+    from memory or via a handle to the browser process rather than copying the file
+    on disk, then calls CryptUnprotectData to decrypt the stored secrets. Process-access
+    events show one process opening another with read access. A non-browser process
+    opening a Chromium or Firefox process, or touching the credential file, in the
+    same window as the copy operation indicates the copy was part of an active
+    credential-extraction effort rather than an isolated file operation.
+  range: +/-10m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_access
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      filter_browser:
+        SourceImage|endswith:
+          - '\chrome.exe'
+          - '\msedge.exe'
+          - '\firefox.exe'
+          - '\brave.exe'
+          - '\opera.exe'
+      condition: selection and not filter_browser
+    fields:
+      - SourceImage
+      - TargetImage
+      - GrantedAccess
+- source: template:universal.evidence_preservation
+  question: Is the copied browser credential database still on disk for analysis?
+  context: The copy operation writes the browser credential store to a destination
+    path. If that copied file still exists, it can be hashed, its contents reviewed,
+    and the scope of exposed credentials assessed. If it has already been deleted or
+    moved off the host, that itself indicates staging for exfiltration and narrows the
+    window for recovery from backups or shadow copies.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: template:cue_process_tool.process_chain
+  question: What process spawned this copy operation, and is that parent chain expected?
+  context: The parent process reveals how the copy was invoked. A user-driven backup
+    usually shows explorer.exe or an interactive shell launched by the user; an
+    unexpected parent such as a script host, a remote-administration tool, or a process
+    running under an automation account points to scripted credential collection rather
+    than a manual file copy. The parent is where the decision to read the browser store
+    was made.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:credential_access.credential_exposure_assessment
+  question: Which accounts may be exposed, and do any browser profiles belong to
+    privileged or shared users?
+  context: The severity of browser credential theft depends on what was saved in the
+    targeted profile. A standard user's personal browser logins differ sharply from a
+    profile belonging to an administrator, a shared kiosk account, or a workstation
+    used for privileged management, where saved credentials may include access to
+    internal consoles, cloud portals, or VPNs. Identify whose profile was copied and
+    cross-reference the account against directory group memberships to decide whether
+    a credential reset and escalation are warranted.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:credential_access.post_access_lateral_movement
+  question: Were any new logon sessions or remote connections initiated after this
+    event?
+  context: Stolen browser credentials are typically reused to access other systems or
+    cloud services. New logon events or outbound remote connections shortly after the
+    credential store was copied indicate the harvested secrets are already being
+    exercised. Look for sessions or alerts on this host in the hours following the copy
+    that point to authentication with the exposed accounts.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - rule.name
+      - rule.uuid
+      - event.severity_label
+- source: template:cue_user_actor.baseline
+  question: Does this user normally copy browser profile databases?
+  context: Compare the acting account against its own history. An IT or migration
+    engineer may copy browser profiles routinely as part of provisioning work; an
+    account that has never done so suddenly reading a browser credential store is more
+    notable. The user role and typical toolset should align with profile management
+    for the activity to read as routine.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        CommandLine|contains:
+          - \Google\Chrome\User Data
+          - \Microsoft\Edge\User Data
+          - \Mozilla\Firefox\Profiles
+          - \BraveSoftware\Brave-Browser\User Data
+          - \Opera Software\Opera Stable\
+          - \Vivaldi\User Data
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent process and browser-profile-copy command-line pattern
+    historically routine on this host or across the environment, or is the parent
+    unusual for it?
+  context: When the alert fires under a service principal, user identity does not
+    attribute the behavior; the meaningful pivot is which parent process launched a
+    child that copies a browser User Data path and whether that pairing is historically
+    common. A new or rare parent for this pattern is the deviation worth chasing, while
+    a parent that already accounts for many prior events is more likely a backup agent
+    or imaging pipeline.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        CommandLine|contains:
+          - \Google\Chrome\User Data
+          - \Microsoft\Edge\User Data
+          - \Mozilla\Firefox\Profiles
+          - \BraveSoftware\Brave-Browser\User Data
+          - \Opera Software\Opera Stable\
+          - \Vivaldi\User Data
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the acting account's activity across all hosts reveals whether the
+    browser-store copy was a single event or part of activity spanning multiple
+    endpoints. If the same user copied credential stores or ran related tooling on
+    other hosts, the scope of the incident is larger than one machine.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent process and browser-profile-copy pattern fire on other
+    hosts in the same window, indicating a coordinated collection rather than isolated
+    activity?
+  context: Under a service principal, asking what else the user did across the network
+    returns agent-telemetry noise, since every host runs system-owned agents constantly.
+    The meaningful question is whether the same launch mechanism - a parent process
+    spawning a child that copies a browser User Data path - fired on other hosts in the
+    alert window. Multiple hosts in the same window points to scripted or pushed
+    collection; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        CommandLine|contains:
+          - \Google\Chrome\User Data
+          - \Microsoft\Edge\User Data
+          - \Mozilla\Firefox\Profiles
+          - \BraveSoftware\Brave-Browser\User Data
+          - \Opera Software\Opera Stable\
+          - \Vivaldi\User Data
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining the activity surrounding the
+    browser-store copy reveals what led to it and what followed - reconnaissance of
+    other credential sources, archiving of the copied data, or outbound transfer.
+    Novel parent-child pairs at low counts are what to scan for against the high-count
+    noise of routine system processes.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host - reconnaissance, defense tampering, or
+    other credential access - may reveal the attack stages that preceded the browser
+    credential theft and help reconstruct the full timeline. Credential collection is
+    often a mid-stage action, so prior alerts give context for how the actor reached
+    the point of reading saved browser logins.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:lolbin.renamed_binary_check
+  question: Was the copy tool executed from an expected system path?
+  context: esentutl.exe, xcopy.exe, and robocopy.exe normally live in System32 or
+    SysWOW64. The same binary running from a user-writable directory such as a temp
+    folder, Downloads, or a profile path may have been copied or renamed to evade
+    path-based allowlists, which is more consistent with operator tooling than with a
+    routine administrative copy. Compare the image path and OriginalFileName from the
+    alert against the expected location.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- source: template:lolbin.technique_class_lateral
+  question: Were any other copy or download utilities used to stage data on this host
+    recently?
+  context: An operator who copies one browser store often collects from several
+    credential sources using whatever copy and download utilities are already present.
+    Finding other copy or transfer LOLBins running on the host in the same period -
+    particularly against credential stores, archives, or staging directories -
+    strengthens the case that this is deliberate collection rather than a one-off
+    profile copy.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_img:
+        Image|endswith:
+          - '\certutil.exe'
+          - '\bitsadmin.exe'
+          - '\curl.exe'
+          - '\xcopy.exe'
+          - '\robocopy.exe'
+          - '\expand.exe'
+          - '\extrac32.exe'
+          - '\makecab.exe'
+          - '\replace.exe'
+          - '\diskshadow.exe'
+      condition: selection and selection_img
+    fields:
+      - Image
+      - CommandLine
+- source: template:lolbin.historical_lolbin_baseline
+  question: How often has this host fired the rule's browser-store copy pattern over
+    the past 90 days, and what command-line shapes are typical?
+  context: A browser-profile-copy pattern with no prior history on a host is more
+    suspicious than one used regularly under stable parents - for example a recurring
+    backup job. This query mirrors the rule's selection structure scoped to this host,
+    so the resulting count reflects the rule's specific firing pattern rather than
+    generic copy activity. The CommandLine projection lets the analyst compare typical
+    invocation shapes against the alerting one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_cmd:
+      - CommandLine|contains:
+        - copy-item
+        - 'copy '
+        - 'cpi '
+        - ' cp '
+        - 'move '
+        - move-item
+        - ' mi '
+        - ' mv '
+      - Image|endswith:
+        - \esentutl.exe
+        - \xcopy.exe
+        - \robocopy.exe
+      - OriginalFileName:
+        - esentutl.exe
+        - XCOPY.EXE
+        - robocopy.exe
+      selection_path:
+        CommandLine|contains:
+        - \Amigo\User Data
+        - \BraveSoftware\Brave-Browser\User Data
+        - \CentBrowser\User Data
+        - \Chromium\User Data
+        - \CocCoc\Browser\User Data
+        - \Comodo\Dragon\User Data
+        - \Elements Browser\User Data
+        - \Epic Privacy Browser\User Data
+        - \Google\Chrome Beta\User Data
+        - \Google\Chrome SxS\User Data
+        - \Google\Chrome\User Data\
+        - \Kometa\User Data
+        - \Maxthon5\Users
+        - \Microsoft\Edge\User Data
+        - \Mozilla\Firefox\Profiles
+        - \Nichrome\User Data
+        - \Opera Software\Opera GX Stable\
+        - \Opera Software\Opera Neon\User Data
+        - \Opera Software\Opera Stable\
+        - \Orbitum\User Data
+        - \QIP Surf\User Data
+        - \Sputnik\User Data
+        - \Torch\User Data
+        - \uCozMedia\Uran\User Data
+        - \Vivaldi\User Data
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - CommandLine
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1555.003
+      name: Credentials from Web Browsers
+      role: primary
+    - id: T1555
+      name: Credentials from Password Stores
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: store_access_copy
+      description: "A non-browser process copies a browser credential database out of the User Data directory, the act the rule detects"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: store_identification_decode
+      description: "Identify which browser credential store and file were targeted and confirm the copied artifact is a credential database"
+      mapped_to: Q3
+      source: template:credential_access.credential_target_identification
+    - stage: 3
+      label: memory_or_api_access
+      description: "Correlate the file copy with direct process access to the browser process or credential file (CryptUnprotectData / memory read path) in the same window"
+      mapped_to: Q5
+      source: attack:T1555.003.process_access
+    - stage: 4
+      label: credential_reuse
+      description: "Correlate post-copy logons / remote connections with reuse of the harvested browser credentials"
+      mapped_to: Q9
+      source: template:credential_access.post_access_lateral_movement
+  dimension_coverage:
+    - dimension: file_path_analysis
+      technique: T1555.003
+      covered_by: Q3
+      source: template:credential_access.credential_target_identification
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1555.003
+      covered_by: Q5
+      source: attack:T1555.003.process_access
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1555.003
+      covered_by: Q4
+      source: template:cue_artifact.mechanism_decode
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1555
+      covered_by: Q3
+      source: template:credential_access.credential_target_identification
+      coverage_type: indirect
+    - dimension: user_context
+      technique: T1555
+      covered_by: Q2
+      source: template:universal.host_user_context
+      coverage_type: direct
+  mutable_dispositions:
+    - element: MonitoredPaths
+      dimension: file_path_analysis
+      specific_values: "Chrome Login Data, Edge Credential Locker, Firefox key4.db/logins.json under browser User Data / Profiles paths"
+      disposition: query_injection
+      target_question: Q5
+      notes: >-
+        Browser profile paths are already enforced by the rule's selection_path block.
+        The credential-store file names (Login Data, key4.db, logins.json) are injected
+        into Q3 and Q4 context for the analyst to confirm against the command line.
+        The browser-process image list is injected into the Q5 process_access query
+        (filter_browser) and the Q10-Q13 user_actor pattern selections use the browser
+        User Data paths directly.
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only (correlation window between file read and process memory/API access)"
+      disposition: context
+      target_question: Q5
+      notes: >-
+        No concrete window value in the analytic. Realized as the +/-10m range on the
+        Q5 process_access correlation question, which pairs the copy with handle-open
+        access to the browser process.
+    - element: TargetProcesses
+      dimension: tuning_parameter
+      specific_values: "rationale only (e.g., lsass.exe, svchost.exe)"
+      disposition: context
+      target_question: Q5
+      notes: >-
+        T1555 target-process list is browser-specific here (the rule targets browser
+        stores, not LSASS). Realized as the browser-process filter list in the Q5
+        process_access query rather than the generic LSASS list.
+    - element: KeywordPatterns
+      dimension: tuning_parameter
+      specific_values: "rationale only (dpapi, credman, mimikatz regex)"
+      disposition: context
+      target_question: Q4
+      notes: >-
+        Generic credential-tooling keyword regex; not the pattern this rule fires on
+        (rule fires on copy verb + browser path). Realized as the CryptUnprotectData /
+        esentutl /y decode framing in Q4 and Q5 context, which is the relevant
+        browser-store decryption mechanism.
+  dedup_decisions:
+    - dropped: cue_user_actor.baseline + cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable; both emitted (subject-pivot Q10 and launch-mechanism-pivot Q11). Image-pivot adapted to the browser User Data CommandLine pattern per the CommandLine-derived-path hint."
+      kept: both
+    - dropped: cue_user_actor.clustering + cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable; both emitted (subject-pivot Q12 and launch-mechanism-pivot Q13). Image-pivot adapted to the browser User Data CommandLine pattern."
+      kept: both
+    - dropped: cue_process_tool.mechanism_decode
+      reason: "replaced_by: credential_access.credential_target_identification (hint 2). Phase 2 mechanism decode of the targeted store is provided by credential_target_identification (Q3); the cue_artifact.mechanism_decode (Q4) covers the copied-file content/path decode, a distinct artifact-content angle."
+      kept: credential_access.credential_target_identification
+    - dropped: cue_process_tool.baseline_deviation
+      reason: "REFLECTED host_pattern query (-14d, ParentImage/User projection) is subsumed by lolbin.historical_lolbin_baseline (Q18), which mirrors the identical rule selection scoped to host over -90d with a CommandLine projection. Keeping both would produce near-identical host-scoped rule-pattern aggregations."
+      kept: lolbin.historical_lolbin_baseline
+    - dropped: cue_process_tool.clustering
+      reason: "Image-only host aggregation subsumed by cue_host_context.clustering (Q14), which projects Image+ParentImage and surfaces novel parent-child pairs."
+      kept: cue_host_context.clustering
+    - dropped: cue_artifact.baseline
+      reason: "file_event baseline of the copied artifact over -90d adds little: the copied browser DB is a legitimate file whose first-seen status is uninformative. Host history of the firing pattern is covered by lolbin.historical_lolbin_baseline (Q18)."
+      kept: lolbin.historical_lolbin_baseline
+  skipped_templates:
+    - template: cue_process_tool.mechanism_decode
+      reason: "replaced_by: credential_access.credential_target_identification (hint 2)."
+    - template: cue_process_tool.follow_on
+      reason: "follow_on scopes children by ParentImage|endswith %Image%; the copy tools (esentutl/xcopy/robocopy) rarely spawn children, and post-copy host activity is covered by cue_host_context.clustering (Q14) and post_access_lateral_movement (Q9). Trimmed to stay within the 14-18 target."
+    - template: cue_process_tool.scope
+      reason: "REFLECTED fleet_pattern (-7d, no host scope). Cross-host distribution of the rule's pattern in the alert window is covered by cue_user_actor.clustering_svc (Q13), and host-history of the rule pattern by lolbin.historical_lolbin_baseline (Q18). Trimmed to stay within the 14-18 target; the credential_access + lolbin must_include questions and the user_actor pairs are higher value here."
+    - template: cue_artifact.artifact_verification
+      reason: "Hash / AV-reputation lookup of the copied file is not informative for this rule: the copied artifact is a legitimate browser SQLite credential database, not a malware sample, so it has no meaningful threat-intel reputation. The investigative value is in the file's CONTENT and DESTINATION (Q4 mechanism_decode) and whether it persists on disk (Q6 evidence_preservation), not its hash."
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "logsource 'process_access' (recommended by techniques: T1555.003) is not covered and no template family exists — author a custom question with category: process_access"
+      disposition: acted_on
+      reason: >-
+        Acted on. Authored Q5 (attack:T1555.003.process_access) with
+        logsource category process_access. It surfaces non-browser processes
+        opening a handle to a browser process (the memory/API-read path the
+        T1555.003 analytic correlates with the file read), filtering out
+        browser-self access. This is recorded here for the audit trail even
+        though the hint was acted on, since it is a logsource-coverage hint
+        that defaults to act-on.
+  contextual_sets:
+    included: []
+    excluded:
+      - id: ransomware_impact
+        confidence: low
+        reason: "The 'ransomware' keyword comes from an Akira advisory reference that happens to use esentutl for browser-credential theft; the rule itself detects browser-store copying (credential access), not encryption/impact. Including ransomware_impact questions would investigate a stage this rule does not detect."
+      - id: network_scope
+        confidence: low
+        reason: "Same incidental 'ransomware' keyword source. The rule has no network logsource and no exfiltration indicator; cross-host scope is already covered by the user_actor clustering pair (Q12/Q13)."
+  technique_sets_applied:
+    - universal
+    - credential_access
+    - lolbin
+    - cue_process_tool
+    - cue_artifact
+    - cue_user_actor
+    - cue_host_context
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 17
+      attack: 1
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 2
+      context: 14
+    logsource_diversity:
+      process_creation: 14
+      file_event: 1
+      process_access: 1
+      sigma_alert: 2

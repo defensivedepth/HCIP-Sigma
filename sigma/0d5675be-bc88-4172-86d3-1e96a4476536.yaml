@@ -1,0 +1,822 @@
+name: Potential Tampering With RDP Related Registry Keys Via Reg.EXE
+id: e617e480-15c9-4819-ab1f-f023d26c1294
+description: |
+  Detects reg.exe adding a REG_DWORD value with the force flag under
+  HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server, where the value
+  written is EITHER the Licensing Core concurrent-sessions pair (Licensing
+  Core plus EnableConcurrentSessions) OR one of the RDP control values such as
+  fDenyTSConnections, AllowTSConnections, fEnableWinStation, SecurityLayer, or
+  WinStations\RDP-Tcp settings, and where SecurityLayer is not being set to
+  the value 02. Command-line registry edits to these keys can enable RDP, lift
+  the single-session restriction, weaken the connection security layer, or
+  permit concurrent sessions, all of which expand remote-access exposure.
+  Administrators legitimately make these changes when standing up Remote
+  Desktop, but the same edits are used to open or harden a foothold for
+  interactive lateral movement. Determine who ran reg.exe, which Terminal
+  Server value changed and to what data, and whether interactive or RDP logons
+  followed.
+type: detection
+detection_id: 0d5675be-bc88-4172-86d3-1e96a4476536
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-04
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line show reg.exe adding a Terminal Server REG_DWORD value, and which control value was written?
+  context: >-
+    Confirm the alert before investing time. The rule fires when reg.exe runs an
+    'add' against a key under CurrentControlSet\Control\Terminal Server with
+    REG_DWORD and the /f force flag, and the value is EITHER the Licensing Core
+    concurrent-sessions pair (Licensing Core with EnableConcurrentSessions) OR
+    one of the RDP control values (for example fDenyTSConnections,
+    AllowTSConnections, fEnableWinStation, SecurityLayer, fSingleSessionPerUser,
+    or a WinStations\RDP-Tcp setting), and SecurityLayer is not being set to 02.
+    Note which branch fired and the data written, because the specific value
+    determines whether the change enables RDP, allows concurrent sessions, or
+    weakens the connection security layer.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to reconfigure Remote Desktop settings from the command line?
+  context: >-
+    Legitimate Remote Desktop configuration is usually done on servers or jump
+    hosts by administrators, often through group policy or system properties
+    rather than reg.exe. A workstation or a non-administrative account editing
+    Terminal Server values directly is a stronger signal than a server admin
+    doing the same on an RDS host. Knowing whether the user role and host
+    function fit this operation is often the fastest path to disposition.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:registry.registry_key_context
+  question: What exact Terminal Server value name and data were written, and what does that setting control?
+  context: >-
+    The registry_set event tied to the same process gives the actual key path
+    (TargetObject) and value written (Details) as structured fields instead of
+    parsing them from the reg.exe command line. fDenyTSConnections set to 0
+    enables inbound RDP; fSingleSessionPerUser set to 0 plus EnableConcurrentSessions
+    permits multiple simultaneous sessions; SecurityLayer or UserAuthentication
+    lowered weakens transport security or disables network-level authentication.
+    The specific value and data determine whether this opened remote access or
+    reduced its protections.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+- source: template:parent_child.parent_process_legitimacy
+  question: What spawned reg.exe, and what started that parent?
+  context: >-
+    The launch chain attributes the change. A legitimate edit typically traces
+    to an interactive shell an administrator opened, a deployment tool, or a
+    configuration script. An unsigned or unusual parent, or a parent that is
+    itself a script host or remote-execution service, points to operator-driven
+    tampering rather than routine administration. Tracing the parent's own
+    origin reveals whether the chain is interactive or automated.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- source: template:parent_child.sibling_processes
+  question: What other child processes did the same parent spawn around this time?
+  context: >-
+    If the parent that launched reg.exe also spawned other tooling in the same
+    window, the registry edit is likely one step in a sequence. Multiple
+    children such as additional reg.exe edits, net.exe, schtasks.exe, or a
+    script host from the same parent indicate orchestrated activity rather than
+    a single isolated configuration change.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:lolbin.renamed_binary_check
+  question: Was reg.exe executed from its expected System32 path?
+  context: >-
+    reg.exe normally runs from System32 or SysWOW64. The same binary copied or
+    renamed into a user-writable directory, or an unrelated executable carrying
+    the reg.exe OriginalFileName, can be used to dodge path-based allowlists.
+    Compare the Image path against the OriginalFileName to confirm this is the
+    genuine system binary in its standard location.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- source: template:registry.registry_related_modifications
+  question: Were other registry modifications made on this host in the same session?
+  context: >-
+    Actors who change one Terminal Server value often change several, or pair
+    the RDP enablement with other registry edits such as firewall rules,
+    persistence keys, or security-tool settings. Finding a cluster of reg.exe or
+    regedit write operations on this host within a short window reveals the full
+    scope of the configuration changes and whether more than one objective was
+    pursued.
+  range: +/-30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_reg:
+        Image|endswith:
+          - '\reg.exe'
+          - '\regedit.exe'
+        CommandLine|contains:
+          - ' add '
+          - ' delete '
+          - ' import '
+          - '/s '
+      condition: selection and selection_reg
+    fields:
+      - CommandLine
+- source: attack:T1021.001.security
+  question: Did interactive or RDP logon events occur on this host shortly after the Terminal Server settings were changed?
+  context: >-
+    Enabling RDP or relaxing its session and security settings is preparation;
+    the payoff is a remote logon. Security logon events on this host in the
+    window after the change show whether someone actually connected. RDP and
+    session-shadow logons (network-level and session-reconnect events) arriving
+    from an uncommon source, or under an account that does not normally log in
+    here, indicate the configuration change was used. If Security logs are not
+    collected in this environment, treat zero results as a visibility gap rather
+    than evidence nothing connected.
+  range: +4h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      service: security
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID:
+          - 4624
+          - 4778
+          - 4779
+      condition: selection
+    fields:
+      - TargetUserName
+      - LogonType
+      - IpAddress
+- source: template:lateral_movement.target_activity_after_access
+  question: What processes ran on this host in the hours after the Terminal Server change?
+  context: >-
+    A registry edit that opens or weakens RDP is a means to an end. Examining
+    what executed afterward reveals whether the access was used for hands-on
+    activity such as command interpreters, reconnaissance utilities, or
+    credential-access tooling. Post-change execution under a newly logged-in
+    account is the activity that turns a configuration change into an active
+    intrusion.
+  range: +30m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - User
+      - Image
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run reg.exe to change Remote Desktop settings?
+  context: >-
+    Compare this user's current action against their history. A user who has
+    never edited Terminal Server registry values is a stronger signal than one
+    who does so as part of a routine administrative role. Zero or very low
+    historical counts indicate first-time or rare use of this tool for this
+    purpose by this account.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is the parent-plus-reg.exe launch combination historically routine on this host or across the environment?
+  context: >-
+    When the alert fires under a service principal, the user identity does not
+    attribute behavior. The meaningful pivot is the launch mechanism, which
+    parent process spawned reg.exe, and whether that pair is historically
+    common. A new or rare parent for reg.exe on this host or environment-wide is
+    the deviation worth chasing; a pair that already accounts for thousands of
+    prior events is deployment or OS automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the environment around this time?
+  context: >-
+    Tracking the user's activity across all hosts reveals whether this is
+    isolated or part of broader movement. The same account enabling RDP on one
+    host and then appearing on others within a short window suggests the scope
+    of the activity extends past the alerting host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did the same parent-plus-reg.exe combination fire on other hosts in the same window, or is it isolated to this host?
+  context: >-
+    Under a service principal, asking what else the user did across the network
+    returns agent-telemetry noise. The meaningful question is whether the same
+    launch mechanism, parent process plus reg.exe, fired on other hosts in the
+    alert window. Multiple hosts in the same window points to scheduled or
+    pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired this Terminal Server tampering pattern, what parents and users normally drove it, and does this alert fit?
+  context: >-
+    Even routine RDP configuration recurs under stable parents and accounts. The
+    query mirrors the rule's selection structure scoped to this host, so the
+    parent and user distribution reflects how this specific firing pattern (not
+    generic reg.exe usage) has historically run here. A new parent process, an
+    unexpected user, or an unusual command shape is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_main_img:
+      - Image|endswith: \reg.exe
+      - OriginalFileName: reg.exe
+      selection_main_cli:
+        CommandLine|contains|all:
+        - ' add '
+        - \CurrentControlSet\Control\Terminal Server
+        - REG_DWORD
+        - ' /f'
+      selection_values_1:
+        CommandLine|contains|all:
+        - Licensing Core
+        - EnableConcurrentSessions
+      selection_values_2:
+        CommandLine|contains:
+        - AllowTSConnections
+        - fDenyTSConnections
+        - fEnableWinStation
+        - fSingleSessionPerUser
+        - IdleWinStationPoolCount
+        - MaxInstanceCount
+        - SecurityLayer
+        - TSAdvertise
+        - TSAppCompat
+        - TSEnabled
+        - TSUserEnabled
+        - WinStations\RDP-Tcp
+      filter_main_values_tls:
+        CommandLine|contains|all:
+        - SecurityLayer
+        - '02'
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_main_* and 1 of selection_values_* and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired this Terminal Server tampering pattern in the past week, and does the spread look like automation or one-off activity?
+  context: >-
+    The query mirrors the rule's selection structure with no host scope, so the
+    result is a fleet-wide count of this specific firing pattern rather than
+    generic reg.exe usage. Many hosts editing the same Terminal Server values
+    points to scripted deployment or imaging; one host or a small unrelated set
+    points to manual operator activity. Use the host distribution to calibrate
+    severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_main_img:
+      - Image|endswith: \reg.exe
+      - OriginalFileName: reg.exe
+      selection_main_cli:
+        CommandLine|contains|all:
+        - ' add '
+        - \CurrentControlSet\Control\Terminal Server
+        - REG_DWORD
+        - ' /f'
+      selection_values_1:
+        CommandLine|contains|all:
+        - Licensing Core
+        - EnableConcurrentSessions
+      selection_values_2:
+        CommandLine|contains:
+        - AllowTSConnections
+        - fDenyTSConnections
+        - fEnableWinStation
+        - fSingleSessionPerUser
+        - IdleWinStationPoolCount
+        - MaxInstanceCount
+        - SecurityLayer
+        - TSAdvertise
+        - TSAppCompat
+        - TSEnabled
+        - TSUserEnabled
+        - WinStations\RDP-Tcp
+      filter_main_values_tls:
+        CommandLine|contains|all:
+        - SecurityLayer
+        - '02'
+      condition: all of selection_main_* and 1 of selection_values_* and not 1 of filter_main_*
+    fields:
+    - host.name
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in the hour before the alert?
+  context: >-
+    Operators who reconfigure remote access frequently disable or weaken
+    endpoint protection first. The query surfaces direct attempts to disable
+    AV/EDR services, flip Defender flags, add broad exclusions, clear logs, or
+    patch AMSI/ETW. Zero rows is a useful signal that protection looks healthy,
+    though kernel-level driver tampering and in-memory patches will not appear
+    here. Populated rows shift the disposition toward operator preparation;
+    review the parent process and signing chain to identify the writer.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+- source: template:organizational_context.change_ticket
+  question: Was there a change ticket, maintenance window, or documented approval for enabling or reconfiguring Remote Desktop on this host?
+  context: >-
+    Remote Desktop configuration on managed systems is usually planned work. A
+    corresponding ticket or maintenance window suggests authorized activity;
+    the absence of one when policy requires it suggests the change was
+    unauthorized. This check can quickly close false positives or escalate true
+    positives.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Alerts rarely happen in isolation. Earlier detections on the same host, such
+    as defense tampering, reconnaissance, or credential access, may reveal the
+    stages that preceded the RDP configuration change and help reconstruct the
+    timeline. Defense tampering and credential access commonly precede activity
+    that prepares a host for remote access.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1112
+      name: Modify Registry
+      role: primary
+    - id: T1021.001
+      name: Remote Desktop Protocol
+      role: secondary
+    - id: T1021
+      name: Remote Services
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: registry_modification
+      description: "reg.exe writes a REG_DWORD value under CurrentControlSet\\Control\\Terminal Server to enable/relax RDP"
+      mapped_to: Q3
+      source: template:registry.registry_key_context
+    - stage: 2
+      label: registry_change_attribution
+      description: "Abnormal parent/lineage performing the registry modification (CLI tool vs allowlisted registry tool)"
+      mapped_to: Q4
+      source: template:parent_child.parent_process_legitimacy
+    - stage: 3
+      label: post_change_remote_logon
+      description: "RDP/interactive logon following the configuration change (T1021.001 login-then-activity chain)"
+      mapped_to: Q8
+      source: attack:T1021.001.security
+    - stage: 4
+      label: post_access_execution
+      description: "Uncommon process execution / post-login activity within a short window of the change"
+      mapped_to: Q9
+      source: template:lateral_movement.target_activity_after_access
+  dimension_coverage:
+    - dimension: parent_process_analysis
+      technique: T1112
+      covered_by: Q4
+      source: template:parent_child.parent_process_legitimacy
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1112
+      covered_by: Q7
+      source: template:registry.registry_related_modifications
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1112
+      covered_by: Q3
+      source: template:registry.registry_key_context
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1021.001
+      covered_by: Q8
+      source: attack:T1021.001.security
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1021.001
+      covered_by: Q9
+      source: template:lateral_movement.target_activity_after_access
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1021.001
+      covered_by: Q2
+      source: template:universal.host_user_context
+      coverage_type: direct
+    - dimension: command_analysis
+      technique: T1021
+      covered_by: Q3
+      source: template:registry.registry_key_context
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1021
+      covered_by: Q8
+      source: attack:T1021.001.security
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1021
+      covered_by: Q3
+      source: template:registry.registry_key_context
+      coverage_type: indirect
+  mutable_dispositions:
+    - element: RegistryKeyPathPatterns
+      dimension: tuning_parameter
+      specific_values: "CurrentControlSet\\Control\\Terminal Server values: fDenyTSConnections, AllowTSConnections, fEnableWinStation, fSingleSessionPerUser, EnableConcurrentSessions, SecurityLayer, WinStations\\RDP-Tcp"
+      disposition: context
+      target_question: Q3
+      notes: "registry_key_context is KEEP_EXACT and ProcessGuid-scoped; the specific Terminal Server values are named in Q1/Q3 context. The rule's own selection embeds these values into the REFLECTED baseline_deviation/scope queries (Q14/Q15)."
+    - element: ParentProcessAllowList
+      dimension: parent_process_analysis
+      specific_values: "rationale only (regedit.exe, msiexec.exe as legitimate registry tools)"
+      disposition: context
+      target_question: Q4
+      notes: "Allowlist concept surfaced in Q4 context (legitimate vs unusual parent); no concrete query injection because the rule does not constrain parent."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only (~5m correlation between change and nearby activity)"
+      disposition: context
+      target_question: Q7
+      notes: "Q7 uses +/-30m; Q8 uses +4h; Q9 uses +30m to correlate the change with post-change registry edits, logons, and execution."
+    - element: SignatureCheck
+      dimension: tuning_parameter
+      specific_values: "rationale only (unsigned executable / abnormal lineage performing registry mod)"
+      disposition: context
+      target_question: Q6
+      notes: "Q6 (renamed_binary_check) verifies reg.exe path/OriginalFileName; Q4 reviews lineage for the writer's signing chain."
+    - element: UserContext
+      dimension: user_context
+      specific_values: "rationale only (non-admin / service-account RDP expectation)"
+      disposition: context
+      target_question: Q2
+      notes: "Q2 (host_user_context) and Q10 (user baseline) cover whether the account is expected to reconfigure RDP."
+    - element: ProcessList
+      dimension: tuning_parameter
+      specific_values: "cmd.exe, powershell.exe, certutil.exe (suspicious post-login processes)"
+      disposition: context
+      target_question: Q9
+      notes: "Q9 (target_activity_after_access) surfaces post-change execution; the specific suspicious-process list is named in its context as what to scan the result for."
+    - element: HostAccessPatterns
+      dimension: tuning_parameter
+      specific_values: "rationale only (uncommon/first-time source-to-destination access)"
+      disposition: context
+      target_question: Q8
+      notes: "Q8 RDP-logon query projects source IP and logon type so the analyst can spot uncommon source-to-destination access after the change."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only (T1021 / T1021.001 login-to-activity window)"
+      disposition: context
+      target_question: Q8
+      notes: "Covered by the +4h post-change RDP-logon window in Q8 and +30m post-access execution in Q9."
+    - element: LogonUser
+      dimension: tuning_parameter
+      specific_values: "rationale only (limit to service/privileged users)"
+      disposition: context
+      target_question: Q8
+      notes: "Q8 projects TargetUserName for logon attribution; Q2/Q10 cover account expectation."
+    - element: RemoteHostList
+      dimension: tuning_parameter
+      specific_values: "rationale only (allowlist admin jumpboxes / deployment tools)"
+      disposition: context
+      target_question: Q8
+      notes: "Q8 IpAddress projection lets the analyst compare logon sources against known admin jumpboxes."
+  dedup_decisions:
+    - dropped: cue_process_tool.mechanism_decode
+      reason: "replaced_by registry.registry_key_context — the registry_set event gives TargetObject/Details as structured fields, superior to parsing reg.exe CommandLine"
+      kept: registry.registry_key_context
+    - dropped: cue_process_tool.process_chain
+      reason: "parent_child technique set active — parent_process_legitimacy is the more specific parent-attribution question"
+      kept: parent_child.parent_process_legitimacy
+    - dropped: cue_user_actor.baseline (vs baseline_svc) double-count
+      reason: "user_actor pair — non-deduplicable; both Q10 (user-pivot) and Q11 (service-principal substitute) emitted"
+      kept: both
+    - dropped: cue_user_actor.clustering (vs clustering_svc) double-count
+      reason: "user_actor pair — non-deduplicable; both Q12 (user-pivot) and Q13 (service-principal substitute) emitted"
+      kept: both
+  skipped_templates:
+    - template: cue_process_tool.mechanism_decode
+      reason: "replaced_by registry.registry_key_context"
+    - template: cue_process_tool.baseline
+      reason: "subsumed by REFLECTED baseline_deviation (Q14), which counts the rule's specific firing pattern on this host rather than generic reg.exe usage"
+    - template: cue_process_tool.follow_on
+      reason: "post-change execution covered by lateral_movement.target_activity_after_access (Q9); a generic ParentImage=reg.exe follow-on adds little since reg.exe rarely spawns children"
+    - template: cue_process_tool.clustering
+      reason: "host clustering covered by cue_user_actor.clustering (Q12) and the precursor question (Q18); avoids a third near-identical host-scoped aggregation"
+    - template: cue_host_context.clustering
+      reason: "redundant with the user clustering and precursor questions; per-host process aggregation overlaps Q9"
+    - template: registry.registry_value_persistence_check
+      reason: "applicability is_persistence_rule but this rule writes a Terminal Server DWORD toggle, not a Run-key payload path — there is no referenced executable on disk to verify, which is exactly the case notes_to_llm says to skip"
+    - template: lateral_movement.source_host_identification
+      reason: "rule detects the config change that ENABLES RDP, not an inbound RDP connection; inbound-source enumeration is premature before a logon exists. Post-change logon source is covered by Q8 (security logsource)"
+    - template: lateral_movement.authentication_method
+      reason: "no remote connection has occurred at detection time; ProcessGuid re-lookup of reg.exe adds no auth-method signal. Logon attribution handled by Q8"
+    - template: lateral_movement.lateral_movement_scope
+      reason: "psexec/mstsc/ssh lateral-tool enumeration by this user is covered by cue_user_actor.clustering (Q12); avoids a near-duplicate user-scoped aggregation"
+    - template: network_scope.same_action_other_hosts
+      reason: "fleet spread of the rule's specific pattern is covered more precisely by the REFLECTED scope question (Q15), which enforces the Terminal Server selection rather than just Image=reg.exe"
+    - template: network_scope.actor_activity_network_wide
+      reason: "duplicates cue_user_actor.clustering (Q12) — same User-scoped cross-host aggregation"
+    - template: network_scope.actor_authentication_trail
+      reason: "RDP/interactive logon correlation is authored as the security-logsource question Q8 with EventID 4624/4778/4779 scoped to this host; the generic 4624/4625 user-trail overlaps it"
+    - template: organizational_context.human_recall
+      reason: "change_ticket (Q17) already covers the authorization/recall axis; a second organizational question adds little for a config-change rule"
+    - template: organizational_context.timing_alignment
+      reason: "timing-vs-maintenance-window judgment is folded into change_ticket (Q17) context"
+    - template: organizational_context.procedural_consistency
+      reason: "the reg.exe-vs-GPO procedural angle is folded into Q2 (host_user_context) and Q17 (change_ticket)"
+    - template: persistence_scope.process_based_persistence
+      reason: "other-persistence-tool enumeration overlaps registry.registry_related_modifications (Q7) and the host-context questions; this rule's persistence is the registry change itself"
+    - template: persistence_scope.file_based_persistence
+      reason: "this rule writes a registry DWORD toggle, not a Startup-folder/Run-key payload file; no file-drop persistence to enumerate"
+    - template: lolbin.technique_class_lateral
+      reason: "the bundled LOLBin list is download/proxy-execution focused (certutil, rundll32, mshta); reg.exe's objective here is registry tampering, so other-LOLBin-same-objective enumeration would query an unrelated tool set. Other-tool scope is covered topically by Q7 (registry tools) and Q12"
+    - template: lolbin.historical_lolbin_baseline
+      reason: "REFLECTED host_pattern duplicates cue_process_tool.baseline_deviation (Q14) — same host-scoped count of the rule's selection over a comparable window; baseline_deviation's ParentImage/User projection is the more useful one"
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "logsource 'security' (recommended by techniques: T1021.001) is not covered and no template family exists — author a custom question with category: security"
+      disposition: acted_on
+      reason: >-
+        Authored Q8 (source attack:T1021.001.security) querying the security
+        logsource for EventID 4624/4778/4779 on this host in the +4h window after
+        the registry change, projecting TargetUserName, LogonType, and IpAddress
+        to correlate the RDP-enablement with an actual interactive/RDP logon.
+  contextual_sets:
+    included: []
+    excluded:
+      - id: ransomware_impact
+        confidence: low
+        reason: "Description mention of ransomware is incidental reference context, not the rule's behavior — the rule detects RDP registry tampering, not file encryption or shadow-copy deletion. No ransomware-impact questions authored."
+  technique_sets_applied:
+    - universal
+    - registry
+    - parent_child
+    - lateral_movement
+    - lolbin
+    - organizational_context
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 17
+      attack: 1
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 15
+    logsource_diversity:
+      process_creation: 15
+      registry_set: 1
+      security: 1
+      sigma_alert: 1

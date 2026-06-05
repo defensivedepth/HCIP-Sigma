@@ -1,0 +1,592 @@
+name: Outlook EnableUnsafeClientMailRules Setting Enabled
+id: 108c2662-e708-428e-93cd-1afc1024d779
+description: |
+  Detects a process whose command line references the Outlook security setting
+  \Outlook\Security\EnableUnsafeClientMailRules. This registry value re-enables
+  the "Start an application" and "Run a script" mail-rule actions that modern
+  Outlook builds disable by default, allowing a client-side inbox rule to launch
+  a program when a matching message arrives. The rule fires when a single
+  process command line contains that registry path. Some administrative or
+  diagnostic workflows may touch this value, but enabling unsafe client mail
+  rules is a known mailbox-persistence step: an actor sets the value, creates a
+  rule whose action points to a self-contained payload hosted over SMB/UNC or
+  WebDAV, and the payload runs from outlook.exe when the trigger message is
+  delivered. The investigation should determine which process and command set
+  the value, whether the value enables the unsafe actions, what parent launched
+  it, what executed afterward, and whether the same pattern appears elsewhere on
+  the host or fleet.
+type: detection
+detection_id: 55f0a3a1-846e-40eb-8273-677371b8d912
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line reference \Outlook\Security\EnableUnsafeClientMailRules,
+    matching what this rule detects?
+  context: Before investing investigation time, confirm the alert is a true positive.
+    The rule fires when a process command line contains the registry path
+    \Outlook\Security\EnableUnsafeClientMailRules. Read the exact command line and
+    note which tool set the value, what value is being written, and whether the
+    operation enables (DWORD 1) or queries the setting. A write of 1 re-enables the
+    unsafe "Start an application" and "Run a script" mail-rule actions.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to modify Outlook mail-rule security settings?
+  context: Re-enabling unsafe client mail rules is not part of normal end-user Outlook
+    use; the actions were disabled by default specifically because they are abused
+    for mailbox persistence. A small set of administrators or support staff may touch
+    Outlook policy values, but most users and most endpoints never write this
+    setting. Knowing whether the acting account and host function involve Outlook or
+    Office administration is often the fastest way to separate a sanctioned change
+    from operator activity.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What exactly did the command do to the EnableUnsafeClientMailRules value,
+    and was it set to 1?
+  context: The full command line reveals the specific action taken against the
+    setting. Decode the tool and its arguments - a reg.exe or PowerShell write that
+    sets the value to DWORD 1 re-enables the unsafe rule actions, while a read or a
+    value of 0 does not. Identify which Outlook version key was targeted and whether
+    the same invocation also touched related values such as Level,
+    LoadMacroProviderOnBoot, EnableRoamingFolderHomepages, or NonDefaultStoreScript,
+    which indicate a broader Outlook persistence setup.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains: \Outlook\Security\EnableUnsafeClientMailRules
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+      - Image
+- source: attack:T1059.command_analysis
+  question: Which executable carried the EnableUnsafeClientMailRules command line, and
+    is that binary expected to write Outlook policy values?
+  context: The rule constrains only the command line, not the image, so any process
+    can carry the registry path. Identify the executable that ran with the token and
+    where it lives. A signed administrative tool such as reg.exe or powershell.exe
+    launched interactively by an Office administrator is a different finding than the
+    same write coming from an unknown binary, a script host, or a process running
+    from a user-writable directory. The image and command line together identify what
+    actually set the value.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - User
+- source: template:cue_process_tool.process_chain
+  question: What process spawned the process that set this value, and is that parent
+    chain expected?
+  context: The parent process reveals how the setting was changed. Interactive
+    administration usually shows a console shell, an IDE, or a management tool launched
+    from explorer.exe. An unexpected parent such as outlook.exe, mshta.exe,
+    wscript.exe, cscript.exe, or an Office application points to automated or malicious
+    invocation - mail-rule and macro abuse is frequently driven from the Outlook
+    process itself or from a script host rather than by an administrator at a console.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: attack:T1202.high_risk_children
+  question: Did outlook.exe spawn a command interpreter, script host, or signed-binary
+    proxy on this host around the alert?
+  context: A client mail rule with the unsafe actions enabled executes its payload
+    through outlook.exe when a trigger message arrives. Outlook normally spawns Office
+    child processes, not interpreters. Children such as cmd.exe, powershell.exe,
+    pwsh.exe, wscript.exe, cscript.exe, rundll32.exe, regsvr32.exe, mshta.exe,
+    msiexec.exe, or curl.exe under an outlook.exe parent indicate the rule action
+    firing or a related Office-launched stage. Treat any such child as the execution
+    the setting was enabled to allow.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_parent:
+        ParentImage|endswith: \outlook.exe
+      selection_children:
+        Image|endswith:
+          - \cmd.exe
+          - \powershell.exe
+          - \pwsh.exe
+          - \wscript.exe
+          - \cscript.exe
+          - \rundll32.exe
+          - \regsvr32.exe
+          - \mshta.exe
+          - \msiexec.exe
+          - \curl.exe
+          - \bitsadmin.exe
+      condition: selection_host and selection_parent and selection_children
+    fields:
+      - Image
+      - CommandLine
+      - User
+- source: attack:T1202.unc_payload_launch
+  question: Did outlook.exe launch a child process whose image path points to a UNC,
+    WebDAV, or MUP location on this host?
+  context: Outlook mail-rule actions execute through ShellExec and pass no arguments
+    to the payload, so the payload is usually a self-contained binary hosted on an
+    SMB/UNC share or a WebDAV server rather than a local file. An outlook.exe parent
+    with a child whose image path begins with a double backslash UNC prefix or
+    resolves through \Device\Mup\ is the execution artifact of an enabled unsafe rule.
+    Identify the remote path and host it resolves to.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_parent:
+        ParentImage|endswith: \outlook.exe
+      selection_remote:
+        Image|contains:
+          - \\
+          - \Device\Mup\
+      condition: selection_host and selection_parent and selection_remote
+    fields:
+      - Image
+      - CommandLine
+      - User
+- source: attack:T1202.outbound_from_office
+  question: Did outlook.exe or a child it launched make outbound network connections
+    on this host around the alert?
+  context: Fetching a self-contained rule payload over WebDAV or SMB means outlook.exe
+    or its child reaches out to a remote host, often over ports 80 or 443 to a
+    non-corporate address. Outlook normally connects to mail infrastructure, not
+    arbitrary external IPs, so unexpected egress from the Outlook process or its child
+    is the network-side artifact of mail-rule payload retrieval. Review the
+    destination address and port against known mail and proxy endpoints.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'true'
+        Image|endswith:
+          - \outlook.exe
+          - \cmd.exe
+          - \powershell.exe
+          - \pwsh.exe
+          - \wscript.exe
+          - \cscript.exe
+          - \rundll32.exe
+          - \regsvr32.exe
+          - \mshta.exe
+          - \curl.exe
+      condition: selection
+    fields:
+      - Image
+      - DestinationIp
+      - DestinationPort
+      - User
+- source: attack:T1202.payload_file_drop
+  question: Were Outlook persistence artifacts such as VbaProject.OTM or staged
+    payloads written under the user's Outlook or Forms profile on this host?
+  context: Mail-rule and macro abuse leaves files on disk alongside the registry
+    change. A VbaProject.OTM under the roaming Outlook profile, cached forms under the
+    local Forms directory, or a staged executable written before the rule is created
+    all corroborate a persistence setup rather than a one-off setting change. Look for
+    recent writes under the acting user's Outlook profile and Forms cache and at the
+    paths referenced in any created rule.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains:
+          - \Microsoft\Outlook\VbaProject.OTM
+          - \Microsoft\Outlook\
+          - \Microsoft\Forms\
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - User
+- source: template:cue_user_actor.baseline
+  question: Does this user normally modify Outlook mail-rule or macro security settings?
+  context: Compare the acting account against its own history. An Office administrator
+    or support engineer may touch Outlook policy values as part of sanctioned work; an
+    account that has never written the EnableUnsafeClientMailRules value doing so now
+    is more notable. The user role and typical toolset should align with Outlook or
+    endpoint administration.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        CommandLine|contains: \Outlook\Security\EnableUnsafeClientMailRules
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is the parent process behind this EnableUnsafeClientMailRules write
+    historically routine on this host or across the environment, or is the parent
+    unusual for it?
+  context: When the alert fires under a service principal, user identity does not
+    attribute the behavior; the meaningful pivot is which parent process launched the
+    child that wrote the setting and whether that pairing is historically common. A
+    new or rare parent for this write on this host or environment-wide is the
+    deviation worth chasing, while a parent that already accounts for many prior
+    events is more likely a sanctioned configuration tool or automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        CommandLine|contains: \Outlook\Security\EnableUnsafeClientMailRules
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the acting account's activity across all hosts reveals whether
+    enabling unsafe mail rules was a single event or part of activity spanning
+    multiple endpoints. If the same user touched Outlook settings or ran follow-on
+    tools on other hosts, the scope of the incident is larger than one machine.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did the same parent process and EnableUnsafeClientMailRules write fire on
+    other hosts in the same window, indicating a coordinated rollout rather than
+    isolated activity?
+  context: Under a service principal, asking what else the user did across the network
+    returns agent-telemetry noise, since every host runs system-owned agents
+    constantly. The meaningful question is whether the same launch mechanism - a
+    parent process spawning a child that writes the EnableUnsafeClientMailRules value
+    - fired on other hosts in the alert window. Multiple hosts in the same window
+    points to scheduled or pushed automation; a single host points to a host-local
+    trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        CommandLine|contains: \Outlook\Security\EnableUnsafeClientMailRules
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining the activity surrounding the
+    mail-rule setting change reveals what led to it and what followed - the parent
+    that staged the process, reconnaissance, credential access, or the follow-on
+    execution the unsafe rule was meant to enable. Novel parent-child pairs at low
+    counts are what to scan for against the high-count noise of routine system
+    processes.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host - valid-account abuse, reconnaissance,
+    credential access, or other Office or persistence activity - may reveal the attack
+    stages that preceded enabling unsafe mail rules and help reconstruct the full
+    timeline. Mailbox persistence is usually one step in a sequence, so prior alerts
+    give the context for why the setting was changed.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired the rule's EnableUnsafeClientMailRules
+    pattern, what parents and users normally drive it, and does the current alert fit?
+  context: Even sanctioned administration can touch this value. This query mirrors the
+    rule's selection structure scoped to this host, so the resulting parent and user
+    distribution reflects how this specific firing pattern has historically run here,
+    not generic process activity. A new parent process, an unexpected account, or a
+    first-ever occurrence is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains: \Outlook\Security\EnableUnsafeClientMailRules
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired the rule's EnableUnsafeClientMailRules pattern in
+    the past week, and does the cross-host distribution look like consistent
+    automation or one-off activity?
+  context: This query mirrors the rule's selection structure with no host scope, so
+    the result is a fleet-wide count of the EnableUnsafeClientMailRules firing pattern
+    rather than generic process activity. Many hosts firing the same pattern points to
+    a managed configuration push or scripted deployment that sets the value by design;
+    one host or a small unrelated set points to manual operator activity. Use the host
+    distribution to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains: \Outlook\Security\EnableUnsafeClientMailRules
+      condition: selection
+    fields:
+    - host.name
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1059
+      name: Command and Scripting Interpreter
+      role: primary
+    - id: T1202
+      name: Indirect Command Execution
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: setting_write
+      description: "A process command line writes \\Outlook\\Security\\EnableUnsafeClientMailRules, re-enabling the unsafe Start-application / Run-script mail-rule actions - the act the rule detects"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: mechanism_and_value
+      description: "Decode which tool wrote the value and whether it was set to 1, plus any sibling Outlook persistence values touched in the same invocation"
+      mapped_to: Q3
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 3
+      label: rule_action_execution
+      description: "The enabled rule executes its payload through outlook.exe - a child interpreter / signed-binary proxy, or a child launched from a UNC/WebDAV path, optionally with outbound network retrieval"
+      mapped_to: Q6
+      source: attack:T1202.high_risk_children
+  dimension_coverage:
+    - dimension: command_analysis
+      technique: T1059
+      covered_by: Q3
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1059
+      covered_by: Q5
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1059
+      covered_by: Q6
+      source: attack:T1202.high_risk_children
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1059
+      covered_by: Q6
+      source: attack:T1202.high_risk_children
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1059
+      covered_by: Q2
+      source: template:universal.host_user_context
+      coverage_type: direct
+  mutable_dispositions:
+    - element: CommandLinePattern
+      dimension: command_analysis
+      specific_values: "rule pattern: \\Outlook\\Security\\EnableUnsafeClientMailRules"
+      disposition: query_injection
+      target_question: Q3
+      notes: "Rule's CommandLine|contains value injected into the mechanism_decode selection so the host-scoped decode is filtered to the EnableUnsafeClientMailRules pattern, not all process activity. Also drives baseline/baseline_svc/baseline_deviation/scope selections."
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "rationale only (varies by managed/unmanaged workstation)"
+      disposition: context
+      target_question: Q5
+      notes: "No fixed values in the analytic. Realized as the parent-chain question, which evaluates whether the parent (e.g. outlook.exe, a script host, an Office app) is expected for this write."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only (10-30 min correlation window per T1202)"
+      disposition: context
+      target_question: Q6
+      notes: "Threshold not directly queryable; realized as the +/-1h correlation window on the outlook.exe child-execution and network questions."
+    - element: HighRiskChildren
+      dimension: tuning_parameter
+      specific_values: "powershell.exe, cmd.exe, rundll32.exe, regsvr32.exe, mshta.exe, msiexec.exe, curl.exe, bitsadmin.exe (+ pwsh, wscript, cscript)"
+      disposition: query_injection
+      target_question: Q6
+      notes: "Injected verbatim into the attack:T1202.high_risk_children Image|endswith list under an outlook.exe parent."
+    - element: AllowedUtilities
+      dimension: tuning_parameter
+      specific_values: "rationale only (forfiles, wsl, ssh permitted on jumphosts)"
+      disposition: context
+      target_question: Q6
+      notes: "Suppression rationale, not relevant to an Outlook-rule rule (no indirection utility in this detection). Noted as context that benign parents/children reduce severity; no concrete suppression list injected."
+    - element: UserContext
+      dimension: user_context
+      specific_values: "rationale only (raise severity for standard interactive user vs server/CI)"
+      disposition: context
+      target_question: Q2
+      notes: "Realized as host_user_context and the user baseline question - whether the acting account is expected to modify Outlook policy values."
+    - element: DestCIDRs
+      dimension: tuning_parameter
+      specific_values: "rationale only (known-good egress for SSH/WSL)"
+      disposition: context
+      target_question: Q8
+      notes: "No concrete CIDRs in the analytic. Realized as the outbound-from-Office question, which directs the analyst to compare destination addresses against known mail/proxy endpoints rather than a fixed allowlist."
+  dedup_decisions:
+    - dropped: cue_user_actor.baseline + cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable; both emitted (subject-pivot and launch-mechanism-pivot). Image-pivot adapted to the CommandLine EnableUnsafeClientMailRules pattern per the CommandLine-only hint."
+      kept: both
+    - dropped: cue_user_actor.clustering + cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable; both emitted (subject-pivot and launch-mechanism-pivot). Image-pivot adapted to the CommandLine EnableUnsafeClientMailRules pattern per the CommandLine-only hint."
+      kept: both
+    - dropped: cue_process_tool.clustering
+      reason: "Image-only host aggregation subsumed by cue_host_context.clustering, which projects Image+ParentImage and surfaces novel parent-child pairs"
+      kept: cue_host_context.clustering
+    - dropped: cue_process_tool.baseline
+      reason: "generic Image|endswith host baseline depends on a rule Image that does not exist (CommandLine-only rule); subsumed by the REFLECTED host-pattern question (baseline_deviation) which scopes to the rule's actual EnableUnsafeClientMailRules firing pattern"
+      kept: cue_process_tool.baseline_deviation
+  skipped_templates:
+    - template: cue_process_tool.follow_on
+      reason: "follow_on scopes children by ParentImage|endswith %Image%, which depends on a constraining rule Image that does not exist here (CommandLine-only). Post-setting execution is covered more precisely by the attack:T1202.high_risk_children and attack:T1202.unc_payload_launch questions, which scope children to an outlook.exe parent — the actual execution path for an enabled unsafe mail rule."
+  reflection_overrides: []
+  hint_dispositions: []
+  # All three brief hints were ACTED ON, so they carry no declined entries:
+  #  1. "CommandLine-only detection — use CommandLine pattern matching for scoping":
+  #     acted on — every host/fleet/user scoping query (mechanism_decode, baseline,
+  #     baseline_svc, clustering_svc, baseline_deviation, scope) uses
+  #     CommandLine|contains \Outlook\Security\EnableUnsafeClientMailRules instead of
+  #     an Image pivot; cue_process_tool.baseline (Image-based) was dropped for this
+  #     reason — see dedup_decisions.
+  #  2. "logsource file_event (T1202) not covered": acted on — Q9
+  #     (attack:T1202.payload_file_drop) is a category: file_event question for
+  #     VbaProject.OTM / Outlook-profile / Forms writes.
+  #  3. "logsource network_connection (T1202) not covered": acted on — Q8
+  #     (attack:T1202.outbound_from_office) is a category: network_connection question
+  #     for outbound from outlook.exe and its children.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - cue_process_tool
+    - cue_user_actor
+    - cue_host_context
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 12
+      attack: 5
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 14
+    logsource_diversity:
+      process_creation: 14
+      network_connection: 1
+      file_event: 1
+      sigma_alert: 1

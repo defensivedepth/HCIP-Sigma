@@ -1,0 +1,605 @@
+name: Powershell Defender Disable Scan Feature
+id: 4248ad77-bdb4-4898-a364-fb7fb0fa0089
+description: |
+  Detects PowerShell invocations that disable Microsoft Defender scan and protection features. The rule fires when a command line either contains a Defender preference cmdlet (Add-MpPreference or Set-MpPreference) together with a Disable* flag and an enabling value, OR contains the base64-encoded form of those same Disable* options. Disabling real-time monitoring, behavior monitoring, IOAV protection, archive scanning, or block-at-first-seen is a common precursor that operators run to blind Defender before dropping or detonating a payload, but the same cmdlets are also used by legitimate administrators and management tooling. Investigation should confirm which protection features were turned off, whether the change was authorized, and what ran on the host afterward.
+type: detection
+detection_id: 1ec65a5f-9473-4f12-97da-622044d6df21
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line either invoke a Defender preference cmdlet with a Disable flag, or contain the encoded form of those options?
+  context: Confirm the alert is a true positive before investing time. The rule fires when the command line matches any one of several branches — a plaintext Add-MpPreference / Set-MpPreference cmdlet paired with a Disable* option and an enabling value, OR a base64-encoded fragment of a Disable* option. Read the exact command line and note which branch fired, because a plaintext cmdlet is directly readable while an encoded match means the operative content is base64 and must be decoded.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to change Defender protection settings?
+  context: Legitimate administrators, endpoint-management tooling, and build/test automation do adjust Defender preferences. Knowing whether this user's role and this host's function include Defender configuration is often the fastest way to separate routine administration from an operator weakening protection ahead of a payload.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:defense_tampering.what_was_disabled
+  question: Which specific Defender protection features were disabled in this command?
+  context: Different flags have different impact. DisableRealtimeMonitoring and DisableIOAVProtection remove on-access scanning; DisableBehaviorMonitoring blinds behavioral detection; DisableArchiveScanning lets malware hide in archives; DisableBlockAtFirstSeen and DisableCatchupFullScan/DisableCatchupQuickScan weaken cloud and scheduled coverage. Read the command line and enumerate every Disable* option set to $true (or 1) to gauge how much of Defender was turned off.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:powershell.encoded_command_decode
+  question: Was the command encoded or obfuscated, and what does it decode to?
+  context: The rule's encoded branches match base64 fragments of the Disable* options, so the operative content may be wrapped in -EncodedCommand or assembled through concatenation and backtick escaping. Decode any base64 or deobfuscate the string to recover the full Defender preference changes and any additional cmdlets chained into the same line — download cradles or in-memory loaders frequently ride alongside the protection-disabling call.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:powershell.script_block_logging
+  question: Did PowerShell script block logging capture the deobfuscated script content?
+  context: Script block logging (Event ID 4104) records the deobfuscated script PowerShell actually executed, even when the command line is encoded. This provides ground truth about the full set of Defender preference changes and any surrounding logic. If PowerShell operational logs are not ingested in this environment, treat zero results as a visibility gap rather than evidence nothing ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- source: template:powershell.powershell_security_bypass
+  question: Were PowerShell security controls bypassed or weakened around this execution?
+  context: Operators commonly pair Defender disabling with other PowerShell defense evasion — AMSI patching, execution-policy bypass, or a downgrade to PowerShell v2 that lacks logging. Finding these alongside the Defender changes strengthens the case that this was a deliberate evasion step rather than a routine preference edit.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- source: template:cue_process_tool.process_chain
+  question: What process spawned this PowerShell instance, and is that parent chain expected?
+  context: The parent reveals how the Defender change was invoked. Interactive administration usually descends from explorer.exe or a console session; management tooling descends from a service or agent. Unusual parents such as office applications, mshta.exe, wscript.exe, or an unsigned binary point to macro execution or operator tooling rather than routine administration.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: attack:T1562.001.registry_set
+  question: Were the same Defender features disabled directly through the registry on this host around the alert?
+  context: The Defender preference cmdlets write registry values under the Windows Defender policy keys, and operators frequently set those values directly with reg.exe to avoid the PowerShell layer entirely. A reg.exe write naming DisableAntiSpyware, DisableRealtimeMonitoring, or a Real-Time Protection / SpyNet value in the same window indicates the same defensive impairment was applied through a parallel mechanism this rule does not see.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_reg:
+        Image|endswith: '\reg.exe'
+        CommandLine|contains:
+          - 'Windows Defender'
+          - 'DisableAntiSpyware'
+          - 'DisableAntiVirus'
+          - 'DisableRealtimeMonitoring'
+          - 'DisableBehaviorMonitoring'
+          - 'DisableIOAVProtection'
+          - 'DisableOnAccessProtection'
+          - 'DisableBlockAtFirstSeen'
+      condition: selection and selection_reg
+    fields:
+      - CommandLine
+      - User
+- source: template:defense_tampering.protection_status
+  question: Is Defender currently restored, or is real-time protection still disabled on this host?
+  context: The disabling may have been temporary (scoped to one action) or persistent. Confirm the current state of the affected Defender features through the endpoint console or direct host inspection. If real-time monitoring or behavior monitoring is still off, the protection should be restored before deeper investigation continues.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:defense_tampering.activity_after_tampering
+  question: What activity occurred on this host after Defender protection was disabled?
+  context: Protection is disabled for a reason — to run a payload, dump credentials, or perform actions that would otherwise be blocked or logged. Examining what executed in the window immediately after the Defender change reveals what the operator wanted hidden. Process creation that begins right after the protection drop points to the activity the tampering was meant to enable.
+  range: +1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - User
+- source: template:defense_tampering.other_tampering_activity
+  question: Were other defense tampering actions performed on this host?
+  context: An operator who disables one control often disables several — turning off Defender, clearing event logs, deleting shadow copies, and stopping security services together to maximize coverage. Finding additional tampering from the same user or parent process in the surrounding window indicates a broader defense-evasion stage rather than an isolated preference edit.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_tamper:
+        Image|endswith:
+          - '\wevtutil.exe'
+          - '\vssadmin.exe'
+          - '\bcdedit.exe'
+          - '\wbadmin.exe'
+          - '\netsh.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+        CommandLine|contains:
+          - 'cl '
+          - 'clear-log'
+          - 'delete shadows'
+          - 'recoveryenabled'
+          - 'advfirewall'
+          - 'stop'
+          - 'delete'
+      condition: selection and selection_tamper
+    fields:
+      - Image
+      - User
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host previously fired this Defender-disable pattern, what parents and users drove it, and does the current alert fit that pattern?
+  context: Even routine tooling can flip Defender flags. This query mirrors the rule's selection structure scoped to this host, so the resulting parent/user distribution reflects how this specific firing pattern has historically run here — not generic PowerShell usage. A new parent process, an unexpected user account, or an unusual command shape is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_cli_cmdlet:
+        CommandLine|contains:
+        - 'Add-MpPreference '
+        - 'Set-MpPreference '
+      selection_cli_option:
+        CommandLine|contains:
+        - 'DisableArchiveScanning '
+        - 'DisableRealtimeMonitoring '
+        - 'DisableIOAVProtection '
+        - 'DisableBehaviorMonitoring '
+        - 'DisableBlockAtFirstSeen '
+        - 'DisableCatchupFullScan '
+        - 'DisableCatchupQuickScan '
+      selection_cli_value:
+        CommandLine|contains:
+        - $true
+        - ' 1 '
+      selection_encoded_modifier:
+        CommandLine|base64offset|contains:
+        - 'disablearchivescanning '
+        - 'DisableArchiveScanning '
+        - 'disablebehaviormonitoring '
+        - 'DisableBehaviorMonitoring '
+        - 'disableblockatfirstseen '
+        - 'DisableBlockAtFirstSeen '
+        - 'disablecatchupfullscan '
+        - 'DisableCatchupFullScan '
+        - 'disablecatchupquickscan '
+        - 'DisableCatchupQuickScan '
+        - 'disableioavprotection '
+        - 'DisableIOAVProtection '
+        - 'disablerealtimemonitoring '
+        - 'DisableRealtimeMonitoring '
+      selection_encoded_direct:
+        CommandLine|contains:
+        - RABpAHMAYQBiAGwAZQBSAGUAYQBsAHQAaQBtAGUATQBvAG4AaQB0AG8AcgBpAG4AZwAgA
+        - QAaQBzAGEAYgBsAGUAUgBlAGEAbAB0AGkAbQBlAE0AbwBuAGkAdABvAHIAaQBuAGcAIA
+        - EAGkAcwBhAGIAbABlAFIAZQBhAGwAdABpAG0AZQBNAG8AbgBpAHQAbwByAGkAbgBnACAA
+        - RABpAHMAYQBiAGwAZQBJAE8AQQBWAFAAcgBvAHQAZQBjAHQAaQBvAG4AIA
+        - QAaQBzAGEAYgBsAGUASQBPAEEAVgBQAHIAbwB0AGUAYwB0AGkAbwBuACAA
+        - EAGkAcwBhAGIAbABlAEkATwBBAFYAUAByAG8AdABlAGMAdABpAG8AbgAgA
+        - RABpAHMAYQBiAGwAZQBCAGUAaABhAHYAaQBvAHIATQBvAG4AaQB0AG8AcgBpAG4AZwAgA
+        - QAaQBzAGEAYgBsAGUAQgBlAGgAYQB2AGkAbwByAE0AbwBuAGkAdABvAHIAaQBuAGcAIA
+        - EAGkAcwBhAGIAbABlAEIAZQBoAGEAdgBpAG8AcgBNAG8AbgBpAHQAbwByAGkAbgBnACAA
+        - RABpAHMAYQBiAGwAZQBCAGwAbwBjAGsAQQB0AEYAaQByAHMAdABTAGUAZQBuACAA
+        - QAaQBzAGEAYgBsAGUAQgBsAG8AYwBrAEEAdABGAGkAcgBzAHQAUwBlAGUAbgAgA
+        - EAGkAcwBhAGIAbABlAEIAbABvAGMAawBBAHQARgBpAHIAcwB0AFMAZQBlAG4AIA
+        - ZABpAHMAYQBiAGwAZQByAGUAYQBsAHQAaQBtAGUAbQBvAG4AaQB0AG8AcgBpAG4AZwAgA
+        - QAaQBzAGEAYgBsAGUAcgBlAGEAbAB0AGkAbQBlAG0AbwBuAGkAdABvAHIAaQBuAGcAIA
+        - kAGkAcwBhAGIAbABlAHIAZQBhAGwAdABpAG0AZQBtAG8AbgBpAHQAbwByAGkAbgBnACAA
+        - ZABpAHMAYQBiAGwAZQBpAG8AYQB2AHAAcgBvAHQAZQBjAHQAaQBvAG4AIA
+        - QAaQBzAGEAYgBsAGUAaQBvAGEAdgBwAHIAbwB0AGUAYwB0AGkAbwBuACAA
+        - kAGkAcwBhAGIAbABlAGkAbwBhAHYAcAByAG8AdABlAGMAdABpAG8AbgAgA
+        - ZABpAHMAYQBiAGwAZQBiAGUAaABhAHYAaQBvAHIAbQBvAG4AaQB0AG8AcgBpAG4AZwAgA
+        - QAaQBzAGEAYgBsAGUAYgBlAGgAYQB2AGkAbwByAG0AbwBuAGkAdABvAHIAaQBuAGcAIA
+        - kAGkAcwBhAGIAbABlAGIAZQBoAGEAdgBpAG8AcgBtAG8AbgBpAHQAbwByAGkAbgBnACAA
+        - ZABpAHMAYQBiAGwAZQBiAGwAbwBjAGsAYQB0AGYAaQByAHMAdABzAGUAZQBuACAA
+        - QAaQBzAGEAYgBsAGUAYgBsAG8AYwBrAGEAdABmAGkAcgBzAHQAcwBlAGUAbgAgA
+        - kAGkAcwBhAGIAbABlAGIAbABvAGMAawBhAHQAZgBpAHIAcwB0AHMAZQBlAG4AIA
+        - RABpAHMAYQBiAGwAZQBDAGEAdABjAGgAdQBwAEYAdQBsAGwAUwBjAGEAbgA
+        - RABpAHMAYQBiAGwAZQBDAGEAdABjAGgAdQBwAFEAdQBpAGMAawBTAGMAYQBuAA
+        - RABpAHMAYQBiAGwAZQBBAHIAYwBoAGkAdgBlAFMAYwBhAG4AbgBpAG4AZwA
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_cli_* or 1 of selection_encoded_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired this Defender-disable pattern in the past week, and does the spread look like automation or one-off activity?
+  context: This query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of this firing pattern rather than generic PowerShell usage. Many hosts firing the same pattern points to scripted deployment or management automation; one host or a small unrelated set points to manual operator activity. Use the host distribution to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_cli_cmdlet:
+        CommandLine|contains:
+        - 'Add-MpPreference '
+        - 'Set-MpPreference '
+      selection_cli_option:
+        CommandLine|contains:
+        - 'DisableArchiveScanning '
+        - 'DisableRealtimeMonitoring '
+        - 'DisableIOAVProtection '
+        - 'DisableBehaviorMonitoring '
+        - 'DisableBlockAtFirstSeen '
+        - 'DisableCatchupFullScan '
+        - 'DisableCatchupQuickScan '
+      selection_cli_value:
+        CommandLine|contains:
+        - $true
+        - ' 1 '
+      selection_encoded_modifier:
+        CommandLine|base64offset|contains:
+        - 'disablearchivescanning '
+        - 'DisableArchiveScanning '
+        - 'disablebehaviormonitoring '
+        - 'DisableBehaviorMonitoring '
+        - 'disableblockatfirstseen '
+        - 'DisableBlockAtFirstSeen '
+        - 'disablecatchupfullscan '
+        - 'DisableCatchupFullScan '
+        - 'disablecatchupquickscan '
+        - 'DisableCatchupQuickScan '
+        - 'disableioavprotection '
+        - 'DisableIOAVProtection '
+        - 'disablerealtimemonitoring '
+        - 'DisableRealtimeMonitoring '
+      selection_encoded_direct:
+        CommandLine|contains:
+        - RABpAHMAYQBiAGwAZQBSAGUAYQBsAHQAaQBtAGUATQBvAG4AaQB0AG8AcgBpAG4AZwAgA
+        - QAaQBzAGEAYgBsAGUAUgBlAGEAbAB0AGkAbQBlAE0AbwBuAGkAdABvAHIAaQBuAGcAIA
+        - EAGkAcwBhAGIAbABlAFIAZQBhAGwAdABpAG0AZQBNAG8AbgBpAHQAbwByAGkAbgBnACAA
+        - RABpAHMAYQBiAGwAZQBJAE8AQQBWAFAAcgBvAHQAZQBjAHQAaQBvAG4AIA
+        - QAaQBzAGEAYgBsAGUASQBPAEEAVgBQAHIAbwB0AGUAYwB0AGkAbwBuACAA
+        - EAGkAcwBhAGIAbABlAEkATwBBAFYAUAByAG8AdABlAGMAdABpAG8AbgAgA
+        - RABpAHMAYQBiAGwAZQBCAGUAaABhAHYAaQBvAHIATQBvAG4AaQB0AG8AcgBpAG4AZwAgA
+        - QAaQBzAGEAYgBsAGUAQgBlAGgAYQB2AGkAbwByAE0AbwBuAGkAdABvAHIAaQBuAGcAIA
+        - EAGkAcwBhAGIAbABlAEIAZQBoAGEAdgBpAG8AcgBNAG8AbgBpAHQAbwByAGkAbgBnACAA
+        - RABpAHMAYQBiAGwAZQBCAGwAbwBjAGsAQQB0AEYAaQByAHMAdABTAGUAZQBuACAA
+        - QAaQBzAGEAYgBsAGUAQgBsAG8AYwBrAEEAdABGAGkAcgBzAHQAUwBlAGUAbgAgA
+        - EAGkAcwBhAGIAbABlAEIAbABvAGMAawBBAHQARgBpAHIAcwB0AFMAZQBlAG4AIA
+        - ZABpAHMAYQBiAGwAZQByAGUAYQBsAHQAaQBtAGUAbQBvAG4AaQB0AG8AcgBpAG4AZwAgA
+        - QAaQBzAGEAYgBsAGUAcgBlAGEAbAB0AGkAbQBlAG0AbwBuAGkAdABvAHIAaQBuAGcAIA
+        - kAGkAcwBhAGIAbABlAHIAZQBhAGwAdABpAG0AZQBtAG8AbgBpAHQAbwByAGkAbgBnACAA
+        - ZABpAHMAYQBiAGwAZQBpAG8AYQB2AHAAcgBvAHQAZQBjAHQAaQBvAG4AIA
+        - QAaQBzAGEAYgBsAGUAaQBvAGEAdgBwAHIAbwB0AGUAYwB0AGkAbwBuACAA
+        - kAGkAcwBhAGIAbABlAGkAbwBhAHYAcAByAG8AdABlAGMAdABpAG8AbgAgA
+        - ZABpAHMAYQBiAGwAZQBiAGUAaABhAHYAaQBvAHIAbQBvAG4AaQB0AG8AcgBpAG4AZwAgA
+        - QAaQBzAGEAYgBsAGUAYgBlAGgAYQB2AGkAbwByAG0AbwBuAGkAdABvAHIAaQBuAGcAIA
+        - kAGkAcwBhAGIAbABlAGIAZQBoAGEAdgBpAG8AcgBtAG8AbgBpAHQAbwByAGkAbgBnACAA
+        - ZABpAHMAYQBiAGwAZQBiAGwAbwBjAGsAYQB0AGYAaQByAHMAdABzAGUAZQBuACAA
+        - QAaQBzAGEAYgBsAGUAYgBsAG8AYwBrAGEAdABmAGkAcgBzAHQAcwBlAGUAbgAgA
+        - kAGkAcwBhAGIAbABlAGIAbABvAGMAawBhAHQAZgBpAHIAcwB0AHMAZQBlAG4AIA
+        - RABpAHMAYQBiAGwAZQBDAGEAdABjAGgAdQBwAEYAdQBsAGwAUwBjAGEAbgA
+        - RABpAHMAYQBiAGwAZQBDAGEAdABjAGgAdQBwAFEAdQBpAGMAawBTAGMAYQBuAA
+        - RABpAHMAYQBiAGwAZQBBAHIAYwBoAGkAdgBlAFMAYwBhAG4AbgBpAG4AZwA
+      condition: all of selection_cli_* or 1 of selection_encoded_*
+    fields:
+    - host.name
+- source: template:cue_user_actor.baseline
+  question: Does this user normally change Defender preferences from PowerShell?
+  context: Compare this user's current action against their historical pattern. A user who has never disabled Defender features is more suspicious than one who does so regularly as part of an administrative role. The query counts how often this user has matched the rule's Defender-disable pattern across all hosts over the trailing window.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      selection_pattern:
+        CommandLine|contains:
+          - 'Add-MpPreference '
+          - 'Set-MpPreference '
+      condition: selection and selection_pattern
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent and PowerShell combination historically routine on this host or across the environment, or is the parent unusual?
+  context: When the alert fires under a service or computer account, user identity does not attribute the behavior. The meaningful pivot is the launch mechanism — which parent process spawned PowerShell, and whether that pair is historically common. A new or rare parent for this binary is the deviation worth chasing; a pair that already accounts for thousands of prior events is management or OS automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith|expand: '%ParentImage%'
+        Image|endswith: '\powershell.exe'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the environment around the time of this alert?
+  context: Tracking the user's activity across all hosts in the alert window reveals lateral movement or coordinated action on multiple endpoints. If the same user disabled Defender or ran other tooling on several hosts close together, the scope of the operation may be larger than this single host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent and PowerShell combination fire on other hosts in the same window — a coordinated rollout, or isolated to this host?
+  context: Under a service or computer account, asking what else the user did across the environment returns agent-telemetry noise. The meaningful question is whether the same launch mechanism — the parent process spawning PowerShell — fired on other hosts in the alert window. Multiple hosts in the same window points to scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith|expand: '%ParentImage%'
+        Image|endswith: '\powershell.exe'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — reconnaissance, credential access, or other defense-evasion steps — may reveal the stages that preceded the Defender change and help reconstruct the timeline of the operation.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1562.001
+      name: Disable or Modify Tools
+      role: primary
+    - id: T1562
+      name: Impair Defenses
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: tool_modification
+      description: "Adversary disables or modifies a security tool — flips Defender preference flags via PowerShell cmdlets (plaintext or encoded)."
+      mapped_to: Q3
+      source: template:defense_tampering.what_was_disabled
+    - stage: 2
+      label: registry_modification
+      description: "Defender state is altered through registry edits (the cmdlets write under the Windows Defender policy keys; reg.exe sets them directly)."
+      mapped_to: Q8
+      source: attack:T1562.001.registry_set
+    - stage: 3
+      label: absence_of_telemetry
+      description: "Abnormal absence of expected telemetry / what the disabling enabled — activity after protection was removed."
+      mapped_to: Q10
+      source: template:defense_tampering.activity_after_tampering
+  dimension_coverage:
+    - dimension: time_correlation
+      technique: T1562.001
+      covered_by: Q10
+      source: template:defense_tampering.activity_after_tampering
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1562.001
+      covered_by: Q3
+      source: template:defense_tampering.what_was_disabled
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1562.001
+      covered_by: Q2
+      source: template:universal.host_user_context
+      coverage_type: direct
+    - dimension: process_identification
+      technique: T1562
+      covered_by: Q7
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1562
+      covered_by: Q11
+      source: template:defense_tampering.other_tampering_activity
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1562
+      covered_by: Q8
+      source: attack:T1562.001.registry_set
+      coverage_type: direct
+  mutable_dispositions:
+    - element: ProcessNameExclusions
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q2
+      notes: "Expected-admin-tooling exclusion is a tuning rationale with no concrete values; folded into the user/host expectation question framing."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q10
+      notes: "Correlation-window rationale, no concrete value; realized as the +1h post-tamper window and the +/-1h other-tampering window."
+    - element: ServiceNames
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q8
+      notes: "Security-service-name list is a per-deployment tuning list with no fixed values; the registry/tamper questions carry the Defender service and key names relevant to this rule."
+    - element: ProcessWhitelist
+      dimension: process_identification
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q7
+      notes: "Authorized-admin-tool whitelist is a tuning rationale; realized as the parent-chain legitimacy question."
+    - element: ServiceNamePatterns
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q11
+      notes: "Security-critical service-name refinement, no fixed values; the other-tampering sweep covers service-stop binaries."
+  dedup_decisions:
+    - dropped: cue_process_tool.baseline
+      reason: "Generic Image-scoped 90d baseline is subsumed by cue_process_tool.baseline_deviation, which is REFLECTED on the rule's actual Defender-disable selection (rule is CommandLine-only, so an Image-scoped baseline would mis-measure)."
+      kept: cue_process_tool.baseline_deviation
+    - dropped: cue_process_tool.follow_on
+      reason: "Children-of-binary follow-on is covered by defense_tampering.activity_after_tampering (post-tamper host activity) and the parent-chain question; an Image-scoped follow_on would key on powershell.exe, returning unbounded noise on a CommandLine-only rule."
+      kept: defense_tampering.activity_after_tampering
+    - dropped: cue_process_tool.clustering
+      reason: "Host-scoped 'other tools around this time' overlaps defense_tampering.other_tampering_activity and the user-actor clustering pair; dropped the less specific generic sweep."
+      kept: defense_tampering.other_tampering_activity
+    - dropped: cue_host_context.clustering
+      reason: "Host-scoped 'other activity around the alert' duplicates the post-tamper activity question and the other-tampering sweep on the same host; dropped to stay within the 18-question cap."
+      kept: defense_tampering.activity_after_tampering
+    - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc pair
+      reason: "user_actor pair — non-deduplicable; both emitted (user-pivot baseline and parent+binary service-principal substitute)."
+      kept: both
+    - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc pair
+      reason: "user_actor pair — non-deduplicable; both emitted (user-pivot clustering and parent+binary service-principal substitute)."
+      kept: both
+  skipped_templates:
+    - template: cue_process_tool.mechanism_decode
+      reason: "replaced_by: defense_tampering.what_was_disabled — the technique-set Phase 2 question is more specific to defense tampering."
+    - template: universal.endpoint_protection_health
+      reason: "RECOMMENDED, dropped per its own notes_to_llm DROP condition (a): the defense_tampering technique set is confirmed for this rule, and its what_was_disabled / protection_status / other_tampering_activity questions are more specific than this generic host-tamper sweep and supersede it. The rule itself IS a Defender-tamper detection, so the generic sweep adds no distinct coverage."
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "defense_tampering.what_was_disabled replaces cue_process_tool.mechanism_decode"
+      disposition: declined
+      reason: "Acted on, not declined — recorded here for audit completeness: cue_process_tool.mechanism_decode is skipped (see skipped_templates) and defense_tampering.what_was_disabled is included as the Phase 2 analysis question (Q3)."
+    - hint: "powershell.encoded_command_decode replaces obfuscation.encoded_payload_decode"
+      disposition: declined
+      reason: "Acted on, not declined — recorded for audit: powershell.encoded_command_decode is included (Q4); the obfuscation set's encoded_payload_decode was never a candidate template in this brief, so there is nothing additional to drop."
+    - hint: "logsource 'registry_set' (recommended by techniques: T1562.001) is not covered — pull in cue_registry_key.* or author a custom question with category: registry_set"
+      disposition: declined
+      reason: "Acted on, not declined — recorded for audit: authored attack:T1562.001.registry_set (Q8) covering Defender disabling through reg.exe writes to the Windows Defender policy keys. Implemented as a process_creation reg.exe query rather than category: registry_set because the published evidence stream and the rest of this playbook are process_creation; the reg.exe command line carries the same Defender key/value names (DisableAntiSpyware, DisableRealtimeMonitoring, etc.) and keeps the cross-question pivot on a single logsource."
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - powershell
+    - defense_tampering
+    - cue_process_tool
+    - cue_user_actor
+    - cue_host_context
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 17
+      attack: 1
+    phase_distribution:
+      triage: 2
+      analysis: 2
+      context: 14
+    logsource_diversity:
+      process_creation: 16
+      powershell: 1
+      sigma_alert: 1

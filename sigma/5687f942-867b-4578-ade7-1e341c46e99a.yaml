@@ -1,0 +1,592 @@
+name: VMToolsd Suspicious Child Process
+id: 8b6d8b37-3167-46cd-8be6-0f9107f1acdb
+description: |
+  Detects vmtoolsd.exe (the VMware Tools guest service) spawning a command or
+  script interpreter - cmd.exe, cscript.exe, mshta.exe, powershell.exe, pwsh.exe,
+  regsvr32.exe, rundll32.exe, or wscript.exe - identified by either the child
+  Image name or its embedded OriginalFileName. The rule fires when the parent is
+  vmtoolsd.exe AND the child matches one of those interpreters, excluding the
+  signed VMware Tools default power-state scripts and empty cmd.exe launches.
+  vmtoolsd runs as NT AUTHORITY\SYSTEM, so a child interpreter it spawns inherits
+  SYSTEM context; the per-power-event script hooks VMware Tools supports can be
+  repointed to an arbitrary batch or script path, giving a signed, registry-free
+  persistence that re-executes on VM power-on, resume, suspend, or shutdown. Some
+  environments legitimately configure operational power scripts, so the
+  investigation should determine which interpreter ran, what it executed, whether
+  a power-state script hook was configured, and whether the same pattern appears
+  elsewhere on the host or fleet.
+type: detection
+detection_id: 5687f942-867b-4578-ade7-1e341c46e99a
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Did vmtoolsd.exe spawn a command or script interpreter, matching what this
+    rule detects?
+  context: Before investing investigation time, confirm the alert is a true positive.
+    The rule fires when the parent is vmtoolsd.exe AND the child is one of cmd.exe,
+    cscript.exe, mshta.exe, powershell.exe, pwsh.exe, regsvr32.exe, rundll32.exe, or
+    wscript.exe - matched either by the Image name on disk or by the embedded
+    OriginalFileName. Read the exact ParentImage, Image, and OriginalFileName and
+    note which interpreter ran. The signed VMware Tools default power scripts and
+    empty cmd.exe launches are excluded by the rule, so a firing event is a child
+    outside that allowlist.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - OriginalFileName
+- source: template:universal.host_user_context
+  question: Is this host expected to run command or script interpreters as children of
+    VMware Tools?
+  context: vmtoolsd.exe legitimately spawns its own default power-state scripts, but a
+    general-purpose interpreter as its child is uncommon outside a deliberately
+    configured operational script hook. Because vmtoolsd runs as SYSTEM, the child
+    inherits SYSTEM context regardless of which user is logged in. Knowing whether
+    this host has documented VM power-state automation, and whether its
+    administrators configure such hooks, is often the fastest path to separating a
+    sanctioned operational script from an attacker-planted persistence.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:masquerading.true_identity
+  question: What is the actual identity of the spawned binary based on its metadata and
+    hash, and does the Image name match its OriginalFileName?
+  context: The rule matches on either the Image name on disk or the embedded
+    OriginalFileName, so a binary renamed to evade the Image list can still fire on
+    its metadata, and a binary masquerading under an interpreter name can be caught
+    by comparing the two. Compare the Image path against OriginalFileName and check
+    the signing party and status - a Microsoft-signed interpreter from System32 is a
+    different finding than an unsigned or mismatched binary running from a
+    user-writable path. The hash enables a reputation lookup to determine whether the
+    child is a known-good interpreter or a novel sample.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - Hashes
+- source: template:cue_process_tool.mechanism_decode
+  question: What exactly did the spawned interpreter run? Decode its full command line
+    and any referenced script.
+  context: The full command line of the interpreter reveals the action taken. Decode
+    any flags, referenced script or batch paths, encoded content, or URLs. For the
+    persistence pattern this rule targets, the interpreter (commonly cmd.exe) is
+    invoked to run a configured power-state script - identify the script path it
+    points at and whether that path lives outside the VMware Tools directory. The
+    query is scoped to this exact process instance because cmd.exe and similar
+    interpreters are too common for host-wide binary scoping to be meaningful here.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:powershell.encoded_command_decode
+  question: If the interpreter was PowerShell, was the command encoded or obfuscated,
+    and what does it decode to?
+  context: When the child is powershell.exe or pwsh.exe, the command may use
+    -EncodedCommand (-enc), string concatenation, backtick escaping, or variable
+    substitution to hide its intent. Base64-encoded commands are the most common
+    form. Decoding reveals the actual payload - download cradles, reverse shells, or
+    in-memory execution of .NET assemblies. If the child interpreter is not
+    PowerShell, read the command line directly for the script or batch path it
+    invokes.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: attack:T1059.command_analysis
+  question: Did the interpreter reference a power-state script hook or a batch or script
+    path outside the VMware Tools directory?
+  context: The persistence variant of this pattern works by pointing a VM power-state
+    hook (power-on, resume, suspend, shutdown) at an arbitrary script path, which
+    vmtoolsd then runs through cmd.exe on the next transition. The configuration is
+    held in the tools.conf file rather than in the per-VM default .bat files. The
+    query surfaces VMware Tools configuration utility invocations on the host so the
+    analyst can see whether a script hook was set or enabled; a child interpreter
+    that runs a script from a path outside the standard VMware Tools directory is the
+    signal that distinguishes attacker configuration from the shipped defaults.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains:
+        - 'script'
+        - 'tools.conf'
+      selection_tool:
+        Image|endswith:
+        - '\VMwareToolBoxCmd.exe'
+        - '\cmd.exe'
+      condition: selection and selection_tool
+    fields:
+      - Image
+      - CommandLine
+      - User
+- source: attack:T1059.tuning_parameter
+  question: Was a tools.conf file or a VMware Tools power-state script written or
+    modified on this host?
+  context: The power-state persistence anchors on the tools.conf configuration file
+    under the VMware Tools ProgramData directory, and on the per-state default batch
+    scripts under the VMware Tools program directory. A write or modification of
+    tools.conf, or tampering with the default power scripts, is the durable artifact
+    the command-line activity leaves behind and persists across reboots. Surfacing
+    file writes to these specific paths confirms whether a configuration change was
+    actually committed, independent of which interpreter carried it out.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains:
+        - '\VMware\VMware Tools\tools.conf'
+        - '\VMware\VMware Tools\poweron-vm-default.bat'
+        - '\VMware\VMware Tools\poweroff-vm-default.bat'
+        - '\VMware\VMware Tools\resume-vm-default.bat'
+        - '\VMware\VMware Tools\suspend-vm-default.bat'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - User
+- source: template:parent_child.parent_process_legitimacy
+  question: What started vmtoolsd.exe, and is its own origin the expected VMware Tools
+    service chain?
+  context: vmtoolsd.exe normally runs as a long-lived service started by the service
+    control manager at boot. Tracing the parent's own origin confirms whether this is
+    the genuine VMware Tools guest service or a process masquerading under that name.
+    A vmtoolsd.exe started by an interactive shell, a script host, or from a
+    non-standard path is itself the anomaly, separate from whatever child it spawned.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- source: template:parent_child.sibling_processes
+  question: What other child processes did this same vmtoolsd.exe instance spawn?
+  context: If this vmtoolsd.exe instance was used to launch a malicious interpreter, it
+    may have spawned other processes in the same window. Examining siblings of the
+    exact parent instance reveals the full scope of activity initiated through this
+    SYSTEM-context service - multiple interpreter children, or an interpreter
+    followed by reconnaissance or download tooling, points to orchestrated activity
+    rather than a single benign script run.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_parent_process.follow_on
+  question: What other interpreter children has vmtoolsd.exe spawned on this host in the
+    hours after the alert?
+  context: An actor using the VMware Tools service for execution may drive multiple
+    stages through it. Listing children of vmtoolsd.exe on this host after the alert
+    reveals follow-on execution the first child may have set up - additional
+    interpreters, reconnaissance, credential access, or download tooling all running
+    under inherited SYSTEM context. A burst of interpreter children from vmtoolsd
+    after the alert points to active hands-on use of the service.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        process.parent.name|expand: '%ParentName%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_user_actor.baseline
+  question: Does this user account normally launch these interpreters from VMware Tools
+    on this network?
+  context: Compare the acting account against its own history. Because vmtoolsd runs as
+    SYSTEM, the recorded user is often a service principal rather than an interactive
+    operator, but where a real user is attributed, an account that has never spawned
+    an interpreter under VMware Tools is more notable than an administrator who
+    routinely manages VM power-state automation. The user role and typical toolset
+    should align with VM administration.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith:
+        - '\cmd.exe'
+        - '\cscript.exe'
+        - '\mshta.exe'
+        - '\powershell.exe'
+        - '\pwsh.exe'
+        - '\regsvr32.exe'
+        - '\rundll32.exe'
+        - '\wscript.exe'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is the vmtoolsd.exe-to-interpreter spawn historically routine on this host
+    or across the environment, or is it new for this host?
+  context: When the alert fires under a service principal, user identity does not
+    attribute the behavior; the meaningful pivot is the launch mechanism - vmtoolsd.exe
+    spawning a command or script interpreter - and whether that pairing is
+    historically common here. A first-ever or rare occurrence of vmtoolsd spawning an
+    interpreter on this host or environment-wide is the deviation worth chasing, while
+    a host that already accounts for many such prior events more likely has a
+    sanctioned power-state script configured.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith:
+        - '\cmd.exe'
+        - '\cscript.exe'
+        - '\mshta.exe'
+        - '\powershell.exe'
+        - '\pwsh.exe'
+        - '\regsvr32.exe'
+        - '\rundll32.exe'
+        - '\wscript.exe'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the acting account's activity across all hosts reveals whether this
+    was a single event or part of activity spanning multiple endpoints. If the same
+    user triggered similar interpreter activity on other hosts, the scope of the
+    incident is larger than one machine.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did vmtoolsd.exe spawn the same interpreters on other hosts in the same
+    window, indicating a coordinated rollout rather than isolated activity?
+  context: Under a service principal, asking what else the user did across the network
+    returns agent-telemetry noise, since every host runs system-owned agents
+    constantly. The meaningful question is whether the same launch mechanism -
+    vmtoolsd.exe spawning a command or script interpreter - fired on other hosts in
+    the alert window. Multiple hosts in the same window points to a pushed or
+    templated power-state configuration; a single host points to a host-local
+    trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith:
+        - '\cmd.exe'
+        - '\cscript.exe'
+        - '\mshta.exe'
+        - '\powershell.exe'
+        - '\pwsh.exe'
+        - '\regsvr32.exe'
+        - '\rundll32.exe'
+        - '\wscript.exe'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining activity around the
+    vmtoolsd-spawned interpreter reveals what led to it and what followed - the
+    configuration step that planted the script hook, reconnaissance, or follow-on
+    execution under SYSTEM. Novel parent-child pairs at low counts are what to scan
+    for against the high-count noise of routine system processes.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:organizational_context.timing_alignment
+  question: Does the timing of this activity align with normal work hours or a
+    documented maintenance window?
+  context: Legitimate VM power-state automation and administrative scripting typically
+    run during business hours or scheduled maintenance, or fire deterministically on
+    a VM power transition that maps to a known event. An interpreter spawned by
+    VMware Tools at an odd hour with no corresponding maintenance window or power-state
+    change is more suspicious than the same activity during a documented change. Note
+    whether the timing lines up with an actual VM power-on, resume, suspend, or
+    shutdown.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host - reconnaissance, credential access, or
+    defense tampering - may reveal the attack stages that preceded the VMware Tools
+    persistence setup and help reconstruct the full timeline. Configuring a
+    SYSTEM-context persistence hook is often a later step in a sequence, so prior
+    alerts give the context for how the operator reached this point.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1059
+      name: Command and Scripting Interpreter
+      role: primary
+  attack_chain_coverage:
+    - stage: 1
+      label: interpreter_spawn
+      description: "vmtoolsd.exe spawns a command or script interpreter child (the act the rule detects)"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: command_decode
+      description: "Decode the interpreter's full command line / encoded payload and identify the script or batch path it runs"
+      mapped_to: Q4
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 3
+      label: followon_execution
+      description: "Correlate secondary execution after the interpreter launch - additional interpreter children of vmtoolsd and host activity the persistence enabled"
+      mapped_to: Q10
+      source: template:cue_parent_process.follow_on
+  dimension_coverage:
+    - dimension: command_analysis
+      technique: T1059
+      covered_by: Q6
+      source: attack:T1059.command_analysis
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1059
+      covered_by: Q8
+      source: template:parent_child.parent_process_legitimacy
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1059
+      covered_by: Q16
+      source: template:organizational_context.timing_alignment
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1059
+      covered_by: Q7
+      source: attack:T1059.tuning_parameter
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1059
+      covered_by: Q2
+      source: template:universal.host_user_context
+      coverage_type: direct
+  mutable_dispositions:
+    - element: CommandLinePattern
+      dimension: command_analysis
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q6
+      notes: "Analytic gives a tuning rationale (match encoded/uncommon script execution patterns), no concrete values. Rule itself carries no positive CommandLine values (commandline_values empty); db_refs supply the concrete persistence values (script subcommand, tools.conf, power-state .bat paths) which are injected into the attack:T1059.command_analysis query CommandLine|contains and the attack:T1059.tuning_parameter TargetFilename|contains."
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "vmtoolsd.exe (from rule selection_parent)"
+      disposition: query_injection
+      target_question: Q8
+      notes: "Parent is fixed by the rule (ParentImage|endswith \\vmtoolsd.exe). parent_process_legitimacy looks up the exact parent instance via ParentProcessGuid; baseline_svc/clustering_svc pivot on process.parent.name to test how routine the vmtoolsd->interpreter pairing is."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q16
+      notes: "Analytic rationale to restrict to work hours / maintenance windows; no concrete threshold. Realized as the timing-alignment judgment question, framed to the VM power-transition trigger this rule's persistence variant uses."
+  dedup_decisions:
+    - dropped: cue_user_actor.baseline + cue_user_actor.baseline_svc
+      reason: "user_actor pair - non-deduplicable; both emitted (subject-pivot and launch-mechanism-pivot)."
+      kept: both
+    - dropped: cue_user_actor.clustering + cue_user_actor.clustering_svc
+      reason: "user_actor pair - non-deduplicable; both emitted (subject-pivot and launch-mechanism-pivot)."
+      kept: both
+    - dropped: cue_process_tool.process_chain
+      reason: "parent_process is primary (hint 3) and parent_child technique set active; parent origin covered by parent_child.parent_process_legitimacy (more specific). process_chain would duplicate the ParentProcessGuid lookup."
+      kept: template:parent_child.parent_process_legitimacy
+    - dropped: cue_parent_process.mechanism_decode
+      reason: "Parent-origin lookup of the vmtoolsd parent is covered by parent_child.parent_process_legitimacy (more specific, projects ParentCommandLine). cue_parent_process.mechanism_decode is the same ParentProcessGuid lookup."
+      kept: template:parent_child.parent_process_legitimacy
+    - dropped: cue_parent_process.clustering
+      reason: "Image+CommandLine activity from the vmtoolsd parent on this host is subsumed by cue_parent_process.follow_on (children of vmtoolsd, post-alert) and cue_host_context.clustering (Image+ParentImage host context)."
+      kept: template:cue_parent_process.follow_on
+    - dropped: cue_process_tool.baseline + cue_parent_process.baseline
+      reason: "Host-frequency baselines of the interpreter / parent-child pairing are subsumed by the user_actor baseline pair (subject and launch-mechanism pivots both scoped to the interpreter set)."
+      kept: cue_user_actor.baseline + cue_user_actor.baseline_svc
+  skipped_templates:
+    - template: obfuscation.encoded_payload_decode
+      reason: "replaced_by powershell.encoded_command_decode (hint 2). The PowerShell-specific encoded-command decode supersedes the generic obfuscation decode; included as Q5."
+    - template: powershell.script_block_logging
+      reason: "must_include in powershell set, but the child interpreter is only PowerShell in 2 of 8 matched binaries; the rule does not constrain to PowerShell. 4104 script-block coverage would return 0 by construction for the cmd/cscript/mshta/regsvr32/rundll32/wscript cases. Decode is covered for all interpreters by cue_process_tool.mechanism_decode (Q4) and for PowerShell by powershell.encoded_command_decode (Q5). Trimmed to stay within the 14-18 target."
+    - template: powershell.powershell_security_bypass
+      reason: "must_include in powershell set, but this is a vmtoolsd-parent persistence rule, not a PowerShell-payload rule; a host-wide -ExecutionPolicy/AMSI bypass sweep is not the load-bearing precursor here. cue_host_context.precursor (Q17) carries prior-alert context. Trimmed to stay within the 14-18 target."
+    - template: persistence_scope.process_based_persistence
+      reason: "recommended priority. The durable persistence artifact for this technique is the tools.conf power-state hook, not schtasks/sc/reg/bitsadmin tooling; it is covered directly by attack:T1059.tuning_parameter (Q7, file writes to tools.conf and the power-state .bat scripts). A generic persistence-tool sweep would not surface the VMware-specific mechanism. Trimmed to stay within the 14-18 target."
+    - template: persistence_scope.file_based_persistence
+      reason: "recommended priority. Startup-folder / Run-key drops are orthogonal to the VMware Tools power-state hook this rule's persistence variant uses; the relevant file artifact (tools.conf, power-state .bat) is covered by attack:T1059.tuning_parameter (Q7). Trimmed to stay within the 14-18 target."
+    - template: masquerading.binary_origin
+      reason: "must_include in masquerading set, but file-event arrival tracing of the interpreter binary is low-value here: the matched children are standard system interpreters (cmd, powershell, etc.) that ship with Windows and are not dropped. The masquerading angle that matters - Image vs OriginalFileName mismatch - is covered by masquerading.true_identity (Q3). Trimmed to stay within the 14-18 target."
+    - template: masquerading.renamed_binary_activity
+      reason: "must_include in masquerading set, but its ParentImage|endswith %Image% child-activity scope targets a renamed standalone tool; here the child is a standard interpreter and post-execution activity is covered by parent_child.sibling_processes (Q9) and cue_parent_process.follow_on (Q10). Trimmed to stay within the 14-18 target."
+    - template: organizational_context.change_ticket
+      reason: "recommended priority. timing_alignment (Q16) carries the was-this-sanctioned judgment scoped to the VM power-transition trigger; a separate change-ticket question would duplicate the authorization angle. Trimmed to stay within the 14-18 target."
+    - template: organizational_context.human_recall
+      reason: "recommended priority. The alert fires under SYSTEM-context vmtoolsd; user recall is weak signal when no interactive user is attributed. Authorization is covered by timing_alignment (Q16). Trimmed to stay within the 14-18 target."
+    - template: organizational_context.procedural_consistency
+      reason: "recommended priority. Subsumed by host_user_context (Q2), which asks whether this host is expected to run interpreters as VMware Tools children. Trimmed to stay within the 14-18 target."
+    - template: cue_parent_process.scope
+      reason: "Cross-host scope of the vmtoolsd->interpreter pairing is covered by cue_user_actor.clustering_svc (Q14), which pivots on process.parent.name plus the interpreter set in the alert window. cue_parent_process.scope would duplicate that fleet pivot."
+      kept: cue_user_actor.clustering_svc
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "powershell.encoded_command_decode replaces obfuscation.encoded_payload_decode"
+      disposition: acted-on
+      reason: >-
+        Acted on. powershell.encoded_command_decode is included as Q5; the
+        superseded obfuscation.encoded_payload_decode is recorded under
+        skipped_templates. Listed here for audit completeness, not as a decline.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - powershell
+    - masquerading
+    - parent_child
+    - organizational_context
+    - cue_parent_process
+    - cue_process_tool
+    - cue_user_actor
+    - cue_host_context
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 15
+      attack: 2
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 2
+      context: 13
+    logsource_diversity:
+      process_creation: 15
+      file_event: 1
+      sigma_alert: 1

@@ -1,0 +1,604 @@
+name: PowerShell Download Pattern
+id: 05680074-2c4b-4958-8dd9-16c8433b6ad8
+description: |
+  Detects a PowerShell process (powershell.exe, powershell_ise.exe, or pwsh.exe) whose command line
+  contains a Net.WebClient download-cradle pattern: the rule fires when the binary is a PowerShell host
+  AND the command line contains all of 'new-object', 'net.webclient).', and 'download' together with
+  either 'string(' or 'file('. This is the canonical fileless download cradle — (new-object
+  net.webclient).downloadstring(...) or .downloadfile(...) — used to fetch and execute remote script or
+  binary payloads directly in memory. Legitimate administrative scripts occasionally use this idiom, so the
+  investigation should decode the cradle to identify the source URL, determine what was fetched and whether
+  it ran, and confirm whether the user, host, and parent process are expected to invoke command-line
+  downloaders.
+type: detection
+detection_id: 3b6ab547-8ec2-4991-b9d2-2b06702a48d7
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: '2026-06-05'
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line match the Net.WebClient download cradle this rule detects?
+  context: Confirm the alert is a true positive before investing investigation time. The rule fires only
+    when a PowerShell host binary runs with a command line containing all of 'new-object',
+    'net.webclient).', and 'download' plus either 'string(' or 'file(' — the .downloadstring or
+    .downloadfile cradle. Review the full command line and confirm the Image is powershell.exe,
+    powershell_ise.exe, or pwsh.exe and that the cradle fragments are actually present and not a benign
+    coincidence.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to download files via command-line PowerShell?
+  context: Legitimate administrative scripting and software-deployment tooling can produce Net.WebClient
+    download calls. Knowing whether the user role and host function routinely involve command-line
+    downloaders is often the fastest way to separate routine automation from operator activity.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What exactly did this PowerShell command do? Decode the cradle and identify the source URL and
+    destination.
+  context: The full command line reveals the specific download action. Identify the remote URL passed to
+    DownloadString or DownloadFile, the local path any payload is written to, and whether the fetched
+    content is piped into Invoke-Expression for in-memory execution. The query scopes to all PowerShell
+    host executions on this host within the window because a download cradle is frequently one stage of a
+    longer scripted sequence.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:powershell.encoded_command_decode
+  question: Was the command encoded or obfuscated, and what does the cradle decode to?
+  context: PowerShell download cradles are routinely hidden with backtick escaping, string concatenation,
+    format-string operators, and cmdlet-name splitting (for example .("new-"+"o"+"bject")), or wrapped in
+    a base64 -EncodedCommand. Deobfuscate the command line to recover the literal source URL and the
+    DownloadString/DownloadFile target, then check the URL reputation and determine whether the fetched
+    content was executed in memory.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:powershell.script_block_logging
+  question: Did PowerShell script block logging capture the deobfuscated cradle content?
+  context: Script block logging (Event ID 4104) records the deobfuscated script PowerShell actually
+    executes, giving ground truth about the cradle even when the command line is obfuscated. Look for the
+    resolved DownloadString/DownloadFile call and any Invoke-Expression that runs the fetched content. If
+    PowerShell operational logs are not ingested in this environment, treat zero results as a visibility
+    gap rather than evidence nothing ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- source: template:powershell.powershell_security_bypass
+  question: Were PowerShell or endpoint security controls bypassed or weakened on this host before the
+    download ran?
+  context: Operators often weaken protection before fetching a payload — patching AMSI, disabling Defender
+    real-time monitoring, or relaxing execution policy. Finding these precursor events on the host in the
+    hour before the cradle strengthens the case for malicious intent. This query also surfaces AV/EDR
+    tamper attempts on the host, so a separate generic tamper sweep is not needed.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- source: template:cue_process_tool.process_chain
+  question: What process spawned this PowerShell instance, and is that parent chain expected?
+  context: The parent process reveals how the cradle was launched. Download cradles are frequently spawned
+    by Office applications, mshta.exe, wscript.exe, or macro-bearing documents rather than an interactive
+    shell or explorer.exe. An unusual or document-borne parent shifts the disposition toward user-execution
+    of a malicious lure.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: attack:T1059.001.image_load
+  question: Did this host load the .NET automation assemblies that indicate in-memory PowerShell execution
+    around the alert?
+  context: PowerShell download cradles can run through .NET automation rather than the powershell.exe
+    console, and fetched assemblies may be loaded directly into memory via Reflection.Assembly::Load.
+    Loads of System.Management.Automation, clr.dll, or mscoree.dll into a non-PowerShell host, or
+    never-before-seen assemblies, point to fileless or hosted execution that the process command line
+    alone would not reveal. If image-load events are not ingested in this environment, treat zero results
+    as a visibility gap.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_modules:
+        ImageLoaded|contains:
+          - '\System.Management.Automation'
+          - '\clr.dll'
+          - '\mscoree.dll'
+          - '\mscorlib'
+      condition: selection and selection_modules
+    fields:
+      - Image
+      - ImageLoaded
+- source: attack:T1059.001.network_connection
+  question: What outbound network connections did this host make around the alert, and do any match the
+    cradle's source URL?
+  context: The download cradle's purpose is to fetch a remote payload, so the in-memory cradle is normally
+    followed by an outbound HTTP or HTTPS connection to the URL recovered from the command line. Correlate
+    the destination addresses here against the URL decoded from the cradle, and check the reputation of any
+    external host the PowerShell process reached.
+  range: +/-10m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - '\powershell.exe'
+          - '\powershell_ise.exe'
+          - '\pwsh.exe'
+      condition: selection
+    fields:
+      - Image
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+- source: template:cue_process_tool.follow_on
+  question: What child processes did this PowerShell instance spawn afterward?
+  context: A download cradle's actual impact shows in what it executes next. A fetched payload written to
+    disk and run, or an in-memory loader spawning cmd.exe, rundll32.exe, or a second PowerShell stage,
+    reveals post-download execution. Predictable, signed children point to benign automation.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired this download-cradle pattern, what parents and users drove
+    it, and does the current alert fit?
+  context: Even routine tooling can produce Net.WebClient calls. This query mirrors the rule's full
+    selection scoped to this host, so the resulting parent and user distribution reflects how this specific
+    cradle pattern has historically run here — not generic PowerShell usage. A new parent, an unexpected
+    user, or a first-ever occurrence is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \powershell_ise.exe
+        - \powershell.exe
+        - \pwsh.exe
+      - OriginalFileName:
+        - PowerShell_ISE.EXE
+        - PowerShell.EXE
+        - pwsh.dll
+      selection_cli:
+        CommandLine|contains|all:
+        - new-object
+        - net.webclient).
+        - download
+        CommandLine|contains:
+        - string(
+        - file(
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired this download-cradle pattern in the past week, and does the cross-host
+    distribution look like automation or one-off activity?
+  context: This query mirrors the rule's full selection with no host scope, so the result is a fleet-wide
+    count of this specific cradle pattern rather than generic PowerShell usage. Many hosts firing the same
+    pattern points to scripted deployment or vendor automation; one host or a small unrelated set points to
+    manual operator activity. Use the host spread and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \powershell_ise.exe
+        - \powershell.exe
+        - \pwsh.exe
+      - OriginalFileName:
+        - PowerShell_ISE.EXE
+        - PowerShell.EXE
+        - pwsh.dll
+      selection_cli:
+        CommandLine|contains|all:
+        - new-object
+        - net.webclient).
+        - download
+        CommandLine|contains:
+        - string(
+        - file(
+      condition: all of selection_*
+    fields:
+    - host.name
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run PowerShell download cradles?
+  context: Compare this user's current action against their historical behavior. A user who has never run
+    command-line PowerShell downloaders is more suspicious than one who does so as part of a routine role.
+    User role and typical toolset should align with command-line file retrieval.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent and PowerShell-binary combination historically routine on this host or across
+    the environment, or is the parent unusual for this binary?
+  context: When the alert fires under a service principal, user identity does not attribute behavior. The
+    meaningful pivot is the launch mechanism — which parent spawned this PowerShell binary, and whether
+    that pair is historically common. A new or rare parent for this binary is the deviation worth chasing;
+    a pair already accounting for thousands of prior events is vendor or OS automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning
+    multiple endpoints. If the same user triggered similar download activity on several hosts, the scope of
+    the operation may be larger than a single alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent and PowerShell-binary combination fire on other hosts in the same window —
+    a coordinated rollout, or isolated to this host?
+  context: Under a service principal, user-pivoted clustering returns agent-telemetry noise because every
+    host runs SYSTEM-owned agents constantly. The meaningful question is whether the same launch mechanism
+    — parent process plus spawned binary — fired on other hosts in the alert window. Multiple hosts points
+    to scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: 'Alerts rarely occur in isolation. Examining activity around the alert reveals the immediate
+    context: what led to the download cradle, what happened after, and whether it is part of a larger
+    sequence. Look for reconnaissance, privilege escalation, or persistence mechanisms running near the
+    alert time.'
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host — defense tampering, reconnaissance, or credential access —
+    may reveal the attack stages that preceded the download cradle and help reconstruct the full timeline.
+    A delivery or user-execution alert shortly before this one would corroborate a multi-stage operation.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1059.001
+      name: PowerShell
+      role: primary
+    - id: T1059
+      name: Command and Scripting Interpreter
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: powershell_cradle_invocation
+      description: PowerShell host launched with a Net.WebClient download-cradle command line
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: command_decode
+      description: Decode / deobfuscate the cradle to recover the source URL and execution path
+      mapped_to: Q3
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 3
+      label: parent_process_analysis
+      description: Abnormal parent (Office, mshta, wscript) spawning PowerShell
+      mapped_to: Q7
+      source: template:cue_process_tool.process_chain
+    - stage: 4
+      label: module_load
+      description: Suspicious .NET automation assemblies loaded (in-memory / hosted execution)
+      mapped_to: Q8
+      source: attack:T1059.001.image_load
+    - stage: 5
+      label: network_transfer
+      description: Outbound network connection fetching the remote payload
+      mapped_to: Q9
+      source: attack:T1059.001.network_connection
+    - stage: 6
+      label: child_spawn
+      description: Child processes spawned after the download (post-download execution)
+      mapped_to: Q10
+      source: template:cue_process_tool.follow_on
+  dimension_coverage:
+    - dimension: command_analysis
+      technique: T1059.001
+      covered_by: Q4
+      source: template:powershell.encoded_command_decode
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1059.001
+      covered_by: Q7
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1059.001
+      covered_by: Q17
+      source: template:cue_host_context.clustering
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1059.001
+      covered_by: Q8
+      source: attack:T1059.001.image_load
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1059
+      covered_by: Q2
+      source: template:universal.host_user_context
+      coverage_type: direct
+  mutable_dispositions:
+    - element: CommandLinePattern
+      dimension: command_analysis
+      specific_values: "-enc, -nop (regex for encoded/obfuscated/hidden args)"
+      disposition: query_injection
+      target_question: Q6
+      notes: "Bypass/obfuscation indicators carried in powershell_security_bypass CommandLine|contains
+        list (-ep bypass, AmsiUtils, -Version 2); decode angle covered by encoded_command_decode (Q4)."
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "Excel, WinWord, mshta (abnormal PowerShell parents)"
+      disposition: context
+      target_question: Q7
+      notes: "Abnormal-parent values (Office, mshta, wscript) named in process_chain context; query is
+        ParentProcessGuid-scoped so it returns the actual parent for the analyst to compare."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only (off-hours / non-maintenance scoping)"
+      disposition: context
+      target_question: Q17
+      notes: "No specific values to inject; host-clustering and precursor questions provide the temporal
+        correlation window around the alert."
+    - element: LoadedModuleList
+      dimension: tuning_parameter
+      specific_values: ".NET automation assemblies (System.Management.Automation, clr.dll, mscoree.dll)"
+      disposition: query_injection
+      target_question: Q8
+      notes: "Injected into the image_load question's ImageLoaded|contains selection to surface rare /
+        never-before-seen .NET assemblies tied to hosted PowerShell execution."
+    - element: ScriptBlockLengthThreshold
+      dimension: tuning_parameter
+      specific_values: "rationale only (Event 4104 script-block length tuning)"
+      disposition: context
+      target_question: Q5
+      notes: "Threshold is a noise-tuning rationale, not a queryable value; script_block_logging question
+        retrieves 4104 ScriptBlockText so the analyst reads the full content regardless of length."
+  dedup_decisions:
+    - dropped: cue_process_tool.clustering
+      reason: "Overlaps cue_host_context.clustering (both: what else ran on this host in the window,
+        aggregated). host_context version projects Image+ParentImage which surfaces novel parent-child
+        pairs; process_tool version projects Image only — kept the richer one."
+      kept: cue_host_context.clustering
+    - dropped: cue_process_tool.baseline
+      reason: "Asks 'does this host normally run powershell' — powershell.exe runs constantly, so the
+        generic-binary baseline returns high-volume noise. baseline_deviation (REFLECTED, host-scoped to
+        the rule's full cradle pattern) is strictly more specific and supersedes it."
+      kept: cue_process_tool.baseline_deviation
+    - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable; emitted BOTH (user-pivot + parent/binary substitute) per
+        AGENTS.md service-principal handling."
+      kept: both
+    - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable; emitted BOTH (user-pivot + parent/binary substitute) per
+        AGENTS.md service-principal handling."
+      kept: both
+  skipped_templates:
+    - template: universal.endpoint_protection_health
+      reason: "RECOMMENDED tier. Dropped because powershell.powershell_security_bypass (Q6) already sweeps
+        the same host at -1h for AV/EDR tamper (Set-MpPreference, DisableRealtimeMonitoring) and AMSI
+        patching, which is the tamper-as-precursor angle for a PowerShell-execution rule, and is more
+        specific to this rule's behavior. defense_tampering technique set is not confirmed for this rule.
+        Kept question count at 18 to fit the image_load and network_connection chain questions."
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "powershell.encoded_command_decode replaces obfuscation.encoded_payload_decode"
+      disposition: acted-on
+      reason: "Included powershell.encoded_command_decode as Q4 (the deobfuscation/decode question);
+        obfuscation.encoded_payload_decode was not emitted, honoring the replacement."
+    - hint: "logsource 'image_load' (recommended by techniques: T1059.001) is not covered — pull in
+        cue_image_load.* or author a custom question with category: image_load"
+      disposition: acted-on
+      reason: "Authored Q8 (attack:T1059.001.image_load) with category: image_load, scoped to host.name and
+        filtered on .NET automation assemblies — covers the 'suspicious modules loaded' chain stage the
+        process_creation queries cannot see."
+  contextual_sets:
+    included: []
+    excluded:
+      - id: ransomware_impact
+        confidence: low
+        reason: "Keyword match on 'ransomware' comes from one reference URL summary, not the rule's
+          detection. The rule fires on a generic Net.WebClient download cradle, not impact/encryption
+          behavior. Including ransomware-impact questions would misrepresent a technique-focused execution
+          rule as threat-specific. No templates were extracted for this set in the brief."
+      - id: network_scope
+        confidence: low
+        reason: "Same incidental 'ransomware' keyword origin. The cradle's network fetch is covered
+          directly by the network_connection chain question (Q9); a generic network-scope set would add
+          redundancy without new coverage. No templates extracted for this set in the brief."
+  technique_sets_applied:
+    - universal
+    - powershell
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 16
+      attack: 2
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 2
+      context: 14
+    logsource_diversity:
+      process_creation: 14
+      powershell_script_block: 1
+      image_load: 1
+      network_connection: 1
+      sigma_alert: 1

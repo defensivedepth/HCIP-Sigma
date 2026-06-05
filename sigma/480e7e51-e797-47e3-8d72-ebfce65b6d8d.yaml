@@ -1,0 +1,523 @@
+name: Python Spawning Pretty TTY on Windows
+id: 6fd0f8c5-e998-4ccd-ae0b-19126287170e
+description: |
+  Detects a python.exe, python3.exe, or python2.exe process whose command line
+  carries the canonical "spawn a pretty TTY" pattern. The rule fires when the
+  image is one of the python binaries AND the command line matches either branch:
+  it contains both 'import pty' and '.spawn(', OR it contains 'from pty import
+  spawn'. This one-liner is the standard way to upgrade a dumb shell - the kind
+  obtained from an exploited service or reverse-shell payload - into a fully
+  interactive terminal, so it commonly appears right after a web application or
+  command interpreter is compromised. Python interactive sessions are also normal
+  on developer and data-engineering workstations, so the investigation should
+  determine which command line branch fired, what shell or target the pty was
+  spawned for, what process launched python, and whether the activity fits how
+  this user and host normally run python.
+type: detection
+detection_id: 480e7e51-e797-47e3-8d72-ebfce65b6d8d
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line spawn a pty - either 'import pty' together with
+    '.spawn(', or 'from pty import spawn' - on a python binary, matching this rule?
+  context: Before investing investigation time, confirm the alert is a true positive.
+    The rule fires when the image is python.exe, python3.exe, or python2.exe AND the
+    command line matches either branch - it contains both 'import pty' and '.spawn(',
+    or it contains 'from pty import spawn'. Read the exact command line and note which
+    branch fired and what the pty was spawned for. The branch and the spawn target
+    (commonly a shell path or a socket-backed file descriptor) determine which
+    downstream questions carry weight, so record both.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run python interactive pty sessions?
+  context: Interactive python pty upgrades are routine for a narrow set of developers,
+    data engineers, and automation workflows, and unusual everywhere else. Knowing
+    whether the acting account and the host function involve python development or
+    scripted automation is often the fastest path to separating a benign interactive
+    session from a shell upgrade following a service compromise.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What does the python pty command line do - which pty branch ran, and what
+    shell or descriptor was spawned?
+  context: The full command line reveals the operational purpose. Read which branch
+    fired ('import pty' plus '.spawn(', or 'from pty import spawn') and decode the
+    argument passed to spawn - a shell path such as /bin/bash or cmd.exe, a connected
+    socket file descriptor for a reverse shell, or an inline -c payload. The spawn
+    target tells you whether this is a local interactive session or a remote shell
+    being upgraded to a full terminal.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains:
+          - 'import pty'
+          - 'from pty import spawn'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: attack:T1059.command_analysis
+  question: Was the pty spawn paired with a reverse-shell or socket setup on the same
+    command line?
+  context: A pty upgrade by itself is interactive convenience; paired with socket or
+    network plumbing it is shell delivery. Inspect the command line for tokens that
+    connect the pty to a network endpoint - socket.socket, connect(, os.dup2, or an
+    inline IP and port - which indicate the interactive terminal is being bound to a
+    remote operator rather than a local console. The presence of these tokens raises
+    the spawn from local convenience to remote access.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_pty:
+        CommandLine|contains:
+          - 'import pty'
+          - 'from pty import spawn'
+      selection_socket:
+        CommandLine|contains:
+          - 'socket.socket'
+          - 'connect('
+          - 'os.dup2'
+          - '.spawn('
+      _pb_scope:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: (selection_pty and selection_socket) and _pb_scope
+    fields:
+      - CommandLine
+      - Image
+- source: template:cue_process_tool.process_chain
+  question: What process spawned this python binary, and is that parent chain expected?
+  context: The parent process reveals how python was invoked. A pty upgrade following
+    a service compromise typically shows an unexpected parent - a web application
+    process, a command interpreter spawned by a server daemon, or a shell launched by
+    an internet-facing service - rather than an interactive console or IDE. Interactive
+    development usually shows explorer.exe, a terminal, or an IDE as the parent; a
+    server or interpreter parent points to a shell obtained through exploitation.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: attack:T1059.parent_process_analysis
+  question: Is the process tree above python a server or service interpreter rather
+    than an interactive session?
+  context: Walking the chain above python distinguishes an interactive developer
+    session from a shell obtained through a compromised service. A grandparent that is
+    a web or application server, a database engine, or a network-facing daemon - with
+    an intermediate command interpreter between it and python - is the fingerprint of
+    a pty being spawned to upgrade a shell delivered by exploitation. An interactive
+    console or IDE grandparent is the benign pattern.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentProcessGuid
+      - CommandLine
+- source: attack:T1059.time_correlation
+  question: What did python and its children do on this host in the hour after the pty
+    was spawned?
+  context: Upgrading to an interactive terminal is a setup step; the operator's actual
+    activity follows. Examining process creation in the window immediately after the
+    spawn reveals what the interactive shell was used for - reconnaissance commands,
+    credential file access, additional payload retrieval, or lateral movement attempts.
+    A burst of shell and tooling activity right after the pty spawn points to hands-on
+    operator use rather than an idle development session.
+  range: +1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+      - User
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run python pty spawn sessions?
+  context: Compare the acting account against its own history. A developer or automation
+    engineer may launch python interactive sessions routinely; an account that has
+    never spawned a pty doing so is more notable. The user role and typical toolset
+    should align with python development or scripted automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        CommandLine|contains:
+          - 'import pty'
+          - 'from pty import spawn'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent process and python pty pattern historically routine on this
+    host or across the environment, or is the parent unusual for it?
+  context: When the alert fires under a service principal, user identity does not
+    attribute the behavior; the meaningful pivot is which parent process launched a
+    python child carrying the pty spawn pattern and whether that pairing is historically
+    common. A new or rare parent for this pattern on this host or environment-wide is
+    the deviation worth chasing, while a parent that already accounts for many prior
+    events is more likely a build pipeline or automation harness.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        CommandLine|contains:
+          - 'import pty'
+          - 'from pty import spawn'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the acting account's activity across all hosts reveals whether the
+    pty spawn was a single event or part of activity spanning multiple endpoints. If
+    the same user triggered similar interactive shell activity on other hosts, the
+    scope of the incident is larger than one machine.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent process and python pty pattern fire on other hosts in
+    the same window, indicating a coordinated rollout rather than isolated activity?
+  context: Under a service principal, asking what else the user did across the network
+    returns agent-telemetry noise, since every host runs system-owned agents constantly.
+    The meaningful question is whether the same launch mechanism - a parent process
+    spawning a python child that carries the pty spawn pattern - fired on other hosts
+    in the alert window. Multiple hosts in the same window points to scheduled or pushed
+    automation; a single host points to a host-local trigger such as a freshly
+    exploited service.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        CommandLine|contains:
+          - 'import pty'
+          - 'from pty import spawn'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining the activity surrounding the pty
+    spawn reveals what led to it and what followed - the service or shell that staged
+    python, reconnaissance, or follow-on execution the interactive terminal enabled.
+    Novel parent-child pairs at low counts are what to scan for against the high-count
+    noise of routine system processes.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host - exploitation of an internet-facing
+    service, web shell activity, or reconnaissance - may reveal the attack stages that
+    preceded the pty spawn and help reconstruct the full timeline. Upgrading to an
+    interactive terminal is usually one step in a sequence, so prior alerts give the
+    context for why the shell was being made interactive.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired the rule's python pty pattern, what
+    parents and users normally drive it, and does the current alert fit?
+  context: Even legitimate interactive use can spawn a pty. This query mirrors the
+    rule's selection structure scoped to this host, so the resulting parent and user
+    distribution reflects how this specific firing pattern has historically run here,
+    not generic python activity. A new parent process, an unexpected account, or a
+    first-ever occurrence is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+        Image|endswith:
+        - python.exe
+        - python3.exe
+        - python2.exe
+      selection_cli_1:
+        CommandLine|contains|all:
+        - import pty
+        - .spawn(
+      selection_cli_2:
+        CommandLine|contains: from pty import spawn
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection_img and 1 of selection_cli_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired the rule's python pty pattern in the past week, and
+    does the cross-host distribution look like consistent automation or one-off activity?
+  context: This query mirrors the rule's selection structure with no host scope, so the
+    result is a fleet-wide count of the python pty firing pattern rather than generic
+    python activity. Many hosts firing the same pattern points to a build pipeline or
+    scripted deployment that spawns a pty by design; one host or a small unrelated set
+    points to manual operator activity following a host-local compromise. Use the host
+    distribution to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+        Image|endswith:
+        - python.exe
+        - python3.exe
+        - python2.exe
+      selection_cli_1:
+        CommandLine|contains|all:
+        - import pty
+        - .spawn(
+      selection_cli_2:
+        CommandLine|contains: from pty import spawn
+      condition: selection_img and 1 of selection_cli_*
+    fields:
+    - host.name
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1059
+      name: Command and Scripting Interpreter
+      role: primary
+  attack_chain_coverage:
+    - stage: 1
+      label: interpreter_invocation
+      description: "A python binary is launched with a pty spawn command line - the act the rule detects (selection_img AND either selection_cli branch)"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: command_decode
+      description: "Decode which pty branch fired and what shell or descriptor was spawned to establish whether this is a local session or a remote shell upgrade"
+      mapped_to: Q3
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 3
+      label: shell_delivery
+      description: "Determine whether the pty spawn is bound to network plumbing (socket/dup2) and what parent service delivered the shell"
+      mapped_to: Q4
+      source: attack:T1059.command_analysis
+    - stage: 4
+      label: secondary_execution
+      description: "Correlate process creation after the pty spawn with the operator activity the interactive terminal enabled"
+      mapped_to: Q7
+      source: attack:T1059.time_correlation
+  dimension_coverage:
+    - dimension: command_analysis
+      technique: T1059
+      covered_by: Q4
+      source: attack:T1059.command_analysis
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1059
+      covered_by: Q6
+      source: attack:T1059.parent_process_analysis
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1059
+      covered_by: Q7
+      source: attack:T1059.time_correlation
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1059
+      covered_by: Q14
+      source: template:cue_process_tool.baseline_deviation
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1059
+      covered_by: Q2
+      source: template:universal.host_user_context
+      coverage_type: direct
+  mutable_dispositions:
+    - element: CommandLinePattern
+      dimension: command_analysis
+      specific_values: "import pty, .spawn(, from pty import spawn"
+      disposition: query_injection
+      target_question: Q4
+      notes: >-
+        Rule's commandline_values injected into the mechanism_decode CommandLine|contains
+        (Q3) and the attack:T1059.command_analysis socket-pairing query (Q4). The pty
+        tokens also scope the cue_user_actor baseline/baseline_svc queries (Q8, Q9) so
+        those count the rule's actual firing pattern rather than generic python usage.
+        The reflected baseline_deviation (Q14) and scope (Q15) embed the full detection
+        block verbatim including the OR-of-cli-selections shape.
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "rationale only"
+      disposition: new_question
+      target_question: Q6
+      notes: >-
+        No concrete values in the analytic. Realized as the attack:T1059.parent_process_analysis
+        question (Q6) which walks the grandparent chain to distinguish a server/service
+        interpreter from an interactive session, plus the cue_process_tool.process_chain
+        immediate-parent question (Q5).
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only"
+      disposition: new_question
+      target_question: Q7
+      notes: >-
+        No concrete threshold in the analytic. Realized as the attack:T1059.time_correlation
+        +1h post-spawn host aggregation (Q7) which restricts analysis to the window
+        immediately following the pty spawn.
+  dedup_decisions:
+    - dropped: cue_user_actor.baseline + cue_user_actor.baseline_svc
+      reason: "user_actor pair - non-deduplicable; both emitted (subject-pivot and launch-mechanism-pivot). Image-pivot adapted to the CommandLine pty pattern since the alerting user may fire under any account."
+      kept: both
+    - dropped: cue_user_actor.clustering + cue_user_actor.clustering_svc
+      reason: "user_actor pair - non-deduplicable; both emitted (subject-pivot and launch-mechanism-pivot)."
+      kept: both
+    - dropped: cue_process_tool.clustering
+      reason: "Image-only host aggregation subsumed by cue_host_context.clustering (Q12), which projects Image+ParentImage and surfaces novel parent-child pairs"
+      kept: cue_host_context.clustering
+  skipped_templates:
+    - template: cue_process_tool.baseline
+      reason: >-
+        Generic Image|endswith host baseline counts ALL python executions, which on a
+        developer or data-engineering host is high-volume and uninformative for this
+        pattern. Subsumed by the REFLECTED cue_process_tool.baseline_deviation (Q14),
+        which scopes to the rule's actual pty firing pattern, and by cue_user_actor.baseline
+        (Q8), which counts the pty pattern by user. Trimmed to stay within the 14-18 target.
+    - template: cue_process_tool.follow_on
+      reason: >-
+        follow_on scopes children by ParentImage|endswith %Image% (python). Post-spawn
+        host activity is covered more directly and without a python-only parent constraint
+        by attack:T1059.time_correlation (Q7, +1h host scope) and cue_host_context.clustering
+        (Q12). Trimmed to stay within the 14-18 target.
+    - template: universal.endpoint_protection_health
+      reason: >-
+        RECOMMENDED, not must_include. This rule fires on execution/shell-upgrade, but
+        tamper-as-precursor is already carried by cue_host_context.precursor (Q13), which
+        surfaces prior defense-tampering and other detections on the host in the -6h window.
+        The pty spawn is the operator's first interactive foothold, not a payload an operator
+        would predictably precede by disabling AV/EDR, so the generic tamper sweep does not
+        earn a slot here. Trimmed to stay within the 14-18 target.
+  reflection_overrides: []
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - cue_process_tool
+    - cue_user_actor
+    - cue_host_context
+  generation_stats:
+    total_questions: 15
+    source_counts:
+      template: 12
+      attack: 3
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 12
+    logsource_diversity:
+      process_creation: 14
+      sigma_alert: 1

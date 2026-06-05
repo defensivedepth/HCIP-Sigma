@@ -1,0 +1,638 @@
+name: Potential Homoglyph Attack Using Lookalike Characters
+id: 23401ed4-6232-4e27-835c-9143db5939f3
+description: |
+  Detects a command line that contains at least one Unicode character which is a "perfect" homoglyph — a Cyrillic or Greek
+  letter that is visually indistinguishable from an ASCII letter. The rule fires when the command line matches EITHER the
+  uppercase-homoglyph set OR the lowercase-homoglyph set; either branch alone is sufficient. Homoglyphs are used to masquerade
+  filenames, paths, domains, or arguments so they look legitimate to a human reader while remaining distinct to string
+  comparison (for example, an update lure named with a Cyrillic letter that resembles a Latin one). Legitimate hits occur in
+  environments that genuinely use Cyrillic or Greek text in commands, so the investigation should determine what string the
+  homoglyph belongs to, what the executing process did with it, and whether the activity fits this host's and user's normal
+  pattern.
+type: detection
+detection_id: 32e280f1-8ad4-46ef-9e80-910657611fbc
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line contain an uppercase OR lowercase homoglyph character, and which string does it sit in?
+  context: Before investing investigation time, confirm the alert is a true positive. The rule fires when the command line
+    matches either the uppercase Cyrillic/Greek homoglyph set or the lowercase set — only one branch needs to match. Read the
+    full command line and note which character is the lookalike and which token it belongs to (a filename, path, URL, domain,
+    or argument). Note which branch fired, because an uppercase homoglyph in a token versus a lowercase one in a filename can
+    point the rest of the investigation in different directions.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run commands containing Cyrillic or Greek text?
+  context: Legitimate Cyrillic or Greek characters appear in commands in environments where those alphabets are in normal use,
+    or where a user's locale, filenames, or installed software legitimately contain them. Knowing whether this user role and
+    host function would routinely produce such command lines is often the fastest way to separate a true masquerade from
+    benign localized text.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What exactly did the executing process do with the homoglyph-bearing string? Decode the full command line.
+  context: The full command line reveals what the lookalike character was used for. Identify the token holding the homoglyph
+    and decode the rest of the command — flags, parameters, encoded content, file paths, or URLs. A homoglyph inside a filename
+    or path argument typically means the command references a masqueraded artifact (for example, a script or installer named
+    to resemble a legitimate one); decode any encoded payloads to see what the process was actually instructed to do.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+      - Image
+- source: attack:T1036.003.command_analysis
+  question: Which exact homoglyph character was used, and what legitimate string does it impersonate?
+  context: The masquerade only works because a specific Cyrillic or Greek code point visually substitutes for an ASCII letter
+    (for example, Cyrillic resembling Latin a, c, e, o, p, s, or x). Identify each lookalike character and reconstruct what the
+    token would read as if the homoglyphs were normalized to ASCII — that normalized string is what the attacker is trying to
+    impersonate (a known filename, a trusted domain, a system path, or a brand name). An impersonation of a real artifact name
+    is materially more concerning than an isolated foreign-language word.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+      - Image
+- source: template:masquerading.true_identity
+  question: What is the actual identity of the executing process based on its metadata and hash?
+  context: The homoglyph may sit in the executing process's own name or in one of its arguments. Comparing the Image path (the
+    name on disk) against OriginalFileName (embedded PE metadata) reveals whether the process itself is a renamed binary, while
+    the signing party and signature status indicate whether it is a system-signed binary, a third-party signed tool, or
+    unsigned. The file hash enables a reputation lookup to determine whether this is a known legitimate tool, a known malicious
+    sample, or a novel binary requiring deeper analysis.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - Hashes
+- source: template:masquerading.binary_origin
+  question: How did the homoglyph-named artifact referenced in the command arrive on the host?
+  context: A homoglyph in a filename or path argument points at a file that was placed on disk — copied, downloaded, or dropped
+    by a parent process. Tracing the file-creation event for that artifact reveals how it was delivered, whether by a download
+    tool, an archive extraction, a manual copy, or a dropper. If the file landed in a user-writable location such as Downloads,
+    Temp, or AppData, it was likely downloaded or extracted; the process that created it shows who or what put it there.
+  range: -30d
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: template:masquerading.renamed_binary_activity
+  question: What did the executing process do after it ran?
+  context: The point of using a homoglyph is to evade notice while carrying out the intended action. Examining the child
+    processes and follow-on commands launched by the alerting process reveals its actual objective — credential access,
+    reconnaissance, persistence, or download of a second stage. Whether the same pattern reached other hosts is answered by the
+    fleet-wide and cross-host clustering questions; here, focus on what this process did locally.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.process_chain
+  question: What process spawned the alerting process, and is that parent chain expected?
+  context: The parent process reveals how the command was invoked. Legitimate command execution often has predictable parents
+    (explorer.exe for user actions, services.exe for services). Unusual parents such as wscript.exe, mshta.exe, or an Office
+    application may indicate a script-driven lure or macro delivery, which is a common path for homoglyph-named update bait.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired the homoglyph pattern, what parents and users normally drive it, and does the
+    current alert fit that pattern?
+  context: Even benign localized text can trip this rule repeatedly on a host that uses Cyrillic or Greek legitimately. The
+    query mirrors the rule's homoglyph selection scoped to this host, so the resulting parent and user distribution reflects how
+    this specific firing pattern has historically run here. A new parent process, an unexpected user, or an unusual command-line
+    shape against an otherwise quiet baseline is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_upper:
+        CommandLine|contains:
+        - "А"
+        - "В"
+        - "Е"
+        - "К"
+        - "М"
+        - "Н"
+        - "О"
+        - "Р"
+        - "С"
+        - "Т"
+        - "Х"
+        - "Ѕ"
+        - "І"
+        - "Ј"
+        - "Ү"
+        - "Ӏ"
+        - "Ԍ"
+        - "Ԛ"
+        - "Ԝ"
+        - "Α"
+        - "Β"
+        - "Ε"
+        - "Ζ"
+        - "Η"
+        - "Ι"
+        - "Κ"
+        - "Μ"
+        - "Ν"
+        - "Ο"
+        - "Ρ"
+        - "Τ"
+        - "Υ"
+        - "Χ"
+      selection_lower:
+        CommandLine|contains:
+        - "а"
+        - "е"
+        - "о"
+        - "р"
+        - "с"
+        - "х"
+        - "ѕ"
+        - "і"
+        - "ӏ"
+        - "ј"
+        - "һ"
+        - "ԁ"
+        - "ԛ"
+        - "ԝ"
+        - "ο"
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (1 of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired the homoglyph pattern in the past week, and does the cross-host distribution look like
+    automation or one-off activity?
+  context: The query mirrors the rule's homoglyph selection with no host scope, so the result is a fleet-wide count of this
+    firing pattern. Many hosts matching the same pattern can point to a localized software deployment or a broadly distributed
+    lure; one host or a small unrelated set points to targeted or manual activity. Use the host distribution to calibrate
+    severity and decide whether this is environment-wide localized text or a contained masquerade.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_upper:
+        CommandLine|contains:
+        - "А"
+        - "В"
+        - "Е"
+        - "К"
+        - "М"
+        - "Н"
+        - "О"
+        - "Р"
+        - "С"
+        - "Т"
+        - "Х"
+        - "Ѕ"
+        - "І"
+        - "Ј"
+        - "Ү"
+        - "Ӏ"
+        - "Ԍ"
+        - "Ԛ"
+        - "Ԝ"
+        - "Α"
+        - "Β"
+        - "Ε"
+        - "Ζ"
+        - "Η"
+        - "Ι"
+        - "Κ"
+        - "Μ"
+        - "Ν"
+        - "Ο"
+        - "Ρ"
+        - "Τ"
+        - "Υ"
+        - "Χ"
+      selection_lower:
+        CommandLine|contains:
+        - "а"
+        - "е"
+        - "о"
+        - "р"
+        - "с"
+        - "х"
+        - "ѕ"
+        - "і"
+        - "ӏ"
+        - "ј"
+        - "һ"
+        - "ԁ"
+        - "ԛ"
+        - "ԝ"
+        - "ο"
+      condition: 1 of selection_*
+    fields:
+    - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: 'Alerts rarely occur in isolation. Examining activity around the alert reveals the immediate context: what led to
+    this event, what happened after, and whether it is part of a larger sequence. Look for reconnaissance, download or
+    extraction of a staged file, privilege escalation, or persistence near the alert time.'
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run commands that contain these homoglyph characters?
+  context: Compare this user's current action against their historical pattern. A user who has never produced a command line
+    with these Cyrillic or Greek lookalikes is more suspicious than one who does so regularly because of locale or installed
+    software. The result, grouped by host, shows where this user has matched the same pattern before.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_upper:
+        CommandLine|contains:
+        - "А"
+        - "В"
+        - "Е"
+        - "К"
+        - "М"
+        - "Н"
+        - "О"
+        - "Р"
+        - "С"
+        - "Т"
+        - "Х"
+        - "Ѕ"
+        - "І"
+        - "Ј"
+        - "Ү"
+        - "Ӏ"
+        - "Ԍ"
+        - "Ԛ"
+        - "Ԝ"
+        - "Α"
+        - "Β"
+        - "Ε"
+        - "Ζ"
+        - "Η"
+        - "Ι"
+        - "Κ"
+        - "Μ"
+        - "Ν"
+        - "Ο"
+        - "Ρ"
+        - "Τ"
+        - "Υ"
+        - "Χ"
+      selection_lower:
+        CommandLine|contains:
+        - "а"
+        - "е"
+        - "о"
+        - "р"
+        - "с"
+        - "х"
+        - "ѕ"
+        - "і"
+        - "ӏ"
+        - "ј"
+        - "һ"
+        - "ԁ"
+        - "ԛ"
+        - "ԝ"
+        - "ο"
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (1 of selection_*) and _pb_scope
+    fields:
+    - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent process historically routine as a launcher on this host or across the environment?
+  context: 'When the alert fires under a service principal, user identity does not attribute the behavior; the meaningful pivot
+    is the launch mechanism. Which parent process spawned the alerting process, and is that parent historically common as a
+    launcher here? A new or rare parent is the deviation worth chasing, while one that already accounts for many prior events is
+    likely vendor or operating-system automation that happens to carry localized text.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith|expand: '%ParentImage%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints. If
+    the same user triggered similar activity on several hosts in this window, the scope of the event may be larger than a single
+    endpoint.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent process launch activity on other hosts in the same window, or is it isolated to this host?
+  context: Under a service principal, asking what else the user did across the network returns agent-telemetry noise, since
+    every host runs service-owned processes constantly. The meaningful question is whether the same launch mechanism — the same
+    parent process — was active on other hosts in the alert window. Multiple hosts in the same window points to scheduled or
+    pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith|expand: '%ParentImage%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering, reconnaissance, or
+    download of a staged file — may reveal the stages that preceded this event and help reconstruct the full timeline. A
+    homoglyph-named lure is frequently an early step, so look in both directions for what surrounds it.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1036.003
+      name: Rename Legitimate Utilities
+      role: primary
+    - id: T1036
+      name: Masquerading
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: masqueraded_string_present
+      description: "A masqueraded token (homoglyph filename, path, domain, or argument) is present in the command line, visually impersonating a legitimate string."
+      mapped_to: Q4
+      source: attack:T1036.003.command_analysis
+    - stage: 2
+      label: execution_with_masquerade
+      description: "The process executes carrying the homoglyph-bearing argument; on-disk identity may or may not match its metadata."
+      mapped_to: Q5
+      source: template:masquerading.true_identity
+    - stage: 3
+      label: delivery_of_artifact
+      description: "The masqueraded file is created/copied/downloaded on the host (file_event), revealing the delivery mechanism."
+      mapped_to: Q6
+      source: template:masquerading.binary_origin
+    - stage: 4
+      label: follow_on_activity
+      description: "Renamed/masqueraded execution is followed by child processes or downstream actions consistent with the operator's objective."
+      mapped_to: Q7
+      source: template:masquerading.renamed_binary_activity
+  dimension_coverage:
+    - dimension: command_analysis
+      technique: T1036.003
+      covered_by: Q4
+      source: attack:T1036.003.command_analysis
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1036.003
+      covered_by: Q11
+      source: template:cue_host_context.clustering
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1036.003
+      covered_by: Q9
+      source: template:cue_process_tool.baseline_deviation
+      coverage_type: indirect
+    - dimension: execution_context
+      technique: T1036
+      covered_by: Q8
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1036
+      covered_by: Q11
+      source: template:cue_host_context.clustering
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1036
+      covered_by: Q10
+      source: template:cue_process_tool.scope
+      coverage_type: indirect
+  mutable_dispositions:
+    - element: OriginalFilenameMismatch
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q5
+      notes: "No queryable values; PE-metadata-vs-disk-name comparison is the analytical task surfaced in masquerading.true_identity (Image vs OriginalFileName fields)."
+    - element: KnownSystemUtilityPaths
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q6
+      notes: "No queryable values; user-writable vs system install-path reasoning carried in binary_origin context (Downloads/Temp/AppData vs system directory)."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q11
+      notes: "Correlation window between artifact creation and execution; expressed as the +/-15m clustering window and the -30d file_event lookback."
+    - element: ImagePath
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q6
+      notes: "Suspicious/non-standard directory reasoning carried in binary_origin context."
+    - element: PEInternalNameMismatch
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q5
+      notes: "Metadata/disk-name mismatch is the core true_identity task."
+    - element: CommandLinePattern
+      dimension: command_analysis
+      specific_values: "rationale only (the homoglyph code points themselves are the pattern; concrete values live in the rule selection embedded in Q10/Q11)"
+      disposition: new_question
+      target_question: Q4
+      notes: "Unusual-argument reasoning drove the dedicated attack:T1036.003.command_analysis question (identify the homoglyph and its impersonation target). The concrete Cyrillic/Greek code points are present as query values in the reflected baseline_deviation (Q9) and scope (Q10) selections."
+  dedup_decisions:
+    - dropped: cue_process_tool.clustering
+      reason: "Within-phase duplicate of cue_host_context.clustering — both are host-scoped +/-15m process_creation aggregations of surrounding activity. Kept the host_context version (aggregates Image+ParentImage, surfacing novel parent-child pairs)."
+      kept: cue_host_context.clustering
+    - dropped: cue_process_tool.follow_on
+      reason: "Overlaps masquerading.renamed_binary_activity (children of the alerting process). follow_on relied on ParentImage|endswith|expand %Image%, but this rule has no binary in detection; renamed_binary_activity scoped via ParentProcessGuid is more precise."
+      kept: masquerading.renamed_binary_activity
+    - dropped: cue_process_tool.baseline
+      reason: "Relied on Image|endswith|expand %Image%; rule is CommandLine-only with no binary, so a binary-frequency baseline is not constructible. The reflected baseline_deviation (homoglyph-pattern frequency on this host) is the meaningful baseline and is included."
+      kept: cue_process_tool.baseline_deviation
+    - dropped: cue_user_actor.baseline (user-pivot) / cue_user_actor.baseline_svc (service-principal substitute)
+      reason: "user_actor pair — non-deduplicable; emitted BOTH as Q13 and Q14 per AGENTS.md service-principal handling."
+      kept: both
+    - dropped: cue_user_actor.clustering (user-pivot) / cue_user_actor.clustering_svc (service-principal substitute)
+      reason: "user_actor pair — non-deduplicable; emitted BOTH as Q15 and Q16 per AGENTS.md service-principal handling."
+      kept: both
+  skipped_templates:
+    - template: universal.endpoint_protection_health
+      reason: >-
+        Dropped under notes_to_llm drop-condition (b): cue_host_context.precursor (Q16) is present AND this rule is not an
+        execution/credential-access rule. The rule fires on a masquerading/obfuscation pattern (homoglyph characters in a
+        command line), not on payload execution, credential access, privilege escalation, or impact. The disposition does not
+        turn on whether AV/EDR was weakened first; prior-tamper context, if any, is carried by the precursor question's
+        sigma-alert sweep over the preceding 6 hours. Recorded here per the universal-question no-silent-drop requirement.
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "CommandLine-only detection — no Image field in rule. Use CommandLine pattern matching for scoping, not Image-based queries"
+      disposition: acted-on
+      notes: >-
+        Acted on throughout. All historical/baseline/fleet scoping queries embed the rule's homoglyph CommandLine|contains
+        selection rather than Image|endswith: baseline_deviation (Q10), scope (Q11), and the user-pivot baseline (Q13) all
+        scope on the homoglyph pattern. Templates that depended on %Image% (cue_process_tool.baseline, .follow_on, and the
+        Image-based variants of masquerading questions) were dropped or re-scoped: binary_origin (Q6) now matches the
+        masqueraded artifact via TargetFilename|contains %file_paths%; renamed_binary_activity (Q7) and process_chain (Q9)
+        use ProcessGuid/ParentProcessGuid entity scoping; the service-principal substitutes (Q14/Q16) pivot on ParentImage.
+        No bare Image-scoped query remains.
+    - hint: "Condition uses OR among selection groups: (selection_upper OR selection_lower). Q1 and the playbook description must frame this as 'EITHER ... OR ...'"
+      disposition: acted-on
+      notes: >-
+        Acted on. condition_topology.shape is OR_of_selections. The description uses disjunctive framing ("fires when the
+        command line matches EITHER the uppercase-homoglyph set OR the lowercase-homoglyph set; either branch alone is
+        sufficient"). Q1 (verify_trigger_match) asks "uppercase OR lowercase homoglyph" and its context directs the analyst to
+        note which branch fired. Reflected queries preserve the rule's '1 of selection_*' condition verbatim.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - masquerading
+  generation_stats:
+    total_questions: 16
+    source_counts:
+      template: 15
+      attack: 1
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 13
+    logsource_diversity:
+      process_creation: 14
+      file_event: 1
+      sigma_alert: 1

@@ -1,0 +1,522 @@
+name: CMSTP UAC Bypass via COM Object Access
+id: dfe0d793-6f3e-4c9f-b2d2-b45d9c68f2ff
+description: |
+  Detects a high or system integrity process spawned by dllhost.exe when the dllhost command line references an auto-elevate-capable COM interface CLSID (the CMSTPLUA family and related elevation-COM objects). This is the surrogate-hosted path several UAC bypass methods take: an auto-elevated COM object is created via CoCreateInstance, the DLL surrogate (dllhost.exe) runs it at high integrity, and the resulting child process inherits elevation with no consent prompt. Legitimate use of these COM elevation paths is rare in modern enterprise environments, so the investigation should determine which child was launched at elevated integrity, what it did once elevated, and whether registry, file, image-load, or network artifacts of the CMSTP weaponization chain are present.
+type: detection
+detection_id: 4b60e6f2-bf39-47b4-b4ea-398e33cfe253
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Did dllhost.exe spawn this process at high or system integrity with an auto-elevate COM CLSID on its command line?
+  context: Confirm the alert is real before investing time. The rule fires only when all three conditions hold together — the parent is dllhost.exe, the parent command line contains one of the auto-elevate COM CLSIDs (the CMSTPLUA family and related elevation interfaces), and the spawned process runs at High or System integrity. Read the parent command line and integrity level on the triggering event and confirm the CLSID is one of the auto-approval interfaces rather than a benign elevation.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+      - IntegrityLevel
+- source: template:universal.host_user_context
+  question: Is this user and host expected to invoke an auto-elevated COM object to obtain high integrity?
+  context: Legitimate use of the CMSTPLUA elevation COM path is uncommon outside of niche connection-manager profile installs, which are rare in modern environments. Knowing whether the user role and host function involve any such administrative workflow is often the fastest way to separate a true positive from routine activity.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_parent_process.mechanism_decode
+  question: What is the elevated child process and what did its command line do once it ran at high integrity?
+  context: The child process spawned by the dllhost surrogate is the payload of the bypass. Decode its full command line, flags, file paths, and any encoded content to understand what action was taken with the elevated token. The default child for the common UACME-style invocation is cmd.exe, but operators substitute their own binary, so the actual child and its arguments reveal the objective.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - CurrentDirectory
+- source: template:uac_bypass.elevated_action_after_bypass
+  question: What action was performed with elevated privileges after the UAC bypass?
+  context: UAC bypass is a means to an end. Once a high-integrity process exists, operators commonly install persistence, dump credentials, tamper with security tooling, or access protected resources. Examining processes running at High or System integrity on this host shortly after the bypass reveals what the elevation was used for.
+  range: +30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        IntegrityLevel:
+          - 'High'
+          - 'System'
+          - 'S-1-16-16384'
+          - 'S-1-16-12288'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - IntegrityLevel
+- source: template:uac_bypass.bypass_technique_registry_artifacts
+  question: Were registry modifications made through reg.exe, cmd, or PowerShell to set up a UAC bypass on this host?
+  context: Several UAC bypass families write a command to an HKCU key that an auto-elevated process reads and executes (ms-settings, mscfile, exefile, shell open command, environment). Finding such a registry write through a command-line tool confirms a bypass mechanism distinct from the COM surrogate path and reveals the exact payload. The COM-surrogate path this alert fires on typically does not use these keys, so a hit here points to a parallel or alternate bypass attempt.
+  range: -15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - '\reg.exe'
+          - '\powershell.exe'
+          - '\cmd.exe'
+        CommandLine|contains:
+          - 'ms-settings'
+          - 'mscfile'
+          - 'Classes\exefile'
+          - 'Classes\Folder'
+          - 'Environment'
+          - 'Shell\Open\command'
+          - 'DelegateExecute'
+      condition: selection
+    fields:
+      - CommandLine
+      - Image
+- source: attack:T1548.002.registry_set
+  question: Was the CMSTP ProfileInstallPath registry value or a connection-manager profile key written around the time of the alert?
+  context: The CMSTP weaponization path that runs a pre-setup command sets a ProfileInstallPath value under the per-user Connection Manager key pointing at cmmgr32.exe before the elevated command runs. Querying registry-set events for connection-manager profile keys confirms the CMSTP profile-install mechanism rather than a direct COM-only invocation, which leaves no such registry trace.
+  range: -15m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|contains:
+          - 'Connection Manager'
+          - 'ProfileInstallPath'
+          - 'cmmgr32'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+- source: attack:T1548.002.image_load
+  question: Did dllhost.exe load the auto-elevate COM provider DLLs (cmstplua.dll, cmlua.dll, colorui.dll, wscui.cpl) on this host?
+  context: The auto-elevated COM objects are backed by specific provider DLLs that the dllhost surrogate must load to service the elevation request. An image-load event for cmstplua.dll or cmlua.dll inside dllhost.exe is the load-time confirmation of the CMSTPLUA elevation interface, and the other provider DLLs map to the sibling auto-approval CLSIDs in the same family. If image-load telemetry is not collected in this environment, treat zero results as a visibility gap rather than evidence the DLL was not loaded.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith: '\dllhost.exe'
+        ImageLoaded|endswith:
+          - '\cmstplua.dll'
+          - '\cmlua.dll'
+          - '\colorui.dll'
+          - '\wscui.cpl'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Image
+  answer_sources:
+  - file_event
+  - manual_review
+- source: attack:T1548.002.process_access
+  question: Did the dllhost surrogate or another process open a handle into a target process consistent with COM-driven injection around the alert?
+  context: The elevated COM surrogate path can be used to inject into or manipulate another process once it holds a high-integrity token. Process-access events naming dllhost.exe as the source process, or a high-rights granted-access mask against a sensitive target, help distinguish a self-contained elevated launch from one that pivoted into another process. If process-access telemetry is not collected here, zero results is a visibility gap, not an all-clear.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_access
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        SourceImage|endswith: '\dllhost.exe'
+      condition: selection
+    fields:
+      - TargetImage
+      - GrantedAccess
+      - CallTrace
+- source: attack:T1218.003.file_event
+  question: Were INF, SCT, or DLL files created on this host shortly before the elevated process spawned?
+  context: The CMSTP execution paths consume a weaponized INF setup file, and the remote-script variant also pulls or drops an SCT script that scrobj.dll registers. A file-creation event for a recently written INF, SCT, or DLL on this host immediately before the elevated spawn is the staging artifact of the weaponization chain. If file-event telemetry is not ingested in this environment, treat zero results as a visibility gap.
+  range: -15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith:
+          - '.inf'
+          - '.sct'
+          - '.dll'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: attack:T1218.003.network_connection
+  question: Did any process make an outbound connection to an untrusted host around the alert that could be a remote SCT or payload pull?
+  context: One CMSTP weaponization path points the INF at a remotely hosted SCT script that is downloaded and executed under the signed binary. An outbound connection to an external address in the same window as the elevated spawn may be the remote payload retrieval. Review the destination against known-good infrastructure; connections to enterprise or content-delivery endpoints are common and not by themselves suspicious.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'true'
+      filter_local:
+        DestinationIp|cidr:
+          - '10.0.0.0/8'
+          - '172.16.0.0/12'
+          - '192.168.0.0/16'
+          - '127.0.0.0/8'
+      condition: selection and not filter_local
+    fields:
+      - Image
+      - DestinationIp
+      - DestinationPort
+- source: template:uac_bypass.other_escalation_attempts
+  question: Were other privilege escalation or UAC bypass detections seen on this host in the surrounding window?
+  context: Operators who attempt one UAC bypass often try several methods until one succeeds, particularly when OS version or configuration blocks specific techniques. Other privilege-escalation alerts from the same user or host in the surrounding window point to deliberate escalation activity rather than an isolated false positive.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - rule.name
+      - rule.uuid
+      - event.severity_label
+- source: template:cue_user_actor.baseline
+  question: Does this user normally trigger high-integrity COM-surrogate elevations or run the resulting child binary?
+  context: Compare the user against their own history. A user who has never produced a dllhost-surrogate elevation or run the elevated child binary is more notable than one who does so as part of a known administrative workflow. User role and typical toolset should align with what was elevated.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this dllhost-surrogate spawn of the elevated child historically routine on this host or environment, or is it a new launch mechanism?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior. The meaningful pivot is the launch mechanism: how often dllhost.exe has spawned this child binary historically on this host and across the environment. A new or rare pairing is the deviation worth chasing; a pairing that already accounts for many prior events is more likely OS or vendor automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the environment around the time of the alert?
+  context: Tracking the user's activity across all hosts in the alert window reveals lateral movement or activity spread across multiple endpoints. If the same user produced similar elevation activity on other hosts, the scope is larger than a single endpoint.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did the same dllhost-surrogate spawn of this child binary fire on other hosts in the same window, or is it isolated to this host?
+  context: Under a service principal, asking what else the user did across the network returns agent-telemetry noise. The meaningful question is whether the same launch mechanism — dllhost.exe spawning this child binary — appeared on other hosts in the alert window. Multiple hosts point to pushed or scheduled automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering, reconnaissance, credential access — may reveal the stages that preceded the elevation and help reconstruct the timeline leading up to it.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1548.002
+      name: Bypass User Account Control
+      role: primary
+    - id: T1218.003
+      name: CMSTP
+      role: primary
+    - id: T1548
+      name: Abuse Elevation Control Mechanism
+      role: secondary
+    - id: T1218
+      name: System Binary Proxy Execution
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: com_autoelevation_invoked
+      description: "Auto-elevate COM object created via the dllhost.exe DLL surrogate with a CMSTPLUA-family CLSID on the parent command line"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: high_integrity_child_spawned
+      description: "Surrogate spawns a child process inheriting High/System integrity with no consent prompt"
+      mapped_to: Q3
+      source: template:cue_parent_process.mechanism_decode
+    - stage: 3
+      label: elevated_action_performed
+      description: "Elevated token used to perform a privileged action (persistence, credential access, tampering)"
+      mapped_to: Q4
+      source: template:uac_bypass.elevated_action_after_bypass
+    - stage: 4
+      label: cmstp_weaponization_artifacts
+      description: "CMSTP-specific staging: INF/SCT/DLL files, ProfileInstallPath registry, provider-DLL image loads, remote SCT pull"
+      mapped_to: Q9
+      source: attack:T1218.003.file_event
+  dimension_coverage:
+    - dimension: parent_process_analysis
+      technique: T1548.002
+      covered_by: Q3
+      source: template:cue_parent_process.mechanism_decode
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1548.002
+      covered_by: Q4
+      source: template:uac_bypass.elevated_action_after_bypass
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1548.002
+      covered_by: Q7
+      source: attack:T1548.002.image_load
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1548
+      covered_by: Q12
+      source: template:cue_user_actor.baseline
+      coverage_type: direct
+    - dimension: command_analysis
+      technique: T1218
+      covered_by: Q3
+      source: template:cue_parent_process.mechanism_decode
+      coverage_type: direct
+  mutable_dispositions:
+    - element: COMInterfaceGUIDs
+      dimension: tuning_parameter
+      specific_values: "{3E5FC7F9-9A51-4367-9063-A120244FBEC7} cmstplua.dll, {D2E7041B-2927-42FB-8E9F-7CE93B6DC937} colorui.dll, {E9495B87-D950-4AB5-87A5-FF6D70BF3E90} wscui.cpl, plus {3E000D72-...} and {BD54C901-...} from the rule selection"
+      disposition: context
+      target_question: Q1
+      notes: "The rule's detection block already enumerates the five CMSTPLUA-family CLSIDs in ParentCommandLine; Q1 is ProcessGuid-scoped so it returns the exact alerting event with those CLSIDs by construction. The provider-DLL names backing these GUIDs are query-injected into the image_load question (Q7)."
+    - element: INFPathRegex
+      dimension: tuning_parameter
+      specific_values: ".inf, .sct, .dll staging files"
+      disposition: query_injection
+      target_question: Q9
+      notes: "TargetFilename|endswith .inf/.sct/.dll injected into the file_event question."
+    - element: RegistryKeyAllowlist
+      dimension: tuning_parameter
+      specific_values: "Connection Manager / ProfileInstallPath / cmmgr32"
+      disposition: query_injection
+      target_question: Q6
+      notes: "ProfileInstallPath and connection-manager profile keys injected into the registry_set question."
+    - element: ExternalIPAllowlist
+      dimension: tuning_parameter
+      specific_values: "rationale only (no enumerated values)"
+      disposition: query_injection
+      target_question: Q10
+      notes: "Implemented as a NOT filter excluding RFC1918/loopback so the network_connection question surfaces only external destinations; enterprise-domain allowlisting is environment-coupled and left to the analyst per context."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "tunable correlation window (e.g., 30s) — rationale only"
+      disposition: context
+      target_question: Q4
+      notes: "Realized as the time ranges on the correlated questions (+30m elevated action, -15m registry/file staging, +/-5m image-load/process-access). Exact tunable threshold is not directly queryable."
+    - element: ElevatedProcessNameList
+      dimension: tuning_parameter
+      specific_values: "sdclt.exe, eventvwr.exe, computerdefaults.exe (other auto-elevate binaries)"
+      disposition: context
+      target_question: Q4
+      notes: "This rule's detection is the dllhost COM-surrogate path, not the named auto-elevate-binary path; the broader elevated-binary list is contextual. Q4 surfaces any High/System integrity process post-bypass regardless of binary name."
+    - element: ParentProcessAnomalyThreshold
+      dimension: parent_process_analysis
+      specific_values: "non-elevated process spawning auto-elevated one (logic, no fixed value)"
+      disposition: context
+      target_question: Q13
+      notes: "Realized as the parent+binary baseline (Q13) which surfaces rare/new dllhost->child pairings; the rule itself encodes the anomaly (dllhost surrogate + CLSID + High IL)."
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "dllhost.exe (fixed by rule)"
+      disposition: context
+      target_question: Q3
+      notes: "ParentImage is fixed to dllhost.exe by the rule selection; Q3 decodes the parent->child relationship and Q13 baselines it."
+    - element: ElevatedProcessPath
+      dimension: tuning_parameter
+      specific_values: "rationale only — unsigned/unexpected elevated binary paths"
+      disposition: context
+      target_question: Q3
+      notes: "Q3 surfaces the elevated child Image/CommandLine/CurrentDirectory for the analyst to assess signing and path; no fixed path values to inject."
+    - element: SignedBinaryList
+      dimension: tuning_parameter
+      specific_values: "rationale only (T1218 generic signed-binary allowlist)"
+      disposition: context
+      target_question: Q1
+      notes: "T1218 is a secondary technique; its generic signed-binary list is not specific to the CMSTP/COM-surrogate path this rule detects."
+    - element: RemoteDomainAllowlist
+      dimension: tuning_parameter
+      specific_values: "rationale only (no enumerated values)"
+      disposition: context
+      target_question: Q10
+      notes: "Q10 context tells the analyst to assess destinations against known-good infrastructure; concrete allowlist is environment-coupled."
+    - element: CommandLineRegex
+      dimension: command_analysis
+      specific_values: "rationale only — suspicious args (URLs, script paths, DLL entrypoints)"
+      disposition: context
+      target_question: Q3
+      notes: "Q3 decodes the elevated child's full command line for URLs/script paths/entrypoints; no fixed regex to inject."
+  dedup_decisions:
+    - dropped: cue_process_tool.process_chain
+      reason: "parent_process is primary cue and ParentImage/ParentCommandLine are in the detection — the parent relationship is covered by cue_parent_process.mechanism_decode (Q3) and the parent+binary baselines (Q13)"
+      kept: template:cue_parent_process.mechanism_decode
+    - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable; both emitted as Q12 and Q13"
+      kept: both
+    - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable; both emitted as Q14 and Q15"
+      kept: both
+    - dropped: cue_parent_process.mechanism_decode (cue_process_tool variant)
+      reason: "cue_parent_process.mechanism_decode and cue_process_tool.mechanism_decode collapse to the same Phase-2 decode of the elevated child; kept the parent-process variant since parent_process is primary"
+      kept: template:cue_parent_process.mechanism_decode
+  skipped_templates:
+    - template: cue_parent_process.baseline
+      reason: "Superseded by the user_actor service-principal baseline (Q13), which baselines the same parent.name+Image pairing over -90d with identical query shape; keeping both would duplicate the parent+binary aggregation."
+    - template: cue_parent_process.follow_on
+      reason: "Other-children-of-parent coverage is subsumed by uac_bypass.elevated_action_after_bypass (Q4, High/System children post-bypass) and cue_host_context activity; a generic dllhost-children query would be noisy since dllhost is a shared surrogate for many COM objects."
+    - template: cue_parent_process.clustering
+      reason: "Around-the-alert parent activity is covered by Q4 (elevated action +30m) and the precursor alert question (Q16); a third around-the-time parent query adds no distinct signal."
+    - template: cue_parent_process.scope
+      reason: "Cross-host scope of the parent+binary pair is covered by cue_user_actor.clustering_svc (Q15), which asks whether the same dllhost->child mechanism fired on other hosts in the window."
+    - template: cue_process_tool.baseline
+      reason: "Host-level binary baseline is subsumed by the user_actor baselines (Q12 user-pivot, Q13 parent+binary pivot) which carry the historical-frequency signal more precisely for this parent-driven detection."
+    - template: cue_host_context.clustering
+      reason: "Around-the-alert host activity overlaps Q4 (elevated children on host) and Q16 (prior alerts on host); kept the precursor (alert-correlation) variant for distinct alert-timeline signal."
+    - template: universal.endpoint_protection_health
+      reason: "RECOMMENDED, not must_include. defense_tampering is not a confirmed set for this rule, and tamper-as-precursor is covered topically by cue_host_context.precursor (Q16, prior alerts including defense-tampering) and uac_bypass.other_escalation_attempts (Q11). The disposition here turns on what the elevated token was used for (Q4), not on whether AV was disabled first, so the generic tamper sweep does not earn a slot under the 18-question cap."
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "logsource 'security' (recommended by techniques: T1548.002) is not covered and no template family exists — author a custom question with `category: security`"
+      disposition: declined
+      reason: >-
+        The Security-log signal for this technique is EventCode 4672 (special
+        privileges assigned to a new logon / elevated token). For this rule the
+        elevation outcome is already encoded in the alerting event's
+        IntegrityLevel (High/System) and is investigated directly by
+        Q4 (elevated_action_after_bypass), which enumerates the High/System
+        integrity processes on the host post-bypass. A separate
+        category:security query for 4672 would restate the same elevation fact
+        without adding a distinct artifact, and would consume a slot at the
+        18-question cap better spent on the CMSTP-specific cross-logsource
+        artifacts (file_event, registry_set, image_load, process_access,
+        network_connection) that confirm the weaponization mechanism. No
+        compensating attack:T1548.002.security question authored.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - uac_bypass
+  generation_stats:
+    total_questions: 16
+    source_counts:
+      template: 11
+      attack: 5
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 13
+    logsource_diversity:
+      process_creation: 9
+      registry_set: 1
+      image_load: 1
+      process_access: 1
+      file_event: 1
+      network_connection: 1
+      sigma_alert: 2

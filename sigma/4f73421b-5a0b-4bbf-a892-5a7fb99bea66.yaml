@@ -1,0 +1,592 @@
+name: Mavinject Inject DLL Into Running Process
+id: bf2534f9-4117-4832-973e-5b511acb6139
+description: |
+  Detects use of the Microsoft-signed App-V injector mavinject.exe with the /INJECTRUNNING flag, which performs classic
+  LoadLibraryW-via-CreateRemoteThread DLL injection into another running process. The rule fires when a command line contains
+  ' /INJECTRUNNING ' AND the parent process is NOT AppVClient.exe (the legitimate App-V service that invokes mavinject during
+  normal application virtualization). Because mavinject is a trusted signed binary, it is abused as a proxy-execution and
+  injection primitive that loads attacker DLLs under cover of a Microsoft Authenticode signature. Investigate which target
+  process was injected, what DLL was loaded, whether that DLL is unsigned or from a non-standard path, and what the parent
+  of mavinject was.
+type: detection
+detection_id: 4f73421b-5a0b-4bbf-a892-5a7fb99bea66
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line contain the mavinject /INJECTRUNNING injection flag?
+  context: Confirm the alert is a true positive before investing investigation time. The rule fires when a command line contains
+    ' /INJECTRUNNING ' AND the parent process is not C:\Windows\System32\AppVClient.exe (the legitimate App-V service is
+    already excluded). The canonical abuse form is mavinject.exe <PID> /INJECTRUNNING <path-to-dll>, so read the full command
+    line for the target process ID and the DLL path that follows the flag.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run the App-V injector mavinject.exe outside of App-V application virtualization?
+  context: mavinject.exe normally runs only on devices where App-V is in use, and legitimately it is launched by AppVClient.exe.
+    A user or host with no App-V footprint invoking mavinject directly is a deviation worth chasing. Knowing whether the
+    user role and host function involve App-V is often the fastest path to distinguishing a true positive from routine
+    virtualization activity.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: attack:T1218.013.command_analysis
+  question: Which target process ID and DLL path were passed to mavinject, and is that DLL signed and from a standard location?
+  context: The canonical syntax is mavinject.exe <PID> /INJECTRUNNING <path-to-dll>. Decode the full command line to identify
+    the numeric target PID and the DLL path that follows /INJECTRUNNING. DLLs loaded from %TEMP%, Downloads, user profile
+    directories, or UNC shares, or DLLs that are unsigned or untrusted, are the strongest indicators of abuse; a DLL inside
+    an App-V package path is more consistent with legitimate virtualization.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:cue_process_tool.process_chain
+  question: What process spawned mavinject.exe, and is that parent expected for an injector binary?
+  context: The legitimate parent for mavinject is AppVClient.exe (already excluded by the rule). Any other parent is the
+    investigative pivot. Parents such as Office applications, script hosts (wscript.exe, cscript.exe, mshta.exe), powershell.exe,
+    cmd.exe, or browsers point to operator-driven or macro-driven injection rather than application virtualization.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: attack:T1055.001.access_verification
+  question: Did mavinject.exe obtain a high-access handle to a target process consistent with injection rights?
+  context: mavinject opens the target with an access mask of 0x10043A (PROCESS_VM_WRITE, PROCESS_VM_READ, PROCESS_VM_OPERATION,
+    PROCESS_CREATE_THREAD, PROCESS_QUERY_INFORMATION, SYNCHRONIZE) before writing the DLL path and creating a remote thread.
+    Review process-access events where mavinject.exe is the source process and the granted access includes write/operation/create-thread
+    rights. The target image identifies which process was injected — flag high-value targets such as lsass.exe, explorer.exe,
+    winlogon.exe, browsers, or endpoint-protection processes.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_access
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        SourceImage|endswith: '\mavinject.exe'
+      condition: selection
+    fields:
+      - SourceImage
+      - TargetImage
+      - GrantedAccess
+- source: attack:T1218.013.module_load
+  question: Did the target process load a new module shortly after the injection, and is that module unsigned or from a non-standard path?
+  context: The injection completes when the target process loads the attacker DLL via LoadLibraryW. Review image-load events
+    on this host around the alert time for modules loaded into the injected target. A Microsoft-signed mavinject leading to
+    an unsigned or untrusted module load in another process is the signed-to-unsigned transition that distinguishes abuse
+    from legitimate App-V activity. Correlate the loaded module path against the DLL path seen in the mavinject command line.
+  range: +/-10m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ImageLoaded
+      - Signed
+- source: attack:T1218.013.dll_staging
+  question: Was the injected DLL written to disk on this host before the injection, and by which process?
+  context: Operators frequently drop the payload DLL to disk shortly before injecting it. Review file-creation events for
+    DLLs written to user-writable locations such as %TEMP%, Downloads, the user profile, or ProgramData, then correlate the
+    written path against the DLL path passed to mavinject. The writing process and its parent help establish how the payload
+    arrived (download, archive extraction, script-host drop) before mavinject loaded it.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith: '.dll'
+      condition: selection
+    fields:
+      - Image
+      - TargetFilename
+      - User
+- source: template:cue_process_tool.follow_on
+  question: What child processes did mavinject.exe or the injected target process spawn afterward?
+  context: After a successful injection the target process runs attacker code, which often spawns post-exploitation children
+    such as cmd.exe, powershell.exe, certutil.exe, or rundll32.exe. Children of mavinject itself, or new children of the
+    injected target shortly after the load, reveal the actual operational impact of the injection.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith: '\mavinject.exe'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: attack:T1218.013.network_egress
+  question: Did the injected target process make outbound network connections after the injection?
+  context: A common follow-on to injection is command-and-control or staging egress from the now-compromised target process.
+    Review outbound connections on this host around the alert window, excluding routine system processes, and focus on
+    connections originating from the process that was injected. Correlate destination addresses against known enterprise
+    update and CDN ranges before treating egress as malicious.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'true'
+      filter:
+        Image|endswith:
+          - '\svchost.exe'
+          - '\services.exe'
+      condition: selection and not filter
+    fields:
+      - Image
+      - DestinationIp
+      - DestinationPort
+- source: template:cue_process_tool.baseline
+  question: Has this host run mavinject.exe before, and how often?
+  context: mavinject.exe should not run unless App-V is in use on the host. Zero or very low historical counts indicate
+    first-time or rare execution and raise suspicion; a host with regular mavinject activity driven by AppVClient.exe is
+    more consistent with sanctioned application virtualization.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith: '\mavinject.exe'
+      condition: selection
+    fields:
+      - User
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired the mavinject /INJECTRUNNING pattern, what parents and users drove it, and does the current alert fit?
+  context: The query mirrors the rule's selection and filter scoped to this host, so the parent/user distribution reflects how
+    this specific firing pattern — mavinject with /INJECTRUNNING and a parent other than AppVClient.exe — has historically run
+    here, not generic binary usage. A new parent process, an unexpected user account, or an unusual command-line shape is the
+    deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains: ' /INJECTRUNNING '
+      filter:
+        ParentImage: C:\Windows\System32\AppVClient.exe
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection and not filter) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired the mavinject /INJECTRUNNING pattern in the past week, and does the distribution look like automation or one-off activity?
+  context: The query mirrors the rule's selection and filter with no host scope, so the result is a fleet-wide count of this
+    firing pattern rather than generic mavinject usage. Many hosts firing the same pattern points to scripted deployment or
+    sanctioned tooling; one host or a small unrelated set points to manual operator activity. Use the host distribution and
+    parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains: ' /INJECTRUNNING '
+      filter:
+        ParentImage: C:\Windows\System32\AppVClient.exe
+      condition: selection and not filter
+    fields:
+    - host.name
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run mavinject.exe?
+  context: Compare this user's current action against their historical behavior. A user who has never invoked the App-V
+    injector is more suspicious than one who does so regularly as part of a packaging or virtualization role. User role and
+    typical toolset should align with hands-on use of an injection-capable binary.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith: '\mavinject.exe'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent-plus-mavinject combination historically routine on this host or across the environment, or is the parent unusual?
+  context: When the alert fires under a service principal, user identity does not attribute behavior. The meaningful pivot is
+    the launch mechanism — which parent process spawned mavinject, and whether that pair is historically common. A new or rare
+    parent for mavinject on this host or environment-wide is the deviation worth chasing; a pair that already accounts for
+    many prior events is more consistent with sanctioned automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith: '\mavinject.exe'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around the time of the alert?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints. If
+    the same user triggered similar injection or staging activity on other hosts, the scope of the operation may be larger
+    than this single alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent-plus-mavinject combination fire on other hosts in the same window, indicating a coordinated rollout?
+  context: Under a service principal, asking what else the user did across the network returns agent-telemetry noise. The
+    meaningful question is whether the same launch mechanism — parent process plus mavinject — fired on other hosts in the
+    alert window. Multiple hosts in the same window points to scheduled or pushed automation; a single host points to a
+    host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith: '\mavinject.exe'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: 'Alerts rarely occur in isolation. Examining activity around the alert reveals the immediate context: what led to
+    this event, what happened after, and whether it is part of a larger sequence. Look for reconnaissance, privilege
+    escalation, persistence installation, or payload staging.'
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host — defense tampering, reconnaissance, credential access, or initial-access
+    activity — may reveal the attack stages that preceded the injection and help reconstruct the full timeline. Injection
+    via a signed binary is often a mid-chain step rather than the entry point.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1218.013
+      name: Mavinject
+      role: primary
+    - id: T1055.001
+      name: Dynamic-link Library Injection
+      role: secondary
+    - id: T1055
+      name: Process Injection
+      role: secondary
+    - id: T1218
+      name: System Binary Proxy Execution
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: mavinject_start
+      description: "mavinject.exe starts with /INJECTRUNNING (the alert itself), parent not AppVClient.exe"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 1b
+      label: injection_parameters
+      description: "Target PID and DLL path passed to /INJECTRUNNING"
+      mapped_to: Q3
+      source: attack:T1218.013.command_analysis
+    - stage: 2
+      label: high_access_handle
+      description: "mavinject obtains high-access handle (VM_WRITE/CREATE_THREAD, 0x10043A) to target process"
+      mapped_to: Q5
+      source: attack:T1055.001.access_verification
+    - stage: 3
+      label: module_load
+      description: "Target process loads the attacker DLL via LoadLibraryW"
+      mapped_to: Q6
+      source: attack:T1218.013.module_load
+    - stage: 4
+      label: follow_on_child
+      description: "Optional follow-on child activity from mavinject or the injected target"
+      mapped_to: Q8
+      source: template:cue_process_tool.follow_on
+    - stage: 4b
+      label: network_egress
+      description: "Optional network egress from the injected target process"
+      mapped_to: Q9
+      source: attack:T1218.013.network_egress
+  dimension_coverage:
+    - dimension: parent_process_analysis
+      technique: T1218.013
+      covered_by: Q4
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1218.013
+      covered_by: Q6
+      source: attack:T1218.013.module_load
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1218.013
+      covered_by: Q7
+      source: attack:T1218.013.dll_staging
+      coverage_type: direct
+    - dimension: access_verification
+      technique: T1055
+      covered_by: Q5
+      source: attack:T1055.001.access_verification
+      coverage_type: direct
+    - dimension: command_analysis
+      technique: T1218
+      covered_by: Q3
+      source: attack:T1218.013.command_analysis
+      coverage_type: direct
+  mutable_dispositions:
+    - element: DLLPathRegex
+      dimension: tuning_parameter
+      specific_values: "%TEMP%, Downloads, user profile, UNC shares"
+      disposition: context
+      target_question: Q7
+      notes: "DLL-staging question scopes to .dll file creations on the host; suspicious-path values surfaced in context for the analyst to correlate against the command-line DLL path."
+    - element: MinGrantedAccessSet
+      dimension: tuning_parameter
+      specific_values: "0x10043A (VM_WRITE, VM_OPERATION, VM_READ, CREATE_THREAD, QUERY_INFORMATION, SYNCHRONIZE)"
+      disposition: context
+      target_question: Q5
+      notes: "Access-verification question projects GrantedAccess; exact mask value documented in context. Not query-injected because the alert is process_creation and GrantedAccess masks vary by EDR/sysmon formatting."
+    - element: TargetProcessAllowList
+      dimension: tuning_parameter
+      specific_values: "lsass.exe, explorer.exe, winlogon.exe, browsers, EDR processes"
+      disposition: context
+      target_question: Q5
+      notes: "High-value target list surfaced in context of the process-access question; TargetImage is projected so the analyst can flag these."
+    - element: SignedToUnsignedTransition
+      dimension: tuning_parameter
+      specific_values: "Microsoft-signed mavinject -> unsigned DLL in target"
+      disposition: context
+      target_question: Q6
+      notes: "Signed-to-unsigned transition described in context; module-load question projects ImageLoaded and Signed."
+    - element: ParentProcessFilter
+      dimension: parent_process_analysis
+      specific_values: "App-V services (legit) vs Office, script hosts, browsers (suspicious)"
+      disposition: context
+      target_question: Q4
+      notes: "Legitimate vs suspicious parent guidance surfaced in process_chain context; AppVClient.exe is already filtered by the rule."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "5-10 minutes linking mavinject start -> ProcessAccess -> module load/network"
+      disposition: context
+      target_question: Q6
+      notes: "Correlation window reflected in the +/-10m range on the module-load question and +/-5m on access-verification; threshold not directly queryable."
+    - element: ExternalIPAllowlist
+      dimension: tuning_parameter
+      specific_values: "enterprise update/CDN ranges"
+      disposition: context
+      target_question: Q9
+      notes: "Allowlist guidance surfaced in network-egress context; query excludes svchost/services, analyst correlates remaining destinations."
+    - element: AccessMask
+      dimension: access_verification
+      specific_values: "PROCESS_VM_WRITE (part of 0x10043A)"
+      disposition: context
+      target_question: Q5
+      notes: "Same access-verification question; mask documented in context."
+    - element: InjectedProcessList
+      dimension: tuning_parameter
+      specific_values: "lsass.exe, explorer.exe"
+      disposition: context
+      target_question: Q5
+      notes: "Covered by TargetProcessAllowList disposition on the same question; high-value targets listed in context."
+    - element: InjectedDLLSignatureStatus
+      dimension: tuning_parameter
+      specific_values: "unsigned/untrusted/non-standard path"
+      disposition: context
+      target_question: Q6
+      notes: "Module-load question projects Signed and ImageLoaded; signature status described in context."
+    - element: TargetProcessList
+      dimension: tuning_parameter
+      specific_values: "explorer.exe, winlogon.exe"
+      disposition: context
+      target_question: Q5
+      notes: "Same high-value target list as TargetProcessAllowList; surfaced in process-access context."
+    - element: ParentProcessAnomalyThreshold
+      dimension: parent_process_analysis
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q12
+      notes: "Parent lineage deviation handled by baseline_deviation (rule-pattern parent/user distribution) and process_chain; threshold is a tuning rationale without concrete values."
+    - element: CommandLineRegex
+      dimension: command_analysis
+      specific_values: "URLs, script paths, DLL entrypoints"
+      disposition: context
+      target_question: Q3
+      notes: "Command-analysis question decodes the full mavinject command line including the DLL path argument; rule already constrains CommandLine to /INJECTRUNNING."
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q4
+      notes: "Unexpected parent-child profiling covered by process_chain question."
+    - element: SignedBinaryList
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q1
+      notes: "mavinject.exe is the signed binary in scope; the rule itself is the signed-binary allowlist entry being investigated."
+    - element: RemoteDomainAllowlist
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q9
+      notes: "Network-egress question handles enterprise-domain suppression guidance in context."
+  dedup_decisions:
+    - dropped: cue_process_tool.process_chain (process_chain pattern subsumption check)
+      reason: "process_chain kept and adapted (no parent_process technique-set cue is active, so it is not subsumed); retained as Q4."
+      kept: cue_process_tool.process_chain
+    - dropped: none
+      reason: "user_actor pair baseline/baseline_svc — non-deduplicable (subject-identity vs launch-mechanism pivot); both emitted (Q13, Q14)."
+      kept: cue_user_actor.baseline + cue_user_actor.baseline_svc
+    - dropped: none
+      reason: "user_actor pair clustering/clustering_svc — non-deduplicable (subject-identity vs launch-mechanism pivot); both emitted (Q15, Q16)."
+      kept: cue_user_actor.clustering + cue_user_actor.clustering_svc
+  skipped_templates:
+    - template: universal.endpoint_protection_health
+      reason: "RECOMMENDED, not must_include. cue_host_context.precursor (Q18) is present and surfaces prior tamper-as-precursor alerts on this host; the rule fires on a mid-chain injection primitive rather than a direct execution/credential-access action whose disposition turns on whether AV/EDR was weakened first. Dropped to stay within the 18-question cap while preserving full ATT&CK chain and cross-logsource coverage."
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "CommandLine-only detection — no Image field in rule. Use CommandLine pattern matching for scoping, not Image-based queries"
+      disposition: declined
+      reason: >-
+        Partially declined for the baseline/follow-on/baseline_svc/clustering_svc
+        aggregations, which scope by Image|endswith '\mavinject.exe' rather than
+        a CommandLine sweep. The rule is unambiguously about mavinject.exe
+        (specterops db_ref and T1218.013 confirm the binary; the hint exists only
+        because the rule's selection happens to key on the flag and primary_binary
+        is null in the brief), so binary-name scoping is both correct and far less
+        noisy than a CommandLine|contains ' /INJECTRUNNING ' sweep for these
+        90-day historical aggregations. The two REFLECTED templates
+        (baseline_deviation, scope) correctly retain the rule's CommandLine-based
+        detection block verbatim, satisfying the hint's intent where rule-pattern
+        fidelity matters.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 13
+      attack: 5
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 15
+    logsource_diversity:
+      process_creation: 13
+      process_access: 1
+      image_load: 1
+      file_event: 1
+      network_connection: 1
+      sigma_alert: 1

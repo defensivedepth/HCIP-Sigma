@@ -1,0 +1,628 @@
+name: PowerShell Execution With Potential Decryption Capabilities
+id: 85843504-e8f8-47f1-87f1-ce22fca7e4dd
+description: |
+  Detects a powershell.exe or pwsh.exe invocation whose command line combines a
+  directory-listing cmdlet (Get-ChildItem, dir, gci, ls), a content-reading
+  cmdlet (Get-Content, gc, cat, type, ReadAllBytes), and a specific pipeline that
+  enumerates *.lnk files and carves bytes out of them - either piping a recursive
+  *.lnk listing through -Skip, or selecting an .lnk via -ExpandProperty and writing
+  a sliced byte range with WriteAllBytes. This pattern is the self-extracting
+  loader stage of a shortcut-delivered intrusion: a malicious .LNK is read by
+  PowerShell, a fixed-size header is stripped off, and the remaining bytes are
+  written out as an archive or payload that is then expanded and executed. The
+  same cmdlets appear in legitimate scripting, so the investigation should confirm
+  the full command line carves bytes from an .lnk, identify what was written and
+  executed next, determine which parent launched the shell, and establish whether
+  this user, host, and fleet have run the pattern before.
+type: detection
+detection_id: 434c08ba-8406-4d15-8b24-782cb071a691
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line run PowerShell that lists, reads, and carves bytes
+    from an .lnk file, matching all parts of what this rule detects?
+  context: Before investing investigation time, confirm the alert is a true positive.
+    The rule fires only when a single powershell.exe or pwsh.exe command line contains
+    all of - a directory-listing cmdlet (Get-ChildItem, dir, gci, ls), a content-read
+    cmdlet (Get-Content, gc, cat, type, ReadAllBytes), and a pipeline that enumerates
+    *.lnk and either runs -Recurse with -Skip or selects FullName via -ExpandProperty
+    and calls WriteAllBytes on a sliced byte range. Read the exact command line and
+    confirm each element is present rather than an incidental cmdlet match.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run PowerShell that reads and carves
+    bytes from shortcut files?
+  context: Legitimate administrative scripting rarely enumerates *.lnk files and writes
+    a sliced byte range from them. Knowing whether the acting account and the host
+    function involve scripting, packaging, or installer work that would plausibly
+    manipulate shortcut bytes is often the fastest path to separating a benign script
+    from a self-extracting loader stage.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What did this PowerShell command actually do - which .lnk was read, how
+    many bytes were skipped, and where were the carved bytes written?
+  context: The full command line reveals the loader mechanics. Decode the pipeline -
+    which *.lnk was matched (often by an exact .length value), how many leading bytes
+    were stripped with -Skip or an array slice such as $bytes[8192..($bytes.length)],
+    and the destination path passed to WriteAllBytes (frequently a temporary archive
+    under the user profile). The byte offset and output path identify the payload the
+    shortcut was carrying.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains:
+          - '.lnk'
+          - WriteAllBytes
+          - ReadAllBytes
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:powershell.encoded_command_decode
+  question: Does the command fetch and decode an embedded payload, and what does the
+    carved output decode or expand to?
+  context: This pattern is a plain-text self-extractor rather than an -EncodedCommand
+    payload, so the readable command line is the ground truth. Trace what happens to
+    the bytes carved from the .lnk - whether they are written as an archive and passed
+    to Expand-Archive, decrypted in place, or executed directly. Identify the
+    destination file and any program launched from it, since the extracted content is
+    the next stage the shortcut was delivering.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:powershell.script_block_logging
+  question: Did PowerShell script block logging capture the full deobfuscated script
+    content for this execution?
+  context: Script block logging records the deobfuscated script PowerShell actually
+    executed, including the full byte-carving and extraction logic even when the
+    command line is wrapped or split across variables. This provides ground truth
+    about the loader's behavior. If PowerShell operational logs are not ingested in
+    this environment, treat zero results as a visibility gap rather than evidence
+    nothing ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- source: template:powershell.powershell_security_bypass
+  question: Were PowerShell security controls bypassed or weakened before this
+    execution?
+  context: Loader stages delivered through shortcut files often clear the path first -
+    setting an execution-policy bypass, patching AMSI in memory, or downgrading to
+    PowerShell v2 to avoid logging. Finding these precursor events on the host shortly
+    before the carving command strengthens the case that the extraction was the
+    payload stage of a deliberate intrusion rather than incidental scripting.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in
+    the hour before the alert?
+  context: A loader stage that strips and writes a payload is the kind of hands-on
+    action an operator may precede by weakening protection. The query surfaces direct
+    attempts to disable AV/EDR services, flip Defender flags, add broad exclusions,
+    clear logs, or patch AMSI and ETW from the command line. Zero rows is a useful
+    protection-looks-healthy signal; populated rows shift the disposition toward
+    operator preparation, so review the parent process and signing chain to identify
+    the writer.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+- source: template:cue_process_tool.process_chain
+  question: What process spawned this PowerShell instance, and is that parent chain
+    expected?
+  context: The parent process reveals how the carving command was invoked. A shortcut
+    delivered to a user is launched by explorer.exe when double-clicked, but the
+    resulting PowerShell is frequently spawned from the .lnk target itself; an
+    unexpected parent such as a script host, mshta.exe, an archive tool, or an Office
+    application points to a delivery chain rather than deliberate administration. The
+    parent is where the loader command originated.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.follow_on
+  question: What did this PowerShell instance spawn afterward, such as an archive
+    extractor or a freshly written executable?
+  context: The bytes carved from the .lnk are typically written as an archive,
+    expanded, and then executed - so the children of this PowerShell process show
+    what the loader actually delivered. Look for Expand-Archive activity, a newly
+    dropped signed program used for side-loading, or any executable launched from a
+    temporary or user-writable path immediately after the carving. These children are
+    the next stage the shortcut was carrying.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_user_actor.baseline
+  question: Has this user run PowerShell that carves bytes from .lnk files before, or
+    is this their first time?
+  context: Compare the acting account against its own history for this specific
+    pattern. A packaging or installer engineer may manipulate shortcut bytes as part
+    of routine tooling; an account that has never run a *.lnk read-and-write pipeline
+    suddenly doing so is more notable. The user role and typical toolset should align
+    with shortcut or archive manipulation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        CommandLine|contains:
+          - '.lnk'
+          - WriteAllBytes
+          - ReadAllBytes
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent process and .lnk-carving command-line pattern historically
+    routine on this host or across the environment, or is the parent unusual for it?
+  context: When the alert fires under a service principal, user identity does not
+    attribute the behavior; the meaningful pivot is which parent process launched a
+    PowerShell child carrying the .lnk read-and-write pattern and whether that pairing
+    is historically common. A new or rare parent for this pattern on this host or
+    environment-wide is the deviation worth chasing, while a parent that already
+    accounts for many prior events is more likely a build pipeline or packaging
+    automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        CommandLine|contains:
+          - '.lnk'
+          - WriteAllBytes
+          - ReadAllBytes
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the acting account's activity across all hosts reveals whether the
+    shortcut-loader execution was a single event or part of activity spanning multiple
+    endpoints. If the same user triggered similar activity on other hosts, the scope
+    of the incident is larger than one machine.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent process and .lnk-carving command-line pattern fire on
+    other hosts in the same window, indicating a coordinated rollout rather than
+    isolated activity?
+  context: Under a service principal, asking what else the user did across the network
+    returns agent-telemetry noise, since every host runs system-owned agents
+    constantly. The meaningful question is whether the same launch mechanism - a
+    parent process spawning a PowerShell child that carries the .lnk read-and-write
+    pattern - fired on other hosts in the alert window. Multiple hosts in the same
+    window points to a pushed shortcut campaign or scripted deployment; a single host
+    points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        CommandLine|contains:
+          - '.lnk'
+          - WriteAllBytes
+          - ReadAllBytes
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining the activity surrounding the
+    carving command reveals what led to it and what followed - the parent that staged
+    the shortcut, the archive extraction, or follow-on execution of the dropped
+    payload. Novel parent-child pairs at low counts are what to scan for against the
+    high-count noise of routine system processes.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host - phishing-attachment execution, user
+    execution of a downloaded file, or defense tampering - may reveal the delivery
+    stages that preceded the shortcut loader and help reconstruct the full timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired the rule's .lnk-carving PowerShell
+    pattern, what parents and users normally drive it, and does the current alert fit?
+  context: Even legitimate packaging scripts can read and rewrite shortcut bytes. This
+    query mirrors the rule's full selection structure scoped to this host, so the
+    resulting parent and user distribution reflects how this specific firing pattern
+    has historically run here, not generic PowerShell activity. A new parent process,
+    an unexpected account, or a first-ever occurrence is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_img:
+        Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+        OriginalFileName:
+        - PowerShell.EXE
+        - pwsh.dll
+      selection_cli_dir:
+        CommandLine|contains:
+        - 'Get-ChildItem '
+        - 'dir '
+        - 'gci '
+        - 'ls '
+      selection_cli_gc:
+        CommandLine|contains:
+        - 'Get-Content '
+        - 'gc '
+        - 'cat '
+        - 'type '
+        - ReadAllBytes
+      selection_cli_specific:
+      - CommandLine|contains|all:
+        - ' ^| '
+        - \*.lnk
+        - -Recurse
+        - '-Skip '
+      - CommandLine|contains|all:
+        - ' -ExpandProperty '
+        - \*.lnk
+        - WriteAllBytes
+        - ' .length '
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired the rule's .lnk-carving PowerShell pattern in the
+    past week, and does the cross-host distribution look like automation or one-off
+    activity?
+  context: This query mirrors the rule's full selection structure with no host scope,
+    so the result is a fleet-wide count of the .lnk read-and-write firing pattern
+    rather than generic PowerShell activity. Many hosts firing the same pattern points
+    to a packaging pipeline or a pushed shortcut campaign; one host or a small
+    unrelated set points to manual or targeted activity. Use the host distribution to
+    calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_img:
+        Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+        OriginalFileName:
+        - PowerShell.EXE
+        - pwsh.dll
+      selection_cli_dir:
+        CommandLine|contains:
+        - 'Get-ChildItem '
+        - 'dir '
+        - 'gci '
+        - 'ls '
+      selection_cli_gc:
+        CommandLine|contains:
+        - 'Get-Content '
+        - 'gc '
+        - 'cat '
+        - 'type '
+        - ReadAllBytes
+      selection_cli_specific:
+      - CommandLine|contains|all:
+        - ' ^| '
+        - \*.lnk
+        - -Recurse
+        - '-Skip '
+      - CommandLine|contains|all:
+        - ' -ExpandProperty '
+        - \*.lnk
+        - WriteAllBytes
+        - ' .length '
+      condition: all of selection_*
+    fields:
+    - host.name
+_generation_meta:
+  has_attack_brief: false
+  techniques: []
+  attack_chain_coverage: []
+  dimension_coverage: []
+  mutable_dispositions: []
+  dedup_decisions:
+    - dropped: cue_user_actor.baseline + cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable; both emitted (subject-pivot and launch-mechanism-pivot). Image-pivot tightened with the .lnk/ReadAllBytes/WriteAllBytes CommandLine pattern per the powershell.exe-too-common hint, since Image|endswith %Image% would aggregate all powershell.exe and the .lnk-carving pattern is the distinctive selector."
+      kept: both
+    - dropped: cue_user_actor.clustering + cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable; both emitted (subject-pivot and launch-mechanism-pivot). clustering_svc tightened with the .lnk/ReadAllBytes/WriteAllBytes CommandLine pattern per the powershell.exe-too-common hint; subject-pivot clustering left broad to answer what-else-did-the-user-do."
+      kept: both
+    - dropped: cue_process_tool.baseline
+      reason: "generic Image|endswith %Image% host baseline over powershell.exe returns whole-fleet PowerShell volume with no precision for the carving pattern; subsumed by the REFLECTED host-pattern question (baseline_deviation) which scopes to the rule's actual .lnk-carving firing pattern"
+      kept: cue_process_tool.baseline_deviation
+    - dropped: cue_process_tool.clustering
+      reason: "Image-only host aggregation subsumed by cue_host_context.clustering, which projects Image+ParentImage and surfaces novel parent-child pairs"
+      kept: cue_host_context.clustering
+  skipped_templates: []
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "powershell.encoded_command_decode replaces obfuscation.encoded_payload_decode"
+      disposition: declined
+      reason: >-
+        Acted-on in spirit and recorded here only because no obfuscation.* template
+        was offered in the brief's templates[] to replace. powershell.encoded_command_decode
+        IS included as the Phase 2 decode question (the carved-output decode question),
+        adapted per its notes_to_llm to the plain-text self-extractor case (no
+        -EncodedCommand present), redirecting the analyst to trace the carved bytes
+        into Expand-Archive / execution. No obfuscation set question exists to drop.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - powershell
+    - cue_process_tool
+    - cue_user_actor
+    - cue_host_context
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 17
+      attack: 0
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 2
+      context: 13
+    logsource_diversity:
+      process_creation: 15
+      powershell: 1
+      sigma_alert: 1

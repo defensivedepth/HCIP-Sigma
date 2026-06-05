@@ -1,0 +1,688 @@
+name: HackTool - Potential Impacket Lateral Movement Activity
+id: 9d95bd20-21ed-4964-90a9-b954cbaf5ca1
+description: |
+  Detects the command-shell launch pattern produced by the Impacket lateral-movement scripts (wmiexec, dcomexec, atexec, smbexec), which run commands on a remote host and read the output back over SMB. The rule fires when EITHER a child cmd.exe is spawned by wmiprvse.exe, mmc.exe, explorer.exe, or services.exe AND its command line contains all of cmd.exe, /Q, /c, \\127.0.0.1\, and &1 (the wmiexec/dcomexec output-to-loopback-share pattern), OR a child cmd.exe is spawned under a parent whose command line contains svchost.exe -k netsvcs or taskeng.exe AND the child command line contains all of cmd.exe, /C, Windows\Temp\, and &1 (the atexec scheduled-task pattern). Both branches share the fire-and-forget design: the remote tool has no return channel over WMI/DCOM/SMB, so it redirects command output to a temp file or an admin-share path on 127.0.0.1 and reads it back. Legitimate WMI/DCOM administration rarely produces this exact redirect-to-loopback-share shape; investigation should confirm which branch fired, recover the full command and its output path, identify the remote source that drove the execution, and determine the authentication used.
+type: detection
+detection_id: 10c14723-61c7-4c75-92ca-9af245723ad2
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-04
+questions:
+- source: template:universal.verify_trigger_match
+  question: Did a parent process spawn cmd.exe with EITHER the loopback-share redirect pattern OR the Windows\Temp redirect pattern this rule looks for?
+  context: >-
+    Before investing investigation time, confirm the alert is a true positive by reviewing the exact parent and child command
+    lines against the rule's two-branch logic. The first branch is a parent of wmiprvse.exe, mmc.exe, explorer.exe, or
+    services.exe spawning cmd.exe whose command line contains all of /Q, /c, \\127.0.0.1\, and &1. The second branch is a
+    parent whose command line contains svchost.exe -k netsvcs or taskeng.exe spawning cmd.exe whose command line contains
+    all of /C, Windows\Temp\, and &1. Note which branch fired, because it tells you the delivery channel - the loopback-share
+    branch points to wmiexec/dcomexec driven over WMI or DCOM, and the Windows\Temp branch points to atexec driven through a
+    scheduled task, and that distinction steers the source-host and authentication questions.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run remote command execution that redirects output to a loopback share or a temp file?
+  context: >-
+    Legitimate administrative activity can trigger many detections, but the redirect-output-to-loopback-share or
+    redirect-to-temp pattern is the signature of a remote-execution tool reading results back over SMB, not normal interactive
+    cmd.exe use. Knowing whether the user role and host function are consistent with being a remote-management target, and
+    whether an administrator is expected to drive WMI, DCOM, or scheduled-task execution against this host, is often the
+    fastest path to distinguishing sanctioned administration from an intrusion.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:hacking_tool.authorized_engagement
+  question: Is this Impacket-style remote execution part of an authorized penetration test or red team engagement?
+  context: >-
+    The Impacket lateral-movement scripts are standard tooling in authorized security assessments. Before investing
+    investigation time, check whether a penetration test or red team exercise is currently active on this host or network
+    segment. An authorized engagement whose scope, timing, and source host match the observed activity resolves the alert
+    without further analysis.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:parent_child.parent_process_legitimacy
+  question: Is this parent expected to spawn cmd.exe in this way, and what started the parent?
+  context: >-
+    The parent-child relationship is the core signal. wmiprvse.exe is the WMI provider host and is the expected parent for
+    wmiexec; mmc.exe and explorer.exe appear with DCOM-based execution; services.exe and a svchost.exe -k netsvcs or
+    taskeng.exe parent appear with service- and scheduled-task-based execution. Tracing the parent's own origin reveals
+    whether the chain is a remotely driven execution path or a legitimate local administrative action, and for the WMI and
+    scheduled-task parents it confirms the channel that delivered the command.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- source: template:parent_child.sibling_processes
+  question: What other child processes did this same parent spawn?
+  context: >-
+    A remote operator usually runs more than one command per session, and each command is a separate cmd.exe spawned by the
+    same provider, COM host, or scheduled-task parent. Examining all children of that parent instance reveals the full set of
+    commands executed through the channel, including reconnaissance, credential access, or further movement that did not each
+    trip the rule individually.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.mechanism_decode
+  question: Decode the full cmd.exe command line - what command ran and to which output path was its result redirected?
+  context: >-
+    The full command line carries two parts. The redirect tokens (&1 with a \\127.0.0.1\ADMIN$ or C$ share path, or a
+    Windows\Temp file) show where the tool captured output so it could read results back over SMB, and the named output file
+    is an on-disk artifact to recover. The command between cmd.exe /Q /c (or /C) and the redirect is what actually executed
+    on this host. Scoping to all cmd.exe executions on the host in the window catches the sequence of commands a single
+    remote session typically issues, not just the one that tripped the rule.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains|all:
+          - cmd.exe
+          - '&1'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: attack:T1021.003.process_identification
+  question: Beyond cmd.exe, what processes were created under the same provider or COM host on this target around the alert time?
+  context: >-
+    DCOM- and WMI-based execution instantiates a server process on the target that then creates the payload processes, so the
+    identity of the processes spawned under that host is what reveals the operator's objective. Listing the processes created
+    under the WMI provider host or COM server, with their own parents, separates the expected cmd.exe shell from additional
+    binaries the operator ran - script interpreters, credential-access tools, or copies of system utilities run from unusual
+    paths.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith:
+          - \wmiprvse.exe
+          - \mmc.exe
+          - \dllhost.exe
+          - \svchost.exe
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: attack:T1047.wmi
+  question: Do the WMI activity logs show a remote process creation or subscription on this host matching the alert time?
+  context: >-
+    WMI execution leaves operational records distinct from the spawned cmd.exe - a remote WMI operation or temporary event
+    subscription that drove the command. Correlating WMI operational events on this host with the alert window confirms
+    whether the cmd.exe was launched through WMI rather than a local action, and surfaces any subscription left behind as
+    persistence. If WMI operational logging is not collected in this environment, treat zero results as a visibility gap
+    rather than evidence WMI was not used.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      category: wmi
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - EventID
+      - User
+      - Operation
+- source: template:lateral_movement.source_host_identification
+  question: What host initiated this remote connection, and is it an expected administrative source?
+  context: >-
+    Lateral movement requires a source and destination. WMI and DCOM execution reach this host over RPC on port 135 with
+    follow-on dynamic ports, and SMB output retrieval uses port 445. Identifying the originating address of those inbound
+    connections reveals whether the execution came from a known admin jump box, a compromised workstation, or an unexpected
+    source pivoting through the environment.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        DestinationPort:
+          - 445
+          - 135
+          - 3389
+          - 5985
+          - 5986
+          - 22
+      condition: selection
+    fields:
+      - SourceIp
+      - DestinationPort
+- source: template:lateral_movement.authentication_method
+  question: What authentication method was used to drive this remote execution -- legitimate credentials, pass-the-hash, or Kerberos ticket?
+  context: >-
+    The authentication that preceded the execution reveals how the operator gained access. Pass-the-hash (NTLM network logons
+    with no matching interactive logon) and pass-the-ticket bypass password entry; legitimate credential use suggests the
+    operator obtained valid passwords through dumping, phishing, or prior compromise. The account and logon type tied to the
+    cmd.exe identify whose credentials drove the remote tool.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - User
+      - CommandLine
+- source: template:network_scope.actor_authentication_trail
+  question: Where has this user authenticated recently, and from which source addresses?
+  context: >-
+    Authentication events show which systems the user accessed before and after the detected execution. A network logon from
+    a remote source immediately before the cmd.exe, and the same account authenticating to many systems in a short window,
+    point to credentials being used for movement. Logon type and source address distinguish a remote network logon driving
+    the tool from routine interactive use.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      service: security
+    detection:
+      selection:
+        EventID:
+          - 4624
+          - 4625
+        TargetUserName|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - IpAddress
+      - EventID
+      - LogonType
+- source: template:lateral_movement.target_activity_after_access
+  question: What processes were spawned on this host after the remote execution was established?
+  context: >-
+    Remote execution is a means to an end - operators move laterally to run commands, deploy tools, or access data on the
+    target. Examining processes created on this host shortly after the redirect-to-share execution reveals the operator's
+    objectives, including reconnaissance, credential access, or staging that followed the initial foothold.
+  range: +30m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - User
+      - Image
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in the hour before the alert?
+  context: >-
+    Operators who establish remote execution on a host frequently follow with attempts to disable or blind protection before
+    running heavier tooling. The query surfaces attempts to disable AV/EDR services, flip Defender flags, add broad
+    exclusions, clear logs, or patch AMSI/ETW. Zero rows is a useful protection-looks-healthy signal; populated rows shift
+    the disposition toward operator preparation, so review the parent process and signing chain to identify the writer.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+- source: template:cue_user_actor.baseline
+  question: Does this user normally drive remote command execution of this kind?
+  context: >-
+    Compare this user's current action against their historical behavior. A user who has never driven loopback-share or
+    temp-redirect remote execution is more suspicious than one who does so regularly as part of a known administrative role.
+    Scoping to the Impacket-style cmd.exe redirect pattern rather than to cmd.exe broadly keeps the comparison meaningful.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        CommandLine|contains|all:
+          - cmd.exe
+          - '&1'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this provider-or-host parent driving the redirect-style cmd.exe historically routine on this host or across the environment?
+  context: >-
+    When the alert fires under a service principal, user identity does not attribute behavior; the meaningful pivot is the
+    launch mechanism. A WMI provider, COM host, or scheduled-task parent spawning the loopback-share or temp-redirect cmd.exe
+    that is new or rare on this host or across the environment is the deviation worth chasing, whereas a pairing that already
+    accounts for many prior events points to established management automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+          - cmd.exe
+          - '&1'
+      condition: selection
+    fields:
+      - host.name
+      - ParentImage
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: >-
+    Tracking the user's activity across all hosts reveals whether the same actor drove similar remote execution on multiple
+    endpoints. If the same account ran comparable activity elsewhere in the window, the scope of compromise may extend beyond
+    this single host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did the same redirect-style remote execution fire on other hosts in the same window, indicating a coordinated rollout rather than host-local activity?
+  context: >-
+    Under a service principal, asking what else the user did returns agent-telemetry noise. The meaningful question is whether
+    the same loopback-share or temp-redirect cmd.exe pattern appeared on other hosts in the alert window. Multiple hosts in
+    the same window points to an operator sweeping the environment from one source; a single host points to a targeted
+    action.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+          - cmd.exe
+          - '&1'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Alerts rarely happen in isolation. Earlier detections on the same host, such as credential access, reconnaissance, or
+    initial access, may reveal the stages that led to this remote execution and help reconstruct the timeline of how the
+    operator reached and used this host.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1047
+      name: Windows Management Instrumentation
+      role: primary
+    - id: T1021.003
+      name: Distributed Component Object Model
+      role: secondary
+    - id: T1021
+      name: Remote Services
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: remote_invocation
+      description: A remote source drives execution on this host via WMI, DCOM, or a scheduled task (RPC 135 / SMB 445).
+      mapped_to: Q9
+      source: template:lateral_movement.source_host_identification
+    - stage: 2
+      label: provider_or_host_spawn
+      description: The WMI provider host, COM server, services.exe, or scheduled-task host spawns cmd.exe.
+      mapped_to: Q4
+      source: template:parent_child.parent_process_legitimacy
+    - stage: 3
+      label: command_execution
+      description: cmd.exe runs the operator's command and redirects output to a loopback share or Windows\Temp file.
+      mapped_to: Q6
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 4
+      label: output_retrieval_and_followon
+      description: Output is read back over SMB and further processes / objectives follow on the target.
+      mapped_to: Q12
+      source: template:lateral_movement.target_activity_after_access
+  dimension_coverage:
+    - dimension: time_correlation
+      technique: T1047
+      covered_by: Q8
+      source: attack:T1047.wmi
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1047
+      covered_by: Q9
+      source: template:lateral_movement.source_host_identification
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1047
+      covered_by: Q2
+      source: template:universal.host_user_context
+      coverage_type: direct
+    - dimension: process_identification
+      technique: T1021.003
+      covered_by: Q7
+      source: attack:T1021.003.process_identification
+      coverage_type: direct
+    - dimension: command_analysis
+      technique: T1021
+      covered_by: Q6
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: direct
+  mutable_dispositions:
+    - element: ParentImage / ParentCommandLine
+      dimension: process_identification
+      specific_values: '\wmiprvse.exe, \mmc.exe, \explorer.exe, \services.exe; svchost.exe -k netsvcs, taskeng.exe'
+      disposition: query_injection
+      target_question: Q7
+      notes: >-
+        Rule's parent set is entity-scoped in Q1 (ProcessGuid) and named in Q4. The provider/COM-host parents are injected as
+        ParentImage|endswith into the process_identification query Q7 to enumerate processes created under the launching host.
+    - element: SuspiciousCommandPatterns
+      dimension: tuning_parameter
+      specific_values: cmd.exe, /Q, /c (or /C), \\127.0.0.1\, Windows\Temp\, &1
+      disposition: query_injection
+      target_question: Q6
+      notes: >-
+        Rule's CommandLine|contains|all tokens are entity-scoped in Q1; the cross-branch redirect signature (cmd.exe + &1) is
+        injected into the mechanism_decode (Q6) and the user/mechanism baselines (Q14/Q15/Q17) to honor the CommandLine-only
+        scoping hint instead of scoping on cmd.exe Image.
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: rationale only (correlate RPC/WMI invocation with spawned process, e.g. 300s)
+      disposition: context
+      target_question: Q8
+      notes: No single queryable value; correlation handled by the +/-15m WMI window (Q8), the source-host inbound window (Q9), and the precursor alert timeline (Q18).
+    - element: RemoteDestinationThreshold / RemoteHostList
+      dimension: tuning_parameter
+      specific_values: rationale only (unique remote hosts / allowlisted admin sources)
+      disposition: context
+      target_question: Q9
+      notes: Source-host identity and whether it is an expected admin source covered in Q9; cross-host spread covered in Q17.
+    - element: UserContext / LogonUser
+      dimension: user_context
+      specific_values: rationale only (interactive vs system, service vs privileged accounts)
+      disposition: context
+      target_question: Q2
+      notes: User/host expectation in Q2; authentication method and account in Q10; authentication trail in Q11.
+    - element: WMIQueryScope
+      dimension: tuning_parameter
+      specific_values: '\root\cimv2, \root\subscription'
+      disposition: context
+      target_question: Q8
+      notes: WMI operational correlation in Q8 surfaces the namespace/subscription; specific namespaces named in context as the scopes to review for left-behind subscriptions.
+    - element: ProcessName
+      dimension: process_identification
+      specific_values: excel.exe, wmiprvse.exe (DCOM-abused hosts)
+      disposition: query_injection
+      target_question: Q7
+      notes: Provider/COM-host process names injected as ParentImage|endswith in Q7 to enumerate children of the DCOM/WMI host.
+  dedup_decisions:
+    - dropped: cue_process_tool.process_chain
+      reason: parent_process is primary cue (per hint) and parent_child technique set active — process_chain subsumed by parent_process_legitimacy (Q4).
+      kept: template:parent_child.parent_process_legitimacy
+    - dropped: hacking_tool.tool_capability_used
+      reason: Which-Impacket-method and what-command-ran is a ProcessGuid re-read of the same CommandLine already decoded by cue_process_tool.mechanism_decode (Q6); kept the host-scoped decode which also catches the sequence of session commands.
+      kept: template:cue_process_tool.mechanism_decode
+    - dropped: cue_parent_process.mechanism_decode
+      reason: Parent's own process event is already retrieved by parent_child.parent_process_legitimacy (Q4), which projects the same Image/CommandLine/ParentImage/ParentCommandLine via ParentProcessGuid.
+      kept: template:parent_child.parent_process_legitimacy
+    - dropped: cue_user_actor user-pivot vs service-principal substitute
+      reason: user_actor pair — non-deduplicable (Q14/Q15 baseline pair, Q16/Q17 clustering pair).
+      kept: both variants
+  skipped_templates:
+    - template: cue_parent_process.baseline
+      reason: Host-level parent+child baseline is covered by the mechanism-pivot baseline cue_user_actor.baseline_svc (Q15), which scopes on the redirect CommandLine pattern rather than the noisy cmd.exe Image per the CommandLine-only hint.
+    - template: cue_parent_process.follow_on
+      reason: Other children of the same parent are covered by parent_child.sibling_processes (Q5) via ParentProcessGuid.
+    - template: cue_parent_process.clustering
+      reason: Same-time activity from the parent is covered by sibling_processes (Q5) and target_activity_after_access (Q12); cross-logsource pivots covered by the WMI and network questions (Q8/Q9).
+    - template: cue_parent_process.scope
+      reason: Cross-host occurrence of the parent+pattern is covered by cue_user_actor.clustering_svc (Q17), which checks the redirect pattern across hosts in-window.
+    - template: cue_process_tool.baseline
+      reason: Host-binary baseline on cmd.exe would be uninformative; replaced by the redirect-pattern baselines (Q14/Q15) per the CommandLine-only scoping hint.
+    - template: cue_network_endpoint.mechanism_decode
+      reason: The IP in the CommandLine is the loopback 127.0.0.1 output-share target, not external infrastructure; decoded in mechanism_decode (Q6). The real lateral network (RPC 135 / SMB 445 from the source) is covered by source_host_identification (Q9). See hint_dispositions.
+    - template: cue_network_endpoint.baseline
+      reason: No external destination to baseline (loopback only); host-to-source baselining is subsumed by Q9 and Q11.
+    - template: cue_host_context.clustering
+      reason: Per-host activity at alert time is covered by sibling_processes (Q5), process_identification (Q7), and target_activity_after_access (Q12); omitted to stay within 14-18.
+    - template: network_scope.same_action_other_hosts
+      reason: Cross-host occurrence of the same pattern is covered by cue_user_actor.clustering_svc (Q17); avoided as a near-duplicate.
+    - template: network_scope.actor_activity_network_wide
+      reason: Duplicate of cue_user_actor.clustering (Q16) — same User-scoped network-wide aggregation.
+    - template: lateral_movement.lateral_movement_scope
+      reason: Outbound lateral-tool usage by the user is a near-duplicate of clustering (Q16); this host is the movement target, so inbound source (Q9) and the auth trail (Q11) are the load-bearing scope questions.
+    - template: remote_access_tool.tool_authorization
+      reason: remote_access_tool set was triggered by a stale 'title contains atera' keyword match that does not appear in this rule's title; RMM/helpdesk framing (approved tool list, support ticket, vendor relay endpoint) is inapplicable to Impacket WMI/DCOM execution.
+    - template: remote_access_tool.active_session_context
+      reason: Same stale 'atera' trigger — no commercial RMM session to correlate against a helpdesk ticket for this technique.
+    - template: remote_access_tool.connection_destination
+      reason: Same stale 'atera' trigger — the relevant network angle (inbound RPC/SMB source) is covered by source_host_identification (Q9), not an outbound RMM relay destination.
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "logsource 'image_load' (recommended by techniques: T1021.003) is not covered — pull in cue_image_load.* or author a custom question with `category: image_load`"
+      disposition: declined
+      reason: >-
+        The rule fires on the spawned cmd.exe command line, not on module loads. Remote-invocation corroboration is already
+        provided by the WMI operational question (Q8, category: wmi) and the provider-scoped process_identification question
+        (Q7), which enumerate processes created under wmiprvse.exe / the COM host. An image_load query scoped to wmiprvse.exe
+        returns continuous provider module-load volume without added discrimination for this CommandLine-driven detection, so
+        no compensating attack:T1021.003.image_load question was authored.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - hacking_tool
+    - lateral_movement
+    - parent_child
+    - network_scope
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 16
+      attack: 2
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 15
+    logsource_diversity:
+      process_creation: 14
+      wmi: 1
+      network_connection: 1
+      security: 1
+      sigma_alert: 1
+      sigma: 1

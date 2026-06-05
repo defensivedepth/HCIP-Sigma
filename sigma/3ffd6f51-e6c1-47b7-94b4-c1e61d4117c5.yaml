@@ -1,0 +1,601 @@
+name: Certificate Exported Via Certutil.EXE
+id: 0fe63623-b45f-469f-908f-5add01a6fbbf
+description: |
+  Detects execution of certutil.exe (or a binary whose OriginalFileName is CertUtil.exe) with the -exportPFX flag,
+  which exports a certificate together with its private key to a password-protected .pfx file. The rule fires only when
+  both the binary identity AND the -exportPFX command-line flag match. Exporting certificates with their private keys has
+  legitimate uses (certificate backup, migration, renewal by administrators), but the same operation is the prerequisite
+  step for stealing token-signing or code-signing private keys. Investigation should establish what certificate store and
+  certificate were targeted, where the .pfx was written, whether the parent process and user are expected to run this, and
+  whether the exported key material was subsequently moved or accessed.
+type: detection
+detection_id: 3ffd6f51-e6c1-47b7-94b4-c1e61d4117c5
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Did certutil.exe run with the -exportPFX flag, and does the alerting event match the rule's pattern?
+  context: Before investing investigation time, confirm the alert is a true positive. The rule fires only when the image is
+    certutil.exe (or its OriginalFileName is CertUtil.exe) AND the command line contains -exportPFX. Review the full command
+    line and process identity against both conditions.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to export certificates with their private keys?
+  context: Certificate export with the private key is routine for administrators handling certificate backup, migration, or
+    renewal, but is unusual from a standard user account or a host that is not a certificate authority, ADFS server, or admin
+    workstation. Knowing whether the user role and host function fit this operation is often the fastest path to a disposition.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What did this certutil invocation export? Decode the full command line and identify the certificate store, serial,
+    and output .pfx path.
+  context: The full command line reveals exactly what was exported. certutil -exportPFX takes the certificate store, a certificate
+    serial or thumbprint, and the destination .pfx path; the resulting file contains the private key encrypted under a supplied
+    password. This query returns every certutil execution on this host within the window, so sequential invocations that together
+    stage and export key material appear side by side rather than as a single isolated event.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:obfuscation.encoded_payload_decode
+  question: Is the command line, script, or payload encoded or obfuscated? What does it decode to, and what operation does
+    the decoded content perform?
+  context: The exported .pfx is a password-protected container holding the certificate and its private key, so the key material
+    is opaque to casual inspection. Read the -exportPFX arguments to recover the certificate store and serial that were targeted,
+    the output path, and any password supplied inline. If certutil also appears with -decode or -decodehex nearby, identify
+    the encoded source file and the decoded output, since attackers chain encode/decode steps with cert export to stage and
+    move key material.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:universal.evidence_preservation
+  question: Is the exported .pfx file still on disk for analysis?
+  context: The .pfx output named in the command line contains the exported certificate and private key. Checking whether it
+    still exists on disk enables deeper analysis -- hashing the file, confirming which certificate it holds, and determining
+    whether the key material is still recoverable or has already been moved off the host.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: template:cue_process_tool.process_chain
+  question: What process spawned certutil.exe, and is that parent chain expected for a certificate export?
+  context: The parent process reveals how the export was invoked. Administrative export usually descends from an interactive
+    shell or management console launched by explorer.exe; export driven from a script host, an Office application, a web server
+    worker, or a remote-execution service is the deviation worth chasing. Tuning the set of parent processes treated as suspicious
+    to the environment's known admin workflow sharpens this signal.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:download_tool.download_success_verification
+  question: Was the export successful? Check for .pfx file creation at the destination.
+  context: A certutil -exportPFX command does not guarantee the file was written. A missing certificate, a wrong store, an
+    incorrect password, or an access error may have prevented export. Confirming file creation at the destination path establishes
+    whether key material actually left the certificate store and reached disk.
+  range: +15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: template:download_tool.payload_analysis
+  question: Can you retrieve and analyze the exported .pfx from a safe environment?
+  context: If the exported .pfx is still on disk, hashing it and inspecting its contents in a controlled environment reveals
+    which certificate and key were exported -- for example a token-signing, code-signing, or web-server certificate -- and
+    whether that key should be rotated. Capturing the hash also supports tracking the file if it is later moved or
+    exfiltrated.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Hashes
+- source: template:download_tool.directory_activity
+  question: What other file activity occurred in the export target directory?
+  context: Operators often stage multiple certificates or key files into the same directory, or follow an export with compression
+    and archiving to prepare the material for exfiltration. Examining directory-level file activity around the export reveals
+    whether this was a single certificate backup or part of a broader collection of key material.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains|expand: '%file_dirs%'
+      filter_self:
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection and not filter_self
+    fields:
+      - TargetFilename
+      - Image
+- source: template:cue_process_tool.clustering
+  question: What other tools ran on this host around the same time as the certificate export?
+  context: Certificate and private-key theft rarely stands alone -- it is often bracketed by reconnaissance of certificate
+    stores, credential access, or staging for exfiltration. Examining the activity in a tight window around the export provides
+    the broader context needed to tell a routine certificate backup from a deliberate key-theft step. The correlation window
+    can be widened or narrowed depending on how spread out the surrounding activity is.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in the hour before the export?
+  context: Operators preparing to steal private keys often weaken endpoint protection first so that follow-on credential-access
+    and exfiltration tooling runs unimpeded. The query surfaces direct attempts to disable protection services, flip Defender
+    flags, add broad exclusions, clear logs, or patch in-memory inspection. Zero rows is a useful "protection looks healthy"
+    signal; populated rows shift the disposition toward operator preparation, so review the parent process and signing chain
+    to identify the writer.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+- source: template:cue_user_actor.baseline
+  question: Does this user normally export certificates with certutil?
+  context: Compare this user's current action against their historical behavior. A user who has never exported certificates
+    is more suspicious than an administrator who does so regularly as part of certificate management. The user's role and typical
+    toolset should align with private-key export.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent+certutil combination historically routine on this host or across the environment, or is the parent
+    unusual for certutil?
+  context: When the alert fires under a service principal, user identity does not attribute behavior, so the meaningful pivot
+    is the launch mechanism -- which parent process spawned certutil, and whether that pair is historically common. A new or
+    rare parent for certutil on this host or environment-wide is the deviation worth chasing; a pair that already accounts
+    for thousands of prior events is vendor or OS automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals whether the certificate export was an isolated action or part
+    of activity spanning multiple endpoints. If the same user exported certificates or accessed credential stores on several
+    hosts, the scope of compromise may be larger than a single export.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent+certutil combination fire on other hosts in the same window -- is this a coordinated automation
+    rollout or isolated to this host?
+  context: Under a service principal, asking what else the user did across the network returns agent-telemetry noise, since
+    every host runs service-owned processes constantly. The meaningful question is whether the same launch mechanism -- parent
+    process plus certutil -- fired on other hosts in the alert window. Multiple hosts in the same window points to scheduled
+    or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:lolbin.technique_class_lateral
+  question: Were any other encode/decode or transfer LOLBins used on this host recently?
+  context: Operators who use certutil to export and stage key material often pair it with other living-off-the-land binaries
+    that encode, archive, or move files -- for example expand, makecab, extrac32, or bitsadmin. Finding several such binaries
+    performing complementary actions around the export strengthens the case that this was deliberate staging of key material
+    rather than a one-off certificate backup.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_img:
+        Image|endswith:
+          - '\bitsadmin.exe'
+          - '\curl.exe'
+          - '\esentutl.exe'
+          - '\expand.exe'
+          - '\extrac32.exe'
+          - '\makecab.exe'
+          - '\replace.exe'
+          - '\hh.exe'
+      condition: selection and selection_img
+    fields:
+      - Image
+      - CommandLine
+- source: template:lolbin.renamed_binary_check
+  question: Was certutil.exe executed from its expected path?
+  context: certutil.exe run from outside System32 or SysWOW64 -- for example from a user temp or Downloads directory -- may
+    indicate the binary was copied or renamed to evade path-based allowlists. A certutil in System32 is the expected location;
+    one running from a user-writable path alongside a private-key export is more suspicious.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- source: template:lolbin.historical_lolbin_baseline
+  question: How often has this host exported certificates with certutil -exportPFX over the past 90 days, and what command-line
+    shapes are typical?
+  context: A certutil -exportPFX pattern with no prior history on a host is more suspicious than one that recurs under a stable
+    parent as part of routine certificate management. The query mirrors the rule's selection structure scoped to this host,
+    so the count reflects the rule's specific export pattern rather than generic certutil usage. The command-line projection
+    lets the analyst compare typical export shapes against the alerting one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \certutil.exe
+      - OriginalFileName: CertUtil.exe
+      selection_cli:
+        CommandLine|contains|windash: '-exportPFX '
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - CommandLine
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1027
+      name: Obfuscated Files or Information
+      role: primary
+  attack_chain_coverage:
+    - stage: 1
+      label: process_execution_abnormal_cli
+      description: "certutil executes with the abnormal -exportPFX command-line flag"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: mechanism_decode
+      description: "Decode the export command line: certificate store, serial, output .pfx path"
+      mapped_to: Q3
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 3
+      label: encrypted_file_creation
+      description: "Creation of the password-encrypted .pfx file (encoded/encrypted file format)"
+      mapped_to: Q7
+      source: template:download_tool.download_success_verification
+    - stage: 4
+      label: suspicious_parent_correlation
+      description: "Correlate the export with the spawning parent process"
+      mapped_to: Q6
+      source: template:cue_process_tool.process_chain
+  dimension_coverage:
+    - dimension: obfuscation_check
+      technique: T1027
+      covered_by: Q4
+      source: template:obfuscation.encoded_payload_decode
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1027
+      covered_by: Q10
+      source: template:cue_process_tool.clustering
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1027
+      covered_by: Q6
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1027
+      covered_by: Q2
+      source: template:universal.host_user_context
+      coverage_type: direct
+  mutable_dispositions:
+    - element: PayloadEntropyThreshold
+      dimension: obfuscation_check
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q4
+      notes: "No specific threshold value given. The .pfx is a password-encrypted key container; described in Q4 context as opaque/password-protected rather than as a queryable entropy threshold."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q10
+      notes: "No specific value. The correlation window between execution and encrypted-file creation is expressed as the +/-15m clustering window; Q10 context notes the window can be widened/narrowed."
+    - element: SuspiciousParentProcessList
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q6
+      notes: "No specific binary list given. Q6 (process_chain) investigates the spawning parent; context notes tuning the suspicious-parent set to the environment's admin workflow."
+  dedup_decisions:
+    - dropped: cue_process_tool.baseline
+      reason: "Host historical frequency of generic certutil usage is subsumed by lolbin.historical_lolbin_baseline (Q18), which counts the rule's specific -exportPFX pattern on this host over 90d — more precise than counting all certutil executions."
+      kept: lolbin.historical_lolbin_baseline
+    - dropped: cue_process_tool.baseline_deviation
+      reason: "REFLECTED host-pattern parent/user deviation overlaps lolbin.historical_lolbin_baseline (Q18, same host-scoped reflected -exportPFX query, 90d) plus the process_chain parent question (Q6) and user baseline (Q12). Dropped to stay within the 18-question cap while keeping the more specific reflected host-baseline."
+      kept: lolbin.historical_lolbin_baseline
+    - dropped: cue_process_tool.scope
+      reason: "REFLECTED fleet-wide -exportPFX count overlaps cue_user_actor.clustering_svc (Q15), which already establishes whether the same parent+certutil mechanism fired across multiple hosts in the window. Dropped under the 18-question cap; cross-host rollout signal retained via Q15."
+      kept: cue_user_actor.clustering_svc
+    - dropped: cue_process_tool.follow_on
+      reason: "Child processes spawned by certutil are not central to an export-to-disk operation (the impact is the .pfx file, not spawned children); directory_activity (Q9) and evidence_preservation (Q5) carry the post-export file-artifact investigation. Dropped under the 18-question cap."
+      kept: download_tool.directory_activity
+    - dropped: cue_host_context.clustering
+      reason: "Near-identical to cue_process_tool.clustering (Q10) — both aggregate process_creation on the host in a +/-15m window. Kept the cue_process_tool variant, which carries the time_correlation dimension framing."
+      kept: cue_process_tool.clustering
+  skipped_templates:
+    - template: cue_host_context.precursor
+      reason: "Prior-alert timeline context dropped under the 18-question cap. The credential-access-precursor signal it would carry is covered more specifically for this key-export rule by endpoint_protection_health (Q11), which is retained (rule is credential/key-export centric). No silent universal drop: endpoint_protection_health is the kept universal precursor-class question."
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "LOLBin rule — check for renamed binary and other LOLBins achieving same objective"
+      disposition: acted-on
+      reason: >-
+        Acted on. lolbin.renamed_binary_check (Q17) checks certutil's execution
+        path for renamed/relocated binary; lolbin.technique_class_lateral (Q16)
+        checks for other encode/decode/transfer LOLBins on the host. Recorded
+        here for the audit trail (acted-on hints normally manifest only as
+        questions).
+    - hint: "File paths derived from CommandLine — use %file_paths% placeholder"
+      disposition: acted-on
+      reason: >-
+        Acted on. The .pfx output path lives in the command line, so the
+        file-artifact questions use %file_paths% (Q5 evidence_preservation, Q7
+        download_success_verification, Q8 payload_analysis) and %file_dirs%
+        (Q9 directory_activity) rather than returning all host file events.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - download_tool
+    - obfuscation
+    - lolbin
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 18
+      attack: 0
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 2
+      context: 14
+    logsource_diversity:
+      process_creation: 14
+      file_event: 4

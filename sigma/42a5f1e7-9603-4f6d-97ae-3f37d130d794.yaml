@@ -1,0 +1,696 @@
+name: Suspicious File Downloaded From File-Sharing Website Via Certutil.EXE
+id: ecaae12e-bccd-46db-a139-cf27f60d0ce0
+description: |
+  Detects certutil.exe (or a binary whose OriginalFileName is CertUtil.exe) invoked
+  with a download verb (urlcache, verifyctl, or URL) AND a command line that references
+  a known file-sharing or paste/CDN domain such as pastebin.com, cdn.discordapp.com,
+  transfer.sh, gofile.io, or a *.githubusercontent.com / *.workers.dev / *.trycloudflare.com
+  host. certutil is a signed Microsoft binary that ships on every Windows install, so its
+  download primitive lets an operator pull a second-stage payload while looking like routine
+  certificate handling. Some administrators and scripts use certutil legitimately, so the
+  investigation should confirm the exact command line, identify the source URL and the
+  destination file, determine whether the download succeeded and what the payload is, and
+  establish whether the binary, parent, user, and host pattern are expected here or fleet-wide.
+type: detection
+detection_id: 42a5f1e7-9603-4f6d-97ae-3f37d130d794
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Did certutil run with a download verb (urlcache, verifyctl, or URL) and a
+    file-sharing domain in the command line, matching what this rule detects?
+  context: Before investing investigation time, confirm the alert is a true positive. The
+    rule fires only when all three conditions hold together - the image is certutil.exe
+    (or OriginalFileName CertUtil.exe), the command line carries a download verb (urlcache,
+    verifyctl, or URL), and it references a known file-sharing, paste, or CDN domain. Read
+    the exact command line and note the source URL, the download verb used, and the output
+    file path certutil was told to write.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to download files from the internet with
+    certutil?
+  context: certutil is a certificate-handling utility; using it to pull files from
+    file-sharing sites is a living-off-the-land download primitive rather than normal
+    administrative use. A packaging or build host run by an engineer who scripts certutil
+    is a different finding than an end-user workstation or a server where certutil downloads
+    never occur. Knowing the account role and host function is often the fastest way to
+    separate a benign script from operator-driven delivery.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:lolbin.renamed_binary_check
+  question: Was certutil executed from its expected System32 or SysWOW64 path, or from
+    somewhere else?
+  context: certutil ships at C:\Windows\System32\certutil.exe and C:\Windows\SysWOW64\certutil.exe.
+    A certutil.exe running from a user temp directory, Downloads, ProgramData, or any
+    user-writable path may have been copied or renamed to sidestep path-based allowlists.
+    Compare Image against OriginalFileName - a mismatch, or an Image outside the system
+    directories, points to a relocated or renamed copy rather than the built-in binary.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- source: template:cue_process_tool.mechanism_decode
+  question: What is the full certutil command line - which source URL, which download
+    verb, and what output file was specified?
+  context: The full command line reveals the operation. Identify the file-sharing URL
+    certutil was pointed at, which download verb was used (urlcache, verifyctl, or URL),
+    and the destination path the payload was written to. The canonical download form is
+    urlcache -split -f <URL> <outfile>; verifyctl and URL land the file in the
+    CryptnetUrlCache directory when no output path is given. The source URL and output
+    path together identify what was fetched and where it lives now.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith: \certutil.exe
+        CommandLine|contains:
+        - 'urlcache '
+        - 'verifyctl '
+        - 'URL '
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:obfuscation.encoded_payload_decode
+  question: Does the certutil command line or the downloaded file involve encoding, and
+    if so what does the decoded content do?
+  context: certutil is used both to download payloads and to decode them. The same chain
+    that pulls a file from a paste or file-sharing site often base64- or hex-wraps the PE
+    so it transits as text, then decodes it with -decode or -decodehex back to an
+    executable. Inspect the command line for a decode verb and named source/output files,
+    and check whether the downloaded artifact is a text-wrapped payload (for example a PE
+    behind -----BEGIN CERTIFICATE----- headers or a byte-reversed file with a benign
+    extension). Decoding reveals whether the transfer delivered an executable, a script
+    cradle, or benign data.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:cue_process_tool.process_chain
+  question: What process spawned certutil, and is that parent chain expected for a
+    download?
+  context: The parent process shows how the certutil download was launched. Interactive
+    administration usually shows a console shell or a known automation parent; an
+    unexpected parent such as an Office application, wscript.exe, mshta.exe, or a script
+    interpreter points to a macro or staged loader invoking certutil to fetch a payload.
+    Known-good updater parents account for some benign certutil use, so identify the
+    parent and judge whether that launch path is routine here.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: attack:T1105.network_transfer
+  question: Did certutil open an outbound network connection to the file-sharing host
+    around the time of the alert?
+  context: The download verb implies an HTTP or HTTPS transfer; confirming the network
+    connection ties the command line to an actual egress event and surfaces the resolved
+    destination address. certutil downloads carry distinctive request signatures
+    (Microsoft-CryptoAPI and CertUtil URL Agent user agents), and the connection record
+    shows the destination IP and port the payload was pulled from. No connection in the
+    window suggests the transfer was blocked, cached, or never reached the network.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith: \certutil.exe
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationHostname
+      - DestinationPort
+- source: template:download_tool.payload_analysis
+  question: Was a payload written to the destination, and can it be retrieved and analyzed
+    from a safe environment?
+  context: A download command does not guarantee the file was retrieved, so first confirm a
+    file creation at the destination path - or in the CryptnetUrlCache content directory
+    when no output path was supplied. If the file is on disk, submitting its hash to threat
+    intelligence services or detonating it in an isolated environment reveals whether it is
+    a known malicious payload, a legitimate tool, or something novel needing deeper
+    analysis. Payloads pulled via certutil from paste and file-sharing sites are frequently
+    second-stage loaders that are themselves packed or text-wrapped, so a hash miss does
+    not clear the file - examine its content and any process it spawns.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Hashes
+- source: template:download_tool.directory_activity
+  question: What other file activity occurred in the directory certutil wrote the payload
+    to?
+  context: Operators often stage multiple files in one directory, or the downloaded file
+    triggers further writes - decompression, decoding to a second file, or additional
+    downloads. Examining directory-level file activity around the certutil write, with the
+    known payload filtered out, reveals the broader scope of the delivery and any follow-on
+    artifacts dropped alongside it.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains|expand: '%file_dirs%'
+      filter_self:
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection and not filter_self
+    fields:
+      - TargetFilename
+      - Image
+- source: attack:T1105.followon_execution
+  question: What did certutil spawn, or what new processes ran on this host shortly after
+    the download?
+  context: A successful download is usually followed by execution of the retrieved payload
+    - the same parent or certutil itself launching the dropped file, or a fresh process
+    starting from the staging directory. Examining process creation in the window after the
+    download reveals whether the delivered file ran and what it did. A burst of new
+    processes, especially from user-writable paths or under the same parent, points to the
+    payload executing rather than a download that stalled.
+  range: +1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run certutil downloads from file-sharing domains?
+  context: Compare the acting account against its own history. An engineer who scripts
+    certutil for packaging may carry prior events; an account that has never pulled files
+    with certutil from a paste or file-sharing site launching this pattern is more notable.
+    The user role and typical toolset should align with command-line file retrieval.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith: \certutil.exe
+        CommandLine|contains:
+        - 'urlcache '
+        - 'verifyctl '
+        - 'URL '
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent-plus-certutil download pattern historically routine on this
+    host or across the environment, or is the parent unusual for it?
+  context: When the alert fires under a service or machine account, user identity does not
+    attribute the behavior; the meaningful pivot is which parent process launched a certutil
+    download and whether that pairing is historically common. A new or rare parent for this
+    pattern on this host or environment-wide is the deviation worth chasing, while a parent
+    that already accounts for many prior events is more likely a build pipeline or packaging
+    automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith: \certutil.exe
+        CommandLine|contains:
+        - 'urlcache '
+        - 'verifyctl '
+        - 'URL '
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the acting account's activity across all hosts reveals whether the
+    certutil download was a single event or part of activity spanning multiple endpoints.
+    If the same user triggered similar activity on other hosts, the scope of the incident
+    is larger than one machine.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent-plus-certutil download pattern fire on other hosts in the
+    same window, indicating a coordinated rollout rather than isolated activity?
+  context: Under a service principal, asking what else the user did across the network
+    returns agent-telemetry noise, since every host runs system-owned agents constantly.
+    The meaningful question is whether the same launch mechanism - a parent process spawning
+    a certutil download - fired on other hosts in the alert window. Multiple hosts in the
+    same window points to scheduled or pushed automation; a single host points to a
+    host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith: \certutil.exe
+        CommandLine|contains:
+        - 'urlcache '
+        - 'verifyctl '
+        - 'URL '
+      condition: selection
+    fields:
+      - host.name
+- source: template:lolbin.technique_class_lateral
+  question: Were any other download LOLBins used on this host recently?
+  context: Operators who reach for one download LOLBin often use several. If certutil
+    pulled a file, check whether bitsadmin, curl, esentutl, expand, or other transfer-capable
+    signed binaries were also run on this host. Finding multiple download primitives in a
+    short span strengthens the case that this is deliberate staging rather than an isolated
+    administrative use of certutil.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_img:
+        Image|endswith:
+          - '\bitsadmin.exe'
+          - '\curl.exe'
+          - '\esentutl.exe'
+          - '\expand.exe'
+          - '\extrac32.exe'
+          - '\makecab.exe'
+          - '\replace.exe'
+          - '\hh.exe'
+      condition: selection and selection_img
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host - reconnaissance, initial access, or
+    execution - may reveal the attack stages that preceded the certutil download and help
+    reconstruct the timeline. Ingress tool transfer is usually one step in a sequence, so
+    prior alerts give the context for why a payload was being pulled.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired the rule's certutil download pattern, what
+    parents and users normally drive it, and does the current alert fit?
+  context: Even legitimate scripting can drive certutil downloads. This query mirrors the
+    rule's selection structure scoped to this host, so the resulting parent and user
+    distribution reflects how this specific firing pattern has historically run here, not
+    generic certutil activity. A new parent process, an unexpected account, or a first-ever
+    occurrence is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \certutil.exe
+      - OriginalFileName: CertUtil.exe
+      selection_flags:
+        CommandLine|contains:
+        - 'urlcache '
+        - 'verifyctl '
+        - 'URL '
+      selection_http:
+        CommandLine|contains:
+        - .githubusercontent.com
+        - anonfiles.com
+        - cdn.discordapp.com
+        - ddns.net
+        - dl.dropboxusercontent.com
+        - ghostbin.co
+        - github.com
+        - glitch.me
+        - gofile.io
+        - hastebin.com
+        - mediafire.com
+        - mega.nz
+        - onrender.com
+        - pages.dev
+        - paste.ee
+        - pastebin.com
+        - pastebin.pl
+        - pastetext.net
+        - privatlab.com
+        - privatlab.net
+        - send.exploit.in
+        - sendspace.com
+        - storage.googleapis.com
+        - storjshare.io
+        - supabase.co
+        - temp.sh
+        - transfer.sh
+        - trycloudflare.com
+        - ufile.io
+        - w3spaces.com
+        - workers.dev
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired the rule's certutil download pattern in the past week,
+    and does the cross-host distribution look like consistent automation or one-off activity?
+  context: This query mirrors the rule's selection structure with no host scope, so the
+    result is a fleet-wide count of the certutil file-sharing download pattern rather than
+    generic certutil activity. Many hosts firing the same pattern points to a build pipeline
+    or scripted deployment that pulls from a shared source by design; one host or a small
+    unrelated set points to manual operator activity. Use the host distribution to calibrate
+    severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \certutil.exe
+      - OriginalFileName: CertUtil.exe
+      selection_flags:
+        CommandLine|contains:
+        - 'urlcache '
+        - 'verifyctl '
+        - 'URL '
+      selection_http:
+        CommandLine|contains:
+        - .githubusercontent.com
+        - anonfiles.com
+        - cdn.discordapp.com
+        - ddns.net
+        - dl.dropboxusercontent.com
+        - ghostbin.co
+        - github.com
+        - glitch.me
+        - gofile.io
+        - hastebin.com
+        - mediafire.com
+        - mega.nz
+        - onrender.com
+        - pages.dev
+        - paste.ee
+        - pastebin.com
+        - pastebin.pl
+        - pastetext.net
+        - privatlab.com
+        - privatlab.net
+        - send.exploit.in
+        - sendspace.com
+        - storage.googleapis.com
+        - storjshare.io
+        - supabase.co
+        - temp.sh
+        - transfer.sh
+        - trycloudflare.com
+        - ufile.io
+        - w3spaces.com
+        - workers.dev
+      condition: all of selection_*
+    fields:
+    - host.name
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1105
+      name: Ingress Tool Transfer
+      role: primary
+    - id: T1027
+      name: Obfuscated Files or Information
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: download_invocation
+      description: "certutil is launched with a download verb and a file-sharing URL on its command line - the act the rule detects"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: network_transfer
+      description: "certutil opens an outbound HTTP/HTTPS connection to the file-sharing host to pull the payload"
+      mapped_to: Q7
+      source: attack:T1105.network_transfer
+    - stage: 3
+      label: file_creation
+      description: "the downloaded payload is written to disk at the destination path or the CryptnetUrlCache directory"
+      mapped_to: Q8
+      source: template:download_tool.payload_analysis
+    - stage: 4
+      label: followon_execution
+      description: "the retrieved payload is executed - new processes spawn after the download"
+      mapped_to: Q10
+      source: attack:T1105.followon_execution
+  dimension_coverage:
+    - dimension: file_path_analysis
+      technique: T1105
+      covered_by: Q9
+      source: template:download_tool.directory_activity
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1105
+      covered_by: Q6
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1105
+      covered_by: Q18
+      source: template:cue_process_tool.scope
+      coverage_type: indirect
+    - dimension: obfuscation_check
+      technique: T1027
+      covered_by: Q5
+      source: template:obfuscation.encoded_payload_decode
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1027
+      covered_by: Q10
+      source: attack:T1105.followon_execution
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1027
+      covered_by: Q2
+      source: template:universal.host_user_context
+      coverage_type: direct
+  mutable_dispositions:
+    - element: PayloadEntropyThreshold
+      dimension: obfuscation_check
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q5
+      notes: "Tuning rationale (entropy threshold to separate obfuscation from legit compression); no concrete value in the analytic. Realized as the encode/decode judgment in obfuscation.encoded_payload_decode, which directs the analyst to inspect whether the certutil command or the downloaded artifact is text-wrapped/encoded."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q10
+      notes: "Tuning rationale (correlation window between execution and encoded file creation); no concrete value. Realized as the +1h follow-on execution window in attack:T1105.followon_execution and the file-creation windows in payload_analysis and directory_activity."
+    - element: SuspiciousParentProcessList
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q6
+      notes: "Tuning rationale (which parents/LOLBins to weight); no concrete values. Realized as the parent-chain legitimacy judgment in cue_process_tool.process_chain (Office/script-host parents called out) and the download-LOLBin sweep in lolbin.technique_class_lateral."
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q6
+      notes: "Tuning rationale (tune for known-good updaters like ChromeUpdate, OneDrive); no concrete queryable values. Realized as the known-good-updater-vs-unexpected-parent judgment in cue_process_tool.process_chain."
+    - element: DestinationIPCategory
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q8
+      notes: "Tuning rationale (internal vs external IP filtering); no concrete value. The rule already constrains to external file-sharing domains; the network_transfer question surfaces DestinationIp/Hostname/Port so the analyst sees the resolved external destination."
+    - element: FilePathRegex
+      dimension: file_path_analysis
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q9
+      notes: "Tuning rationale (focus on uncommon drop paths like C:\\Users\\Public); no concrete value queryable here because the destination path is derived from the alerting command line. Realized via %file_dirs%/%file_paths% scoping in download_tool.directory_activity and payload_analysis."
+  dedup_decisions:
+    - dropped: cue_user_actor.baseline + cue_user_actor.baseline_svc
+      reason: "user_actor pair - non-deduplicable; both emitted (subject-pivot and launch-mechanism-pivot). Image|endswith certutil.exe plus the download-verb CommandLine|contains constraint aligns each query with the question's certutil-download claim."
+      kept: both
+    - dropped: cue_user_actor.clustering + cue_user_actor.clustering_svc
+      reason: "user_actor pair - non-deduplicable; both emitted (subject-pivot returns network-wide user activity, launch-mechanism-pivot returns the parent+certutil download pattern across hosts)."
+      kept: both
+    - dropped: cue_process_tool.baseline
+      reason: "generic Image|endswith certutil.exe host baseline is subsumed by the REFLECTED host-pattern question (baseline_deviation), which scopes to the rule's actual urlcache/verifyctl/URL + file-sharing-domain firing pattern rather than all certutil runs."
+      kept: cue_process_tool.baseline_deviation
+    - dropped: cue_process_tool.clustering
+      reason: "Image-only host aggregation subsumed by cue_host_context.clustering, which projects Image+ParentImage and surfaces novel parent-child pairs."
+      kept: cue_host_context.clustering
+    - dropped: cue_process_tool.follow_on
+      reason: "follow_on scopes children by ParentImage|endswith %Image%; the post-download execution angle is covered more directly and entity-neutrally by attack:T1105.followon_execution (+1h host process_creation), which captures payload execution regardless of whether certutil itself is the parent."
+      kept: attack:T1105.followon_execution
+    - dropped: download_tool.download_success_verification
+      reason: "duplicate file_event query (host.name + TargetFilename|endswith %file_paths%) of download_tool.payload_analysis; merged into payload_analysis (Q8), which now also confirms the file landed before prompting hash/sandbox analysis. Trimmed to stay within the 14-18 target."
+      kept: template:download_tool.payload_analysis
+    - dropped: cue_host_context.clustering
+      reason: "host-wide Image+ParentImage aggregation overlaps cue_process_tool.baseline_deviation (rule-pattern parent/user distribution on this host) and cue_host_context.precursor (prior alerts on this host); the supporting-cue clustering added the least unique signal of the host-context set. Trimmed to stay within the 14-18 target."
+      kept: template:cue_process_tool.baseline_deviation
+  skipped_templates:
+    - template: lolbin.historical_lolbin_baseline
+      reason: "REFLECTED host_pattern query is structurally identical to cue_process_tool.baseline_deviation (same embedded rule detection block ANDed with host.name scope); both count the rule's certutil download pattern on this host over a historical window. baseline_deviation (Q17) is kept and projects ParentImage+User; this one would only have changed the projection to CommandLine. Trimmed to avoid a near-duplicate reflected question and stay within the 14-18 target."
+  reflection_overrides: []
+  hint_dispositions:
+    # All three brief hints were ACTED ON (manifest as questions / query scoping below).
+    # No hint was declined. Recorded here as acted_on for an explicit audit trail.
+    - hint: "LOLBin rule - check for renamed binary and other LOLBins achieving same objective"
+      disposition: acted_on
+      reason: >-
+        lolbin.renamed_binary_check is Q3 (certutil expected-path check, Image vs
+        OriginalFileName) and lolbin.technique_class_lateral is Q15 (other download
+        LOLBins on the host, with certutil excluded from the Image list).
+    - hint: "File paths derived from CommandLine - use %file_paths% placeholder"
+      disposition: acted_on
+      reason: >-
+        The file_event questions payload_analysis (Q8) and directory_activity (Q9)
+        use %file_paths% / %file_dirs% scoping so they resolve to the certutil download
+        destination rather than returning all host file events.
+    - hint: >-
+        logsource 'network_connection' (recommended by techniques: T1105) is not covered
+        - pull in cue_network_endpoint.* or author a custom question with category:
+        network_connection
+      disposition: acted_on
+      reason: >-
+        Authored attack:T1105.network_transfer (Q7) with category: network_connection,
+        scoped to host.name + Image|endswith certutil.exe, projecting DestinationIp,
+        DestinationHostname, DestinationPort to confirm the egress transfer the download
+        verb implies and surface the resolved external destination.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - download_tool
+    - obfuscation
+    - lolbin
+    - cue_process_tool
+    - cue_user_actor
+    - cue_host_context
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 16
+      attack: 2
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 2
+      context: 14
+    logsource_diversity:
+      process_creation: 14
+      file_event: 2
+      network_connection: 1
+      sigma_alert: 1

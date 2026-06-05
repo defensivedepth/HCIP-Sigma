@@ -1,0 +1,479 @@
+name: Port Forwarding Activity Via SSH.EXE
+id: acced3eb-e5e8-4594-a38e-26039eacbbb1
+description: |
+  Detects the built-in OpenSSH client (ssh.exe) invoked with a remote port-forward flag (-R), which exposes a service on the victim back to a remote SSH endpoint over an encrypted channel. This is a protocol-tunneling pattern: legitimate administrators use SSH forwarding for remote management, but the same -R form is commonly used to relay internal services to an external command-and-control host once initial access is gained, and to maintain a persistent reverse tunnel. The investigation should determine the tunnel direction and target, whether the SSH usage is authorized and documented, what process launched it, and whether the same tunneling pattern appears under other users or on other hosts.
+type: detection
+detection_id: 327f48c1-a6db-4eb8-875a-f6981f1b0183
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line show ssh.exe invoked with a remote port-forward (-R) flag?
+  context: Before investing investigation time, confirm the alert is a true positive by reviewing the exact command line and process image. The rule fires when the image ends in ssh.exe AND the command line contains a remote-forward switch (-R, in any dash variant). Read the full argument string to confirm both conditions are present and to capture the forward specification that follows -R.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run SSH port forwarding?
+  context: Legitimate administrative activity can trigger this detection. Knowing whether the user's role and the host's function include SSH tunneling or remote management is often the fastest path to distinguishing routine operations from operator activity. Developers, network engineers, and IT admins may run SSH forwards routinely; general user workstations and servers without an SSH-administration role rarely should.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What does the full ssh.exe command line specify -- the forward direction, the bind/target ports, and the remote endpoint?
+  context: The full command line reveals the tunnel's purpose. Decode the -R specification (remoteport:host:localport) to see which victim-side service is being exposed and where it is relayed. Note any additional forwards (-L local forward, -D dynamic SOCKS proxy) and the destination user@host. This query returns every ssh.exe execution on this host within the window, so sequential or repeated tunnel setups appear together.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:remote_access_tool.tool_authorization
+  question: Is SSH port forwarding authorized for use on this host, and what business purpose does it serve?
+  context: Organizations typically sanction a specific set of remote-access and tunneling methods. SSH reverse forwarding that is not part of a documented administrative procedure may represent shadow IT or operator-deployed persistence, regardless of the fact that ssh.exe ships with Windows. Confirm whether this host has an approved use case for outbound SSH tunnels.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+- source: template:remote_access_tool.active_session_context
+  question: Is this SSH session part of a documented administrative procedure or an active support ticket?
+  context: Legitimate tunnel usage typically correlates with an active maintenance window, a change ticket, or a documented remote-management procedure. If no support or change context explains this session, the tunnel may have been established for persistent external access or to circumvent network controls.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:remote_access_tool.connection_destination
+  question: What external endpoint is ssh.exe connecting to, and is it internal infrastructure or an arbitrary external address?
+  context: A reverse SSH tunnel relays a victim-side service to the remote SSH server named on the command line. The destination reveals whether the tunnel terminates on managed internal infrastructure or on an arbitrary external host. Outbound port 22 (or a non-standard port set with -p) to an unfamiliar address is consistent with relaying an internal service to a remote operator endpoint.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationHostname
+      - DestinationPort
+- source: attack:T1572.obfuscation_check
+  question: Does the ssh.exe command line carry unattended-automation flags such as -N, -f, -i, or -o StrictHostKeyChecking=no?
+  context: A tunnel built for hands-off operation usually disables the interactive shell and suppresses prompts. -N runs a pure tunnel with no remote command, -f backgrounds it, -i supplies a key file for non-interactive auth, and -o StrictHostKeyChecking=no skips the host-key prompt. These flags accompanying -R point to a scripted or persistent reverse tunnel rather than an analyst typing an interactive session. Decode any -o ServerAliveInterval / ServerAliveCountMax values, which keep the tunnel alive across idle periods.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \ssh.exe
+        CommandLine|contains:
+          - ' -N'
+          - ' -f'
+          - ' -i '
+          - 'StrictHostKeyChecking=no'
+          - 'ServerAliveInterval'
+          - 'ServerAliveCountMax'
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: selection and _pb_scope
+    fields:
+      - CommandLine
+      - User
+- source: template:cue_process_tool.process_chain
+  question: What process spawned ssh.exe, and is that parent chain expected for SSH usage?
+  context: The parent process reveals how the tunnel was launched. Interactive SSH usage typically descends from a shell or terminal started by explorer.exe. Parents such as script hosts, Office applications, web servers, or a service binary that has no business running SSH suggest the forward was launched by automation or by an implant rather than by an administrator at the keyboard.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.follow_on
+  question: What child processes did ssh.exe spawn afterward on this host?
+  context: A pure forwarder normally spawns nothing. Children of ssh.exe -- a shell, an interpreter, or post-exploitation utilities -- indicate the session ran remote commands in addition to (or instead of) tunneling, which broadens the scope of what the access was used for.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.baseline
+  question: Does this host normally run ssh.exe?
+  context: A binary that has never been seen on a host is more notable than one that runs regularly. Zero or very low counts over the baseline window indicate first-time or rare SSH usage on this endpoint, which raises the priority of the other tunnel-direction and authorization questions.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously run ssh.exe with a remote-forward flag, what parents and users normally drive it, and does the current alert fit that pattern?
+  context: Even legitimate tooling can be abused. This query mirrors the rule's selection -- ssh.exe with a -R remote-forward switch -- scoped to this host, so the resulting parent/user distribution reflects how the rule's specific firing pattern has historically run here, not generic SSH usage. A new parent process, an unexpected user account, or a first-time appearance of this pattern is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \ssh.exe
+        CommandLine|contains|windash: ' -R '
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run ssh.exe across the environment?
+  context: Compare this user's current action against their historical behavior. A user who has never run SSH or established tunnels is more notable than one who does so regularly. The user's role and typical toolset should align with remote-management or development work for this to be routine.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent and ssh.exe combination historically routine on this host or across the environment, or is the parent unusual for SSH?
+  context: 'When the alert fires under a service principal, user identity does not attribute the behavior. The meaningful pivot is the launch mechanism: which parent process spawned ssh.exe, and whether that pair is historically common. A new or rare parent for ssh.exe on this host or environment-wide is the deviation worth chasing; a pair that already accounts for many prior events is automation or scheduled tooling.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:lateral_movement.lateral_movement_scope
+  question: Has this user account run SSH or other tunneling tools against other hosts in the environment?
+  context: A reverse tunnel is often one leg of broader movement. If the same user account is running SSH or other tunneling utilities across multiple systems in a short window, the scope of activity is larger than a single host. A spread across many hosts from one account points to active pivoting rather than an isolated admin task.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      selection_lateral:
+        Image|endswith:
+          - '\psexec.exe'
+          - '\psexec64.exe'
+          - '\mstsc.exe'
+          - '\ssh.exe'
+          - '\plink.exe'
+          - '\wmic.exe'
+      condition: selection and selection_lateral
+    fields:
+      - host.name
+      - Image
+- source: template:network_scope.actor_authentication_trail
+  question: Where has this user authenticated recently?
+  context: Authentication events show which systems the user accessed before and after the tunnel was established. A user authenticating to many systems in a short period, especially network (type 3) or remote-interactive (type 10) logons, suggests movement in progress that the tunnel may be supporting. If Security logon events are not collected in this environment, treat empty results as a visibility gap rather than evidence of no activity.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      service: security
+    detection:
+      selection:
+        EventID:
+          - 4624
+          - 4625
+        TargetUserName|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - IpAddress
+      - EventID
+      - LogonType
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: 'Alerts rarely occur in isolation. Examining activity around the tunnel setup reveals the immediate context: what led to it, what followed, and whether it is part of a larger sequence. Look for reconnaissance, privilege escalation, credential access, or staging that surrounds the SSH invocation.'
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host -- defense tampering, reconnaissance, credential access -- may reveal the stages that preceded the tunnel and help reconstruct the timeline. Reverse tunnels are frequently established after initial access and enumeration, so prior alerts often mark how the operator reached this point.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:cue_process_tool.scope
+  question: Have other hosts run ssh.exe with a remote-forward flag in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: This query mirrors the rule's selection -- ssh.exe with a -R remote-forward switch -- with no host scope, so the result is a fleet-wide count of the firing pattern rather than generic SSH usage. Many hosts running the same pattern points to scripted deployment or sanctioned management tooling; a single host or a small unrelated set points to manual operator activity. Use the host distribution to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \ssh.exe
+        CommandLine|contains|windash: ' -R '
+      condition: selection
+    fields:
+    - host.name
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1572
+      name: Protocol Tunneling
+      role: primary
+    - id: T1021.001
+      name: Remote Desktop Protocol
+      role: secondary
+    - id: T1021.004
+      name: SSH
+      role: secondary
+    - id: T1021
+      name: Remote Services
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: tunnel_process_invocation
+      description: "ssh.exe (or comparable tunneling client) launched with a forward flag, establishing the tunneling process"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: tunnel_parameter_decode
+      description: "Decode the forward specification (-R direction, bind/target ports, remote endpoint) to identify what is being relayed and where"
+      mapped_to: Q3
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 3
+      label: outbound_tunnel_connection
+      description: "Outbound network connection to the remote SSH endpoint carrying the encapsulated/forwarded traffic"
+      mapped_to: Q6
+      source: template:remote_access_tool.connection_destination
+  dimension_coverage:
+    - dimension: obfuscation_check
+      technique: T1572
+      covered_by: Q7
+      source: attack:T1572.obfuscation_check
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1572
+      covered_by: Q16
+      source: template:cue_host_context.clustering
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1572
+      covered_by: Q11
+      source: template:cue_process_tool.baseline_deviation
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1021.001
+      covered_by: Q2
+      source: template:universal.host_user_context
+      coverage_type: direct
+    - dimension: command_analysis
+      technique: T1021
+      covered_by: Q3
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: direct
+  mutable_dispositions:
+    - element: AllowedTools
+      dimension: tuning_parameter
+      specific_values: "rationale only (whitelist legitimate tunneling tools)"
+      disposition: context
+      target_question: Q4
+      notes: "Tuning rationale, no concrete values. Surfaced as the authorization question -- is SSH tunneling on the approved tool list for this host."
+    - element: DataAsymmetryThreshold
+      dimension: tuning_parameter
+      specific_values: "rationale only (sent vs received byte ratio)"
+      disposition: context
+      target_question: Q6
+      notes: "Threshold without a concrete value; not directly queryable from process_creation. Connection-destination question carries the asymmetric-flow framing in context."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only (correlate process creation with network connection within N seconds)"
+      disposition: context
+      target_question: Q16
+      notes: "No concrete value. Host clustering at +/-15m correlates surrounding process and network activity to the tunnel setup."
+    - element: UserContext
+      dimension: user_context
+      specific_values: "rationale only (tune for non-admin/service accounts)"
+      disposition: context
+      target_question: Q2
+      notes: "Surfaced as host_user_context role question; service-principal angle covered by the user_actor baseline_svc substitute."
+    - element: ProcessList
+      dimension: tuning_parameter
+      specific_values: "cmd.exe, powershell.exe, certutil.exe"
+      disposition: context
+      target_question: Q9
+      notes: "Suspicious post-tunnel child processes. follow_on question surfaces ssh.exe children for the analyst; the named interpreters are described in context rather than hard-filtered so unexpected children are not missed."
+    - element: HostAccessPatterns
+      dimension: tuning_parameter
+      specific_values: "rationale only (uncommon/first-time host access)"
+      disposition: context
+      target_question: Q18
+      notes: "Cross-host distribution of the firing pattern (scope) and host baseline address first-time/uncommon access."
+    - element: ServerAliveInterval/ServerAliveCountMax/StrictHostKeyChecking/-N/-f/-i flags
+      dimension: obfuscation_check
+      specific_values: "-N, -f, -i, StrictHostKeyChecking=no, ServerAliveInterval, ServerAliveCountMax"
+      disposition: query_injection
+      target_question: Q7
+      notes: "Automation/persistence flags from db_refs injected into the attack:T1572.obfuscation_check CommandLine|contains selection (host-scoped)."
+  dedup_decisions:
+    - dropped: cue_user_actor.clustering
+      reason: "user-pivot 'what else did this user do network-wide' overlaps the kept user baseline (Q12) and lateral_movement_scope (Q14); the rule's signal is tunnel direction/authorization, not broad user activity. Dropping the user-pivot clustering also makes its non-deduplicable clustering_svc partner unnecessary."
+      kept: template:lateral_movement.lateral_movement_scope
+    - dropped: cue_user_actor.clustering_svc
+      reason: "service-principal partner of cue_user_actor.clustering; dropped together since the user-pivot clustering question it pairs with was not included. The baseline_svc substitute (Q13) already carries the parent+binary service-principal pivot."
+      kept: template:cue_user_actor.baseline_svc
+    - dropped: lateral_movement.source_host_identification
+      reason: "Question frames an INBOUND remote connection ('what host initiated this connection') answered via inbound DestinationPort 445/3389/22 hits. This rule fires on an OUTBOUND reverse tunnel from the victim; there is no inbound login event to attribute, so the inbound-source framing does not fit. connection_destination (Q6) covers the relevant outbound endpoint."
+      kept: template:remote_access_tool.connection_destination
+    - dropped: lateral_movement.authentication_method
+      reason: "Pass-the-hash / Kerberos-ticket authentication analysis applies to an inbound interactive/network logon. The rule detects an outbound SSH tunneling process, not an authentication event on this host, so the auth-method framing is not load-bearing. User authentication trail (Q15) covers the relevant logon context."
+      kept: template:network_scope.actor_authentication_trail
+    - dropped: lateral_movement.target_activity_after_access
+      reason: "Post-access process spawning on the target overlaps cue_process_tool.follow_on (Q9), which scopes to children of ssh.exe specifically and is more precise than a broad host-wide post-access sweep."
+      kept: template:cue_process_tool.follow_on
+    - dropped: network_scope.same_action_other_hosts
+      reason: "Cross-host count of the same binary is subsumed by the REFLECTED scope question (Q18), which mirrors the rule's full selection (ssh.exe AND -R) fleet-wide rather than just the binary, giving a tighter cross-host pattern count."
+      kept: template:cue_process_tool.scope
+    - dropped: network_scope.actor_activity_network_wide
+      reason: "Generic 'user activity across all hosts' duplicates the user baseline (Q12) and lateral_movement_scope (Q14); both already pivot on this user across the fleet without adding a redundant broad sweep."
+      kept: template:lateral_movement.lateral_movement_scope
+  skipped_templates:
+    - template: universal.endpoint_protection_health
+      reason: "Recommended-tier generic host-tamper sweep. Dropped: this rule fires on outbound C2 tunneling, not payload execution or credential access, so tamper-as-precursor is not the disposition-driving question. Prior-alert context is already carried by cue_host_context.precursor (Q17), which would surface any defense-tampering alerts that preceded the tunnel. Not Windows-execution-centric in the sense the template's must-keep guidance targets."
+  reflection_overrides: []
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - remote_access_tool
+    - lateral_movement
+    - network_scope
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 17
+      attack: 1
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 15
+    logsource_diversity:
+      process_creation: 15
+      network_connection: 1
+      security: 1
+      sigma_alert: 1

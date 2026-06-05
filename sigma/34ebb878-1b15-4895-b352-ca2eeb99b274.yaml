@@ -1,0 +1,549 @@
+name: Suspicious Execution of Shutdown
+id: 6f2d8a41-9c3e-4b07-bc2a-1e5f7d930a8c
+description: |
+  Detects shutdown.exe invoked from the command line with a shutdown (/s) or restart (/r) switch. The
+  rule fires when the image ends in shutdown.exe AND the command line contains '/r ' or '/s '. This is a
+  legitimate native administration action — planned maintenance reboots, patch cycles, and remote-host
+  restarts are routine — but a forced or unannounced shutdown/reboot can also be the impact stage of a
+  destructive operation, the cleanup step after recovery inhibition, or a denial-of-service action against
+  a single host. Determine whether the invocation matches expected administrative patterns (reason codes,
+  comments, planned timing, an admin/helpdesk actor) and whether it is accompanied by recovery-inhibiting
+  or destructive commands that would change its disposition from routine to malicious.
+type: detection
+detection_id: 34ebb878-1b15-4895-b352-ca2eeb99b274
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line match what this rule detects — shutdown.exe with a /s or /r switch?
+  context: Before investing investigation time, confirm the alert is a true positive by reviewing the exact
+    command line and process. The rule fires when the image ends in shutdown.exe AND the command line
+    contains '/r ' (restart) or '/s ' (shutdown). Note which switch fired and whether force (/f), an
+    immediate timeout (/t 0), a remote target (/m \\host), or an abort (/a) is also present.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to initiate a system shutdown or reboot from the command line?
+  context: Legitimate shutdown/reboot activity is normally driven by administrators, helpdesk staff, patch
+    automation, or a service account with the Shut down the system user right. A standard user account, an
+    unexpected service principal, or a host that is not normally rebooted on demand shifts the disposition.
+    Absence of administrative context — the actor not belonging to an admin or helpdesk group — is a core
+    part of what distinguishes routine from suspicious here.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What exactly did this shutdown command do? Decode every switch and parameter on the command line.
+  context: The full command line reveals whether this is a planned admin reboot or an abrupt destructive one.
+    Decode each switch — /s shutdown, /r restart, /g full restart, /f force-close apps with no warning, /t
+    countdown (/t 0 means immediate), /m \\host targets a remote machine, /d p|u:xx:yy supplies a reason code,
+    /c adds a comment, /a aborts an in-progress shutdown. Planned admin use typically carries a reason code
+    and a comment; a forced, immediate, unannounced shutdown without reason codes is the suspicious shape.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:cue_process_tool.process_chain
+  question: What process spawned shutdown.exe and is that parent chain expected?
+  context: The parent process reveals how the shutdown was invoked. Admin-driven reboots typically descend
+    from explorer.exe, an interactive shell, a management agent, or a scheduled-task host. Unusual parents
+    such as mshta.exe, wscript.exe, an Office application, or an unknown binary in a user-writable path
+    suggest the shutdown was driven by a script or payload rather than an operator.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired this rule's shutdown/restart pattern, what parents and users
+    normally drive it, and does the current alert fit that pattern?
+  context: Even routine maintenance reboots leave a stable history. The query mirrors the rule's selection
+    scoped to this host, so the parent and user distribution reflects how this specific shutdown/restart
+    pattern has historically run here. A new parent process, an unexpected user account, or a first-time
+    appearance of the pattern on this host is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \shutdown.exe
+        CommandLine|contains:
+        - '/r '
+        - '/s '
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired this shutdown/restart pattern in the past week, and does the cross-host
+    distribution look like consistent automation or one-off activity?
+  context: The query mirrors the rule's selection with no host scope, giving a fleet-wide count of the
+    shutdown/restart pattern rather than generic shutdown.exe usage. Many hosts firing the same pattern in a
+    short window points to a patch wave or scheduled maintenance rollout; one host or a small unrelated set
+    points to manual operator activity that deserves closer scrutiny.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \shutdown.exe
+        CommandLine|contains:
+        - '/r '
+        - '/s '
+      condition: selection
+    fields:
+    - host.name
+- source: template:cue_user_actor.baseline
+  question: Does this user normally initiate shutdown or reboot operations?
+  context: Compare this user's current action against their historical behavior. A user who has never run
+    shutdown.exe — or whose role does not include host administration — is more suspicious than an admin or
+    helpdesk operator who reboots machines regularly. User role and typical toolset should align with
+    on-demand reboot activity.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent-plus-shutdown.exe combination historically routine on this host or across the
+    environment, or is the parent unusual for this binary?
+  context: When the alert fires under a service principal, user identity does not attribute behavior. The
+    meaningful pivot is the launch mechanism — which parent process spawned shutdown.exe, and whether that
+    pair is historically common. A new or rare parent for shutdown.exe on this host or environment-wide is
+    the deviation worth chasing; a pair that already accounts for many prior events is maintenance or OS
+    automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals whether a forced reboot is isolated or part
+    of broader action. If the same user triggered destructive or reconnaissance activity on multiple hosts
+    around this time, the scope of the operation may be larger than a single shutdown.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent-plus-shutdown.exe combination fire on other hosts in the same window — a
+    coordinated automation rollout, or activity isolated to this host?
+  context: Under a service principal, asking what else the user did across the network returns agent-telemetry
+    noise. The meaningful question is whether the same launch mechanism — parent process plus shutdown.exe —
+    fired on other hosts in the alert window. Multiple hosts in the same window points to scheduled or pushed
+    automation such as a patch wave; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: A forced shutdown rarely occurs in isolation. Examining process activity in the minutes around the
+    reboot reveals what preceded it and what ran immediately before the host went down. Look for recovery
+    inhibition, security-service tampering, mass file activity, or reconnaissance that would reframe the
+    shutdown as the final stage of a destructive sequence.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host — defense tampering, reconnaissance, credential access, or
+    recovery inhibition — may reveal the attack stages that preceded a forced reboot and help reconstruct the
+    timeline. A shutdown following a chain of destructive alerts is materially different from an isolated
+    maintenance reboot.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: attack:T1529.host_status_correlation
+  question: Did a corresponding system shutdown or restart event get logged on this host around this time?
+  context: Process execution of shutdown.exe records intent; the host status change events confirm the system
+    actually initiated a shutdown or restart and capture the reason and the initiating account. Correlating
+    the command line with these events confirms the action took effect and exposes the recorded reason code —
+    an unexpected or unplanned reason, or no corresponding event at all, changes the disposition. If these
+    operational events are not collected in this environment, treat their absence as a visibility gap rather
+    than evidence the shutdown did not occur.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: security
+    detection:
+      selection:
+        EventID:
+          - 1074
+          - 6006
+        Computer|expand: '%hostname%'
+      condition: selection
+    fields:
+      - host.name
+      - EventID
+      - User
+- source: template:ransomware_impact.recovery_options_assessment
+  question: What recovery-inhibiting commands were executed on this host around the shutdown?
+  context: 'A forced reboot is sometimes the final step after recovery is sabotaged. Operators chain
+    recovery-inhibiting commands: deleting shadow copies (vssadmin, wmic), disabling boot recovery (bcdedit),
+    deleting backups (wbadmin), corrupting boot.ini, and disabling the Recovery Environment (reagentc). This
+    query surfaces all such commands on the host. The analyst should then verify whether each action succeeded
+    by checking system state (vssadmin list shadows, bcdedit /enum, reagentc /info).'
+  range: +24h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_recovery:
+        Image|endswith:
+          - '\vssadmin.exe'
+          - '\wmic.exe'
+          - '\bcdedit.exe'
+          - '\wbadmin.exe'
+          - '\reagentc.exe'
+          - '\diskshadow.exe'
+      selection_cmdline:
+        CommandLine|contains:
+          - 'delete shadows'
+          - 'shadowcopy delete'
+          - 'recoveryenabled'
+          - 'bootstatuspolicy'
+          - 'delete catalog'
+          - 'delete systemstatebackup'
+          - 'boot.ini'
+          - 'winre.wim'
+          - '/disable'
+      condition: selection and (selection_recovery or selection_cmdline)
+    fields:
+      - Image
+      - CommandLine
+- source: template:ransomware_impact.destruction_scope_on_host
+  question: What other destructive or recovery-inhibiting actions occurred on this host?
+  context: 'Destructive operations typically chain several actions: deleting shadow copies AND disabling
+    recovery AND stopping security services AND clearing event logs, with a forced reboot at the end. Finding
+    the complete set of destructive commands reveals whether the shutdown caps an impact sequence or is an
+    isolated administrative action.'
+  range: +/-30m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_destructive:
+        Image|endswith:
+          - '\vssadmin.exe'
+          - '\wmic.exe'
+          - '\bcdedit.exe'
+          - '\wbadmin.exe'
+          - '\cipher.exe'
+          - '\fsutil.exe'
+          - '\icacls.exe'
+          - '\takeown.exe'
+          - '\attrib.exe'
+          - '\sc.exe'
+          - '\net.exe'
+          - '\net1.exe'
+          - '\powershell.exe'
+          - '\taskkill.exe'
+      condition: selection and selection_destructive
+    fields:
+      - Image
+      - User
+- source: template:ransomware_impact.network_wide_impact
+  question: Is this same shutdown/restart activity firing on other hosts in the environment?
+  context: Destructive operations often issue the same command across many hosts simultaneously or in rapid
+    succession. Finding this alert firing on multiple hosts in a short window indicates a network-wide forced
+    reboot rather than a single planned maintenance action, and determines the scope for containment and
+    incident response.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        rule.uuid|expand: '%rule.uuid%'
+      condition: selection
+    fields:
+      - host.name
+      - rule.name
+      - event.severity_label
+- source: template:ransomware_impact.encryption_or_ransom_indicators
+  question: Are there signs of file encryption, ransom notes, or unknown binary execution on this host before
+    the shutdown?
+  context: Recovery-inhibiting actions and a forced reboot often bracket a file-encryption or wiper phase.
+    Checking for unknown or suspicious binaries executing from user-writable or temp paths around the
+    shutdown helps determine whether destruction or encryption preceded the reboot and how far it progressed.
+    Ransom notes (README.txt, HOW_TO_DECRYPT) should also be checked via file events or the endpoint console.
+  range: +30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      filter_known:
+        Image|startswith:
+          - 'C:\Program Files'
+          - 'C:\Windows\System32\svchost'
+          - 'C:\Windows\System32\wbem'
+      condition: selection and not filter_known
+    fields:
+      - Image
+      - CommandLine
+      - CurrentDirectory
+- source: template:network_scope.actor_authentication_trail
+  question: Where has this user authenticated recently?
+  context: Authentication events show which systems the user accessed before and after the shutdown. A user
+    authenticating to many hosts in a short period — especially remote logons preceding forced reboots —
+    suggests the activity spans the environment rather than a single planned maintenance window. Network and
+    RDP logon types are the ones of interest for remote-initiated shutdowns.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      service: security
+    detection:
+      selection:
+        EventID:
+          - 4624
+          - 4625
+        TargetUserName|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - IpAddress
+      - EventID
+      - LogonType
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1529
+      name: System Shutdown/Reboot
+      role: primary
+  attack_chain_coverage:
+    - stage: 1
+      label: shutdown_command_execution
+      description: Process execution of a shutdown/reboot command (shutdown.exe with /s or /r)
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 1b
+      label: command_decode
+      description: Decode the full set of shutdown switches (force, timeout, remote target, reason code)
+      mapped_to: Q3
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 2
+      label: host_status_correlation
+      description: Correlate execution with host status change logs (Event IDs 1074, 6006) confirming the
+        shutdown/restart initiated
+      mapped_to: Q13
+      source: attack:T1529.host_status_correlation
+    - stage: 3
+      label: administrative_context_absence
+      description: Absence of related administrative context — actor not in an admin/helpdesk group
+      mapped_to: Q2
+      source: template:universal.host_user_context
+  dimension_coverage:
+    - dimension: time_correlation
+      technique: T1529
+      covered_by: Q13
+      source: attack:T1529.host_status_correlation
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1529
+      covered_by: Q3
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1529
+      covered_by: Q2
+      source: template:universal.host_user_context
+      coverage_type: direct
+  mutable_dispositions:
+    - element: UserContext
+      dimension: user_context
+      specific_values: "rationale only (privilege to initiate shutdown/reboot; actor in admin/helpdesk group)"
+      disposition: context
+      target_question: Q2
+      notes: "No concrete field values in the analytic; rationale folded into host_user_context (Q2) and the
+        user baseline (Q7). The absence-of-admin-context check is stated explicitly in Q2 context."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only (unexpected shutdowns during business hours warrant scrutiny)"
+      disposition: context
+      target_question: Q13
+      notes: "No concrete threshold; addressed by the host status correlation question (Q13, +/-15m window
+        capturing the recorded reason and timing) and the host clustering question (Q11)."
+  dedup_decisions:
+    - dropped: cue_process_tool.clustering
+      reason: "Host-scoped +/-15m process clustering duplicates cue_host_context.clustering, which projects
+        Image+ParentImage (richer) over the same window."
+      kept: cue_host_context.clustering
+    - dropped: cue_process_tool.baseline
+      reason: "Generic shutdown.exe host-frequency baseline subsumed by cue_process_tool.baseline_deviation
+        (REFLECTED), which counts the rule's actual /s|/r pattern by parent and user — more precise for this
+        host-normality question."
+      kept: cue_process_tool.baseline_deviation
+    - dropped: network_scope.same_action_other_hosts
+      reason: "Binary-only cross-host footprint is weaker than cue_process_tool.scope (REFLECTED), which
+        enforces the rule's /s|/r pattern fleet-wide. Kept the reflected, pattern-precise version."
+      kept: cue_process_tool.scope
+    - dropped: network_scope.actor_activity_network_wide
+      reason: "User|expand network-wide activity (aggregated host+Image) duplicates cue_user_actor.clustering
+        (always_include); kept the always_include cue version."
+      kept: cue_user_actor.clustering
+    - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc pair (not dropped — recorded for audit)
+      reason: "user_actor pair — non-deduplicable (subject vs. mechanism identity pivot). Both emitted (Q7,
+        Q8)."
+      kept: both
+    - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc pair (not dropped — recorded for audit)
+      reason: "user_actor pair — non-deduplicable (subject vs. mechanism identity pivot). Both emitted (Q9,
+        Q10)."
+      kept: both
+  skipped_templates:
+    - template: cue_process_tool.follow_on
+      reason: "shutdown.exe terminates the session and does not spawn meaningful child processes; a
+        ParentImage|endswith %Image% query returns negligible signal for this binary. No coverage lost."
+    - template: universal.endpoint_protection_health
+      reason: "Recommended-tier, dropped per its own notes_to_llm condition (b): cue_host_context.precursor
+        (Q12) is present and the rule is impact-centric (T1529 system shutdown/reboot), not
+        execution/credential-centric. Prior-alert context (Q12) plus the destructive-action sweeps (Q14, Q15)
+        already surface tamper-as-precursor on this host. Not a silent drop — recorded here."
+  reflection_overrides: []
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - ransomware_impact
+    - network_scope
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 17
+      attack: 1
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 15
+    logsource_diversity:
+      process_creation: 14
+      security: 2
+      sigma_alert: 2

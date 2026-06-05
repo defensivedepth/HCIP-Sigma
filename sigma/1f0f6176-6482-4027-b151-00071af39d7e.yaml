@@ -1,0 +1,505 @@
+name: Arbitrary File Download Via ConfigSecurityPolicy.EXE
+id: 2a10c39a-12d5-4ab3-9bbe-8e553467b28c
+description: |
+  Detects ConfigSecurityPolicy.exe, a Microsoft-signed Windows Defender management binary, running with a
+  ftp, http, or https URL on its command line. The rule fires only when both conditions hold: the
+  process is ConfigSecurityPolicy.exe (by Image path, CommandLine reference, or OriginalFileName) AND a URL
+  appears in the command line. The binary exposes two abusable primitives: invoked with a local file path plus
+  a URL it uploads that file's contents to the URL (exfiltration), and invoked with just a URL it fetches a
+  remote payload into the user's INetCache directory (ingress download). Legitimate Defender management runs in
+  a service context and does not reach arbitrary internet hosts, so investigate the user context, the
+  destination, the file involved, and what ran before and after.
+type: detection
+detection_id: 1f0f6176-6482-4027-b151-00071af39d7e
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line show ConfigSecurityPolicy.exe running with a ftp/http/https URL?
+  context: Before investing investigation time, confirm the alert is a true positive. The rule fires only when
+    the process is ConfigSecurityPolicy.exe (by Image path, command-line reference, or OriginalFileName) and a
+    ftp, http, or https URL is present on the command line. Confirm both halves are present and read
+    the URL and any local file path, which together distinguish an upload invocation from a download invocation.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run a Defender management binary against an internet URL?
+  context: Legitimate ConfigSecurityPolicy.exe invocation runs in a service context and manages local Defender
+    or co-management settings, not arbitrary internet hosts. A normal interactive user account launching it with
+    a URL is the deviation worth confirming. Knowing whether this account and host function are consistent with
+    Defender administration is often the fastest path to separating a true positive from routine operations.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What exactly did ConfigSecurityPolicy.exe do? Decode the full command line and determine upload
+    versus download.
+  context: The full command line reveals the operation. A local file path followed by a URL means the file's
+    contents were uploaded to that URL; a URL with no preceding local file path means a remote payload was
+    fetched into the user's INetCache directory. Identify the exact URL, any local file path, and the working
+    directory so you know whether data left the host or arrived on it.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:cue_network_endpoint.mechanism_decode
+  question: What is the destination URL on the command line, and what do DNS, WHOIS, and threat intel reveal
+    about it?
+  context: Investigate the host extracted from the command-line URL through DNS resolution history,
+    registration age, TLS certificate details, and known threat intelligence. Recently registered domains,
+    self-signed certificates, raw IP destinations, or known infrastructure point to attacker-controlled
+    endpoints. Defender management traffic does not legitimately reach arbitrary external hosts, so any
+    non-corporate destination is significant. Outbound egress to non-RFC1918 addresses from this binary is a
+    documented detection signal.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        DestinationIp|expand: '%dst_ip%'
+      condition: selection
+    fields:
+      - DestinationHostname
+      - DestinationPort
+- source: template:cue_process_tool.process_chain
+  question: What process spawned ConfigSecurityPolicy.exe, and is that parent chain expected?
+  context: Legitimate Defender management is launched in a service context by Windows components. An interactive
+    parent such as a shell, script host, Office application, or remote-access tool indicates the binary was
+    driven by an operator rather than the platform. Identify the immediate parent and what spawned it to
+    reconstruct how the invocation originated.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:data_staging_exfil.data_scope
+  question: What local file was selected for upload, and how sensitive is it?
+  context: For the upload primitive, the local file path on the command line is the data that left the host.
+    Identify the specific file or directory targeted (credentials, documents, source code, configuration) to
+    determine the severity of potential data loss and which business units need to be notified. If only a URL is
+    present with no local file path, this was a download rather than an upload and no local file was staged.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - TargetFilename
+- source: template:data_staging_exfil.encryption_password
+  question: Does the command line or its artifacts show obfuscation, such as writing to an alternate data
+    stream?
+  context: This binary is documented as capable of storing data into alternate data streams, which hides
+    content from tools inspecting normal file paths. Re-read the triggering command line for a stream-qualified
+    path (a colon-suffixed target) or other indirection that conceals what was transferred. Concealment around an
+    exfiltration primitive is a stronger indicator of deliberate misuse than a plain transfer.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:data_staging_exfil.archive_destination
+  question: What file did the binary write afterward, and where did it land?
+  context: For the download primitive, the fetched payload is dropped under the current user's INetCache
+    directory. Check for files written by this binary to locate the downloaded payload, then determine whether
+    it was subsequently moved, copied, or executed. For the upload primitive, pivot to outbound network
+    connections from the same host in the same window to confirm the data transfer path.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: template:cue_network_endpoint.baseline
+  question: Does this host normally communicate with this destination?
+  context: First-time connections to a destination are more suspicious than routine communication. A baseline
+    over the historical aggregation window distinguishes new infrastructure from regular business traffic; zero
+    or very low prior counts to this destination indicate a new or unusual endpoint for this host. Calibrate the
+    aggregation period and any baselined web-service allowlist (cloud storage providers such as common file-share
+    services) to this environment.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        DestinationIp|expand: '%dst_ip%'
+      condition: selection
+    fields:
+      - DestinationPort
+      - Image
+- source: template:cue_process_tool.baseline
+  question: Does this host normally run ConfigSecurityPolicy.exe?
+  context: ConfigSecurityPolicy.exe is a platform binary, so it may appear in service-context maintenance, but
+    invocation with an internet URL should be rare or unseen. A 90-day frequency for this binary on the host
+    establishes whether any execution is routine; pair that count with the user and parent context, since the
+    URL-bearing invocation is the part that matters, not the binary alone.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired the rule's pattern, what parents and users normally drive that
+    activity, and does the current alert fit that pattern?
+  context: Even a platform binary can be abused. The query mirrors the rule's selection structure scoped to this
+    host, so the resulting parent and user distribution reflects how the rule's specific firing pattern (the
+    binary running with a URL), not generic Defender maintenance, has historically run here. A new parent
+    process, an unexpected user account, or an unusual command-line shape is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - CommandLine|contains: ConfigSecurityPolicy.exe
+      - Image|endswith: \ConfigSecurityPolicy.exe
+      - OriginalFileName: ConfigSecurityPolicy.exe
+      selection_url:
+        CommandLine|contains:
+        - ftp://
+        - http://
+        - https://
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run ConfigSecurityPolicy.exe with a URL?
+  context: Compare this user's current action against their historical behavior. A user who has never driven
+    this binary against an internet URL is more suspicious than one who does so regularly. The user's role and
+    typical toolset should align; Defender management with an external URL is not normal interactive-user
+    behavior. Combine the count with organizational knowledge of what this account is expected to do.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent and binary combination historically routine on this host or across the environment,
+    or is the parent unusual for ConfigSecurityPolicy.exe?
+  context: When the alert fires under a service principal such as SYSTEM or LOCAL SERVICE, user identity does not
+    attribute behavior, and legitimate Defender invocation does run in that context. The meaningful pivot is the
+    launch mechanism, namely which parent spawned ConfigSecurityPolicy.exe, and whether that pair is historically
+    common. A new
+    or rare parent for this binary is the deviation worth chasing; a pair accounting for many prior events is
+    platform automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple
+    endpoints. If the same user drove similar activity on several hosts in the window, the scope of potential
+    data movement is larger than a single host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent and binary combination fire on other hosts in the same window, indicating a
+    coordinated automation rollout rather than isolated activity?
+  context: Under a service principal, asking what else this user did across the network returns agent-telemetry
+    noise, since every host runs service-owned processes constantly. The meaningful question is whether the same
+    launch mechanism, the parent plus ConfigSecurityPolicy.exe, fired on other hosts in the alert window.
+    Multiple hosts in the same window points to scheduled or pushed automation; a single host points to a
+    host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_process_tool.follow_on
+  question: What child processes did ConfigSecurityPolicy.exe spawn afterward?
+  context: A download into INetCache is only the staging step; the impact comes from what runs the fetched
+    payload. Children such as cmd.exe, powershell.exe, wscript.exe, or a freshly dropped binary indicate
+    post-download execution. Legitimate Defender management has predictable, narrow children, so unexpected
+    spawns reframe the alert from a transfer to active execution.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired the rule's pattern in the past week, and does the cross-host distribution look
+    like consistent automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide
+    count of the rule's firing pattern (the binary running with a URL), not generic usage of the binary. Many
+    hosts firing the same pattern points to scripted deployment or vendor automation; one host or a small
+    unrelated set points to manual operator activity. Use the host distribution and parent consistency to
+    calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - CommandLine|contains: ConfigSecurityPolicy.exe
+      - Image|endswith: \ConfigSecurityPolicy.exe
+      - OriginalFileName: ConfigSecurityPolicy.exe
+      selection_url:
+        CommandLine|contains:
+        - ftp://
+        - http://
+        - https://
+      condition: all of selection_*
+    fields:
+    - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host, such as defense tampering,
+    reconnaissance, or credential access, may reveal the stages that preceded a transfer and help reconstruct the
+    timeline. Exfiltration and ingress transfers commonly follow earlier hands-on activity, so a prior-alert
+    sweep can place this event in a larger sequence.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1567
+      name: Exfiltration Over Web Service
+      role: primary
+  attack_chain_coverage:
+    - stage: 1
+      label: process_invocation_with_url
+      description: "ConfigSecurityPolicy.exe launched with a ftp/http/https URL (upload or download primitive)"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: outbound_transfer
+      description: "Anomalous outbound connection / data transfer to the web-service destination"
+      mapped_to: Q4
+      source: template:cue_network_endpoint.mechanism_decode
+    - stage: 3
+      label: file_staged_or_dropped
+      description: "Local file uploaded, or remote payload dropped to INetCache"
+      mapped_to: Q6
+      source: template:data_staging_exfil.data_scope
+  dimension_coverage:
+    - dimension: time_correlation
+      technique: T1567
+      covered_by: Q15
+      source: template:cue_user_actor.clustering_svc
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1567
+      covered_by: Q9
+      source: template:cue_network_endpoint.baseline
+      coverage_type: direct
+  mutable_dispositions:
+    - element: MonitoredServices
+      dimension: tuning_parameter
+      specific_values: "rationale only (Dropbox, OneDrive, Google Drive — baseline allowlist of web services)"
+      disposition: context
+      target_question: Q9
+      notes: "No queryable destination values in the rule; baselined web-service allowlist concept folded into the destination-baseline context as an environment-tunable allowlist."
+    - element: ExfilVolumeThreshold
+      dimension: tuning_parameter
+      specific_values: "rationale only (outbound-data threshold, environment-tunable)"
+      disposition: context
+      target_question: Q4
+      notes: "No fixed value supplied; the high outbound-to-inbound ratio signal is described in the destination-decode context. Not directly queryable from process_creation."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only (aggregation period for outbound-volume anomaly)"
+      disposition: context
+      target_question: Q9
+      notes: "Expressed as the tunable aggregation/baseline window in the destination-baseline context; the cross-host window questions (Q14/Q15) carry the same-window correlation intent."
+  dedup_decisions:
+    - dropped: cue_process_tool.clustering
+      reason: "host-context clustering of surrounding tools is subsumed; cue_host_context.precursor (prior alerts on host) plus cue_user_actor.clustering_svc (same-window cross-host) cover the surrounding-activity dimension without a third broad host-scoped sweep."
+      kept: cue_host_context.precursor
+    - dropped: cue_host_context.clustering
+      reason: "near-identical host-scoped +/-15m surrounding-activity sweep to cue_process_tool.clustering; precursor (prior sigma alerts) is the more decision-relevant host-context question and is retained instead."
+      kept: cue_host_context.precursor
+    - dropped: null
+      reason: "user_actor pair — non-deduplicable: cue_user_actor.baseline (Q12) and cue_user_actor.baseline_svc (Q13) both emitted; subject-pivot vs launch-mechanism-pivot degrade under different conditions."
+      kept: cue_user_actor.baseline + cue_user_actor.baseline_svc
+    - dropped: null
+      reason: "user_actor pair — non-deduplicable: cue_user_actor.clustering (Q14) and cue_user_actor.clustering_svc (Q15) both emitted."
+      kept: cue_user_actor.clustering + cue_user_actor.clustering_svc
+  skipped_templates:
+    - template: universal.endpoint_protection_health
+      reason: >-
+        RECOMMENDED tier, dropped. Per its notes_to_llm, safe to drop when the rule is not
+        execution/credential-centric and a prior-alert host-context question is present. This rule fires on an
+        exfiltration/ingress-transfer LOLBin (T1567), not payload execution or credential access, so a generic
+        AV/EDR tamper sweep is not a live disposition driver here. The defense_tampering technique set is not
+        confirmed for this rule, and cue_host_context.precursor (Q18) already surfaces any prior tamper alerts on
+        the host. Dropping to stay at the 18-question cap.
+    - template: cue_process_tool.clustering
+      reason: "dropped for dedup against host-context surrounding-activity coverage — see dedup_decisions."
+    - template: cue_host_context.clustering
+      reason: "dropped for dedup against cue_host_context.precursor — see dedup_decisions."
+  reflection_overrides: []
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - data_staging_exfil
+  acted_on_hints:
+    - hint: "cue_network_endpoint: derived: https?:// in CommandLine"
+      action: >-
+        Acted on. The derived network-endpoint cue drove two questions investigating the URL destination
+        extracted from the command line: Q4 (cue_network_endpoint.mechanism_decode — destination identity via
+        DNS/WHOIS/threat intel, with the documented non-RFC1918 egress signal) and Q9
+        (cue_network_endpoint.baseline — whether this host normally talks to the destination). The derived cue's
+        network logsource is covered by these network_connection queries.
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 18
+      attack: 0
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 2
+      context: 14
+    logsource_diversity:
+      process_creation: 13
+      network_connection: 2
+      file_event: 2
+      sigma_alert: 1

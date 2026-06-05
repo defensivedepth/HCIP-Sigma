@@ -1,0 +1,621 @@
+name: HackTool - CreateMiniDump Execution
+id: 6d672c2f-b49b-44a7-a50a-07830b2d6098
+description: |
+  Detects execution of the CreateMiniDump hacking tool, identified either by its image name (CreateMiniDump.exe)
+  or by a known import hash, used to dump the lsass.exe process memory for offline credential extraction. The tool
+  opens a full-access handle to LSASS and writes a minidump (to disk or held in memory) that yields plaintext
+  passwords, hashes, and Kerberos tickets when parsed offline; legitimate process-memory captures normally come
+  from signed AV/EDR or diagnostic tooling, not a renamed custom dumper. Investigation should confirm the tool
+  identity, determine whether an authorized assessment is in flight, find the dump artifact, and scope which
+  accounts and downstream activity may be exposed.
+type: detection
+detection_id: 36d88494-1d43-4dc0-b3fa-35c8fea0ca9d
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the alerting process match CreateMiniDump either by image name or by its known import hash?
+  context: >-
+    Before investing investigation time, confirm the alert is a true positive. The rule fires when a process image
+    ends in CreateMiniDump.exe or when its import hash matches the known CreateMiniDump build. Review the Image path
+    and the Hashes value of the triggering event to confirm which branch matched, since a renamed binary can match
+    on the import hash alone even when the filename looks innocuous.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - Hashes
+- source: template:universal.host_user_context
+  question: Is this user and host expected to capture or dump process memory from LSASS?
+  context: >-
+    Legitimate LSASS memory access is normally performed by signed AV/EDR agents or sanctioned diagnostic tools, not
+    by a custom dumper run interactively by a user. Knowing whether the user role and host function involve credential
+    or memory diagnostics is often the fastest path to distinguishing a true positive from sanctioned activity.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:hacking_tool.authorized_engagement
+  question: Is this CreateMiniDump execution part of an authorized penetration test or red team engagement?
+  context: >-
+    Offensive credential-dumping tools are routinely used in authorized security assessments. Before deeper analysis,
+    check whether a pentest or red team exercise is active on this host or network segment. An authorized engagement
+    with matching tool usage and timing resolves the alert without further investigation.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:hacking_tool.tool_capability_used
+  question: What dumping method and target did the command line invoke?
+  context: >-
+    CreateMiniDump implements several LSASS-dump paths — a direct MiniDumpWriteDump to disk, an in-memory dump via
+    callbacks that never touches disk, and a snapshot-based read using PssCaptureSnapshot. The command-line arguments
+    and any specified output path reveal which method was used and where the dump landed, which determines how
+    detectable the artifact is and how the dump may be exfiltrated.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:hacking_tool.tool_specific_artifacts
+  question: Did this tool's process write any dump files or other artifacts to disk?
+  context: >-
+    This dumper's default behavior writes a minidump such as lsass.dmp to the working directory or a temp path. Files
+    created by the tool's process confirm execution and capture the dump location even after the process exits. An
+    in-memory-only run leaves no file here, so absence of a dump artifact does not rule out a successful capture.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in the hour before the alert?
+  context: >-
+    Operators frequently weaken AV/EDR before running a credential dumper, since LSASS access is a heavily monitored
+    action. This query surfaces direct attempts to disable protection services, flip Defender flags, add broad
+    exclusions, clear logs, or patch AMSI/ETW. Zero rows is a useful "protection looks healthy" signal; kernel-level
+    driver tampering and in-memory patches will not appear here. Populated rows shift the disposition toward operator
+    preparation — review the parent process and signing chain to identify the writer.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+- source: template:credential_access.credential_target_identification
+  question: Was LSASS memory the target, and which dump method accessed it?
+  context: >-
+    This tool targets LSASS memory specifically, where logon credentials, hashes, and Kerberos tickets reside. Confirm
+    from the triggering command and surrounding activity whether LSASS was opened and dumped, and by which method —
+    direct MiniDumpWriteDump to disk, callback-based in-memory capture, or a PssCaptureSnapshot snapshot read. The
+    method reveals attacker sophistication and how detectable the resulting dump is.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: attack:T1003.001.access_verification
+  question: Did any process open a full-access handle into lsass.exe around this event?
+  context: >-
+    Memory dumping requires a process to open a handle into lsass.exe, typically with full access rights (mask
+    0x1F0FFF). Process-access telemetry showing a non-AV/EDR source process opening lsass.exe with that mask confirms
+    the credential-scraping step independently of the dumper's filename or import hash. The source image and granted
+    access distinguish a memory-read attempt from ordinary inter-process activity. If process-access telemetry is not
+    collected in this environment, treat zero results as a visibility gap rather than evidence nothing occurred.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_access
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetImage|endswith: \lsass.exe
+        GrantedAccess: '0x1F0FFF'
+      condition: selection
+    fields:
+      - SourceImage
+      - TargetImage
+      - GrantedAccess
+      - CallTrace
+- source: attack:T1003.001.tuning_parameter
+  question: Were minidump files created in temp or staging directories on this host around the alert?
+  context: >-
+    LSASS dumps are commonly written to user-writable staging paths such as %TEMP%, C:\Windows\Temp, the tool's
+    working directory, or C:\temp, often with names like lsass.dmp. A dump file appearing in these locations close to
+    the alert pinpoints the artifact for collection and confirms credentials were staged for offline extraction.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains:
+          - \Temp\
+          - \temp\
+          - .dmp
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - User
+- source: template:cue_process_tool.process_chain
+  question: What process spawned this dumper, and is that parent chain expected?
+  context: >-
+    The parent process reveals how the tool was launched. Interactive use from explorer.exe or a command shell points
+    to hands-on-keyboard operation, while parents like wscript.exe, mshta.exe, a service, or an Office application
+    suggest scripted or exploitation-driven launch. Allowlisting known legitimate parents helps separate sanctioned
+    diagnostics from operator activity.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:credential_access.post_access_lateral_movement
+  question: Were any new logon sessions or remote connections initiated after this event?
+  context: >-
+    Credential theft is typically followed by lateral movement as the attacker uses harvested credentials to reach
+    other systems. Follow-on alerts on this host shortly after the dump — RDP, SMB, WinRM, PsExec, or new
+    authentication events — indicate active exploitation of the compromised credentials rather than an isolated tool
+    run.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - rule.name
+      - rule.uuid
+      - event.severity_label
+- source: template:credential_access.credential_exposure_assessment
+  question: Which accounts may be compromised, and do any have elevated privileges?
+  context: >-
+    A full LSASS dump exposes every credential cached in memory on this host, including any privileged or service
+    accounts that authenticated since last boot. The severity depends on those accounts' privilege levels — domain
+    admin or broad service-account exposure requires escalation and credential rotation, while a single standard user
+    may only need monitoring. Cross-reference the accounts active on this host with directory group memberships.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:cue_process_tool.baseline
+  question: Does this host normally run this dumper?
+  context: >-
+    A custom credential-dumping binary that has never been seen on a host is far more suspicious than one that recurs
+    as part of sanctioned tooling. Zero or very low historical counts over 90 days indicate first-time or rare
+    execution, which raises the priority of the investigation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run credential-dumping or memory-capture tools?
+  context: >-
+    Compare this user's current action against their historical behavior. A user who has never run this tool is more
+    suspicious than one who does so as part of a known role. Most users have no legitimate reason to capture LSASS
+    memory, so any prior history should align with a security or diagnostic function.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent and dumper combination historically routine on this host or across the environment, or is the parent unusual for this binary?
+  context: >-
+    When the alert fires under a service principal, user identity does not attribute behavior; the meaningful pivot is
+    the launch mechanism. Which parent process spawned this binary, and is that pair historically common? A new or
+    rare parent for this dumper on this host or environment-wide is the deviation worth chasing; a pair that already
+    accounts for many prior events points to sanctioned automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: >-
+    Tracking the user's activity across all hosts reveals whether the credential access is isolated or part of broader
+    movement. If the same user triggered related activity on multiple endpoints in this window, the scope of potential
+    compromise is larger than this single host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent and dumper combination fire on other hosts in the same window, indicating a coordinated rollout rather than isolated activity?
+  context: >-
+    Under a service principal, asking what else the user did across the network returns agent-telemetry noise. The
+    meaningful question is whether the same launch mechanism — parent process plus spawned binary — fired on other
+    hosts in the alert window. Multiple hosts in the same window points to scheduled or pushed automation; a single
+    host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Credential dumping rarely happens in isolation. Earlier detections on the same host — defense tampering,
+    reconnaissance, or privilege escalation — may reveal the attack stages that set up this memory capture and help
+    reconstruct the full timeline leading to it.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1003.001
+      name: LSASS Memory
+      role: primary
+    - id: T1003
+      name: OS Credential Dumping
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: lsass_handle_open
+      description: "A non-privileged or abnormal process opens a full-access handle (0x1F0FFF) to lsass.exe"
+      mapped_to: Q8
+      source: attack:T1003.001.access_verification
+    - stage: 2
+      label: memory_dump_invocation
+      description: "The process invokes a memory dump (MiniDumpWriteDump / snapshot) of LSASS"
+      mapped_to: Q7
+      source: template:credential_access.credential_target_identification
+    - stage: 3
+      label: dump_file_creation
+      description: "A dump file is written to disk (or staged) indicative of credential scraping"
+      mapped_to: Q9
+      source: attack:T1003.001.tuning_parameter
+  dimension_coverage:
+    - dimension: access_verification
+      technique: T1003.001
+      covered_by: Q8
+      source: attack:T1003.001.access_verification
+      coverage_type: direct
+    - dimension: command_analysis
+      technique: T1003.001
+      covered_by: Q4
+      source: template:hacking_tool.tool_capability_used
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1003.001
+      covered_by: Q10
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1003.001
+      covered_by: Q9
+      source: attack:T1003.001.tuning_parameter
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1003.001
+      covered_by: Q9
+      source: attack:T1003.001.tuning_parameter
+      coverage_type: direct
+  mutable_dispositions:
+    - element: AccessMask
+      dimension: access_verification
+      specific_values: "0x1F0FFF"
+      disposition: query_injection
+      target_question: Q8
+      notes: "Injected into process_access GrantedAccess selection against TargetImage lsass.exe"
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "5 minutes between LSASS access and dump/registry activity"
+      disposition: context
+      target_question: Q9
+      notes: "Threshold is not directly queryable; Q9 (+/-15m) and Q7/Q8 (+/-5m) bracket the access-to-dump window."
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "rationale only (allowlist AV/EDR parents)"
+      disposition: context
+      target_question: Q10
+      notes: "process_chain question surfaces ParentImage so the analyst can apply an AV/EDR allowlist."
+    - element: DumpFilePath
+      dimension: tuning_parameter
+      specific_values: "%TEMP%, C:\\Windows\\Temp, .\\lsass.dmp, C:\\temp\\lsass.dmp"
+      disposition: query_injection
+      target_question: Q9
+      notes: "Injected into file_event TargetFilename|contains (\\Temp\\, \\temp\\, .dmp)."
+    - element: CommandLinePattern
+      dimension: command_analysis
+      specific_values: "rundll32, procdump, comsvcs.dll, Invoke-Mimikatz"
+      disposition: context
+      target_question: Q4
+      notes: "Rule has empty commandline_values and fires on image/imphash, not CLI flags; common dumping syntax described in Q4 context rather than injected to avoid mismatching this specific tool."
+  dedup_decisions:
+    - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable; emit BOTH (subject vs. mechanism pivot)"
+      kept: both
+    - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable; emit BOTH (subject vs. mechanism pivot)"
+      kept: both
+    - dropped: cue_process_tool.mechanism_decode
+      reason: "replaced_by: credential_access.credential_target_identification (Phase 2 supersedes mechanism_decode)"
+      kept: credential_access.credential_target_identification
+  skipped_templates:
+    - template: cue_process_tool.baseline_deviation
+      reason: "Dropped for budget at the 18-question cap. REFLECTED host-pattern deviation overlaps cue_process_tool.baseline (host frequency) and cue_user_actor.baseline_svc (parent/user deviation); credential-access-specific coverage (process_access, dump artifact, exposure assessment) was prioritized over a second host-scoped baseline."
+    - template: cue_process_tool.follow_on
+      reason: "Dropped for budget. CreateMiniDump's impact is the dump artifact (Q9) and credential exposure (Q12), not spawned children; a custom dumper typically writes a file and exits rather than spawning post-exploitation processes. post_access_lateral_movement (Q11) covers downstream alert activity."
+    - template: cue_process_tool.clustering
+      reason: "Dropped for budget. Surrounding-tool context is covered by the precursor alert sweep (Q18) and the user-network clustering questions (Q16/Q17); a third host-wide process aggregation added volume without distinct signal at the cap."
+    - template: cue_process_tool.scope
+      reason: "Dropped for budget at the 18-question cap. REFLECTED fleet-pattern cross-host count overlaps cue_user_actor.clustering_svc (Q17), which already answers whether the same parent+binary fired on other hosts; credential-access depth was prioritized."
+    - template: cue_host_context.clustering
+      reason: "Dropped for budget. Host-wide around-the-alert process activity overlaps the precursor alert sweep (Q18); time_correlation is covered by the dump-window file_event question (Q9) and the +/-5m access questions."
+  hint_dispositions:
+    - hint: "logsource 'registry_set' (recommended by techniques: T1003.001) is not covered — pull in cue_registry_key.* or author a custom question with category: registry_set"
+      disposition: declined
+      reason: >-
+        CreateMiniDump captures LSASS via MiniDumpWriteDump / PssCaptureSnapshot and writes a minidump to disk or
+        holds it in memory; it does not perform registry-based credential scraping. The registry_set path in the
+        T1003.001 analytic (EventCode 13/14) covers a distinct dumping method (e.g., LSASS-as-PPL flag flips or
+        reg-stored hive exports) that this specific tool does not use. The dump-artifact file_event question
+        (T1003.001.tuning_parameter) and the process_access handle question (T1003.001.access_verification) cover the
+        access-and-dump chain this tool actually executes. No compensating registry_set question authored.
+    - hint: "logsource 'security' (recommended by techniques: T1003.001) is not covered and no template family exists — author a custom question with category: security"
+      disposition: declined
+      reason: >-
+        The Security-channel signal for this technique (4673 sensitive-privilege use / SeDebugPrivilege to open
+        LSASS) measures the same access-verification step already captured directly by the process_access question
+        (T1003.001.access_verification), which surfaces the full-access handle into lsass.exe with the 0x1F0FFF mask
+        and the source image. Authoring a separate security/4673 question would re-ask the LSASS-access question on a
+        noisier channel without adding a distinct investigative angle. No compensating security question authored.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - credential_access
+    - hacking_tool
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 16
+      attack: 2
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 2
+      context: 14
+    logsource_diversity:
+      process_creation: 13
+      process_access: 1
+      file_event: 2
+      sigma_alert: 2

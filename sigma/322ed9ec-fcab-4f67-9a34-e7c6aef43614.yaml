@@ -1,0 +1,591 @@
+name: New Port Forwarding Rule Added Via Netsh.EXE
+id: cbe46d44-4cb0-40a4-ad27-3d8670a28f33
+description: |
+  Detects netsh.exe configuring a new IPv4-to-IPv4 port forwarding (PortProxy) rule. The alert fires when the
+  process is netsh (by Image or OriginalFileName) AND at least one of three command-line shapes matches: the
+  spelled-out form (interface, portproxy, add, v4tov4), the heavily abbreviated short-flag form (i, p, a, v), or
+  the connect/listen abbreviation form (connectp, listena, c=). Because netsh accepts abbreviated arguments, the
+  rule fires on EITHER the verbose syntax OR either of the shorthand variants, so note which shape fired.
+  PortProxy turns a host into a TCP relay: a listen address/port is forwarded to a connect address/port, and the
+  forwarding is performed by the IP Helper Service (iphlpsvc, hosted in svchost.exe -k netsvcs), not by netsh
+  itself. The configuration is written to the registry under HKLM\SYSTEM\CurrentControlSet\Services\PortProxy\v4tov4\tcp
+  and persists across reboots. Legitimate use comes from administrators bridging WSL, container, or test networks;
+  malicious use turns a reachable host into a pivot to reach segmented internal systems or to tunnel inbound RDP.
+  Determine who configured the proxy, what listen and connect endpoints it bridges, whether traffic has flowed
+  through it, and whether the source host or user is reaching other systems.
+type: detection
+detection_id: 322ed9ec-fcab-4f67-9a34-e7c6aef43614
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the netsh command line match a PortProxy rule being added — either the spelled-out interface/portproxy/add/v4tov4
+    form, the abbreviated short-flag form, or the connect/listen abbreviation form?
+  context: Confirm the alert is a true positive before investing time. The rule fires when the process is netsh AND
+    at least one of three command-line shapes is present, so the match is disjunctive — note which of the three
+    forms is present, because the abbreviated forms (i / p / a / v, or connectp / listena / c=) are themselves a
+    detection-bypass signal that an operator was avoiding the obvious keywords. Read the full command line and
+    confirm a portproxy add operation, then capture the listen and connect address/port operands.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to configure port forwarding rules with netsh?
+  context: Legitimate administrative activity can trigger this detection — WSL, container, and lab-network bridging
+    scripts use netsh portproxy routinely. Knowing whether the user role and host function (a server, an admin
+    jump box, a developer workstation, or an ordinary endpoint) are consistent with configuring a TCP relay is
+    often the fastest way to separate routine operations from an operator turning the host into a pivot.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: Decode the full netsh command line — what listen address/port and connect address/port does this PortProxy
+    rule bridge?
+  context: The command line carries the complete relay definition. Resolve listenaddress/listenport (or their
+    abbreviations l= / listena) and connectaddress/connectport (connectp / c=) to the actual endpoints being
+    forwarded. A listen address of 0.0.0.0 exposes the relay on every interface; a connect port of 3389 forwards
+    to RDP; a connect address pointing into a segmented internal range indicates a pivot into a network the host
+    can otherwise reach but external sources cannot. This host-scoped, time-bounded query captures any sequential
+    netsh invocations (add, then delete to clean up) that form one logical operation.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:cue_process_tool.process_chain
+  question: What process spawned netsh, and is that parent chain expected for a port-forwarding change?
+  context: The parent process reveals how netsh was invoked. An interactive administrator action typically descends
+    from explorer.exe or a console shell; a scripted bridge runs under a known automation parent. Parents such as
+    a remote-execution service host, an Office application, a script interpreter (wscript, mshta, powershell launched
+    by a document), or an unfamiliar binary suggest the proxy was configured as part of hands-on-keyboard activity
+    or post-exploitation rather than routine administration.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: attack:T1090.proxy_config
+  question: What listen and connect endpoints does this PortProxy rule bridge, and is the connect port a remote-access
+    or otherwise sensitive service?
+  context: PortProxy maps a listen address/port on this host to a connect address/port elsewhere. Extract both
+    endpoints from the command line and assess them against the relay's purpose. Forwarding to well-known
+    remote-access and proxy ports — RDP (3389), SSH (22), SMB (445), WinRM (5985/5986), or common proxy ports
+    such as 1080, 8080, and 4444 — points to a pivot or tunnel; a listen address of 0.0.0.0 with a connect address
+    in an internal range indicates the host is being used to reach a segmented network. The query re-displays the
+    triggering command so the analyst can read the address and port operands directly.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: attack:T1090.forwarded_traffic
+  question: Has traffic actually flowed through the proxy — are there connections to or from the IP Helper service
+    on this host?
+  context: Netsh only writes the configuration; the forwarding is performed by the IP Helper Service (iphlpsvc),
+    which runs inside svchost.exe -k netsvcs. After the rule is added, inbound connections to the listen port and
+    the corresponding outbound connections to the connect endpoint appear attributed to that service host, not to
+    netsh. Connections through the relay confirm the proxy is in active use rather than merely staged; a spike of
+    such connections over a short window indicates an active tunneling session. If endpoint network telemetry is
+    not collected in this environment, treat zero results as a visibility gap and inspect the host directly for
+    listening sockets on the configured port.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith: \svchost.exe
+      condition: selection
+    fields:
+      - SourceIp
+      - DestinationIp
+      - SourcePort
+      - DestinationPort
+      - Initiated
+- source: template:lateral_movement.source_host_identification
+  question: What hosts have connected inbound to this host on remote-access ports, and are those sources expected
+    administrative origins?
+  context: A port-forwarding relay exists to receive inbound connections and pass them on. Identifying which hosts
+    reach this one on remote-access ports reveals whether the traffic comes from a known admin jump box, an ordinary
+    workstation acting out of role, or an unexpected source. A connection arriving from 127.0.0.1 or a loopback
+    range on a remote-access port is itself a tunnel indicator — it means the session was routed in from a local
+    listening port rather than originating remotely.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        DestinationPort:
+          - 445
+          - 135
+          - 3389
+          - 5985
+          - 5986
+          - 22
+      condition: selection
+    fields:
+      - SourceIp
+      - DestinationPort
+- source: template:lateral_movement.lateral_movement_scope
+  question: Has this user account run lateral-movement or tunneling tools against other hosts in the environment?
+  context: Configuring a relay on one host is often one step in moving across an environment. If the same user
+    account is also invoking remote-execution, RDP-client, SSH, or tunneling tooling against multiple systems
+    within a short window, the scope of activity is larger than this single host. Concentrated lateral tool usage
+    from one account is a stronger signal of active movement than an isolated portproxy change.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      selection_lateral:
+        Image|endswith:
+          - '\psexec.exe'
+          - '\psexec64.exe'
+          - '\mstsc.exe'
+          - '\ssh.exe'
+          - '\plink.exe'
+          - '\wmic.exe'
+          - '\netsh.exe'
+      condition: selection and selection_lateral
+    fields:
+      - host.name
+      - Image
+- source: template:remote_access_tool.tool_authorization
+  question: Is configuring a netsh PortProxy relay an authorized activity on this host, and what business purpose
+    does it serve?
+  context: Port forwarding via netsh portproxy is a tunneling capability, not a packaged remote-access product, so
+    there is no vendor allow-list to check — the question is whether THIS host has a sanctioned reason to act as a
+    TCP relay. Bridging WSL, container, or test networks is a legitimate developer or IT use case; an ordinary
+    workstation or production server reconfigured to forward a remote-access port generally is not. Treat an
+    unexplained relay as shadow IT or attacker-deployed pivoting regardless of who appears to have run the command.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+- source: template:remote_access_tool.active_session_context
+  question: Is there a current change ticket, maintenance window, or support session that explains this port-forwarding
+    change?
+  context: Legitimate relay configuration usually correlates with a documented change, a development or testing
+    task, or an administrative procedure. If no ticket, maintenance window, or approved use case covers a portproxy
+    rule being added on this host, the relay may have been created by an operator establishing a pivot or by a user
+    circumventing network segmentation. The query re-displays the command for matching against change records.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:cue_process_tool.baseline
+  question: Does this host normally run netsh, and has it configured port forwarding before?
+  context: A host that has never run netsh, or has run it only for routine interface and firewall management, is
+    more notable here than one where portproxy bridging is established practice. Zero or very low historical counts
+    point to first-time or rare execution; a steady baseline (for example a developer machine that bridges WSL on
+    every boot) reframes the alert as routine.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired the PortProxy pattern, what parents and users normally drive it, and
+    does the current alert fit that pattern?
+  context: Even routine tooling can be abused. The query mirrors the rule's selection structure scoped to this host,
+    so the resulting parent and user distribution reflects how this specific portproxy-add pattern — not generic
+    netsh usage — has historically run here. A new parent process, an unexpected user account, or an unusual
+    command-line shape relative to that history is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \netsh.exe
+      - OriginalFileName: netsh.exe
+      selection_cli_1:
+        CommandLine|contains|all:
+        - interface
+        - portproxy
+        - add
+        - v4tov4
+      selection_cli_2:
+        CommandLine|contains|all:
+        - 'i '
+        - 'p '
+        - 'a '
+        - 'v '
+      selection_cli_3:
+        CommandLine|contains|all:
+        - connectp
+        - listena
+        - c=
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection_img and 1 of selection_cli_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_user_actor.baseline
+  question: Does this user normally configure network or port-forwarding settings with netsh?
+  context: Compare this user's current action against their historical behavior across all hosts. A user who has
+    never run netsh — or never used it for portproxy — is more notable than one who manages network configuration
+    routinely. The user's role and typical toolset should align with reconfiguring a host as a TCP relay.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent-plus-netsh launch combination historically routine on this host or across the environment,
+    or is the parent unusual for netsh?
+  context: When the alert fires under a service principal (SYSTEM, LOCAL SERVICE, NETWORK SERVICE, or a computer
+    account), the user identity does not attribute the behavior. The meaningful pivot is the launch mechanism —
+    which parent process spawned netsh, and whether that pair is historically common. A new or rare parent for
+    netsh on this host or environment-wide is the deviation worth chasing; a pair already responsible for thousands
+    of prior events is automation or OS-driven configuration.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around the time of this alert?
+  context: Tracking the user's activity across all hosts in the surrounding window reveals whether the portproxy
+    change is isolated or part of broader movement. If the same account triggered configuration changes or tool
+    execution on multiple endpoints, the scope of activity may extend well beyond this host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent-plus-netsh combination fire on other hosts in the same window — is this a coordinated
+    automation rollout, or isolated to this host?
+  context: Under a service principal, asking what else the user did network-wide returns agent-telemetry noise,
+    because every host runs SYSTEM-owned agents constantly. The meaningful question is whether the same launch
+    mechanism — the same parent process spawning netsh — fired on other hosts in the alert window. Multiple hosts
+    in the same window point to scheduled or pushed automation bridging networks fleet-wide; a single host points
+    to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired the PortProxy pattern in the past week, and does the cross-host distribution look
+    like consistent automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count
+    of the portproxy-add pattern rather than generic netsh usage. Many hosts firing the same pattern points to
+    scripted deployment or vendor automation (for example a WSL bridge rolled out by configuration management);
+    one host or a small unrelated set points to manual operator activity. Use the host distribution and parent
+    consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \netsh.exe
+      - OriginalFileName: netsh.exe
+      selection_cli_1:
+        CommandLine|contains|all:
+        - interface
+        - portproxy
+        - add
+        - v4tov4
+      selection_cli_2:
+        CommandLine|contains|all:
+        - 'i '
+        - 'p '
+        - 'a '
+        - 'v '
+      selection_cli_3:
+        CommandLine|contains|all:
+        - connectp
+        - listena
+        - c=
+      condition: selection_img and 1 of selection_cli_*
+    fields:
+    - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — reconnaissance, credential
+    access, defense tampering, or remote-execution activity — may reveal the stages that preceded the proxy being
+    configured and help reconstruct how the operator reached the point of establishing a pivot.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1090
+      name: Proxy
+      role: primary
+  attack_chain_coverage:
+    - stage: 1
+      label: proxy_process_execution
+      description: "Suspicious process (netsh) executes to configure a port-forwarding / proxy rule"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 1
+      label: proxy_config_decode
+      description: "Decode the relay definition: listen and connect address/port operands"
+      mapped_to: Q3
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 1
+      label: parent_invocation
+      description: "Identify the parent that spawned netsh to assess how the relay was configured"
+      mapped_to: Q4
+      source: template:cue_process_tool.process_chain
+    - stage: 2
+      label: traffic_bridging
+      description: "Network connections flow through the relay, performed by the IP Helper service (iphlpsvc/svchost), confirming the proxy is in use"
+      mapped_to: Q6
+      source: attack:T1090.forwarded_traffic
+    - stage: 2
+      label: inbound_source
+      description: "Inbound connections to the relay's listen port reveal the originating host(s) using the pivot"
+      mapped_to: Q7
+      source: template:lateral_movement.source_host_identification
+  dimension_coverage:
+    - dimension: command_analysis
+      technique: T1090
+      covered_by: Q3
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: direct
+    - dimension: network_destination
+      technique: T1090
+      covered_by: Q5
+      source: attack:T1090.proxy_config
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1090
+      covered_by: Q4
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1090
+      covered_by: Q6
+      source: attack:T1090.forwarded_traffic
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1090
+      covered_by: Q5
+      source: attack:T1090.proxy_config
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1090
+      covered_by: Q2
+      source: template:universal.host_user_context
+      coverage_type: direct
+  mutable_dispositions:
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "rationale only (e.g. rundll32, svchost as rare network-capable spawners)"
+      disposition: new_question
+      target_question: Q4
+      notes: "process_chain retrieves the actual parent of netsh; parent legitimacy is the investigation. No fixed value to inject — the rationale (which parents are unexpected) drives Q4 context."
+    - element: DestinationPort
+      dimension: tuning_parameter
+      specific_values: "1080, 8080, 4444 (proxy ports); plus rule-relevant 3389/22/445/5985/5986 remote-access ports"
+      disposition: query_injection
+      target_question: Q7
+      notes: "Remote-access port list injected into source_host_identification DestinationPort selection (445,135,3389,5985,5986,22). Proxy ports 1080/8080/4444 recorded in Q5 context for the analyst to compare the configured connect port against."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only (spikes in outbound connections over a short period)"
+      disposition: new_question
+      target_question: Q6
+      notes: "forwarded_traffic question scopes iphlpsvc/svchost connections to +/-1h so a short-window spike of relayed connections is visible. Threshold is rationale, not a queryable value."
+  dedup_decisions:
+    - dropped: cue_process_tool.clustering
+      reason: "Near-identical host-scoped aggregation to cue_host_context.clustering; only one host-wide 'what else ran' view is needed. Host-context aggregation (Image+ParentImage) is the broader of the two."
+      kept: cue_host_context.clustering
+    - dropped: cue_host_context.clustering
+      reason: "Host-wide activity context is already carried by cue_host_context.precursor (prior alerts on host) plus the user-actor clustering questions; a third broad host-aggregation question adds volume without a distinct investigative angle for a relay-config rule."
+      kept: cue_host_context.precursor
+    - dropped: cue_process_tool.follow_on
+      reason: "netsh portproxy does not spawn the relayed activity — the forwarding is done by iphlpsvc/svchost, not by child processes of netsh. The chain stage-2 'what does the proxy actually do' angle is covered by the forwarded_traffic network question instead."
+      kept: attack:T1090.forwarded_traffic
+    - dropped: lateral_movement.authentication_method
+      reason: "Query is ProcessGuid boilerplate re-displaying User/CommandLine; the meaningful auth angle for a tunneled-RDP pivot (logon source, loopback-source indicator) is covered by source_host_identification, which surfaces the inbound source IP and the 127.0.0.1 tunnel indicator directly."
+      kept: lateral_movement.source_host_identification
+    - dropped: lateral_movement.target_activity_after_access
+      reason: "This host is the relay/pivot, not the lateral-movement target; post-access process activity belongs on the destination of the forwarded traffic, which is not knowable from this alert. forwarded_traffic + source_host_identification cover the 'is the pivot in use and from where' angle."
+      kept: attack:T1090.forwarded_traffic
+    - dropped: cue_user_actor.baseline + cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable; both emitted (Q13 user-pivot, Q14 parent+binary substitute) per service-principal handling."
+      kept: both
+    - dropped: cue_user_actor.clustering + cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable; both emitted (Q15 user-pivot, Q16 parent+binary substitute) per service-principal handling."
+      kept: both
+  skipped_templates:
+    - template: universal.endpoint_protection_health
+      reason: >-
+        RECOMMENDED-tier universal question, dropped with cause. This rule fires on proxy/tunneling configuration
+        (lateral-movement / command-and-control / defense-evasion), not on payload execution, credential access,
+        privilege escalation, or ransomware/impact — the cases where tamper-as-precursor is the live question. The
+        disposition here turns on the legitimacy of the relay endpoints and who configured it, not on whether
+        AV/EDR was weakened first. The defense_tampering technique set is not confirmed for this rule, and prior
+        host context is instead carried by cue_host_context.precursor (Q18), which surfaces any earlier tamper
+        alert on this host. Dropping it keeps the playbook at 18 questions focused on the relay investigation.
+    - template: network_scope.same_action_other_hosts
+      reason: "Cross-host count of the netsh portproxy pattern is already provided by cue_process_tool.scope (Q17, REFLECTED fleet_pattern), which enforces the rule's exact selection rather than just Image|endswith netsh.exe — strictly more precise. same_action_other_hosts would be a looser duplicate."
+    - template: network_scope.actor_activity_network_wide
+      reason: "User-wide network activity is covered by cue_user_actor.clustering (Q15) with the same User-pivot aggregation; this is a duplicate angle."
+    - template: network_scope.actor_authentication_trail
+      reason: "Security-log 4624/4625 authentication trail for the user. The relay-relevant authentication angle (who is reaching the listen port, loopback-source tunnel indicator) is covered by source_host_identification (Q7). A network-wide user logon sweep adds breadth without a distinct step for this relay-config rule; kept the playbook at 18."
+  reflection_overrides: []
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - lateral_movement
+    - remote_access_tool
+    - cue_process_tool
+    - cue_user_actor
+    - cue_host_context
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 16
+      attack: 2
+      llm_generated: 0
+    phase_distribution:
+      triage: 1
+      analysis: 1
+      context: 16
+    logsource_diversity:
+      process_creation: 15
+      network_connection: 2
+      sigma_alert: 1

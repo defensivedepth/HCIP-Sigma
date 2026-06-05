@@ -1,0 +1,581 @@
+name: Suspicious Serv-U Process Pattern
+id: 16456974-f59c-49fe-bcc5-153abc13b137
+description: |
+  Detects the Serv-U file-transfer service (Serv-U.exe) spawning a command
+  interpreter, script host, or living-off-the-land binary - cmd.exe,
+  powershell.exe, pwsh.exe, wscript.exe, cscript.exe, sh.exe, bash.exe,
+  schtasks.exe, regsvr32.exe, wmic.exe, mshta.exe, rundll32.exe, msiexec.exe,
+  forfiles.exe, or scriptrunner.exe. The rule fires when ParentImage ends in
+  \Serv-U.exe AND the child Image ends in one of those binaries. Serv-U is a
+  network-facing service and should not normally launch shells or scripting
+  tools; this pattern is consistent with exploitation of an internet-exposed
+  Serv-U instance, where a child process is used to run reconnaissance, write
+  output to a download-accessible folder, or establish persistence. Some
+  deployments legitimately use the Serv-U SSH service for remote command
+  execution, so the investigation should confirm which child ran, decode what
+  it did, identify follow-on children and any credential-store or persistence
+  activity, and determine whether the Serv-U service account is expected to
+  spawn this kind of process here.
+type: detection
+detection_id: 58f4ea09-0fc2-4520-ba18-b85c540b0eaf
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Did Serv-U.exe spawn a command interpreter, script host, or
+    living-off-the-land binary, matching what this rule detects?
+  context: Before investing investigation time, confirm the alert is a true
+    positive. The rule fires when the parent process is Serv-U.exe AND the child
+    is one of cmd.exe, powershell.exe, pwsh.exe, wscript.exe, cscript.exe,
+    sh.exe, bash.exe, schtasks.exe, regsvr32.exe, wmic.exe, mshta.exe,
+    rundll32.exe, msiexec.exe, forfiles.exe, or scriptrunner.exe. Read the exact
+    parent and child Image and the child command line, and note which binary was
+    spawned - the binary identity and its arguments distinguish a benign
+    SSH-driven remote command from exploitation of the service.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+- source: template:universal.host_user_context
+  question: Is the Serv-U service account on this host expected to launch shells
+    or scripting tools?
+  context: Serv-U normally runs as a service account dedicated to file transfer
+    and should not spawn command interpreters or scripting tools as part of
+    routine operation. The exception is a deployment that intentionally uses the
+    Serv-U SSH service for remote command execution. Knowing whether this host's
+    Serv-U installation is configured for remote command execution, and whether
+    the acting account is expected to run these binaries, is often the fastest
+    way to separate a sanctioned use from exploitation of an internet-facing
+    service.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:parent_child.parent_process_legitimacy
+  question: Is Serv-U.exe expected to spawn this child, and what started the
+    Serv-U process itself?
+  context: The Serv-U parent-to-child relationship is the core signal for this
+    detection. Serv-U.exe is a long-running network service; tracing its own
+    origin confirms it is the genuine service binary running from its install
+    path rather than a renamed or relocated process, and confirms the spawn was
+    not an analyst- or admin-initiated remote command. A service process
+    suddenly launching a shell with no corresponding administrative change is
+    consistent with exploitation of the service.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- source: template:parent_child.sibling_processes
+  question: What other child processes did this same Serv-U instance spawn?
+  context: If exploitation drove this spawn, the same Serv-U instance likely
+    launched additional processes in sequence - reconnaissance, output
+    redirection, download, or persistence. Examining the siblings of the exact
+    parent instance reveals the full scope of activity initiated through the
+    service. Multiple suspicious children from a single Serv-U process points to
+    hands-on operation rather than an isolated remote command.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:credential_access.credential_target_identification
+  question: What did the spawned child command do - decode its full command line
+    and identify reconnaissance, output redirection, download, or
+    credential-store access.
+  context: The child command line reveals the operational purpose of the spawn.
+    Decode every argument and look for system and user discovery (whoami, dir),
+    output redirected to a web- or download-accessible directory, file copies
+    that stage credential material, or download cradles. Output piped into a
+    folder that the file-transfer service serves to the internet lets an
+    operator retrieve reconnaissance results remotely, and copying credential
+    or user-store files indicates credential-access intent.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:powershell.encoded_command_decode
+  question: If the child was powershell.exe or pwsh.exe, was the command encoded
+    or obfuscated, and what does it decode to?
+  context: When the spawned child is PowerShell, attackers frequently use the
+    -EncodedCommand (-enc) parameter, string concatenation, backtick escaping,
+    or variable substitution to hide intent. Base64-encoded commands are the
+    most common form. Decoding reveals the actual payload - download cradles,
+    reverse shells, output redirection, or in-memory execution. If the child was
+    a non-PowerShell binary, read its arguments directly since they are already
+    plain text.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: attack:T1555.credential_store_access
+  question: Did any process access credential stores such as LSASS or
+    user-credential databases around the time of this spawn?
+  context: The tagged technique is credential access from password stores.
+    Exploitation of a file-transfer service is frequently followed by attempts
+    to read credential material - LSASS memory, the credential manager, or
+    stored user databases the service itself maintains. Process-access events to
+    sensitive targets in the same window as the suspicious spawn indicate the
+    child, or a process it launched, reached for credentials. If process-access
+    telemetry is not collected in this environment, treat zero results as a
+    visibility gap rather than evidence nothing occurred.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_access
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - SourceImage
+      - TargetImage
+      - GrantedAccess
+- source: template:cue_parent_process.follow_on
+  question: What other processes did Serv-U.exe spawn on this host in the hours
+    after the alert?
+  context: Beyond the immediate siblings, the compromised service may continue to
+    launch tools over a longer window - staging persistence, exfiltrating
+    reconnaissance output, or pulling additional payloads. Listing all children
+    of Serv-U.exe on this host after the alert reveals whether the activity was a
+    single remote command or an ongoing operation through the exploited service.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        process.parent.name|expand: '%ParentName%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: llm_generated
+  question: Were reconnaissance or staging files written to a directory that the
+    file-transfer service serves to clients?
+  context: A common pattern after exploiting a file-transfer service is to
+    redirect command output into a folder the service makes available for
+    download, so the operator can retrieve reconnaissance results remotely
+    without a separate channel. File writes under the service's client-accessible
+    directories shortly after the suspicious spawn indicate output capture for
+    retrieval. Review the writing process and the file contents to confirm what
+    was staged.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_paths:
+        TargetFilename|contains:
+          - '\Serv-U\'
+          - '\Client\Common\'
+      condition: selection and selection_paths
+    fields:
+      - TargetFilename
+      - Image
+      - User
+- source: attack:T1555.persistence_archive_drop
+  question: Were Serv-U user-store or account-definition files created or modified
+    after the alert?
+  context: A known follow-on to Serv-U exploitation is adding an attacker-controlled
+    administrator by writing a crafted account-definition file into the location
+    where the service stores user records. File creation or modification under the
+    service's user-store directory that does not correspond to an administrative
+    change indicates a persistence or account-creation attempt that grants
+    continued access to the service. Confirm which process wrote the file and
+    whether the new account is authorized.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_paths:
+        TargetFilename|contains:
+          - '\RhinoSoft\Serv-U\Users\'
+          - '\Serv-U\Users\'
+          - '.Archive'
+      condition: selection and selection_paths
+    fields:
+      - TargetFilename
+      - Image
+      - User
+- source: template:credential_access.post_access_lateral_movement
+  question: Were any new logon sessions or remote connections initiated from this
+    host after the spawn?
+  context: Access to a file-transfer service exposed to the internet is often a
+    foothold that precedes movement deeper into the environment. New logon
+    events or outbound remote connections shortly after the suspicious spawn
+    indicate the operator is using the foothold to reach other systems. Look for
+    RDP, SMB, WinRM, or remote-execution alerts on this host in the window after
+    the alert.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - rule.name
+      - rule.uuid
+      - event.severity_label
+- source: template:credential_access.credential_exposure_assessment
+  question: Which accounts may be compromised, and do any have elevated
+    privileges?
+  context: The severity of this activity depends on what the operator could reach.
+    The Serv-U service account, any accounts referenced in the child command, and
+    accounts whose credential stores were touched all need to be assessed. Domain
+    admin or service accounts with broad access require incident escalation; a
+    constrained local account may only need monitoring. Cross-reference the
+    relevant accounts against directory group memberships.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:cue_user_actor.baseline
+  question: Does the acting account normally launch these child binaries from a
+    Serv-U parent?
+  context: Compare the acting account against its own history. If the alert fires
+    under an interactive or administrative account that routinely runs remote
+    commands through the Serv-U SSH service, a shell child may be sanctioned. An
+    account - especially the Serv-U service account - that has never launched
+    these binaries is more notable. The account role and typical toolset should
+    align with file-transfer administration, not shell or scripting activity.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this Serv-U parent and child-binary pairing historically routine on
+    this host or across the environment, or is it new for this binary?
+  context: When the alert fires under a service principal, the user identity does
+    not attribute the behavior; the meaningful pivot is the launch mechanism -
+    whether Serv-U.exe spawning this specific child binary is historically common.
+    A pairing that already accounts for many prior events is more likely a
+    sanctioned remote-command configuration or automation, while a first-ever or
+    rare Serv-U-to-this-binary pairing on this host or environment-wide is the
+    deviation worth chasing.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did the acting account do across the network around this
+    time?
+  context: Tracking the acting account's activity across all hosts reveals whether
+    the spawn was a single event or part of activity spanning multiple endpoints.
+    If the same account triggered similar activity on other hosts, the scope of
+    the incident is larger than one Serv-U server.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did the same Serv-U parent and child-binary pairing fire on other
+    hosts in the same window, indicating a coordinated rollout rather than
+    isolated activity?
+  context: Under a service principal, asking what else the account did across the
+    network returns agent-telemetry noise, since every host runs system-owned
+    agents constantly. The meaningful question is whether the same launch
+    mechanism - Serv-U.exe spawning this child binary - fired on other hosts in
+    the alert window. Multiple internet-facing Serv-U hosts spawning shells in
+    the same window points to mass exploitation of the service; a single host
+    points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the
+    alert?
+  context: Alerts rarely occur in isolation. Examining the activity surrounding
+    the Serv-U spawn reveals what led to it and what followed - reconnaissance,
+    persistence installation, or follow-on execution. Novel parent-child pairs at
+    low counts are what to scan for against the high-count noise of routine
+    system processes.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host - exploitation attempts,
+    reconnaissance, or other anomalous service behavior - may reveal the stages
+    that preceded the Serv-U spawn and help reconstruct the timeline. Exploitation
+    of an internet-facing service is often preceded by scanning or repeated
+    connection failures, so prior alerts give the context for why the service
+    began launching processes.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1555
+      name: Credentials from Password Stores
+      role: primary
+  attack_chain_coverage:
+    - stage: 1
+      label: service_spawns_child
+      description: "Serv-U.exe spawns a command interpreter, script host, or LOLBin - the act the rule detects, consistent with exploitation of the internet-facing service"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: child_command_decode
+      description: "Decode the child command line to identify reconnaissance, output redirection to a download-accessible folder, download, or credential-store access"
+      mapped_to: Q5
+      source: template:credential_access.credential_target_identification
+    - stage: 3
+      label: credential_store_access
+      description: "Process-access to credential stores (LSASS, credential databases) following the spawn, the tagged T1555 behavior"
+      mapped_to: Q7
+      source: attack:T1555.credential_store_access
+    - stage: 4
+      label: persistence_account_creation
+      description: "Creation of a crafted account-definition file in the Serv-U user store to add an attacker-controlled administrator"
+      mapped_to: Q10
+      source: attack:T1555.persistence_archive_drop
+  dimension_coverage:
+    - dimension: tuning_parameter
+      technique: T1555
+      covered_by: Q5
+      source: template:credential_access.credential_target_identification
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1555
+      covered_by: Q2
+      source: template:universal.host_user_context
+      coverage_type: direct
+  mutable_dispositions:
+    - element: TargetProcesses
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q7
+      notes: "Analytic gives no concrete process list (e.g., lsass.exe, svchost.exe as examples only). Realized as the credential-store-access process_access question, which surfaces SourceImage/TargetImage/GrantedAccess so the analyst sees which sensitive targets were touched without a hard-coded target list that would miss the service's own credential database."
+    - element: KeywordPatterns
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q5
+      notes: "Analytic describes a regex of suspicious CLI keywords (dpapi, credman, mimikatz) as a tuning example, not fixed values. Realized as the decode-the-child-command question, which directs the analyst to identify reconnaissance, output redirection, download, and credential-store keywords in the actual command line rather than filtering on a fixed list."
+  dedup_decisions:
+    - dropped: cue_user_actor.baseline + cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable; both emitted (subject-pivot Q13 and launch-mechanism-pivot Q14). Serv-U typically runs as a service account, so the parent+binary substitute is load-bearing."
+      kept: both
+    - dropped: cue_user_actor.clustering + cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable; both emitted (subject-pivot Q15 and launch-mechanism-pivot Q16)."
+      kept: both
+    - dropped: cue_process_tool.process_chain
+      reason: "parent_process is primary (hint) — parent cue subsumes process_chain. Parent origin is covered by parent_child.parent_process_legitimacy (Q3)."
+      kept: parent_child.parent_process_legitimacy
+    - dropped: cue_process_tool.mechanism_decode
+      reason: "replaced_by credential_access.credential_target_identification (hint). The child binary is too common (cmd.exe/powershell.exe) for Image-scoped mechanism decode, and the rule carries no commandline_values to tighten with; the entity-scoped credential_target_identification (Q5) provides Phase 2 decode."
+      kept: credential_access.credential_target_identification
+    - dropped: cue_parent_process.baseline
+      reason: "host+parent.name+Image baseline subsumed by cue_user_actor.baseline_svc (Q14), which pivots on the same parent.name+Image pairing across host and environment."
+      kept: cue_user_actor.baseline_svc
+    - dropped: cue_parent_process.clustering
+      reason: "process_creation activity from the Serv-U parent is covered by cue_parent_process.follow_on (Q8, +4h) and cue_host_context.clustering (Q17); a separate +/-15m parent clustering question would duplicate them."
+      kept: cue_parent_process.follow_on
+    - dropped: cue_parent_process.scope
+      reason: "fleet-wide parent+child distribution is covered by cue_user_actor.clustering_svc (Q16), which pivots parent.name+Image with no host scope in the alert window."
+      kept: cue_user_actor.clustering_svc
+  skipped_templates:
+    - template: cue_process_tool.mechanism_decode
+      reason: "replaced_by: credential_access.credential_target_identification (hint). Recorded in dedup_decisions."
+    - template: scheduled_task.task_configuration / task_trigger_and_timing / task_still_present
+      reason: "scheduled_task set was confirmed only because schtasks.exe is 1 of 15 binaries in the child OR-list. The rule does not require a scheduled task to fire, carries no schtasks-specific commandline_values, and is fundamentally a Serv-U-exploitation spawn rule. Authoring 3 schtasks-specific Phase 2 questions would mis-frame the 14/15 non-schtasks firings. mechanism decode is provided generically by credential_target_identification (Q5)."
+    - template: persistence_scope.process_based_persistence
+      reason: "recommended priority; persistence_scope confirmed via schtasks.exe membership. The rule detects an exploitation spawn, not persistence installation. The Serv-U-specific persistence vector (crafted .Archive account file) is covered directly by attack:T1555.persistence_archive_drop (Q10), which is more precise than a generic schtasks/sc/reg sweep. Trimmed to stay within the 14-18 target."
+    - template: persistence_scope.file_based_persistence
+      reason: "recommended priority. Generic Startup-folder/Run-key file-drop sweep is orthogonal to this rule's actual persistence vector (Serv-U user-store .Archive file), which Q10 covers with the correct paths. Trimmed to stay within the 14-18 target."
+    - template: universal.endpoint_protection_health
+      reason: "recommended priority. The defense_tampering set is not confirmed for this rule and cue_host_context.precursor (Q18) already surfaces prior-alert context on the host. This is an exploitation/credential-access spawn rule where the disposition turns on what the child did, not on whether AV was disabled first; the generic tamper sweep would not change triage here. Trimmed to stay within the 14-18 target."
+    - template: powershell.script_block_logging
+      reason: "recommended/must within the powershell set, but powershell.exe is only 1 of 15 possible children and script-block (4104) coverage adds value only when the child is PowerShell. encoded_command_decode (Q6) already directs the analyst to decode a PowerShell child when present; a separate 4104 question would return 0 for the majority of firings (non-PowerShell children). Trimmed to stay within the 14-18 target."
+    - template: powershell.powershell_security_bypass
+      reason: "PowerShell-specific bypass sweep; same 1-of-15-children constraint. AMSI/ETW/exec-policy bypass precursors are not part of this rule's Serv-U-spawn signal, and prior on-host tampering would surface via cue_host_context.precursor (Q18). Trimmed to stay within the 14-18 target."
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "cmd.exe: too common for Image-based scoping — use CommandLine patterns for mechanism_decode"
+      disposition: declined
+      reason: >-
+        Acted on in spirit, recorded here for the audit trail: the rule carries
+        no commandline_values, so there is no CommandLine pattern to scope with.
+        Phase 2 mechanism decode (Q5, credential_target_identification) is instead
+        scoped to the single alerting event via ProcessGuid rather than
+        Image|endswith on cmd.exe, avoiding the host-wide cmd.exe noise the hint
+        warns about. No Image-scoped mechanism_decode question was authored.
+    - hint: "scheduled_task.task_configuration replaces cue_process_tool.mechanism_decode"
+      disposition: declined
+      reason: >-
+        The scheduled_task set was declined entirely (see skipped_templates):
+        schtasks.exe is only 1 of 15 child binaries and the rule is not a
+        scheduled-task rule. Phase 2 mechanism decode is provided by
+        credential_access.credential_target_identification (Q5) per the
+        credential_access-set hint, which fits all 15 possible children rather
+        than only the schtasks firing.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - parent_child
+    - credential_access
+    - powershell
+    - cue_parent_process
+    - cue_user_actor
+    - cue_host_context
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 15
+      attack: 2
+      llm_generated: 1
+    phase_distribution:
+      triage: 2
+      analysis: 2
+      context: 14
+    logsource_diversity:
+      process_creation: 13
+      file_event: 2
+      process_access: 1
+      sigma_alert: 2

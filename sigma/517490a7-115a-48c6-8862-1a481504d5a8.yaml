@@ -1,0 +1,502 @@
+name: Potential Shim Database Persistence via Sdbinst.EXE
+id: 6707b7a4-ea2e-40ff-a6bd-d4052594c750
+description: |
+  Detects installation of an application compatibility shim database via sdbinst.exe with a .sdb file on
+  the command line, while excluding the known IIS Express msiexec-installed shim. Application shims are a
+  legitimate Windows compatibility mechanism, but a shim database can carry RedirectShim or InjectDll
+  behavior that loads attacker-controlled code into a target process at startup, giving persistence and
+  potential privilege escalation that survives reboots. Installing a shim registers entries under
+  HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\{InstalledSDB,Custom} and writes the
+  .sdb to %WINDIR%\AppPatch\Custom\; the investigation should determine who installed the shim, what
+  target application and DLL it affects, and whether the install was authorized.
+type: detection
+detection_id: 517490a7-115a-48c6-8862-1a481504d5a8
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: '2026-06-05'
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the alerting event show sdbinst.exe (or a binary with that original filename) running with a .sdb file on the command line?
+  context: Confirm the alert is a true positive by reviewing the triggering event. The rule fires when the image is sdbinst.exe (or its OriginalFileName is sdbinst.exe) AND the command line contains '.sdb', and the IIS Express shim installed by msiexec.exe is excluded. Verify both conditions are present and read the full .sdb path the install pointed at.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to install application compatibility shims?
+  context: Shim installation requires administrative rights (HKLM write) and is uncommon outside of specific software deployments. A developer machine or a host running legacy applications may legitimately install shims; a typical workstation or server installing one ad hoc under an interactive or unexpected account is more notable. Knowing whether this user role and host function fit shim installation is often the fastest triage step.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What is the full sdbinst.exe command line, and what .sdb file and path did it install?
+  context: The command line reveals the exact shim database being installed. Read the full .sdb path and any switches (for example /q for silent install). Note whether the .sdb sits in the default %WINDIR%\AppPatch\Custom location or in a user-writable folder such as a profile, Temp, or Public directory, which is more consistent with an operator staging a malicious shim before installing it.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:parent_child.parent_process_legitimacy
+  question: What process spawned sdbinst.exe, and what started that parent?
+  context: Shim installation driven by a software installer or a deployment tool is routine; sdbinst.exe spawned from an interactive shell, a script host, an Office application, or a freshly written binary is the suspicious path. Tracing the parent's own origin shows whether the chain came from a legitimate install or from hands-on-keyboard activity. The IIS Express shim installed via msiexec.exe is already excluded by the rule, so an msiexec parent here would carry a different .sdb.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- source: template:parent_child.sibling_processes
+  question: What other child processes did the same parent spawn around this time?
+  context: If the parent that launched sdbinst.exe also spawned other processes, those siblings reveal the broader scope of the activity. A parent that staged a file, installed the shim, and then launched a target application or a shell points to an orchestrated persistence setup rather than an isolated install.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: attack:T1546.011.registry_persistence
+  question: Were AppCompatFlags shim registry keys created or modified on this host around the install time?
+  context: Installing a shim registers it under HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\InstalledSDB\<GUID> and, for application-targeted shims, under AppCompatFlags\Custom\<target.exe>\<GUID>. Correlating a registry write to these keys with the sdbinst.exe execution confirms the shim was actually registered and names the target application that will load the shim. Tune out known-good shim GUIDs and paths already present from approved software.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|contains: '\AppCompatFlags\'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+- source: attack:T1546.011.sdb_file_drop
+  question: Where on disk was the .sdb file written, and was it staged in a user-writable folder before the install?
+  context: A shim database written into %WINDIR%\AppPatch\Custom is the normal install destination, but a .sdb that first appears in a profile, Temp, Public, or other user-writable directory is consistent with an operator staging a malicious shim before running sdbinst.exe. The file event also shows which process wrote the .sdb, which may differ from sdbinst.exe itself.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith: '.sdb'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - User
+- source: attack:T1546.011.dll_injection
+  question: Did any process load a DLL from %WINDIR%\AppPatch on this host after the shim was installed?
+  context: The InjectDll shim type causes a specified DLL to load into a target application every time it starts, which is how an application shim turns into persistent code execution. A module loaded from %WINDIR%\AppPatch (especially the Custom subfolders) into a normal application, or a load of an unexpected DLL into the shim's target binary, indicates the shim is delivering an injected payload rather than a compatibility fix.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ImageLoaded|contains: '\AppPatch\'
+      condition: selection
+    fields:
+      - Image
+      - ImageLoaded
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously installed shims matching this rule's pattern, what parents and users drove it, and does the current alert fit?
+  context: The query mirrors the rule's selection scoped to this host, so the parent/user distribution reflects how shim installation specifically has run here, not generic sdbinst.exe usage. A new parent process, an unexpected user account, or a first-ever firing is the deviation worth chasing; a host that regularly installs shims via the same deployment parent is likely routine.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \sdbinst.exe
+      - OriginalFileName: sdbinst.exe
+      selection_cli:
+        CommandLine|contains: .sdb
+      filter_optional_iis:
+        ParentImage|endswith: \msiexec.exe
+        CommandLine|contains:
+        - :\Program Files (x86)\IIS Express\iisexpressshim.sdb
+        - :\Program Files\IIS Express\iisexpressshim.sdb
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_* and not 1 of filter_optional_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.scope
+  question: Have other hosts installed shims matching this rule's pattern in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: The query mirrors the rule's selection with no host scope, giving a fleet-wide count of shim installs matching this pattern rather than generic sdbinst.exe usage. Many hosts firing the same pattern points to scripted deployment or vendor software rollout; one host or a small unrelated set points to manual operator activity. Use the host distribution and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \sdbinst.exe
+      - OriginalFileName: sdbinst.exe
+      selection_cli:
+        CommandLine|contains: .sdb
+      filter_optional_iis:
+        ParentImage|endswith: \msiexec.exe
+        CommandLine|contains:
+        - :\Program Files (x86)\IIS Express\iisexpressshim.sdb
+        - :\Program Files\IIS Express\iisexpressshim.sdb
+      condition: all of selection_* and not 1 of filter_optional_*
+    fields:
+    - host.name
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run sdbinst.exe to install shims?
+  context: Compare this user's current action against their historical behavior. A user who has never installed a shim is more notable than an administrator or deployment account that does so regularly. Shim installation requires admin rights, so the acting account's role should align with that privilege.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent-plus-sdbinst.exe launch combination historically routine on this host or environment-wide?
+  context: When the alert fires under a service principal, user identity does not attribute the behavior; the meaningful pivot is the launch mechanism. A parent process that has spawned sdbinst.exe thousands of times before is deployment or OS automation, while a new or rare parent for this binary is the deviation worth chasing.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around the time of this alert?
+  context: Tracking the user's activity across all hosts reveals whether the shim install is isolated or part of broader activity such as lateral movement or persistence stacking on multiple endpoints. The same user installing shims or running admin tooling on several hosts in the window widens the likely scope.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent-plus-sdbinst.exe combination fire on other hosts in the same window, or is it isolated to this host?
+  context: Under a service principal, asking what else the user did returns agent-telemetry noise because every host runs SYSTEM-owned agents constantly. The meaningful question is whether the same launch mechanism fired elsewhere. Multiple hosts in the same window points to scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Persistence installation is rarely the first stage. Earlier detections on the same host — reconnaissance, credential access, defense tampering, or initial execution — may reveal how the operator gained the admin rights needed to install a shim and help reconstruct the timeline leading to this event.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:persistence_scope.process_based_persistence
+  question: Were other process-based persistence mechanisms installed on this host around the same time?
+  context: Attackers rarely rely on a single persistence mechanism. After installing a shim, an operator commonly stacks backup mechanisms using different techniques — scheduled tasks, services, registry Run keys, BITS jobs, or WMI subscriptions. Multiple persistence installations in the same timeframe indicate intentional stacking rather than an isolated administrative action.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine
+- source: template:persistence_scope.file_based_persistence
+  question: Were files dropped to Startup folders or Run key paths on this host around the same time?
+  context: File-based persistence bypasses command-line detection entirely. Dropping an executable or script into a Startup folder or a path referenced by a registry Run key achieves persistence without running standard persistence tools. File event monitoring captures these drops even when the operator avoids them, and a drop alongside a shim install points to layered persistence.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist_paths:
+        TargetFilename|contains:
+          - '\Start Menu\Programs\Startup\'
+          - '\CurrentVersion\Run'
+          - '\CurrentVersion\RunOnce'
+      condition: selection and selection_persist_paths
+    fields:
+      - TargetFilename
+      - Image
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1546.011
+      name: Application Shimming
+      role: primary
+    - id: T1546
+      name: Event Triggered Execution
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: shim_install_execution
+      description: "Execution of sdbinst.exe to install a custom shim database (.sdb)"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: registry_registration
+      description: "Modification of AppCompatFlags registry keys (InstalledSDB / Custom) registering the shim"
+      mapped_to: Q6
+      source: attack:T1546.011.registry_persistence
+    - stage: 3
+      label: sdb_file_artifact
+      description: "The .sdb file is written to disk (AppPatch\\Custom or a user-writable staging folder)"
+      mapped_to: Q7
+      source: attack:T1546.011.sdb_file_drop
+    - stage: 4
+      label: dll_injection
+      description: "InjectDll/RedirectShim behavior loads attacker DLL into target application at startup"
+      mapped_to: Q8
+      source: attack:T1546.011.dll_injection
+  dimension_coverage:
+    - dimension: time_correlation
+      technique: T1546.011
+      covered_by: Q6
+      source: attack:T1546.011.registry_persistence
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1546.011
+      covered_by: Q7
+      source: attack:T1546.011.sdb_file_drop
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1546.011
+      covered_by: Q2
+      source: template:universal.host_user_context
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1546
+      covered_by: Q6
+      source: attack:T1546.011.registry_persistence
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1546
+      covered_by: Q3
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1546
+      covered_by: Q11
+      source: template:cue_user_actor.baseline
+      coverage_type: direct
+  mutable_dispositions:
+    - element: CustomShimPathAllowlist
+      dimension: tuning_parameter
+      specific_values: "%WINDIR%\\AppPatch\\Custom (.sdb path), HKLM\\...\\AppCompatFlags registry path"
+      disposition: query_injection
+      target_question: Q6
+      notes: "AppCompatFlags path injected into registry_set TargetObject|contains; .sdb path location surfaced in Q7 file_event TargetFilename|endswith and Q3 context."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only (tunable correlation window, e.g. within 5 minutes)"
+      disposition: context
+      target_question: Q6
+      notes: "No specific threshold value to query; registry/sdbinst correlation framed via +/-15m range on Q6 and +/-4h on Q7."
+    - element: DLLInjectionTarget
+      dimension: tuning_parameter
+      specific_values: "%WINDIR%\\AppPatch (injected DLL load location), target application binary"
+      disposition: query_injection
+      target_question: Q8
+      notes: "Injected into image_load ImageLoaded|contains '\\AppPatch\\'; target application identified from AppCompatFlags\\Custom\\<target.exe> registry entry in Q6."
+    - element: UserContext
+      dimension: user_context
+      specific_values: "rationale only (admin / SYSTEM-context initiated installs)"
+      disposition: context
+      target_question: Q2
+      notes: "Admin-rights requirement surfaced in Q2 and Q11 context; user-pivot baseline scopes by User."
+    - element: ShimCommandLinePattern
+      dimension: tuning_parameter
+      specific_values: ".sdb (and switches such as /q silent install)"
+      disposition: query_injection
+      target_question: Q1
+      notes: "The rule's own CommandLine|contains '.sdb' is the firing pattern (entity-scoped verify in Q1); decode of switches handled in Q3 context."
+    - element: PathAnomalyThreshold
+      dimension: tuning_parameter
+      specific_values: "rationale only (path deviation scoring, T1546 generic)"
+      disposition: context
+      target_question: Q7
+      notes: "User-writable vs default AppPatch path deviation described in Q7 context; no numeric threshold to query."
+  dedup_decisions:
+    - dropped: cue_process_tool.process_chain
+      reason: "parent_child technique set active — parent_process_legitimacy subsumes process_chain"
+      kept: parent_child.parent_process_legitimacy
+    - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable; both emitted as separate questions (user-pivot vs parent+binary substitute)"
+      kept: both (Q11, Q12)
+    - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable; both emitted as separate questions (user-pivot vs parent+binary substitute)"
+      kept: both (Q13, Q14)
+  skipped_templates:
+    - template: cue_process_tool.baseline
+      reason: "Superseded by cue_process_tool.baseline_deviation (REFLECTED, Q9) which is filter-correct to the rule's pattern, and by cue_user_actor.baseline (Q11) for the user dimension. Generic Image-only 90d baseline adds no coverage beyond these."
+    - template: cue_process_tool.follow_on
+      reason: "Child-of-sdbinst question subsumed by parent_child.sibling_processes (Q5) and the DLL-injection follow-on (Q8); sdbinst.exe install itself does not spawn the payload — the shim loads later via image_load, covered by Q8."
+    - template: cue_process_tool.clustering
+      reason: "Host-wide tool clustering covered by persistence_scope.process_based_persistence (Q16) which is scoped to persistence tooling, more specific for this persistence rule than a generic all-Image host sweep."
+    - template: cue_host_context.clustering
+      reason: "Generic host activity sweep overlaps Q16 (process-based persistence) and Q17 (file-based persistence) which give targeted host context for a persistence rule; the generic Image+ParentImage aggregation adds noise without new investigative angle."
+    - template: universal.endpoint_protection_health
+      reason: "Recommended, not must_include. This is a persistence-install rule, not an execution/credential-access rule where the disposition turns on prior tamper. cue_host_context.precursor (Q15) already surfaces prior tamper detections on the host via the sigma-alert sweep, satisfying the tamper-as-precursor question without the generic command-line tamper sweep."
+    - template: organizational_context.change_ticket
+      reason: "Organizational triage angle (authorized deployment vs unauthorized install) is covered by host_user_context (Q2) and the parent_process_legitimacy parent-origin question (Q4); a separate change-ticket question would not add a distinct queryable angle within the 18-question budget."
+    - template: organizational_context.human_recall
+      reason: "Overlaps host_user_context (Q2) for legitimacy attribution; dropped to stay within the 14-18 budget while retaining the more queryable triage questions."
+    - template: organizational_context.timing_alignment
+      reason: "Timing-vs-work-hours legitimacy overlaps the baseline_deviation (Q9) and host_user_context (Q2) angles; dropped to stay within budget."
+    - template: organizational_context.procedural_consistency
+      reason: "Procedural-norm question overlaps host_user_context (Q2) and parent_process_legitimacy (Q4, deployment-tool vs ad hoc parent); dropped to stay within budget."
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "logsource 'image_load' (recommended by techniques: T1546.011) is not covered — pull in cue_image_load.* or author a custom question with `category: image_load`"
+      disposition: acted_on
+      reason: >-
+        Authored Q8 (attack:T1546.011.dll_injection) as a custom image_load
+        question. The InjectDll shim type is the payload-delivery stage of this
+        technique — a DLL loaded from %WINDIR%\AppPatch into a target
+        application is exactly the cross-logsource pivot the hint flags.
+    - hint: "logsource 'registry_set' (recommended by techniques: T1546.011) is not covered — pull in cue_registry_key.* or author a custom question with `category: registry_set`"
+      disposition: acted_on
+      reason: >-
+        Authored Q6 (attack:T1546.011.registry_persistence) as a custom
+        registry_set question targeting AppCompatFlags\InstalledSDB and
+        AppCompatFlags\Custom keys. Registry registration is the core
+        persistence artifact for application shimming and confirms the shim was
+        actually registered plus names the target application.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - parent_child
+    - persistence_scope
+    - cue_process_tool
+    - cue_user_actor
+    - cue_host_context
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 14
+      attack: 3
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 14
+    logsource_diversity:
+      process_creation: 12
+      registry_set: 1
+      file_event: 2
+      image_load: 1
+      sigma_alert: 1

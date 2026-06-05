@@ -1,0 +1,534 @@
+name: Ruby Inline Command Execution
+id: 9e6ef822-707d-41b4-b8a8-f2d644b8fb38
+description: |
+  Detects ruby.exe (matched by image name or original file name) executing with the inline-code flag ' -e', which runs
+  arbitrary Ruby supplied directly on the command line rather than from a script file. Both conditions must be present for
+  the rule to fire. Inline Ruby is a common way to launch a reverse shell or run live code without dropping a file to disk;
+  it is also used legitimately by developers, build tooling, and packaged Ruby applications. The investigation should
+  recover and decode the exact inline expression, establish whether this user and host normally run Ruby this way, and
+  determine what the process spawned or connected to afterward.
+type: detection
+detection_id: 20a5ffa1-3848-4584-b6f8-c7c7fd9f69c8
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does this event match the rule — ruby.exe (by image name or original file name) running with the ' -e' inline-code flag?
+  context: Before investing investigation time, confirm the alert is a true positive. The rule requires both conditions
+    together. The process must be ruby.exe (identified by either the image name ending in ruby.exe or an original file name
+    of ruby.exe) AND the command line must contain ' -e'. Read the full command line and image fields from the triggering
+    event to verify both halves are present.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run inline Ruby code from the command line?
+  context: Legitimate inline Ruby ' -e' execution comes from developers, build and packaging tooling, and bundled Ruby
+    applications. Knowing whether the user role and host function involve Ruby development or automation is often the fastest
+    way to separate routine activity from a hands-on-keyboard reverse-shell attempt.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What exactly does the inline Ruby expression do? Decode the full command line passed after ' -e'.
+  context: The inline code supplied after ' -e' is the operation. Decode it for network primitives and shell-spawn behavior
+    — a TCPSocket or socket open to a hardcoded IP and port, a require of the socket library, calls that duplicate the socket
+    onto standard input/output, or an exec/spawn of cmd.exe or /bin/sh indicate a reverse shell. Benign inline code typically
+    performs string manipulation, version checks, or build steps without opening sockets or spawning shells.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:cue_process_tool.process_chain
+  question: What process spawned ruby.exe and is that parent chain expected?
+  context: The parent process reveals how Ruby was invoked. A parent such as a development shell, terminal, or build agent
+    fits routine engineering activity; parents such as an Office application, a scripting host, a browser child, or a remote
+    services process point to invocation through an exploit, a macro, or a remote operator.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.follow_on
+  question: What child processes did ruby.exe spawn afterward?
+  context: The processes Ruby launches reveal its actual impact. An inline reverse shell typically execs an interactive
+    command shell (cmd.exe) or duplicates the socket and hands control to one; post-exploitation may spawn reconnaissance or
+    download tooling. Benign inline Ruby usually spawns nothing or only expected build subprocesses.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: attack:T1059.time_correlation
+  question: Did this inline-Ruby execution occur inside or outside expected administrative and development time windows?
+  context: Interpreter abuse is more suspicious when it runs outside the hours where Ruby development and scheduled build
+    automation normally occur. Compare the alert timestamp against this host's historical ruby.exe ' -e' activity to see
+    whether the execution falls in a routine window or off-hours. A run that breaks the established time pattern is the
+    anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \ruby.exe
+      - OriginalFileName: ruby.exe
+      selection_cli:
+        CommandLine|contains: ' -e'
+      selection_host:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and selection_host
+    fields:
+      - User
+      - ParentImage
+- source: template:cue_process_tool.baseline
+  question: Does this host normally run ruby.exe?
+  context: A binary that has never appeared on a host is more suspicious than one that runs regularly. Zero or very low
+    historical counts indicate first-time or rare execution of Ruby here, which raises the priority of recovering the inline
+    expression; high counts on a developer or build host point toward routine engineering use.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired the rule's pattern, what parents and users normally drive that activity, and
+    does the current alert fit that pattern?
+  context: Even routine developer tooling runs inline Ruby. The query mirrors the rule's selection structure (ruby.exe with
+    the ' -e' flag) scoped to this host, so the resulting parent and user distribution reflects how this specific firing
+    pattern has historically run here rather than generic Ruby usage. A new parent process, an unexpected user account, or an
+    unusual command-line shape is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \ruby.exe
+      - OriginalFileName: ruby.exe
+      selection_cli:
+        CommandLine|contains: ' -e'
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run ruby.exe across the environment?
+  context: Compare this user's current action against their historical behavior. A user who has never run Ruby, or never run
+    it with inline code, is more suspicious than one who does so regularly as part of their role. User role and typical
+    toolset should align with running a Ruby interpreter.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent+ruby.exe combination historically routine on this host or across the environment, or is the parent
+    unusual for ruby.exe?
+  context: When the alert fires under a service principal, user identity does not attribute the behavior. The meaningful
+    pivot is the launch mechanism — which parent process spawned ruby.exe, and whether that pair is historically common. A new
+    or rare parent for ruby.exe on this host or environment-wide is the deviation worth chasing; a pair that already accounts
+    for thousands of prior events is build or vendor automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints.
+    If the same user triggered similar interpreter activity on multiple hosts in this window, the scope of the activity may be
+    larger than the single alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent+ruby.exe combination fire on other hosts in the same window — is this a coordinated
+    automation rollout, or is the activity isolated to this host?
+  context: Under a service principal, asking what else the user did across the network returns agent-telemetry noise because
+    every host runs system-owned agents constantly. The meaningful question is whether the same launch mechanism — parent
+    process plus ruby.exe — fired on other hosts in the alert window. Multiple hosts in the same window points to scheduled or
+    pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired the rule's pattern in the past week, and does the cross-host distribution look like
+    consistent automation or one-off activity?
+  context: The query mirrors the rule's selection structure (ruby.exe with the ' -e' flag) with no host scope, so the result
+    is a fleet-wide count of this firing pattern rather than generic Ruby usage. Many hosts firing the same pattern points to
+    scripted deployment or build automation; one host or a small unrelated set points to manual operator activity. Use the
+    host distribution and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \ruby.exe
+      - OriginalFileName: ruby.exe
+      selection_cli:
+        CommandLine|contains: ' -e'
+      condition: all of selection_*
+    fields:
+    - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: 'Alerts rarely occur in isolation. Examining activity around the alert reveals the immediate context: what led to
+    this execution, what happened after, and whether it is part of a larger sequence. Look for reconnaissance, privilege
+    escalation, persistence installation, or data staging surfacing as novel parent-child process pairs.'
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host — defense tampering, reconnaissance, credential access — may reveal the attack
+    stages that preceded this execution and help reconstruct the full timeline. Execution of an inline interpreter is often a
+    mid-chain step rather than the first action.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in the hour before the alert?
+  context: Tampering typically precedes payload execution. The query surfaces direct attempts to disable AV/EDR services,
+    flip protection flags, add broad exclusions, clear logs, or patch in-memory scanning and tracing interfaces. Zero rows is
+    a useful signal that protection looks healthy; kernel-level driver tampering and in-memory patches will not appear here.
+    Populated rows shift the disposition toward operator preparation, so review the parent process and signing chain to
+    identify the writer.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1059
+      name: Command and Scripting Interpreter
+      role: primary
+  attack_chain_coverage:
+    - stage: 1
+      label: interpreter_invocation
+      description: "Scripting/command interpreter (ruby.exe) is launched, here with inline -e code from a parent process"
+      mapped_to: Q4
+      source: template:cue_process_tool.process_chain
+    - stage: 2
+      label: encoded_or_inline_arguments
+      description: "Interpreter runs encoded/obfuscated or inline arguments — the ' -e' inline expression carrying the operation"
+      mapped_to: Q3
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 3
+      label: secondary_execution
+      description: "Inline code triggers secondary execution events (shell spawn, reverse-shell socket handoff, download tooling)"
+      mapped_to: Q5
+      source: template:cue_process_tool.follow_on
+    - stage: 4
+      label: abnormal_time_or_user_context
+      description: "Execution outside expected admin/dev time windows or from an abnormal user context"
+      mapped_to: Q6
+      source: attack:T1059.time_correlation
+  dimension_coverage:
+    - dimension: command_analysis
+      technique: T1059
+      covered_by: Q3
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1059
+      covered_by: Q4
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1059
+      covered_by: Q6
+      source: attack:T1059.time_correlation
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1059
+      covered_by: Q8
+      source: template:cue_process_tool.baseline_deviation
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1059
+      covered_by: Q2
+      source: template:universal.host_user_context
+      coverage_type: direct
+  mutable_dispositions:
+    - element: CommandLinePattern
+      dimension: command_analysis
+      specific_values: "rationale only (tunable encoded/uncommon script patterns) — rule's concrete pattern is the ' -e' inline flag"
+      disposition: query_injection
+      target_question: Q8
+      notes: "Rule's CommandLine|contains ' -e' pattern embedded verbatim in the reflected baseline_deviation (Q8), scope (Q13), and time_correlation (Q6) queries. Decode of the inline expression handled in Q3."
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "rationale only (varies across managed/unmanaged/user-driven)"
+      disposition: context
+      target_question: Q4
+      notes: "Process-chain question (Q4) recovers and judges the parent; baseline_deviation (Q8) and svc-pair (Q10/Q12) profile parent distribution."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only (work-hours / admin maintenance windows)"
+      disposition: new_question
+      target_question: Q6
+      notes: "Generated attack:T1059.time_correlation question profiles the host's historical firing-pattern timing so the analyst can judge in/out of expected window."
+  dedup_decisions:
+    - dropped: cue_process_tool.clustering
+      reason: "host-around-same-time coverage subsumed by cue_host_context.clustering, which aggregates by Image+ParentImage (surfaces novel parent-child pairs) vs Image only — more informative for the same investigative intent"
+      kept: cue_host_context.clustering
+    - dropped: none
+      reason: "user_actor pair (baseline + baseline_svc) emitted as TWO questions (Q9/Q10) — non-deduplicable per AGENTS.md (subject vs mechanism pivot)"
+      kept: cue_user_actor.baseline + cue_user_actor.baseline_svc
+    - dropped: none
+      reason: "user_actor pair (clustering + clustering_svc) emitted as TWO questions (Q11/Q12) — non-deduplicable per AGENTS.md (degenerate under service principals)"
+      kept: cue_user_actor.clustering + cue_user_actor.clustering_svc
+  skipped_templates: []
+  reflection_overrides: []
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+  generation_stats:
+    total_questions: 16
+    source_counts:
+      template: 15
+      attack: 1
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 13
+    logsource_diversity:
+      process_creation: 15
+      sigma_alert: 1

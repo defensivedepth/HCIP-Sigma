@@ -1,0 +1,594 @@
+name: Rundll32 UNC Path Execution
+id: 7262387e-a62b-4e47-84b0-f9b91d6f5b1a
+description: |
+  Detects rundll32.exe (identified by Image, OriginalFileName, or the literal "rundll32" in the command line) executing with a UNC path (a command line containing ' \\') AND the UNC reference together. Loading a DLL from a remote share lets a signed Microsoft binary proxy-execute attacker code that never touches local disk, and the share reference points at lateral movement or remote staging. Legitimate uses exist (software deployment tools, login scripts on a file server), so the investigation should confirm the DLL source, the entry point invoked, the parent that launched rundll32, and any child processes or follow-on activity the proxy execution produced.
+type: detection
+detection_id: 5cdb711b-5740-4fb2-ba88-f7945027afac
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does this rundll32 invocation reference a DLL on a remote UNC path, matching what the rule detects?
+  context: Confirm the alert is a true positive by reviewing the exact command line. The rule fires when the process is rundll32.exe (by Image, OriginalFileName, or the "rundll32" token) AND the command line contains a UNC path (' \\'). Verify both conditions are present and read the DLL path and entry-point argument from the command line.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to load DLLs from remote shares via rundll32?
+  context: Legitimate administrative activity and software deployment can invoke rundll32 against network paths. Knowing whether the user role and host function are consistent with loading DLLs from a remote share is often the fastest way to separate routine operations from proxy execution.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What DLL path and entry point did this rundll32 invocation load, and what does the command line do?
+  context: The full command line reveals the remote DLL path and the named export rundll32 was told to call. DllMain runs at DLL_PROCESS_ATTACH on any rundll32 invocation even when the named entry point does not exist, so the payload can execute regardless of the export argument. Note the UNC host in the path, the export name, and any javascript or vbscript scheme or mshtml,RunHTMLApplication script-proxy syntax.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \rundll32.exe
+      - OriginalFileName: RUNDLL32.EXE
+      - CommandLine|contains: rundll32
+      selection_cli:
+        CommandLine|contains: ' \\\\'
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:lolbin.renamed_binary_check
+  question: Was rundll32 executed from its expected System32 or SysWOW64 path?
+  context: rundll32.exe running from outside System32 or SysWOW64 may indicate the binary was copied or renamed to evade path-based allowlists. Compare the Image path against the expected location and confirm OriginalFileName still reads RUNDLL32.EXE.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- source: template:cue_process_tool.process_chain
+  question: What process spawned rundll32, and is that parent chain expected?
+  context: The parent process reveals how rundll32 was invoked. Legitimate usage often has predictable parents (explorer.exe for user actions, a deployment agent or services.exe for managed software). Unusual parents like office applications, wscript.exe, mshta.exe, or a remote-execution service indicate exploitation or operator-driven proxy execution.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.follow_on
+  question: What child processes did this rundll32 instance spawn afterward?
+  context: rundll32 proxy execution loads a DLL whose code commonly launches follow-on processes such as cmd.exe, powershell.exe, or runonce.exe for post-exploitation. Because rundll32 terminates quickly after spawning a child, the child can appear with an unmapped parent in some tooling; process-creation telemetry still retains the parent linkage. Unexpected children point to the actual payload behavior.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: attack:T1218.011.file_event
+  question: Was a DLL or script file written to or accessed from the referenced share path on this host around the alert time?
+  context: Proxy execution of a remote DLL implies the payload was staged on a share before rundll32 loaded it. Looking at file activity around the alert can surface the .dll, .sct, .hta, or .cpl artifact and where it came from. Scope to the file paths and directories tied to the alert rather than all file events on the host.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        file.path|contains|expand: '%file_dirs%'
+      condition: selection
+    fields:
+      - file.path
+      - Image
+      - User
+- source: attack:T1218.011.image_load
+  question: What modules did rundll32 load into memory on this host around the alert time, and are any loaded from a remote or user-writable path?
+  context: rundll32 maps the target DLL into its own address space; a reflective or remotely sourced DLL surfaces as a module load from a path outside System32. Reviewing image loads for rundll32 distinguishes a normal local DLL from one fetched off a share or injected in memory ("floating modules"). Loads from UNC, temp, or profile directories are the anomaly worth chasing.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith: \rundll32.exe
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+- source: template:lateral_movement.source_host_identification
+  question: What inbound connections to remote-execution and SMB ports did this host receive around the alert time?
+  context: A DLL referenced over a UNC path implies an SMB share access, and lateral movement requires a source. Inbound connections to admin-share and remote-execution ports (445, 135, 3389, 5985, 5986) reveal whether the rundll32 invocation followed remote access from a jump box, a peer workstation, or an unexpected source. The admin shares carrying DLL payloads are typically C$, ADMIN$, or IPC$.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        DestinationPort:
+          - 445
+          - 135
+          - 3389
+          - 5985
+          - 5986
+          - 22
+      condition: selection
+    fields:
+      - SourceIp
+      - DestinationPort
+- source: attack:T1021.002.user_context
+  question: What network logon events on this host precede the alert, and which account and source host authenticated to the admin share?
+  context: A remote DLL load over a UNC path normally follows an SMB session establishment, recorded as a network logon. Reviewing logon events ties the proxy execution back to an account and an originating host, and shows whether this is an expected remote administrator or a rare or first-time access. Correlate the logon time and account with the rundll32 invocation within a few minutes.
+  range: -15m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: security
+    detection:
+      selection:
+        EventID:
+          - 4624
+          - 4648
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - TargetUserName
+      - IpAddress
+      - LogonType
+      - WorkstationName
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired this rundll32-UNC pattern, what parents and users normally drive it, and does the current alert fit?
+  context: Even signed system binaries get reused legitimately. This query mirrors the rule's selection scoped to this host, so the resulting parent and user distribution reflects how the rundll32 remote-DLL pattern has historically run here, not generic rundll32 usage. A new parent, an unexpected account, or an unusual command-line shape is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \rundll32.exe
+      - OriginalFileName: RUNDLL32.EXE
+      - CommandLine|contains: rundll32
+      selection_cli:
+        CommandLine|contains: ' \\\\'
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:lolbin.historical_lolbin_baseline
+  question: How often has this host fired the rundll32-UNC pattern over the past 90 days, and what command-line shapes are typical?
+  context: A remote-DLL load pattern with no prior history on a host is more suspicious than one used daily under stable parents. The query mirrors the rule's selection scoped to this host, so the count reflects the rule's specific firing pattern rather than generic rundll32 usage. The command-line projection lets the analyst compare typical invocation shapes against the alerting one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \rundll32.exe
+      - OriginalFileName: RUNDLL32.EXE
+      - CommandLine|contains: rundll32
+      selection_cli:
+        CommandLine|contains: ' \\\\'
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - CommandLine
+- source: template:lolbin.technique_class_lateral
+  question: Were any other proxy-execution LOLBins used on this host recently?
+  context: Attackers who use one signed-binary proxy often reach for several. If rundll32 loaded a remote DLL, check whether regsvr32, mshta, msiexec, installutil, or similar proxy-execution binaries ran on the same host. Multiple proxy-execution LOLBins performing the same objective strengthens the case for malicious activity.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_img:
+        Image|endswith:
+          - '\regsvr32.exe'
+          - '\mshta.exe'
+          - '\msbuild.exe'
+          - '\cmstp.exe'
+          - '\msiexec.exe'
+          - '\forfiles.exe'
+          - '\pcalua.exe'
+          - '\presentationhost.exe'
+          - '\control.exe'
+          - '\installutil.exe'
+          - '\msdt.exe'
+          - '\mavinject.exe'
+          - '\wmic.exe'
+          - '\xwizard.exe'
+          - '\ie4uinit.exe'
+      condition: selection and selection_img
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run rundll32 against remote DLL paths?
+  context: Compare this user's current action against their historical behavior. A user who has never loaded DLLs from a share via rundll32 is more suspicious than one who does so regularly as part of a deployment or administrative role. User role and typical toolset should align.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent+rundll32 combination historically routine on this host or across the environment, or is the parent unusual for rundll32?
+  context: When the alert fires under a service principal, user identity does not attribute behavior; the meaningful pivot is the launch mechanism. A new or rare parent for rundll32 on this host or environment-wide is the deviation worth chasing, while a pair that already accounts for thousands of prior events is vendor or operating-system automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: 'Alerts rarely occur in isolation. Examining activity around the alert reveals the immediate context: what led to the rundll32 invocation, what happened after, and whether it is part of a larger sequence. Look for reconnaissance, credential access, or persistence installation surrounding the event.'
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host -- defense tampering, reconnaissance, credential access, or remote access -- may reveal the attack stages that preceded the remote-DLL load and help reconstruct the timeline leading to lateral movement.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1218.011
+      name: Rundll32
+      role: primary
+    - id: T1021.002
+      name: SMB/Windows Admin Shares
+      role: secondary
+    - id: T1218
+      name: System Binary Proxy Execution
+      role: secondary
+    - id: T1021
+      name: Remote Services
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: rundll32_atypical_args
+      description: "rundll32.exe invoked with atypical arguments (remote .dll path, javascript:/vbscript:/mshtml syntax)"
+      mapped_to: Q3
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 2
+      label: dll_mapped_into_memory
+      description: "DLL not normally loaded by rundll32 mapped into memory; remote/reflective module load"
+      mapped_to: Q8
+      source: attack:T1218.011.image_load
+    - stage: 3
+      label: payload_staged_on_share
+      description: "Suspicious DLL or script accessed from disk or network share before load"
+      mapped_to: Q7
+      source: attack:T1218.011.file_event
+    - stage: 4
+      label: smb_share_access
+      description: "SMB-based remote admin-share access (C$/ADMIN$/IPC$) and remote logon preceding execution"
+      mapped_to: Q9
+      source: template:lateral_movement.source_host_identification
+    - stage: 5
+      label: remote_logon_correlation
+      description: "Network logon (4624/4648) by an account from a source host within the correlation window"
+      mapped_to: Q10
+      source: attack:T1021.002.user_context
+    - stage: 6
+      label: post_exec_followon
+      description: "Suspicious child processes (cmd.exe, powershell.exe, runonce.exe) executed after proxy load"
+      mapped_to: Q6
+      source: template:cue_process_tool.follow_on
+  dimension_coverage:
+    - dimension: parent_process_analysis
+      technique: T1218.011
+      covered_by: Q5
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1218.011
+      covered_by: Q8
+      source: attack:T1218.011.image_load
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1218.011
+      covered_by: Q13
+      source: template:lolbin.technique_class_lateral
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1021.002
+      covered_by: Q10
+      source: attack:T1021.002.user_context
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1021.002
+      covered_by: Q9
+      source: template:lateral_movement.source_host_identification
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1021.002
+      covered_by: Q2
+      source: template:universal.host_user_context
+      coverage_type: direct
+    - dimension: command_analysis
+      technique: T1218
+      covered_by: Q3
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1218
+      covered_by: Q15
+      source: template:cue_user_actor.baseline_svc
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1218
+      covered_by: Q12
+      source: template:lolbin.historical_lolbin_baseline
+      coverage_type: direct
+    - dimension: command_analysis
+      technique: T1021
+      covered_by: Q3
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1021
+      covered_by: Q16
+      source: template:cue_host_context.clustering
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1021
+      covered_by: Q11
+      source: template:cue_process_tool.baseline_deviation
+      coverage_type: indirect
+  mutable_dispositions:
+    - element: ShareName
+      dimension: tuning_parameter
+      specific_values: "C$, ADMIN$, IPC$"
+      disposition: context
+      target_question: Q9
+      notes: "Admin-share names named in source_host_identification context; the rule already fires on the ' \\\\' UNC token so the share path is captured by the verify_trigger_match command line. Not added to the SMB-port query selection because the port list, not share name, is the network-connection facet."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "5-10 minutes (remote access to remote execution)"
+      disposition: context
+      target_question: Q10
+      notes: "Correlation window described in the security-logon question context (correlate within a few minutes); also reflected in the +/-15m ranges of the file_event/image_load/network questions."
+    - element: UserContext
+      dimension: user_context
+      specific_values: "rationale only (expected remote admins vs rare/first-time access)"
+      disposition: context
+      target_question: Q10
+      notes: "Tuning rationale, no concrete values; surfaced as the 'expected remote administrator vs rare or first-time access' framing in the logon question and the user baseline."
+    - element: ProcessList
+      dimension: tuning_parameter
+      specific_values: "cmd.exe, powershell.exe, runonce.exe"
+      disposition: context
+      target_question: Q6
+      notes: "Suspicious post-copy binaries named in follow_on context. follow_on uses ADAPT_STRUCTURALLY but the value of the question is enumerating ANY child, not filtering to these three; named in context so the analyst knows what to flag."
+    - element: ParentProcessFilter
+      dimension: parent_process_analysis
+      specific_values: "rationale only (explorer.exe, office apps vs trusted installers)"
+      disposition: context
+      target_question: Q5
+      notes: "Tuning rationale; process_chain context names the unusual-parent candidates (office apps, wscript, mshta) vs trusted deployment agents."
+    - element: AllowedDLLs
+      dimension: tuning_parameter
+      specific_values: "rationale only (env baseline of legit rundll32 DLLs)"
+      disposition: context
+      target_question: Q12
+      notes: "Tuning rationale; historical baseline question lets the analyst establish the per-host baseline of typical command-line shapes."
+    - element: ExternalIPRange
+      dimension: tuning_parameter
+      specific_values: "rationale only (anomalous external IP scope)"
+      disposition: context
+      target_question: Q8
+      notes: "Tuning rationale; image_load question flags loads from remote/user-writable paths. External-IP scoping is environment-specific and not hard-codeable in the query."
+    - element: CommandLineRegex
+      dimension: command_analysis
+      specific_values: "rationale only (URLs, script paths, DLL entrypoints)"
+      disposition: context
+      target_question: Q3
+      notes: "Tuning rationale; mechanism_decode context directs the analyst to read the DLL path, export name, and javascript:/vbscript:/mshtml proxy syntax."
+    - element: SignedBinaryList
+      dimension: tuning_parameter
+      specific_values: "msiexec.exe, regsvr32.exe (proxy-exec family)"
+      disposition: query_injection
+      target_question: Q13
+      notes: "Proxy-execution binary family injected into technique_class_lateral selection_img list (regsvr32, mshta, msiexec, installutil, etc.), excluding rundll32 itself."
+    - element: RemoteDomainAllowlist
+      dimension: tuning_parameter
+      specific_values: "rationale only (suppress legit enterprise domains)"
+      disposition: context
+      target_question: Q8
+      notes: "Tuning rationale; environment-specific allowlisting not hard-codeable. image_load/file_event questions surface remote-sourced artifacts for the analyst to judge against known-good sources."
+    - element: LogonUser
+      dimension: tuning_parameter
+      specific_values: "rationale only (limit to service/privileged users)"
+      disposition: context
+      target_question: Q10
+      notes: "Tuning rationale; logon question projects TargetUserName so the analyst can judge service-account vs interactive-user context."
+    - element: RemoteHostList
+      dimension: tuning_parameter
+      specific_values: "rationale only (allowlist admin jumpboxes/deploy tools)"
+      disposition: context
+      target_question: Q9
+      notes: "Tuning rationale; source_host_identification projects SourceIp so the analyst can compare against known admin jump boxes."
+  dedup_decisions:
+    - dropped: cue_process_tool.clustering
+      reason: "within-phase overlap with cue_host_context.clustering (both host.name-scoped 'what else ran' aggregations); host_context version projects Image+ParentImage (broader) and is kept."
+      kept: cue_host_context.clustering
+    - dropped: cue_user_actor.clustering
+      reason: "user-network-wide clustering overlaps with network_scope.actor_activity_network_wide; both answer 'what else did this user do across the network'. Dropped to stay within the 18-question cap and avoid three near-identical User-scoped network questions. User-actor BASELINE pair retained as it pivots on historical frequency, not concurrent activity."
+      kept: cue_user_actor.baseline
+    - dropped: cue_user_actor.clustering_svc
+      reason: "service-principal sibling of cue_user_actor.clustering; dropped together with its user-pivot partner since the clustering pivot itself was dropped (the pair is non-deduplicable from EACH OTHER, but the whole clustering pair was cut for cap reasons in favor of the baseline pair)."
+      kept: cue_user_actor.baseline_svc
+    - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc
+      reason: "user_actor pair -- non-deduplicable. Both emitted as separate questions (Q15 user-pivot, Q16 parent+binary substitute)."
+      kept: both
+  skipped_templates:
+    - template: universal.endpoint_protection_health
+      reason: "RECOMMENDED, not must_include. cue_host_context.precursor is present and surfaces prior tamper/defense-evasion alerts on the host; the rule fires on proxy execution rather than a hands-on-keyboard impact action where tamper-as-precursor is the deciding question. Dropped to stay within the 18-question cap per template notes_to_llm drop-condition (b)."
+    - template: lateral_movement.authentication_method
+      reason: "ProcessGuid-scoped User/CommandLine redisplay; the security-logon question (attack:T1021.002.user_context) covers the authentication-method angle with an actual security-logsource query (4624/4648, LogonType) instead of redisplaying the alert event. Dropped to avoid a low-value alert redisplay under the cap."
+    - template: lateral_movement.target_activity_after_access
+      reason: "host.name-scoped 'what processes spawned after access' aggregation duplicates the follow_on (child processes of rundll32) and host_context.clustering coverage. Dropped under the cap."
+    - template: lateral_movement.lateral_movement_scope
+      reason: "User-scoped lateral-tool usage; overlaps user-actor baseline and network_scope coverage. Dropped under the cap to keep the playbook focused on the rundll32 proxy-execution chain rather than a generic PsExec/RDP lateral sweep the rule does not detect."
+    - template: network_scope.same_action_other_hosts
+      reason: "Image|endswith %Image% cross-host count of rundll32 alone is too generic (rundll32 runs everywhere); the REFLECTED fleet-pattern coverage is provided more precisely by the rule-pattern-scoped queries (historical_lolbin_baseline / baseline_deviation are host-scoped, and the analyst can broaden). Dropped under the cap."
+    - template: network_scope.actor_activity_network_wide
+      reason: "Duplicates cue_user_actor clustering intent (User-scoped network-wide activity). Dropped under the cap in favor of the user-actor baseline pair."
+    - template: network_scope.actor_authentication_trail
+      reason: "Security-logsource 4624/4625 user auth trail overlaps the attack:T1021.002.user_context security-logon question, which is scoped to this host and the share-access window. Dropped under the cap to avoid two security-logsource auth questions."
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "LOLBin rule -- check for renamed binary and other LOLBins achieving same objective"
+      disposition: acted_on
+      reason: >-
+        Acted on. Renamed-binary check authored as Q4 (lolbin.renamed_binary_check, OriginalFileName vs Image path); other
+        proxy-execution LOLBins authored as Q14 (lolbin.technique_class_lateral, scoped to the proxy-execute family and
+        excluding rundll32 itself).
+    - hint: "logsource 'file_event' (recommended by techniques: T1218.011) is not covered -- pull in cue_artifact.* or author a custom question with `category: file_event`"
+      disposition: acted_on
+      reason: >-
+        Acted on. Authored Q7 (attack:T1218.011.file_event) with logsource category: file_event scoped to the alert's
+        file_dirs to surface the staged .dll/.sct/.hta/.cpl artifact behind the remote-DLL load.
+    - hint: "logsource 'image_load' (recommended by techniques: T1218.011) is not covered -- pull in cue_image_load.* or author a custom question with `category: image_load`"
+      disposition: acted_on
+      reason: >-
+        Acted on. Authored Q8 (attack:T1218.011.image_load) with logsource category: image_load filtered to rundll32.exe
+        on the alerting host, surfacing modules mapped from remote or user-writable paths (reflective/floating modules).
+    - hint: "logsource 'security' (recommended by techniques: T1021.002) is not covered and no template family exists -- author a custom question with `category: security`"
+      disposition: acted_on
+      reason: >-
+        Acted on. Authored Q10 (attack:T1021.002.user_context) with logsource service: security querying EventID 4624/4648
+        network/explicit logons scoped to the alerting host, to tie the UNC share access back to an account and source host.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - lateral_movement
+    - network_scope
+    - lolbin
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 14
+      attack: 3
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 14
+    logsource_diversity:
+      process_creation: 12
+      file_event: 1
+      image_load: 1
+      network_connection: 1
+      security: 1
+      sigma_alert: 1

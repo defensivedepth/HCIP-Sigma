@@ -1,0 +1,689 @@
+name: Elevated System Shell Spawned From Uncommon Parent Location
+id: c9443dbb-16f8-4068-8575-72465462cc4b
+description: |
+  Detects a command interpreter (powershell.exe, powershell_ise.exe, pwsh.exe, or
+  cmd.exe, confirmed by OriginalFileName) running with SYSTEM-level credentials
+  (User containing AUTHORI/AUTORI and LogonId 0x3e7) AND launched from a parent
+  process that does not live in the usual system or program directories. The rule
+  excludes the common, expected parent locations (Program Files, ProgramData,
+  System32, SysWOW64, WinSxS, Windows\Temp) and a short list of known-benign
+  agent parents, so a fire means a SYSTEM-privileged shell was spawned by something
+  outside those locations. Legitimately this can be IT tooling or an agent not on
+  the exclusion list; maliciously it is a hallmark of local privilege escalation —
+  an exploit primitive or hijacked service dropping an elevated shell from an
+  unexpected location. The investigation should confirm the SYSTEM context and the
+  unusual parent, decode what the shell did, and determine whether earlier activity
+  on the host set up the escalation.
+type: detection
+detection_id: 178e615d-e666-498b-9630-9ed363038101
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the alert match the rule — a command interpreter running as SYSTEM (User contains AUTHORI/AUTORI and LogonId 0x3e7) from a parent outside the usual system and program directories?
+  context: Before investing investigation time, confirm this is a true positive. Verify the
+    Image is one of cmd.exe, powershell.exe, powershell_ise.exe, or pwsh.exe and that
+    OriginalFileName confirms the genuine interpreter, the User is an AUTHORITY/SYSTEM
+    account with LogonId 0x3e7, and the parent process is NOT in Program Files,
+    ProgramData, System32, SysWOW64, WinSxS, or Windows\Temp. All three conditions
+    must hold together for the rule to fire; the parent location is the anomaly that
+    separates this from routine SYSTEM-context shell activity.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - User
+      - LogonId
+- source: template:universal.host_user_context
+  question: Is this host expected to spawn a SYSTEM-level shell from this parent process?
+  context: A SYSTEM-context interpreter is normal for some management and provisioning
+    tooling, but only from a known set of parents. Knowing whether this host runs
+    software that legitimately launches an elevated shell from this particular parent
+    location is often the fastest way to separate an exception that simply is not on
+    the rule's exclusion list from genuine privilege escalation. A general-purpose
+    workstation with no such tooling launching a SYSTEM shell from an odd parent is
+    far more concerning than a build or management server with known automation.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:masquerading.true_identity
+  question: Is this a genuine Windows command interpreter, or a renamed binary masquerading as one?
+  context: The rule keys on OriginalFileName as well as Image, so confirm the embedded
+    PE metadata (OriginalFileName) actually reads PowerShell.EXE, powershell_ise.EXE,
+    pwsh.dll, or Cmd.Exe and that the Image path is a real interpreter rather than a
+    relocated or renamed copy. The signing party and signature status indicate whether
+    this is the Microsoft-signed system binary or an unsigned/tampered substitute, and
+    the file hash enables a reputation lookup. A genuine, signed interpreter shifts the
+    focus to how it was launched; a mismatch or unsigned binary is itself the finding.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - Hashes
+- source: template:cue_process_tool.mechanism_decode
+  question: What exactly did this elevated shell do? Decode its full command line.
+  context: The full command line reveals the specific action the SYSTEM-context shell
+    took. Decode any flags, encoded content (-EncodedCommand / -enc), file paths, or
+    embedded URLs. Because cmd.exe and powershell.exe are too common to scope by binary
+    name on a busy host, this query retrieves the exact triggering event by its process
+    identity. A SYSTEM shell that immediately downloads, writes, or executes secondary
+    content is materially different from one that runs a single benign maintenance command.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:powershell.encoded_command_decode
+  question: Was the command encoded or obfuscated? What does it decode to?
+  context: Attackers frequently use PowerShell's -EncodedCommand (-enc) parameter or string
+    concatenation, backtick escaping, and variable substitution to hide malicious intent.
+    Base64-encoded commands are the most common form. Decoding reveals the actual payload --
+    download cradles, reverse shells, or in-memory execution of .NET assemblies. An elevated
+    SYSTEM shell carrying an encoded payload is a strong reason to escalate.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:cue_process_tool.process_chain
+  question: What process spawned this elevated shell, and where on disk does that parent live?
+  context: The parent is the core anomaly here — the rule fires precisely because the parent
+    is outside the usual system and program directories. Identify the parent's full Image
+    path and what spawned the parent in turn. A parent running from a user-writable or
+    temporary location, an exploited service, or a recently created executable points to
+    privilege escalation; a parent that is simply an agent missing from the exclusion list
+    points to a benign exception. The ParentProcessGuid lookup uses a long window because
+    long-running services and login sessions often start well before the alert.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in the hour before the alert?
+  context: Tampering typically precedes payload execution. The query surfaces direct attempts
+    to disable AV/EDR services, flip Defender flags, add broad exclusions, clear logs, or
+    patch AMSI/ETW. Zero rows is a useful "protection looks healthy" signal -- kernel-level
+    driver tampering and in-memory patches will not appear here. Populated rows shift the
+    disposition toward operator preparation; review the parent process and signing chain to
+    identify the writer. A SYSTEM-context shell that follows defense tampering is a strong
+    escalation chain.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+- source: template:powershell.powershell_security_bypass
+  question: Were PowerShell security controls bypassed or weakened before this execution?
+  context: Attackers often disable or bypass PowerShell security controls before running their
+    payload. Common techniques include AMSI bypass (patching amsi.dll in memory), execution
+    policy changes (Set-ExecutionPolicy or -ep bypass flag), constrained language mode escape,
+    and PowerShell downgrade attacks (using powershell.exe v2 which lacks logging). Finding
+    these precursor events on the same host strengthens the case for malicious activity.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- source: template:powershell.script_block_logging
+  question: Did PowerShell script block logging capture the full script content?
+  context: Script block logging records the deobfuscated script content that PowerShell actually
+    executes, even when the command line is encoded or obfuscated. This provides ground truth
+    about what ran, bypassing attacker obfuscation. If PowerShell operational logs are not
+    ingested in this environment, treat zero results as a visibility gap rather than evidence
+    nothing ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- source: template:cue_process_tool.follow_on
+  question: What child processes did this elevated shell spawn afterward?
+  context: The processes spawned by the SYSTEM-context shell reveal its actual impact. A
+    legitimate maintenance shell typically spawns predictable, well-known children; an
+    escalation shell often spawns reconnaissance, credential-access, or persistence tooling
+    (cmd.exe, powershell.exe, certutil.exe, reg.exe, or unsigned binaries). Any child running
+    at the same SYSTEM privilege inherits the elevation and widens the blast radius.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired this rule's pattern, what parents and users drove it, and does the current alert fit?
+  context: Even a SYSTEM-context shell from an unusual parent can be routine on some hosts.
+    The query mirrors the rule's full selection structure scoped to this host, so the
+    resulting parent/user distribution reflects how this specific firing pattern -- not
+    generic shell usage -- has historically run here. A new parent process, an unexpected
+    account, or a first-time pattern is the deviation worth chasing; a parent that already
+    accounts for prior fires points to a known local exception.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_shell:
+      - Image|endswith:
+        - \powershell.exe
+        - \powershell_ise.exe
+        - \pwsh.exe
+        - \cmd.exe
+      - OriginalFileName:
+        - PowerShell.EXE
+        - powershell_ise.EXE
+        - pwsh.dll
+        - Cmd.Exe
+      selection_user:
+        User|contains:
+        - AUTHORI
+        - AUTORI
+        LogonId: '0x3e7'
+      filter_main_generic:
+        ParentImage|contains:
+        - :\Program Files (x86)\
+        - :\Program Files\
+        - :\ProgramData\
+        - :\Windows\System32\
+        - :\Windows\SysWOW64\
+        - :\Windows\Temp\
+        - :\Windows\WinSxS\
+      filter_optional_manageengine:
+        ParentImage|endswith: :\ManageEngine\ADManager Plus\pgsql\bin\postgres.exe
+        Image|endswith: \cmd.exe
+      filter_optional_asgard:
+        CommandLine|contains: :\WINDOWS\system32\cmd.exe /c "
+        CurrentDirectory|contains: :\WINDOWS\Temp\asgard2-agent\
+      filter_optional_ibm_spectrumprotect:
+        ParentImage|contains: :\IBM\SpectrumProtect\webserver\scripts\
+        CommandLine|contains: :\IBM\SpectrumProtect\webserver\scripts\
+      filter_main_parent_null:
+        ParentImage: null
+      filter_main_parent_empty:
+        ParentImage:
+        - ''
+        - '-'
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_* and not 1 of filter_main_* and not 1 of filter_optional_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_user_actor.baseline
+  question: Does this user account normally run this command interpreter?
+  context: Compare this account's current action against its historical behavior. The rule
+    fires under an AUTHORITY/SYSTEM principal, so a user-identity pivot is most meaningful
+    when the account is interactive rather than a machine principal. A user who has never
+    run this interpreter is more suspicious than one who does so regularly; user role and
+    typical toolset should align with elevated shell usage.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent+interpreter combination historically routine on this host or across the environment, or is the parent unusual for this binary?
+  context: When the alert fires under a SYSTEM principal, user identity does not attribute
+    behavior, so the meaningful pivot is the launch mechanism — which parent process spawned
+    this interpreter, and whether that pair is historically common. A new or rare parent for
+    this interpreter on this host (or environment-wide) is the deviation worth chasing; a pair
+    that already accounts for thousands of prior events is vendor or OS automation that simply
+    is not on the rule's exclusion list.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user account do across the network around this time?
+  context: Tracking the account's activity across all hosts in the alert window reveals
+    lateral movement or activity spanning multiple endpoints. If the same account triggered
+    similar activity elsewhere, the scope may be larger than one host. When the alert fires
+    under a machine principal, this view returns broad agent-telemetry activity; the
+    parent+interpreter pivot is the precise read in that case.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent+interpreter combination fire on other hosts in the same window — a coordinated automation rollout, or activity isolated to this host?
+  context: Under a SYSTEM principal, asking what else the user did across the network returns
+    agent-telemetry noise, since every host runs SYSTEM-owned agents constantly. The precise
+    question is whether the same launch mechanism — parent process plus spawned interpreter —
+    fired on other hosts in the alert window. Multiple hosts in the same window points to
+    scheduled or pushed automation; a single host points to a host-local trigger such as a
+    local exploit.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired this rule's pattern in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: The query mirrors the rule's full selection structure with no host scope, so the
+    result is a fleet-wide count of this firing pattern rather than generic interpreter usage.
+    Many hosts firing the same SYSTEM-context pattern points to a scripted deployment or a
+    vendor agent that is not on the exclusion list; one host or a small unrelated set points
+    to manual operator activity or a local exploit. Use the host distribution and parent
+    consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_shell:
+      - Image|endswith:
+        - \powershell.exe
+        - \powershell_ise.exe
+        - \pwsh.exe
+        - \cmd.exe
+      - OriginalFileName:
+        - PowerShell.EXE
+        - powershell_ise.EXE
+        - pwsh.dll
+        - Cmd.Exe
+      selection_user:
+        User|contains:
+        - AUTHORI
+        - AUTORI
+        LogonId: '0x3e7'
+      filter_main_generic:
+        ParentImage|contains:
+        - :\Program Files (x86)\
+        - :\Program Files\
+        - :\ProgramData\
+        - :\Windows\System32\
+        - :\Windows\SysWOW64\
+        - :\Windows\Temp\
+        - :\Windows\WinSxS\
+      filter_optional_manageengine:
+        ParentImage|endswith: :\ManageEngine\ADManager Plus\pgsql\bin\postgres.exe
+        Image|endswith: \cmd.exe
+      filter_optional_asgard:
+        CommandLine|contains: :\WINDOWS\system32\cmd.exe /c "
+        CurrentDirectory|contains: :\WINDOWS\Temp\asgard2-agent\
+      filter_optional_ibm_spectrumprotect:
+        ParentImage|contains: :\IBM\SpectrumProtect\webserver\scripts\
+        CommandLine|contains: :\IBM\SpectrumProtect\webserver\scripts\
+      filter_main_parent_null:
+        ParentImage: null
+      filter_main_parent_empty:
+        ParentImage:
+        - ''
+        - '-'
+      condition: all of selection_* and not 1 of filter_main_* and not 1 of filter_optional_*
+    fields:
+    - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — defense
+    tampering, reconnaissance, exploitation attempts, or credential access — may reveal the
+    stages that preceded a SYSTEM-level shell and help reconstruct the escalation timeline.
+    A privilege-escalation primitive that culminates in an elevated shell is often preceded
+    by visible setup activity.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1059
+      name: Command and Scripting Interpreter
+      role: primary
+  attack_chain_coverage:
+    - stage: 1
+      label: interpreter_execution
+      description: "A scripting/command interpreter (cmd.exe, powershell.exe, pwsh.exe, powershell_ise.exe) executes"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: abnormal_user_context
+      description: "Interpreter runs under an abnormal/elevated user context (SYSTEM / AUTHORITY, LogonId 0x3e7)"
+      mapped_to: Q2
+      source: template:universal.host_user_context
+    - stage: 3
+      label: abnormal_parent_origin
+      description: "Interpreter spawned from a parent outside expected system/program locations"
+      mapped_to: Q6
+      source: template:cue_process_tool.process_chain
+    - stage: 4
+      label: encoded_or_secondary_execution
+      description: "Followed by encoded/obfuscated arguments or secondary execution events"
+      mapped_to: Q5
+      source: template:powershell.encoded_command_decode
+  dimension_coverage:
+    - dimension: command_analysis
+      technique: T1059
+      covered_by: Q4
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1059
+      covered_by: Q6
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1059
+      covered_by: Q14
+      source: template:cue_user_actor.clustering
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1059
+      covered_by: Q11
+      source: template:cue_process_tool.baseline_deviation
+      coverage_type: indirect
+    - dimension: user_context
+      technique: T1059
+      covered_by: Q2
+      source: template:universal.host_user_context
+      coverage_type: direct
+  mutable_dispositions:
+    - element: CommandLinePattern
+      dimension: command_analysis
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q4
+      notes: "Tuning rationale (match encoded/uncommon patterns) with no concrete values; rule has empty commandline_values. Covered by the decode question's context plus the encoded_command_decode question; no query injection possible without inventing values."
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q6
+      notes: "Tuning rationale (parents vary across managed/unmanaged hosts). Realized as the parent-chain question and the parent+binary baseline/clustering pivots, which surface the actual parent values per host rather than a fixed list."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q14
+      notes: "Tuning rationale (restrict to work hours / admin windows). No concrete threshold to inject; addressed by the around-this-time clustering window and the -14d/-7d baseline windows."
+  dedup_decisions:
+    - dropped: cue_process_tool.clustering
+      reason: "time_correlation already covered by user_actor.clustering (+/-1h network-wide) and host-window baselines; a separate aggregate-by-Image clustering would duplicate the around-the-alert view without adding a distinct angle."
+      kept: cue_user_actor.clustering
+    - dropped: cue_host_context.clustering
+      reason: "Overlaps host_context.precursor (alert timeline) and user_actor.clustering (around-time activity); dropped to stay within 14-18 and avoid a third near-identical around-the-alert-window question."
+      kept: cue_host_context.precursor
+    - dropped: cue_process_tool.baseline
+      reason: "host+binary 90d frequency of the raw interpreter is dominated by routine cmd/powershell usage and would not isolate the rule's SYSTEM-from-unusual-parent pattern; the reflected baseline_deviation gives the filter-correct host baseline instead."
+      kept: cue_process_tool.baseline_deviation
+    - dropped: cue_user_actor.baseline (paired with substitute)
+      reason: "user_actor pair — non-deduplicable; both user-pivot and parent+binary substitute emitted as Q12 and Q13."
+      kept: cue_user_actor.baseline + cue_user_actor.baseline_svc
+    - dropped: cue_user_actor.clustering (paired with substitute)
+      reason: "user_actor pair — non-deduplicable; both user-pivot and parent+binary substitute emitted as Q14 and Q15."
+      kept: cue_user_actor.clustering + cue_user_actor.clustering_svc
+  skipped_templates:
+    - template: masquerading.binary_origin
+      reason: "file_event basename-arrival question targets dropped/renamed binaries. This rule's binaries are genuine OS interpreters confirmed by OriginalFileName; tracing the arrival of cmd.exe/powershell.exe by basename over 30d returns the OS install/servicing events, not a delivery mechanism. The masquerading angle here is the parent location, not a planted file — covered by the parent-chain and identity questions."
+    - template: masquerading.renamed_binary_activity
+      reason: "Two threads (child-process activity + cross-host scope) are already covered: child activity by cue_process_tool.follow_on (ParentProcessGuid-scoped, more precise than ParentImage match), and cross-host scope by the reflected cue_process_tool.scope which counts the rule's exact pattern fleet-wide. Keeping it would duplicate both without adding signal."
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "powershell.encoded_command_decode replaces obfuscation.encoded_payload_decode"
+      disposition: declined
+      reason: "obfuscation.encoded_payload_decode was never a candidate template for this rule (not present in templates[]). The powershell.encoded_command_decode question is included as Q5, so the intended coverage (encoded/obfuscated command decode) is present; there is nothing to replace."
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - powershell
+    - masquerading
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 17
+      attack: 0
+      llm_generated: 0
+    phase_distribution:
+      triage: 1
+      analysis: 2
+      context: 14
+    logsource_diversity:
+      process_creation: 15
+      powershell_service: 1
+      sigma_alert: 1

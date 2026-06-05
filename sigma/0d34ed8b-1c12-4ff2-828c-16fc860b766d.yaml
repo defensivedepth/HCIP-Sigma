@@ -1,0 +1,575 @@
+name: Suspicious Processes Spawned by Java.EXE
+id: 2bba8cbc-a34e-483d-9132-5925f93a3da4
+description: |
+  Detects a Java host process (an Image ending in java.exe) spawning one of a set of
+  living-off-the-land system binaries such as certutil.exe, bitsadmin.exe, curl.exe, mshta.exe,
+  regsvr32.exe, rundll32.exe, schtasks.exe, reg.exe, net.exe, whoami.exe, or wscript.exe. The rule
+  fires when the parent Image ends in java.exe AND the child Image ends in one of those binaries.
+  Java application servers (Tomcat, Jetty, JBoss and similar) do not normally spawn command-line
+  system utilities, so a java.exe parent launching one of these tools is a common post-exploitation
+  signature, including exploitation of a Java application that logs untrusted input. The
+  investigation should confirm which child binary spawned, decode what that child did, trace what
+  started the Java process and what request reached it, and determine whether the Java application
+  is patched and whether the spawning pattern is routine for this host.
+type: detection
+detection_id: 0d34ed8b-1c12-4ff2-828c-16fc860b766d
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-04
+questions:
+- source: template:universal.verify_trigger_match
+  question: Did a process ending in java.exe spawn one of the watched system binaries, and which child binary fired?
+  context: Confirm the alert before investing time. The rule fires when the parent Image ends in
+    java.exe AND the child Image ends in one of a set of system utilities such as certutil.exe,
+    bitsadmin.exe, curl.exe, mshta.exe, regsvr32.exe, rundll32.exe, schtasks.exe, reg.exe, net.exe,
+    whoami.exe, or wscript.exe. Read the exact ParentImage and Image from the triggering event and
+    note which child binary fired, because the firing binary determines which downstream questions
+    carry weight. A certutil or bitsadmin child points at download or decode; schtasks or reg points
+    at persistence; net, whoami, or systeminfo points at reconnaissance.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+- source: template:universal.host_user_context
+  question: Is this host expected to run a Java application that spawns command-line system tools?
+  context: Java application servers run as service accounts and normally spawn only their own helper
+    processes, not interactive system utilities. A host whose role is to serve a Java application has
+    no routine reason for that application to launch certutil, bitsadmin, schtasks, reg, or net. If
+    the host is a developer workstation where a Java build or IDE legitimately shells out to system
+    tools, that weakens the signal; a production application server spawning these tools strengthens it.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:parent_child.parent_process_legitimacy
+  question: What started the Java process, and is this Java instance expected to spawn a child like this?
+  context: The Java-parent-to-system-tool relationship is the core signal for this detection. Tracing
+    the Java process back to its own origin reveals whether it is a legitimate application server, a
+    build tool, or an interactive Java program. A Java application server that was reached over the
+    network and then spawned a system utility is the classic exploitation chain, where untrusted input
+    drives the server to execute attacker-chosen commands. Identify what launched the Java process and
+    what its own command line and working directory indicate about the running application.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- source: template:cue_process_tool.mechanism_decode
+  question: What exactly did the spawned child binary do? Decode its full command line and working directory.
+  context: The full command line of the child binary reveals the operation. A bitsadmin or certutil
+    invocation may carry a remote URL and an output path for a download or a decode of staged content;
+    a schtasks or reg invocation carries the persistence target; net, whoami, or systeminfo carries the
+    reconnaissance scope. Decode any flags, encoded arguments, URLs, and file paths to determine what
+    the child actually did. The query returns every execution of this binary on the host in a tight
+    window, so a multi-step operation split across sequential invocations is visible as one sequence.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:parent_child.sibling_processes
+  question: What other child processes did this same Java instance spawn?
+  context: If a compromised Java process spawned the detected child, it likely spawned others in
+    sequence. Examining the siblings of the exact Java instance reveals the full scope of activity
+    driven through this process, such as a download followed by a decode followed by a persistence
+    install. Multiple system utilities spawned by one Java process in a short window points to
+    orchestrated post-exploitation rather than a single stray invocation.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:initial_access.delivery_vector
+  question: What request or input reached the Java application immediately before it spawned this child?
+  context: When a Java application server is driven to spawn a system tool, the trigger is usually a
+    network request carrying untrusted input that the application processes. Identifying the originating
+    request, its source address, and the targeted endpoint enables blocking at the perimeter and finding
+    other affected systems. The application logs and any web or proxy records for this host around the
+    spawn time hold the originating request; the query here returns the Java parent context to anchor
+    that timeline.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+- source: template:initial_access.application_patch_status
+  question: Is the Java application running a patched version, or is it exposed to a known remote-code-execution flaw?
+  context: A Java application spawning system tools after receiving network input commonly indicates
+    exploitation of a known vulnerability in the application or one of its libraries, including
+    logging-library flaws that evaluate attacker-controlled input. Confirming the installed version and
+    its patch level against published advisories determines whether the exploitation path was open, and
+    whether other hosts running the same unpatched component are exposed. The query returns the parent
+    application to identify what software needs version verification.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+- source: template:cue_parent_process.scope
+  question: Is a Java process spawning these system binaries occurring on other hosts in the environment?
+  context: The same Java-to-system-tool spawning pattern appearing on multiple hosts points at a wave of
+    exploitation against a shared, internet-reachable, or widely deployed Java application rather than a
+    single targeted host. A single occurrence is more likely isolated. Comparing across hosts calibrates
+    scope and identifies additional servers running the same exposed application that need investigation.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+      - CommandLine
+- source: template:obfuscation.encoded_payload_decode
+  question: Is the child command line encoded or obfuscated, and what does it decode to?
+  context: Operators frequently hide the payload behind encoding so casual inspection of the command line
+    reveals little. Common forms include base64 in a certutil decode, hex, URL-encoding, character
+    concatenation, and double-encoding. For a certutil child, look for the decode flags and the named
+    source and output files; for a script-host child, reconstruct any concatenated or character-code
+    strings. Decoding reveals the real intent, such as a download cradle, an in-memory loader, a reverse
+    shell, or staged content written to disk.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:discovery_recon.discovery_burst_detection
+  question: Did other reconnaissance commands run on this host around the same time?
+  context: A single discovery command may be routine, but several reconnaissance commands in rapid
+    succession, such as whoami, net user, systeminfo, and ipconfig, is a signature of post-compromise
+    enumeration. After driving a Java application to execute a system tool, operators commonly enumerate
+    the host and domain to understand their context before the next stage. Several distinct recon
+    binaries within a short window on this host strengthens the post-exploitation interpretation.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_recon:
+        Image|endswith:
+          - '\whoami.exe'
+          - '\systeminfo.exe'
+          - '\ipconfig.exe'
+          - '\net.exe'
+          - '\net1.exe'
+          - '\nltest.exe'
+          - '\dsquery.exe'
+          - '\nbtstat.exe'
+          - '\arp.exe'
+          - '\netstat.exe'
+          - '\tasklist.exe'
+          - '\qprocess.exe'
+          - '\query.exe'
+          - '\quser.exe'
+          - '\hostname.exe'
+          - '\nslookup.exe'
+          - '\adfind.exe'
+          - '\csvde.exe'
+          - '\ldifde.exe'
+          - '\dnscmd.exe'
+          - '\cmdkey.exe'
+          - '\setspn.exe'
+      condition: selection and selection_recon
+    fields:
+      - Image
+      - User
+- source: template:scheduled_task.task_configuration
+  question: If the child was schtasks.exe, what scheduled task was created and what command does it run?
+  context: When the firing child is schtasks.exe, the command line carries the task name, trigger
+    schedule, and the command or program to execute. A Java process installing a scheduled task is a
+    persistence step, so identify the task name, the run command, the schedule type, and the run-as
+    account from the arguments. A task that runs at logon or system startup, or that runs as SYSTEM,
+    establishes durable execution that survives reboot.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:registry.registry_key_context
+  question: If the child was reg.exe, what registry key and value were modified, and is it a known persistence or evasion location?
+  context: When the firing child is reg.exe, the targeted path reveals intent. Run and RunOnce keys
+    indicate persistence; keys under the Windows Defender policy paths indicate security-tool tampering;
+    Image File Execution Options keys indicate debugger-based hijacking. The query returns the registry
+    write linked to the same process so the key path and value data appear as structured fields; the
+    reg.exe command line carries the same key, value name, and data if the registry event is not available.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in the hour before the alert?
+  context: Tampering with protection often precedes payload execution. The query surfaces direct attempts
+    to disable AV or EDR services, flip Defender flags, add broad exclusions, clear logs, or patch the
+    in-process scanning and tracing interfaces. Zero rows is a useful signal that protection looks
+    healthy, though kernel-level driver tampering and in-memory patches will not appear here. Populated
+    rows shift the disposition toward operator preparation, so review the writing process and its signing
+    chain.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+- source: template:cue_user_actor.baseline
+  question: Does the account that ran this Java process normally perform this kind of activity?
+  context: Compare the running account against its historical behavior. A Java application server account
+    that has never spawned the detected system tool, or a user account that has no history of running it,
+    is more suspicious than one that does so routinely. The account role and its typical toolset should
+    align with the detected behavior; a mismatch points away from sanctioned administration.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is the Java-parent-plus-this-binary launch pattern historically routine on this host or across the environment?
+  context: When the alert fires under a service account, user identity does not attribute behavior, so the
+    meaningful pivot is the launch mechanism. How often has a Java parent spawned this specific binary on
+    this host and across the environment. A new or rare Java-to-this-binary pairing is the deviation worth
+    chasing, while a pairing that already accounts for many prior events is more likely an established
+    application or automation behavior on this host.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining activity around the spawn reveals the immediate
+    context, what led to it and what followed, and whether it is part of a larger sequence. Aggregating by
+    process and parent collapses repetitive agent telemetry into high-count rows while novel parent-child
+    pairs stand out at low counts, which is what distinguishes the operator's activity from background noise.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+_generation_meta:
+  has_attack_brief: false
+  techniques: []
+  attack_chain_coverage: []
+  dimension_coverage: []
+  mutable_dispositions: []
+  dedup_decisions:
+    - dropped: cue_process_tool.process_chain
+      reason: "Hint: parent_process is primary — process_chain (ProcessGuid -> ParentProcessGuid) is subsumed by parent_child.parent_process_legitimacy (Q3), which performs the same parent lookup with a richer projection and the Java-specific framing."
+      kept: parent_child.parent_process_legitimacy
+    - dropped: cue_parent_process.follow_on
+      reason: "parent_child.sibling_processes (Q5) covers the same 'what else did this parent spawn' question scoped to the exact parent instance via ParentProcessGuid, which is more precise than follow_on's parent-binary-name scoping."
+      kept: parent_child.sibling_processes
+    - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc
+      reason: "user_actor clustering pair dropped to hold the 16-question budget; the cross-host / same-window scope it asks is covered by cue_parent_process.scope (Q8, same parent-child pair env-wide) and cue_host_context.clustering (Q16, host-wide activity sweep). The baseline pair (Q14/Q15) is retained as non-deduplicable per AGENTS.md."
+      kept: cue_parent_process.scope / cue_host_context.clustering
+    - dropped: discovery_recon.discovery_user_context
+      reason: "Overlaps universal.host_user_context (Q2); per the template's own note, prefer one role-expectation question. host_user_context is kept because it is framed to the Java-application-server context this rule fires in."
+      kept: universal.host_user_context
+  skipped_templates:
+    - template: cue_parent_process.mechanism_decode
+      reason: "Duplicate of the parent lookup already covered by parent_child.parent_process_legitimacy (Q3); both retrieve the Java parent's own process_creation event."
+    - template: cue_parent_process.baseline
+      reason: "parent-child frequency baseline is covered by cue_user_actor.baseline_svc (Q15), which aggregates the same parent-name + child-binary pair env-wide; a second host-scoped variant would be near-identical."
+    - template: cue_parent_process.clustering
+      reason: "Same +/-15m host activity sweep as cue_host_context.clustering (Q16); kept the host_context version for its Image+ParentImage aggregation shape."
+    - template: cue_process_tool.process_chain
+      reason: "Dropped per parent_process-primary hint — recorded in dedup_decisions."
+    - template: cue_process_tool.baseline
+      reason: "Per-binary host baseline is covered by cue_user_actor.baseline (Q14, account+binary) and baseline_svc (Q15, parent+binary); a third Image-only host baseline adds little for a rule whose discriminator is the Java parent, not the binary alone."
+    - template: cue_host_context.precursor
+      reason: "Budget (16-question target). Prior-alert timeline value is partly carried by cue_parent_process.scope (Q8, same pattern across hosts/time) and the host activity sweep (Q16); the Java-exploitation precursor of interest (the inbound request) is captured by delivery_vector (Q6)."
+    - template: discovery_recon.discovery_parent_chain
+      reason: "The discovery parent chain here is always java.exe by construction of the rule; parent_process_legitimacy (Q3) and the decode question (Q4) already establish the parent and the child's purpose."
+    - template: discovery_recon.discovery_user_context
+      reason: "Dropped as overlapping host_user_context — recorded in dedup_decisions."
+    - template: registry.registry_related_modifications
+      reason: "Budget; reg.exe is one of 23 possible children and only fires conditionally. registry_key_context (Q12) covers the firing reg.exe event; a host-wide reg-sweep is lower yield than the cross-cutting decode/scope questions for this multi-binary rule."
+    - template: registry.registry_value_persistence_check
+      reason: "Budget; persistence-payload-on-disk check is a file_event branch that only applies when the child is reg.exe writing a Run key. Lower yield than the shared decode/parent/scope questions for a multi-binary parent-child rule."
+    - template: scheduled_task.task_trigger_and_timing
+      reason: "Budget; only applies when the child is schtasks.exe. task_configuration (Q11) covers the firing schtasks event; the svchost-Schedule follow-on sweep is lower yield than the cross-binary questions."
+    - template: scheduled_task.task_still_present
+      reason: "Budget; schtasks-only and a manual-recall variant. task_configuration (Q11) already prompts identifying the task; whether it is still registered is a remediation step the analyst takes from Q11's output."
+    - template: initial_access.campaign_scope
+      reason: "Budget; correlating the same rule.uuid env-wide overlaps cue_parent_process.scope (Q8), which already finds the Java-to-system-tool pattern across hosts. Q8 is preferred because it matches the behavior even where this exact rule did not fire."
+    - template: organizational_context.change_ticket
+      reason: "Budget. A Java application server spawning certutil/bitsadmin/schtasks is not a change-ticketed administrative action; host_user_context (Q2) and the patch-status question (Q7) carry the legitimacy and exposure angles more directly."
+    - template: organizational_context.human_recall
+      reason: "Budget; the actor here is a server-side application, not an interactive human, so human recall rarely disambiguates an exploitation-driven spawn. host_user_context (Q2) covers the role-expectation angle."
+    - template: organizational_context.timing_alignment
+      reason: "Budget; work-hours timing is weak signal for an internet-reachable application server that can be exploited at any hour. The inbound-request timeline (Q6) and host activity sweep (Q16) carry the temporal context."
+    - template: organizational_context.procedural_consistency
+      reason: "Budget; there is no standard org tooling for 'a Java app spawning net.exe', so the procedural-consistency frame does not apply cleanly to this rule."
+    - template: persistence_scope.process_based_persistence
+      reason: "Budget; the schtasks/reg/bitsadmin/wmic persistence tools this template sweeps for are the very children this rule already detects when spawned by Java. task_configuration (Q11), registry_key_context (Q12), and sibling_processes (Q5) cover the persistence children directly."
+    - template: persistence_scope.file_based_persistence
+      reason: "Budget; the Startup/Run-key file-drop branch is a secondary persistence vector. For this exploitation-driven multi-binary rule the higher-yield questions are decoding the firing child and tracing the inbound request; file-drop persistence is reachable from sibling_processes (Q5) if a drop tool spawned."
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "registry.registry_key_context replaces cue_process_tool.mechanism_decode"
+      disposition: declined
+      reason: >-
+        Partially acted on rather than literally applied. registry.registry_key_context IS included
+        (Q12), but it only applies when the firing child is reg.exe, which is 1 of 23 possible
+        children. cue_process_tool.mechanism_decode (Q4) is retained as the cross-binary Phase 2
+        decode because the firing child is variable (certutil, bitsadmin, curl, mshta, net, schtasks,
+        reg, etc.); a reg-only decode cannot serve as the playbook's single mechanism_decode for a
+        multi-binary parent-child rule. The two coexist: Q4 decodes whatever binary fired, Q12 adds
+        the registry-specific frame when reg.exe is the child.
+    - hint: "scheduled_task.task_configuration replaces cue_process_tool.mechanism_decode"
+      disposition: declined
+      reason: >-
+        Partially acted on rather than literally applied. scheduled_task.task_configuration IS
+        included (Q11), but it only applies when the firing child is schtasks.exe (1 of 23). For the
+        same reason as the registry hint, cue_process_tool.mechanism_decode (Q4) is kept as the
+        cross-binary decode so the playbook has a Phase 2 question that works regardless of which of
+        the 23 children fired. Q11 adds the schtasks-specific frame when that is the child.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - parent_child
+    - initial_access
+    - discovery_recon
+    - obfuscation
+    - scheduled_task
+    - registry
+    - cue_parent_process
+    - cue_process_tool
+    - cue_user_actor
+    - cue_host_context
+  generation_stats:
+    total_questions: 16
+    source_counts:
+      template: 16
+      attack: 0
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 13
+    logsource_diversity:
+      process_creation: 15
+      registry_set: 1

@@ -1,0 +1,546 @@
+name: Arbitrary File Download Via MSOHTMED.EXE
+id: 9a6d5344-ff5b-4b7a-b48d-432597ef04e3
+description: |
+  Detects MSOHTMED.exe, a Microsoft-signed Office component, running with a URL
+  argument on its command line. The rule fires when the process image ends in
+  MSOHTMED.exe (or its OriginalFileName is MsoHtmEd.exe) AND the command line
+  contains ftp://, http://, or https://. MSOHTMED parses the first URL argument
+  and downloads the referenced file into the user's Internet cache directory
+  with no further operator action, which lets a trusted Office binary fetch a
+  remote payload while staying inside application-allow-listing and signed-binary
+  controls. Some Office-feature workflows fetch remote content legitimately, so
+  the investigation should determine what URL was fetched, what spawned MSOHTMED,
+  whether the download landed and what ran afterward, and whether the destination
+  and the parent chain look like an automated business workflow or operator-driven
+  proxy execution.
+type: detection
+detection_id: 459f2f98-397b-4a4a-9f47-6a5ec2f1c69d
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Is the alerting process MSOHTMED.exe (by image or OriginalFileName) and
+    does its command line contain an ftp, http, or https URL, matching what this rule
+    detects?
+  context: Before investing investigation time, confirm the alert is a true positive.
+    The rule fires only when both conditions hold together - the process is MSOHTMED.exe
+    (image path ending in MSOHTMED.exe or OriginalFileName MsoHtmEd.exe) AND the command
+    line carries an ftp://, http://, or https:// URL. Read the exact command line and
+    note the full URL, since that URL is the file MSOHTMED was asked to fetch.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to fetch remote files through an Office
+    binary?
+  context: MSOHTMED downloading a URL-referenced file is rarely part of normal user
+    activity outside specific Office content workflows. Knowing whether the acting
+    account and the host function involve Office automation, template publishing, or
+    document workflows is often the fastest way to separate a benign feature use from
+    a signed-binary proxy download. An account or endpoint with no Office-automation
+    role fetching a remote file this way is the more notable case.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What is the full command line MSOHTMED ran with, and what URL was it asked
+    to download?
+  context: The command line carries the operational detail - the exact URL passed to
+    MSOHTMED and any additional arguments. Decode the full URL, including scheme, host,
+    path, and any embedded IP address or port. The download lands in the user's Internet
+    cache directory by default, so the URL itself is the clearest description of what
+    was retrieved and from where. Scoping to this binary on this host surfaces every
+    MSOHTMED invocation in the window in case the download was one of several.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:cue_process_tool.process_chain
+  question: What process spawned MSOHTMED, and is that parent chain expected for a
+    file-fetching Office binary?
+  context: The parent process is where the download decision was made, and it is the
+    strongest discriminator for this rule. A user double-clicking content normally
+    produces an Office-application or explorer.exe parent; a parent such as cmd.exe,
+    powershell.exe, wscript.exe, mshta.exe, or a different Office application driving
+    MSOHTMED with a URL points to scripted or proxied invocation rather than a UI
+    action. Identify the parent and what spawned it to judge whether this was
+    operator-driven proxy execution.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: attack:T1218.network_retrieval
+  question: Did MSOHTMED make an outbound network connection to the URL destination,
+    and where did it connect?
+  context: The download is the act that matters, and the outbound connection from
+    MSOHTMED is the cleanest signal that the file was actually fetched rather than
+    just requested. Pivot from the process to its network activity on this host to
+    confirm the connection occurred and to capture the destination address and port.
+    An Office binary opening a direct connection to a non-Office destination is the
+    behavior this technique relies on to move a payload past signed-binary controls.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationHostname
+      - DestinationPort
+- source: template:cue_network_endpoint.mechanism_decode
+  question: What is the download destination, and what do DNS, WHOIS, and threat intel
+    reveal about it?
+  context: The URL host is the remote source of the payload. Resolve and reputation-check
+    the destination - registration age, passive DNS history, certificate details, and
+    known threat-intel hits. A recently registered domain, a raw IP address, a code or
+    paste hosting site, or a known malicious endpoint points to attacker-controlled
+    infrastructure, while an established enterprise or vendor domain is consistent with
+    a sanctioned content workflow.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - DestinationHostname
+      - DestinationPort
+- source: template:cue_network_endpoint.baseline
+  question: Does this host normally connect to this download destination?
+  context: A first-time connection to the destination is more notable than routine
+    communication. Establishing how often this host has reached this address over time
+    helps distinguish newly introduced attacker infrastructure from a destination the
+    host already talks to as part of normal Office content or update workflows.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        DestinationIp|expand: '%dst_ip%'
+      condition: selection
+    fields:
+      - DestinationPort
+      - Image
+- source: template:download_tool.download_success_verification
+  question: Did MSOHTMED write a downloaded file to disk, and where did it land?
+  context: A download command does not guarantee the file arrived - the URL may be
+    unreachable, blocked, or return an error. MSOHTMED writes fetched content into the
+    user's Internet cache directory by default, so check for file-creation events by
+    this binary, focusing on the INetCache path, to confirm the transfer completed and
+    to recover the on-disk name of the dropped file.
+  range: +15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: template:download_tool.payload_analysis
+  question: Can you retrieve and analyze the downloaded payload from a safe environment?
+  context: If the fetched file is still on disk, submitting its hash to threat intel
+    or detonating it in a controlled environment reveals whether it is a known malicious
+    payload, a legitimate file, or something novel. Because the download lands in the
+    shared Internet cache directory that browsers and Office also write to, the file
+    does not stand out by path alone, so hash and content analysis is what establishes
+    whether the delivery was malicious.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Hashes
+- source: template:cue_process_tool.follow_on
+  question: What child processes did MSOHTMED spawn after the download?
+  context: MSOHTMED fetching a file does not normally spawn child processes, so any
+    children are worth scrutiny - they may be the downloaded payload being executed or
+    a follow-on tool launched to act on it. Unexpected children such as cmd.exe,
+    powershell.exe, rundll32.exe, or an executable running from a cache or temp path
+    indicate the delivery progressed into execution.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired the MSOHTMED URL-download pattern, what
+    parents and users normally drive it, and does the current alert fit?
+  context: Even a signed Office binary can be used legitimately for content fetches.
+    This query mirrors the rule's selection structure scoped to this host, so the
+    resulting parent and user distribution reflects how this specific firing pattern
+    has historically run here, not generic Office activity. A new parent process, an
+    unexpected account, or a first-ever occurrence is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \MSOHTMED.exe
+      - OriginalFileName: MsoHtmEd.exe
+      selection_cli:
+        CommandLine|contains:
+        - ftp://
+        - http://
+        - https://
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired the MSOHTMED URL-download pattern in the past week,
+    and does the cross-host distribution look like consistent automation or one-off
+    activity?
+  context: This query mirrors the rule's selection structure with no host scope, so
+    the result is a fleet-wide count of the MSOHTMED URL-download pattern rather than
+    generic Office activity. Many hosts firing the same pattern points to a content
+    workflow, build pipeline, or scripted deployment that fetches remote files by
+    design; one host or a small unrelated set points to manual operator activity. Use
+    the host distribution to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \MSOHTMED.exe
+      - OriginalFileName: MsoHtmEd.exe
+      selection_cli:
+        CommandLine|contains:
+        - ftp://
+        - http://
+        - https://
+      condition: all of selection_*
+    fields:
+    - host.name
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run MSOHTMED to fetch remote files?
+  context: Compare the acting account against its own history. A user whose role
+    involves Office content or template workflows may fetch remote files this way
+    routinely; an account that has never driven MSOHTMED with a URL is more notable.
+    The user role and typical toolset should align with Office-automation activity.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent and MSOHTMED pairing historically routine on this host or
+    across the environment, or is the parent unusual for this binary?
+  context: When the alert fires under a service principal, user identity does not
+    attribute the behavior; the meaningful pivot is which parent process spawned
+    MSOHTMED and whether that pairing is historically common. A new or rare parent
+    for this binary on this host or environment-wide is the deviation worth chasing,
+    while a parent that already accounts for many prior events is more likely an Office
+    workflow or automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the acting account's activity across all hosts reveals whether the
+    MSOHTMED download was a single event or part of activity spanning multiple endpoints.
+    If the same user triggered similar activity on other hosts, the scope of the
+    incident is larger than one machine.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent and MSOHTMED pairing fire on other hosts in the same
+    window, indicating a coordinated rollout rather than isolated activity?
+  context: Under a service principal, asking what else the user did across the network
+    returns agent-telemetry noise, since every host runs system-owned agents constantly.
+    The meaningful question is whether the same launch mechanism - a parent process
+    spawning MSOHTMED with a URL - fired on other hosts in the alert window. Multiple
+    hosts in the same window points to scheduled or pushed automation; a single host
+    points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining the activity surrounding the
+    MSOHTMED download reveals what led to it and what followed - the parent that staged
+    the process, reconnaissance, or follow-on execution of the fetched file. Novel
+    parent-child pairs at low counts are what to scan for against the high-count noise
+    of routine system processes.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host - reconnaissance, defense tampering, or
+    credential access - may reveal the attack stages that preceded the MSOHTMED download
+    and help reconstruct the timeline. A signed-binary proxy download is often a
+    delivery step in a longer sequence, so prior alerts give the context for why the
+    fetch happened.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1218
+      name: System Binary Proxy Execution
+      role: primary
+  attack_chain_coverage:
+    - stage: 1
+      label: signed_binary_url_invocation
+      description: "MSOHTMED.exe, a trusted Microsoft-signed Office binary, is launched with a URL argument on its command line - the act the rule detects"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: network_retrieval
+      description: "The signed binary performs an outbound connection to the URL destination to fetch the externally hosted payload"
+      mapped_to: Q5
+      source: attack:T1218.network_retrieval
+    - stage: 3
+      label: payload_landing_and_followon
+      description: "The fetched file lands on disk (INetCache) and any downstream execution it enables is correlated"
+      mapped_to: Q8
+      source: template:download_tool.download_success_verification
+  dimension_coverage:
+    - dimension: command_analysis
+      technique: T1218
+      covered_by: Q3
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1218
+      covered_by: Q4
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1218
+      covered_by: Q6
+      source: template:cue_network_endpoint.mechanism_decode
+      coverage_type: direct
+  mutable_dispositions:
+    - element: CommandLineRegex
+      dimension: command_analysis
+      specific_values: "ftp://, http://, https:// (the rule's selection_cli URL tokens)"
+      disposition: query_injection
+      target_question: Q11
+      notes: "The URL tokens are present in the rule's selection_cli and are carried verbatim into the REFLECTED baseline_deviation (Q11) and scope (Q12) detection blocks. Q3 (mechanism_decode) reads the full URL out of the alerting command line for the analyst."
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "non-Office parents (cmd.exe, powershell.exe, wscript.exe, mshta.exe) vs Office-app/explorer.exe UI launch"
+      disposition: context
+      target_question: Q4
+      notes: "Analytic gives a profiling rationale, not a fixed list, and the rule does not constrain ParentImage. Realized as the parent-chain judgment in process_chain (Q4): an Office-app/explorer parent reads as a UI action, a script-host/shell parent as proxied invocation. baseline_svc/clustering_svc (Q14/Q16) pivot on the parent+binary pairing."
+    - element: SignedBinaryList
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q1
+      notes: "List of signed binaries allowed for proxy execution; this rule already fixes the binary to MSOHTMED.exe, so the list collapses to a single binary identity confirmed in verify_trigger_match (Q1)."
+    - element: RemoteDomainAllowlist
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q6
+      notes: "Filter to suppress legitimate enterprise destinations; no concrete domains in the analytic. Realized as the destination-reputation judgment in cue_network_endpoint.mechanism_decode (Q6) and the host-to-destination baseline (Q7), which separate sanctioned content domains from attacker infrastructure."
+  dedup_decisions:
+    - dropped: cue_user_actor.baseline + cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable; both emitted (subject-pivot Q13 and launch-mechanism-pivot Q14)"
+      kept: both
+    - dropped: cue_user_actor.clustering + cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable; both emitted (subject-pivot Q15 and launch-mechanism-pivot Q16)"
+      kept: both
+    - dropped: cue_process_tool.baseline
+      reason: "generic Image|endswith host baseline is subsumed by the REFLECTED host-pattern question (baseline_deviation, Q11), which scopes to the rule's actual MSOHTMED-with-URL firing pattern rather than all MSOHTMED launches"
+      kept: cue_process_tool.baseline_deviation
+    - dropped: cue_process_tool.clustering
+      reason: "Image-only host aggregation subsumed by cue_host_context.clustering (Q17), which projects Image+ParentImage and surfaces novel parent-child pairs"
+      kept: cue_host_context.clustering
+  skipped_templates:
+    - template: download_tool.directory_activity
+      reason: "Targets TargetFilename|contains %file_dirs%; the rule references no download destination path on the command line (has_file_reference: false) and MSOHTMED writes to the shared INetCache directory that browsers/Office also write to, so a directory sweep there returns unrelated cache writes. download_success_verification (Q8) and payload_analysis (Q9), scoped to MSOHTMED's own file-creation events, cover the on-disk landing more precisely. Also keeps the download_tool set within its max_questions: 3."
+    - template: universal.endpoint_protection_health
+      reason: "recommended priority, not must_include. This rule fires on signed-binary proxy download (delivery), not hands-on execution or credential access where tamper-as-precursor is the live disposition question. cue_host_context.precursor (Q18) already surfaces prior tamper/recon alerts on the host, and its notes_to_llm explicitly allows dropping when precursor is present and the rule is not execution/credential-centric. Trimmed to stay within the 14-18 target (playbook is at 18)."
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "logsource 'image_load' (recommended by techniques: T1218) is not covered — pull in cue_image_load.* or author a custom question with `category: image_load`"
+      disposition: declined
+      reason: >-
+        T1218's image_load analytic targets proxy-execution binaries that load a
+        payload as a module (regsvr32/rundll32 loading an unsigned DLL). MSOHTMED's
+        behavior here is to download a URL-referenced file into the Internet cache and
+        write it to disk - it does not load the fetched payload as a module itself, so
+        an image_load query on MSOHTMED returns its normal Office DLL dependencies and
+        adds no precision for this download pattern. The load-bearing cross-logsource
+        pivot for this rule is the network_connection retrieval, which IS acted on:
+        Q5 (attack:T1218.network_retrieval) and Q6/Q7 (cue_network_endpoint) cover the
+        outbound fetch and destination reputation. No compensating
+        attack:T1218.image_load question authored.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - download_tool
+    - cue_process_tool
+    - cue_network_endpoint
+    - cue_user_actor
+    - cue_host_context
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 17
+      attack: 1
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 15
+    logsource_diversity:
+      process_creation: 12
+      network_connection: 3
+      file_event: 2
+      sigma_alert: 1

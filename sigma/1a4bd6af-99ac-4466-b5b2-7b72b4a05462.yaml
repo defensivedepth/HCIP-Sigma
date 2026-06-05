@@ -1,0 +1,644 @@
+name: Security Event Logging Disabled via MiniNt Registry Key - Process
+id: ef7d5d98-37c5-44d2-9940-28424f885346
+description: |
+  Detects creation of the registry key HKLM\SYSTEM\CurrentControlSet\Control\MiniNt, which causes
+  the Windows Event Log service to refuse to start on the next reboot and disables system-wide event
+  logging without touching any service ACL. The rule fires on EITHER of two branches: reg.exe adding
+  the MiniNt key, OR PowerShell (powershell.exe, pwsh.exe, powershell_ise.exe) creating it via
+  New-Item. The MiniNt key normally exists only in Recovery/WinPE environments; its presence on a
+  normally booted host suppresses all logging until the key is removed. Determine which branch fired,
+  whether the change was authorized, and what activity the suppression was meant to hide.
+type: detection
+detection_id: 1a4bd6af-99ac-4466-b5b2-7b72b4a05462
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Did this event create the MiniNt registry key via reg.exe or PowerShell?
+  context: >-
+    The rule fires on either of two branches: reg.exe (or a binary with OriginalFileName reg.exe)
+    invoked with ' add ' and the path \SYSTEM\CurrentControlSet\Control\MiniNt, OR PowerShell
+    (powershell.exe, pwsh.exe, powershell_ise.exe) using New-Item / ni against that same key path.
+    Confirm which branch fired by reading Image, OriginalFileName, and CommandLine — the reg.exe
+    branch shows a reg add command, the PowerShell branch shows a New-Item against the MiniNt key.
+    Branch matters downstream: encoding/script-block questions are load-bearing only for the
+    PowerShell branch.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to modify the MiniNt or other Control-class registry keys?
+  context: >-
+    Creating the MiniNt key is not part of normal administration on a booted host — it only appears
+    legitimately in Recovery/WinPE imaging. Knowing whether this account and host role (imaging
+    server, technician workstation, ordinary endpoint) would ever touch this key is often the fastest
+    way to separate a routine recovery workflow from event-log suppression.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:parent_child.parent_process_legitimacy
+  question: What process spawned reg.exe or PowerShell here, and what started that parent?
+  context: >-
+    The parent attribution answers "who modified this key." A user-driven chain (explorer.exe,
+    cmd.exe from an interactive session) reads differently than a script host, remote-execution
+    service, or Office application spawning the registry write. Tracing the parent's own origin
+    reveals whether the execution chain is an administrator at a console or an automated/remote
+    foothold.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- source: template:parent_child.sibling_processes
+  question: What other child processes did the same parent spawn around this time?
+  context: >-
+    If the parent that launched the registry write also spawned other processes, those siblings
+    reveal the full scope of activity from that parent. Several tampering or reconnaissance tools
+    from one parent within a short window points to orchestrated activity rather than a single
+    isolated change.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:organizational_context.change_ticket
+  question: Was there a change ticket, imaging job, or documented approval for this registry change?
+  context: >-
+    Most environments require change records for security-configuration changes. A legitimate reason
+    to create the MiniNt key is narrow (recovery/imaging tooling); a corresponding ticket or imaging
+    workflow suggests authorized activity, while the absence of one where policy requires it pushes
+    toward unauthorized log suppression.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:defense_tampering.what_was_disabled
+  question: Does the command line confirm the MiniNt key was the target, and what exactly was written?
+  context: >-
+    The MiniNt key disables the entire Windows Event Log service on next boot — unlike wevtutil or
+    Clear-EventLog, which clear a single named log and leave a residual cleared-log event. Read the
+    full command line to confirm the target path is \SYSTEM\CurrentControlSet\Control\MiniNt and to
+    see whether a value or only the bare key was created; the bare-key form is the documented
+    suppression primitive.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:registry.registry_key_context
+  question: What registry key path and value were actually written, as recorded in the registry events?
+  context: >-
+    Reading the registry event directly gives the analyst the structured key path (TargetObject) and
+    written data (Details) rather than parsing them from the command line. Confirm the modification
+    landed under \SYSTEM\CurrentControlSet\Control\MiniNt and note whether a key alone or a key plus
+    value was created — both forms suppress logging on reboot.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+- source: template:powershell.encoded_command_decode
+  question: If the PowerShell branch fired, was the command encoded or obfuscated, and what does it decode to?
+  context: >-
+    The PowerShell branch matches New-Item / ni against the MiniNt key path, but attackers commonly
+    wrap that in -EncodedCommand (-enc) base64, backtick escaping, or string concatenation to hide
+    the target key. Decoding reveals the literal New-Item call and confirms the MiniNt path. For the
+    reg.exe branch the command is already plain text and this step adds nothing.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: attack:T1562.002.security
+  question: Did the Security log record an audit-log-cleared event (1102) on this host around this time?
+  context: >-
+    The MiniNt key suppresses collection silently on reboot and produces no cleared-log event, so a
+    1102 here would indicate a separate, complementary log-clearing action (wevtutil, Clear-EventLog,
+    or equivalent) rather than the MiniNt mechanism itself. Pairing the registry suppression with an
+    explicit log clear points to deliberate, layered evidence removal. If Security-channel events are
+    not collected in this environment, treat zero results as a visibility gap rather than evidence
+    nothing happened.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      category: security
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 1102
+      condition: selection
+    fields:
+      - EventID
+      - SubjectUserName
+      - SubjectDomainName
+- source: template:defense_tampering.protection_status
+  question: Is event logging currently still collecting on this host, or has it been suppressed?
+  context: >-
+    The MiniNt suppression takes effect only after a reboot and persists until the key is removed.
+    Check whether the host has rebooted since the key was created and whether the Event Log service
+    is currently collecting — if logging is already suppressed, the key should be removed and the
+    service restored before further investigation, since subsequent activity may not be recorded.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:defense_tampering.activity_after_tampering
+  question: What activity occurred on this host after the MiniNt key was created?
+  context: >-
+    Attackers suppress logging to cover what comes next — credential access, payload execution, or
+    lateral movement that would otherwise be recorded. Activity in the window after the key was
+    written, especially after any reboot that activated the suppression, indicates what the
+    suppression was meant to hide. A gap in events followed by new process creation marks where
+    visibility was lost.
+  range: +1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - User
+- source: template:registry.registry_related_modifications
+  question: Were other registry write operations made on this host in the same session?
+  context: >-
+    Operators who disable logging via one registry key often modify several — adding persistence Run
+    keys, weakening security policy, or changing service start types in the same session. A cluster
+    of reg.exe or regedit.exe write operations from the same user within a short window reveals the
+    full scope of configuration changes and whether multiple objectives were pursued alongside the
+    log suppression.
+  range: +/-30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_reg:
+        Image|endswith:
+          - '\reg.exe'
+          - '\regedit.exe'
+        CommandLine|contains:
+          - ' add '
+          - ' delete '
+          - ' import '
+          - '/s '
+      condition: selection and selection_reg
+    fields:
+      - CommandLine
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run the alerting binary across the environment?
+  context: >-
+    Compare this user's history of running reg.exe or PowerShell (whichever fired) against their
+    current action. An account that rarely runs this binary at all is more notable than one that does
+    so regularly as part of an imaging or administration role. This is a coarse frequency baseline by
+    binary, not by command pattern; pair it with the command-shape history to judge whether the
+    MiniNt-key usage specifically is new.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent-and-binary combination historically routine on this host or environment-wide?
+  context: >-
+    When the alert fires under SYSTEM or a service account, user identity does not attribute the
+    behavior — the meaningful pivot is the launch mechanism. Check whether the parent process that
+    spawned this reg.exe or PowerShell instance is a historically common pair for that binary on this
+    host or across the environment. A new or rare parent for this binary is the deviation worth
+    chasing; a pair that already accounts for many prior events is automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:lolbin.historical_lolbin_baseline
+  question: How often has this host fired this exact MiniNt-key pattern over the past 90 days, and what command shapes are typical?
+  context: >-
+    A MiniNt-key creation pattern with no prior history on a host is more notable than one seen
+    regularly under stable parents. The query mirrors the rule's selection structure scoped to this
+    host, so the count reflects this specific firing pattern rather than generic reg.exe or PowerShell
+    usage. The command-line projection lets the analyst compare typical invocation shapes against the
+    alerting one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_reg_img:
+      - Image|endswith: \reg.exe
+      - OriginalFileName: reg.exe
+      selection_reg_cmd:
+        CommandLine|contains|all:
+        - ' add '
+        - \SYSTEM\CurrentControlSet\Control\MiniNt
+      selection_powershell_img:
+      - Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+        - \powershell_ise.exe
+      - OriginalFileName:
+        - PowerShell.EXE
+        - pwsh.dll
+      selection_powershell_cmd1:
+        CommandLine|contains:
+        - 'New-Item '
+        - 'ni '
+      selection_powershell_cmd2:
+        CommandLine|contains: \SYSTEM\CurrentControlSet\Control\MiniNt
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_reg_* or all of selection_powershell_*) and _pb_scope
+    fields:
+    - CommandLine
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired this MiniNt-key pattern in the past week, and does the distribution look like automation or one-off activity?
+  context: >-
+    The query mirrors the rule's selection structure with no host scope, giving a fleet-wide count of
+    this specific firing pattern rather than generic reg.exe or PowerShell usage. Many hosts firing
+    the same pattern points to scripted deployment or imaging automation; one host or a small
+    unrelated set points to manual operator activity. Use the host distribution to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_reg_img:
+      - Image|endswith: \reg.exe
+      - OriginalFileName: reg.exe
+      selection_reg_cmd:
+        CommandLine|contains|all:
+        - ' add '
+        - \SYSTEM\CurrentControlSet\Control\MiniNt
+      selection_powershell_img:
+      - Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+        - \powershell_ise.exe
+      - OriginalFileName:
+        - PowerShell.EXE
+        - pwsh.dll
+      selection_powershell_cmd1:
+        CommandLine|contains:
+        - 'New-Item '
+        - 'ni '
+      selection_powershell_cmd2:
+        CommandLine|contains: \SYSTEM\CurrentControlSet\Control\MiniNt
+      condition: all of selection_reg_* or all of selection_powershell_*
+    fields:
+    - host.name
+- source: template:lolbin.technique_class_lateral
+  question: Were other persist-or-tamper LOLBins used on this host recently?
+  context: >-
+    Operators who suppress logging via one signed binary often reach for others — wevtutil to clear
+    logs, sc or net to stop services, bcdedit or vssadmin to disable recovery. Finding several of
+    these built-in tools used for defense evasion or persistence in the same window strengthens the
+    case that the MiniNt change was part of deliberate operator activity rather than a one-off.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_img:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\sc.exe'
+          - '\at.exe'
+          - '\netsh.exe'
+          - '\wevtutil.exe'
+          - '\bcdedit.exe'
+          - '\vssadmin.exe'
+          - '\diskshadow.exe'
+          - '\dnscmd.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_img
+    fields:
+      - Image
+      - CommandLine
+- source: template:lolbin.renamed_binary_check
+  question: Was reg.exe or PowerShell executed from its expected System32 or SysWOW64 path?
+  context: >-
+    The rule matches on OriginalFileName as well as Image, so a copied or renamed reg.exe still
+    triggers. A reg.exe or powershell.exe running from a user temp directory or other non-standard
+    path indicates the binary was relocated to evade path-based allowlisting, which is more notable
+    than the same binary in System32.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1562.002
+      name: Disable Windows Event Logging
+      role: primary
+    - id: T1112
+      name: Modify Registry
+      role: secondary
+    - id: T1562
+      name: Impair Defenses
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: process_execution_of_disabling_command
+      description: "reg.exe add or PowerShell New-Item executes against the MiniNt key path"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: registry_key_modification
+      description: "MiniNt key created under HKLM\\SYSTEM\\CurrentControlSet\\Control"
+      mapped_to: Q7
+      source: template:registry.registry_key_context
+    - stage: 3
+      label: event_logging_effect_and_anomaly
+      description: "Event Log service refuses to start on reboot; gaps/resets in event records (security channel)"
+      mapped_to: Q9
+      source: attack:T1562.002.security
+    - stage: 4
+      label: follow_on_execution_after_suppression
+      description: "Service restart / process execution that the suppression was meant to hide (T1112/T1562 follow-on)"
+      mapped_to: Q11
+      source: template:defense_tampering.activity_after_tampering
+  dimension_coverage:
+    - dimension: time_correlation
+      technique: T1562.002
+      covered_by: Q11
+      source: template:defense_tampering.activity_after_tampering
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1562.002
+      covered_by: Q6
+      source: template:defense_tampering.what_was_disabled
+      coverage_type: direct
+    - dimension: process_identification
+      technique: T1562
+      covered_by: Q2
+      source: template:universal.host_user_context
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1112
+      covered_by: Q3
+      source: template:parent_child.parent_process_legitimacy
+      coverage_type: direct
+  mutable_dispositions:
+    - element: RegistryKeyPathPatterns
+      dimension: tuning_parameter
+      specific_values: '\SYSTEM\CurrentControlSet\Control\MiniNt'
+      disposition: query_injection
+      target_question: Q15
+      notes: "MiniNt key path embedded verbatim in the reflected host-pattern and fleet-pattern queries (Q15, Q16) and surfaced in Q6/Q7 context."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q11
+      notes: "Correlation window between registry write, reboot, and follow-on activity realized as the +1h activity_after_tampering window and +/-30m registry_related window."
+    - element: ParentProcessAllowList
+      dimension: parent_process_analysis
+      specific_values: "rationale only (regedit.exe, msiexec.exe examples — no rule-specific values)"
+      disposition: new_question
+      target_question: Q3
+      notes: "Parent legitimacy / allowlisting addressed by parent_process_legitimacy and the parent+binary baseline (Q14)."
+    - element: SignatureCheck
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q18
+      notes: "Abnormal binary lineage / renamed-binary check covered by lolbin.renamed_binary_check via OriginalFileName vs Image."
+    - element: AuthorizedAdminAccounts
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q5
+      notes: "Authorized-account scoping realized via change_ticket and user baseline (Q13) rather than a queryable list."
+    - element: ServiceNames
+      dimension: tuning_parameter
+      specific_values: "rationale only (EventLog service)"
+      disposition: context
+      target_question: Q10
+      notes: "EventLog service state surfaced in protection_status context (Q10)."
+    - element: ProcessWhitelist
+      dimension: process_identification
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q2
+      notes: "Authorized-tool scoping addressed by host_user_context judgment question."
+    - element: ServiceNamePatterns
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q10
+      notes: "Security-critical service scoping is EventLog for this rule; covered in protection_status context."
+  dedup_decisions:
+    - dropped: cue_process_tool.process_chain
+      reason: "parent_child technique set active — parent_process_legitimacy + sibling_processes subsume the cue's parent-chain question with more specific framing"
+      kept: parent_child.parent_process_legitimacy
+    - dropped: cue_process_tool.baseline_deviation
+      reason: "near-identical reflected host_pattern query to lolbin.historical_lolbin_baseline; kept the CommandLine-projected variant for invocation-shape comparison"
+      kept: lolbin.historical_lolbin_baseline
+    - dropped: cue_process_tool.baseline
+      reason: "host-pattern reflected baseline (Q15) plus user baseline (Q13) cover historical frequency; generic Image|endswith baseline would double-count"
+      kept: lolbin.historical_lolbin_baseline
+    - dropped: cue_process_tool.follow_on
+      reason: "post-execution activity covered by defense_tampering.activity_after_tampering (Q11) with the more relevant forward window"
+      kept: defense_tampering.activity_after_tampering
+    - dropped: cue_process_tool.clustering
+      reason: "same-window host activity covered by activity_after_tampering (Q11) and registry_related_modifications (Q12)"
+      kept: defense_tampering.activity_after_tampering
+    - dropped: cue_host_context.clustering
+      reason: "host-wide same-window activity subsumed by activity_after_tampering (Q11)"
+      kept: defense_tampering.activity_after_tampering
+    - dropped: cue_user_actor.clustering
+      reason: "user_actor clustering pair dropped to stay within the 18-question cap; user-pivot dimension covered by baseline (Q13) and the parent+binary substitute baseline (Q14); registry_related and historical-pattern questions cover same-window scope"
+      kept: cue_user_actor.baseline
+    - dropped: cue_user_actor.clustering_svc
+      reason: "service-principal clustering substitute dropped alongside its user-pivot pair for the same cap reason; parent+binary substitute baseline (Q14) preserves the service-principal-safe pivot"
+      kept: cue_user_actor.baseline_svc
+  skipped_templates:
+    - template: cue_process_tool.mechanism_decode
+      reason: "replaced_by registry.registry_key_context (and defense_tampering.what_was_disabled) per template flag and hints"
+    - template: cue_host_context.precursor
+      reason: "prior-detection timeline overlaps the security-channel 1102 check (Q9) and activity_after_tampering; dropped for cap"
+    - template: powershell.script_block_logging
+      reason: "must_include for powershell set but dropped for cap; encoded_command_decode (Q8) covers the PowerShell-branch decode, and the New-Item command is short enough that 4104 adds little — recorded as deliberate"
+    - template: powershell.powershell_security_bypass
+      reason: "dropped for cap; bypass-precursor coverage overlaps lolbin.technique_class_lateral (Q17) and registry_related; the MiniNt branch does not itself require a bypass"
+    - template: universal.endpoint_protection_health
+      reason: "dropped for cap; this rule is itself a defense-tampering detection, and other-tamper coverage is provided by lolbin.technique_class_lateral (Q17) and the 1102 check (Q9)"
+    - template: defense_tampering.other_tampering_activity
+      reason: "dropped for cap; other-tamper coverage provided by lolbin.technique_class_lateral (Q17, persist/tamper LOLBin class)"
+    - template: registry.registry_value_persistence_check
+      reason: "applicability is_persistence_rule but MiniNt writes no executable path to disk — there is no referenced payload file to verify, so the file_event persistence check does not apply"
+    - template: persistence_scope.process_based_persistence
+      reason: "dropped for cap; persistence-tool enumeration overlaps lolbin.technique_class_lateral (Q17), which already lists schtasks/sc/reg-class tools"
+    - template: persistence_scope.file_based_persistence
+      reason: "dropped for cap; MiniNt suppression is registry-only with no Startup/Run file drop, so file-based persistence paths do not apply to this mechanism"
+    - template: organizational_context.human_recall
+      reason: "recommended (not must_include); change_ticket (Q5) and user baseline (Q13) cover the authorization/legitimacy angle within cap"
+    - template: organizational_context.timing_alignment
+      reason: "recommended; timing relative to maintenance windows folded into change_ticket (Q5) authorization context"
+    - template: organizational_context.procedural_consistency
+      reason: "recommended; standard-procedure angle folded into host_user_context (Q2) and change_ticket (Q5)"
+  reflection_overrides: []
+  hint_dispositions: []
+  hints_acted_on:
+    - hint: "defense_tampering.what_was_disabled replaces cue_process_tool.mechanism_decode"
+      acted_on: "Q6 (defense_tampering.what_was_disabled) is the Phase 2 mechanism-decode equivalent; cue_process_tool.mechanism_decode skipped (see skipped_templates)."
+    - hint: "registry.registry_key_context replaces cue_process_tool.mechanism_decode"
+      acted_on: "Q7 (registry.registry_key_context) included as the registry_set decode of the MiniNt write."
+    - hint: "powershell.encoded_command_decode replaces obfuscation.encoded_payload_decode"
+      acted_on: "Q8 (powershell.encoded_command_decode) included for the PowerShell branch; no obfuscation template present to skip."
+    - hint: "LOLBin rule — check for renamed binary and other LOLBins achieving same objective"
+      acted_on: "Q18 (lolbin.renamed_binary_check) and Q17 (lolbin.technique_class_lateral, persist/tamper class with reg.exe/powershell excluded)."
+    - hint: "logsource 'security' (recommended by T1562.002) not covered — author a custom question with category: security"
+      acted_on: "Q9 (attack:T1562.002.security) authored with logsource category security, EventID 1102 audit-log-cleared check on this host."
+    - hint: "Condition uses OR among selection groups — frame Q1 and description as EITHER ... OR"
+      acted_on: "Q1 and the description use disjunctive 'EITHER reg.exe ... OR PowerShell ...' framing; Q1 context directs the analyst to note which branch fired (per condition_topology.prose)."
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - parent_child
+    - organizational_context
+    - defense_tampering
+    - registry
+    - powershell
+    - lolbin
+    - cue_user_actor
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 17
+      attack: 1
+    phase_distribution:
+      triage: 2
+      analysis: 3
+      context: 13
+    logsource_diversity:
+      process_creation: 16
+      registry_set: 1
+      security: 1

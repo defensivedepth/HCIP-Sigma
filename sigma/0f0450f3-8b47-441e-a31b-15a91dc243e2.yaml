@@ -1,0 +1,549 @@
+name: Potential DLL File Download Via PowerShell Invoke-WebRequest
+id: 1ded51d9-c8ae-412d-9c9b-8d0a7c1ba916
+description: |
+  Detects a PowerShell command line that combines a web-fetch cmdlet (Invoke-WebRequest, Invoke-RestMethod, or the IWR/IRM aliases) with an http reference, an OutFile parameter, and a .dll filename, indicating a DLL is being downloaded to disk. Legitimate uses exist - installers, packaging scripts, and developer tooling occasionally pull libraries this way - but the same one-liner is a common ingress cradle that stages a malicious DLL for later side-loading or reflective loading. Determine what URL was contacted, where the DLL was written, whether the download succeeded, and whether the parent chain and user account are consistent with sanctioned automation.
+type: detection
+detection_id: 0f0450f3-8b47-441e-a31b-15a91dc243e2
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-04
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line contain a web-fetch cmdlet together with an http reference, an OutFile parameter, and a .dll filename?
+  context: Before investing investigation time, confirm the alert is a true positive by reading the full command line. The rule fires only when one of Invoke-WebRequest, Invoke-RestMethod, IWR, or IRM appears alongside all of http, OutFile, and .dll in the same command. Confirm all four elements are present and note the source URL and the output path.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to download libraries over the web with PowerShell?
+  context: Legitimate administrative or developer activity can trigger this detection. Knowing whether the user role and host function involve scripted package or library retrieval is often the fastest path to distinguishing a sanctioned automation step from a staging action.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What is the full download cradle doing? Identify the source URL and the destination path of the DLL.
+  context: The full command line reveals the specific transfer. Read out the http(s) URL the cmdlet fetches, the OutFile destination where the .dll is written, and any additional parameters such as headers, credentials, or proxy settings. Note whether the destination is a user-writable or staging directory. This rule matches on the command line only, so scope to the matching cmdlet pattern on this host rather than to a binary path.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains:
+        - 'Invoke-RestMethod '
+        - 'Invoke-WebRequest '
+        - 'IRM '
+        - 'IWR '
+        CommandLine|contains|all:
+        - http
+        - OutFile
+        - .dll
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:powershell.encoded_command_decode
+  question: Was the command encoded or obfuscated, and what does the download cradle resolve to?
+  context: The cmdlet name and URL may be hidden behind base64 -EncodedCommand payloads, string concatenation, backtick escaping, or variable substitution. If the command is encoded, decode it and identify the real fetch target and output path. If it is already readable, focus on the source URL, its reputation, and what the downloaded DLL is expected to do once on disk.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:cue_process_tool.process_chain
+  question: What process spawned this PowerShell instance, and is that parent chain expected?
+  context: The parent process reveals how the download was invoked. A user-driven session under explorer.exe differs sharply from PowerShell spawned by an Office application, mshta.exe, wscript.exe, or a freshly written script. An unusual parent points toward a macro, a phishing payload, or a prior foothold driving the download.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:powershell.script_block_logging
+  question: Did PowerShell script block logging capture the full script content behind the download?
+  context: Event ID 4104 records the deobfuscated script PowerShell actually executed, even when the command line is encoded. This is ground truth for the fetch URL, the output path, and any follow-on loading of the DLL. If PowerShell operational logs are not ingested in this environment, treat zero results as a visibility gap rather than evidence that nothing ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- source: template:powershell.powershell_security_bypass
+  question: Were PowerShell security controls bypassed or weakened before this download?
+  context: Operators often disable or weaken protections before pulling a payload. Common precursors include AMSI patching, execution-policy bypass flags, constrained language mode escapes, and downgrade to PowerShell v2, which lacks logging. Finding these events shortly before the download strengthens the case that the transfer is part of an intrusion rather than routine tooling.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- source: attack:T1059.001.image_load
+  question: After the download, did the alerting process or a child load the .NET runtime or an unexpected module that would execute the DLL in memory?
+  context: PowerShell that downloads a DLL frequently follows up by reflectively loading it rather than launching a new process. Image-load events for clr.dll, clrjit.dll, or the freshly written DLL path tied to the same host and time window indicate the library was executed in memory. Correlate the loading process and the loaded module path with the download cradle to see whether delivery progressed to execution.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ImageLoaded|contains|expand: '%file_paths%'
+      selection_runtime:
+        ImageLoaded|endswith:
+          - '\clr.dll'
+          - '\clrjit.dll'
+          - '\mscoree.dll'
+      condition: selection or selection_runtime
+    fields:
+      - Image
+      - ImageLoaded
+      - Signed
+- source: attack:T1105.network_connection
+  question: What external destination did the host contact for this transfer, and is that endpoint expected?
+  context: The download cradle resolves to an outbound connection to fetch the DLL. Identify the destination address, port, and whether it is internal or external, then judge the endpoint against known software-distribution and update sources. A connection to an unfamiliar external host, a raw IP, or a non-standard port around the alert time supports treating the DLL as untrusted ingress.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - '\powershell.exe'
+          - '\pwsh.exe'
+      filter_internal:
+        DestinationIp|cidr:
+          - '10.0.0.0/8'
+          - '172.16.0.0/12'
+          - '192.168.0.0/16'
+          - '127.0.0.0/8'
+      condition: selection and not filter_internal
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+- source: template:universal.evidence_preservation
+  question: Is the downloaded DLL still on disk at the destination path for analysis?
+  context: If the OutFile destination still holds the .dll, it can be hashed, reputation-checked, or detonated. Confirming the file exists also distinguishes a completed transfer from a command that errored or was blocked before writing.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: template:download_tool.download_success_verification
+  question: Was the download successful? Check for creation of the DLL at the destination.
+  context: A download command does not guarantee the file landed. Network errors, blocked URLs, or security controls may have prevented the write. Confirming a file-creation event at the OutFile path establishes whether the activity progressed past delivery.
+  range: +15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: template:download_tool.payload_analysis
+  question: Can you retrieve and analyze the downloaded DLL from a safe environment?
+  context: If the DLL is still on disk, submitting its hash to threat intelligence or detonating it in a sandbox reveals whether it is a known malicious library, a legitimate dependency, or something novel that needs deeper analysis. Pay attention to the signing chain, since side-loaded DLLs are frequently unsigned or signed by an unrelated entity.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Hashes
+- source: template:download_tool.directory_activity
+  question: What other file activity occurred in the destination directory around the download?
+  context: Staging operations often drop several files into the same directory, or the downloaded DLL triggers further writes through extraction, unpacking, or additional downloads. Directory-level file activity reveals whether this was a single library fetch or part of a broader delivery into a staging path.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains|expand: '%file_dirs%'
+      filter_self:
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection and not filter_self
+    fields:
+      - TargetFilename
+      - Image
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired this download pattern, what parents and users drove it, and does the current alert fit that pattern?
+  context: Even routine tooling can match this rule. The query mirrors the rule's selection scoped to this host, so the resulting parent and user distribution reflects how this specific download pattern has historically run here. A new parent process, an unexpected account, or a first-time appearance of the pattern is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection:
+        CommandLine|contains:
+        - 'Invoke-RestMethod '
+        - 'Invoke-WebRequest '
+        - 'IRM '
+        - 'IWR '
+        CommandLine|contains|all:
+        - http
+        - OutFile
+        - .dll
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired this download pattern in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: The query mirrors the rule's selection with no host scope, giving a fleet-wide count of this specific download pattern rather than generic PowerShell usage. Many hosts firing the same pattern points to scripted deployment or vendor automation; a single host or a small unrelated set points to manual operator activity. Use the host distribution to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection:
+        CommandLine|contains:
+        - 'Invoke-RestMethod '
+        - 'Invoke-WebRequest '
+        - 'IRM '
+        - 'IWR '
+        CommandLine|contains|all:
+        - http
+        - OutFile
+        - .dll
+      condition: selection
+    fields:
+    - host.name
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run web-download cradles like this?
+  context: Compare the alerting account against its own history of running this download pattern. A user who has never scripted a web fetch of a DLL is more suspicious than one who does so as part of a known role. Aggregating by host shows where this user has run the pattern before.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        CommandLine|contains:
+        - 'Invoke-RestMethod '
+        - 'Invoke-WebRequest '
+        - 'IRM '
+        - 'IWR '
+        CommandLine|contains|all:
+        - http
+        - OutFile
+        - .dll
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this download pattern historically routine on this host, or is it new here regardless of which account fired it?
+  context: When the alert fires under SYSTEM, a service account, or a computer account, user identity does not attribute the behavior, so the meaningful pivot is whether the host itself has run this pattern before. A host that already accounts for many prior matches suggests sanctioned automation; a first or rare appearance on this host is the deviation worth chasing.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains:
+        - 'Invoke-RestMethod '
+        - 'Invoke-WebRequest '
+        - 'IRM '
+        - 'IWR '
+        CommandLine|contains|all:
+        - http
+        - OutFile
+        - .dll
+      condition: selection
+    fields:
+      - User
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this download?
+  context: Downloads rarely happen in isolation. Earlier detections on the same host - defense tampering, reconnaissance, or credential access - may reveal the stages that preceded the transfer and help reconstruct the timeline leading to it.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1059.001
+      name: PowerShell
+      role: primary
+    - id: T1105
+      name: Ingress Tool Transfer
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: powershell_invocation
+      description: "PowerShell launched with a web-fetch cmdlet and download arguments (direct or encoded)"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: command_decode
+      description: "Decode the cradle to identify the fetch URL and output path"
+      mapped_to: Q4
+      source: template:powershell.encoded_command_decode
+    - stage: 3
+      label: abnormal_parent
+      description: "Unusual parent process spawning PowerShell (Office, mshta, wscript)"
+      mapped_to: Q5
+      source: template:cue_process_tool.process_chain
+    - stage: 4
+      label: network_transfer
+      description: "Outbound connection to an external destination to retrieve the tool (T1105)"
+      mapped_to: Q9
+      source: attack:T1105.network_connection
+    - stage: 5
+      label: file_drop
+      description: "Downloaded DLL written to disk at the destination path (T1105 file_event)"
+      mapped_to: Q11
+      source: template:download_tool.download_success_verification
+    - stage: 6
+      label: in_memory_load
+      description: "Reflective/.NET load of the downloaded DLL (T1059.001 image_load)"
+      mapped_to: Q8
+      source: attack:T1059.001.image_load
+  dimension_coverage:
+    - dimension: command_analysis
+      technique: T1059.001
+      covered_by: Q4
+      source: template:powershell.encoded_command_decode
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1059.001
+      covered_by: Q5
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1059.001
+      covered_by: Q14
+      source: template:cue_process_tool.baseline_deviation
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1059.001
+      covered_by: Q15
+      source: template:cue_process_tool.scope
+      coverage_type: indirect
+    - dimension: user_context
+      technique: T1059
+      covered_by: Q16
+      source: template:cue_user_actor.baseline
+      coverage_type: direct
+    - dimension: file_path_analysis
+      technique: T1105
+      covered_by: Q13
+      source: template:download_tool.directory_activity
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1105
+      covered_by: Q5
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1105
+      covered_by: Q9
+      source: attack:T1105.network_connection
+      coverage_type: direct
+  mutable_dispositions:
+    - element: CommandLinePattern
+      dimension: command_analysis
+      specific_values: "Invoke-RestMethod, Invoke-WebRequest, IRM, IWR + http + OutFile + .dll"
+      disposition: query_injection
+      target_question: Q3
+      notes: "Rule's CommandLine|contains and contains|all values injected into mechanism_decode (CommandLine-only rule, no Image to scope on); same values reflected into Q14/Q15/Q16/Q17 baseline queries"
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "Excel, WinWord, mshta examples - rationale only"
+      disposition: context
+      target_question: Q5
+      notes: "No parent in rule detection; abnormal-parent rationale carried in process_chain context"
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only (off-hours / non-maintenance window)"
+      disposition: context
+      target_question: Q14
+      notes: "Off-hours/anomaly framing carried in baseline_deviation context; not directly queryable"
+    - element: LoadedModuleList
+      dimension: tuning_parameter
+      specific_values: ".NET runtime DLLs (clr.dll, clrjit.dll, mscoree.dll) + downloaded DLL path"
+      disposition: query_injection
+      target_question: Q8
+      notes: "Injected into attack:T1059.001.image_load ImageLoaded|endswith runtime list and %file_paths% match"
+    - element: ScriptBlockLengthThreshold
+      dimension: tuning_parameter
+      specific_values: "rationale only (4104 length threshold)"
+      disposition: context
+      target_question: Q6
+      notes: "Script-block visibility carried in script_block_logging; threshold not directly queryable"
+    - element: DestinationIPCategory
+      dimension: tuning_parameter
+      specific_values: "internal vs external IP blocks"
+      disposition: query_injection
+      target_question: Q9
+      notes: "RFC1918 filter_internal CIDR exclusion in attack:T1105.network_connection query"
+    - element: FilePathRegex
+      dimension: file_path_analysis
+      specific_values: "uncommon drop paths (C:\\Users\\Public\\)"
+      disposition: query_injection
+      target_question: Q13
+      notes: "Destination directory scoping via %file_dirs% in directory_activity"
+  dedup_decisions:
+    - dropped: cue_process_tool.baseline
+      reason: "Image-scoped 90d baseline degenerates on a CommandLine-only rule (no Image field); baseline_deviation reflects the rule's CommandLine pattern host-scoped and is the correct host baseline"
+      kept: cue_process_tool.baseline_deviation
+    - dropped: cue_process_tool.follow_on
+      reason: "Image-scoped child-process query has no Image to anchor on; in-memory DLL load (image_load) and child execution are covered via attack:T1059.001.image_load"
+      kept: attack:T1059.001.image_load
+    - dropped: cue_process_tool.clustering
+      reason: "host-wide process clustering overlaps host_context.precursor (alert timeline) and baseline questions; dropped to keep count <=18"
+      kept: cue_host_context.precursor
+    - dropped: cue_host_context.clustering
+      reason: "host-wide activity aggregation overlaps precursor alert-timeline question; dropped to keep count <=18"
+      kept: cue_host_context.precursor
+    - dropped: cue_user_actor.clustering
+      reason: "user network-wide clustering and its service-principal substitute dropped to stay within 18; user identity is covered by the baseline / baseline_svc pair which is CommandLine-pattern scoped"
+      kept: cue_user_actor.baseline
+    - kept: cue_user_actor.baseline + cue_user_actor.baseline_svc
+      reason: "user_actor pair - non-deduplicable (subject-pivot vs host/mechanism-pivot); both emitted, both adapted to CommandLine-pattern scope since rule has no Image"
+  skipped_templates:
+    - template: obfuscation.encoded_payload_decode
+      reason: "replaced_by powershell.encoded_command_decode per brief hint"
+  reflection_overrides: []
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - powershell
+    - download_tool
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 16
+      attack: 2
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 2
+      context: 14
+    logsource_diversity:
+      process_creation: 9
+      file_event: 4
+      image_load: 1
+      network_connection: 1
+      powershell_service: 1
+      sigma_alert: 1

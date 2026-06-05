@@ -1,0 +1,520 @@
+name: Domain Trust Discovery Via Dsquery
+id: dfade1f8-b202-4497-9f8f-cd77b44de07a
+description: |
+  Detects execution of the RSAT command-line tool dsquery.exe with a command line containing the string
+  trustedDomain, which is the directory-object class enumerated when an operator lists cross-forest and
+  cross-domain trust relationships (for example dsquery * -filter "(objectClass=trustedDomain)"). The rule fires
+  only when both conditions hold: the process is dsquery.exe (by image name or original file name) AND its
+  command line contains trustedDomain. Legitimate use is limited to administrators and IT automation
+  troubleshooting Active Directory; outside that context, trust enumeration is an early-discovery step that maps
+  the trust topology before lateral movement or cross-domain abuse. The investigation should decode the exact
+  query, identify the parent process and user that ran it, and determine whether the enumeration was paired with
+  other reconnaissance or directory reads.
+type: detection
+detection_id: 3bad990e-4848-4a78-9530-b427d854aac0
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the triggering event show dsquery.exe with trustedDomain on its command line?
+  context: Before investing investigation time, confirm the alert is a true positive. The rule fires only when
+    both criteria match together — the process is dsquery.exe (by image path or original file name) AND the
+    command line contains the string trustedDomain. Read the full command line and confirm both, noting whether
+    the binary matched on its on-disk name or on its embedded original file name (a renamed copy matches only on
+    the latter).
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run Active Directory trust enumeration?
+  context: Listing domain trust relationships is a routine task for domain administrators and IT automation, but
+    standard users and most service accounts have no reason to enumerate cross-forest trusts. Knowing whether the
+    account role (domain admin, help desk, automation identity) and host function (administrative workstation,
+    domain controller, jump host) are consistent with trust discovery is often the fastest path to separating
+    sanctioned administration from operator reconnaissance.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What exactly did this dsquery command enumerate? Decode the full filter and attribute list.
+  context: The full command line reveals the concrete query. dsquery uses dsquery <object-type> <filters> <options>;
+    the trust-discovery form is dsquery * -filter "(objectClass=trustedDomain)" -attr * (often scoped to
+    CN=System,DC=...), which returns every trust the queried domain controller knows about — trustPartner,
+    trustDirection, trustType, and trustAttributes. Decode the -filter expression, the requested -attr list, and
+    any compound filters or wildcards to learn exactly which objects and attributes were pulled. Host+binary
+    scoping surfaces any back-to-back dsquery runs that together form a single enumeration sweep.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:discovery_recon.discovery_burst_detection
+  question: Did other reconnaissance commands run on this host around the same time?
+  context: A single trust query may be legitimate troubleshooting, but several reconnaissance commands in rapid
+    succession is a signature of post-compromise enumeration. Operators commonly chain trust discovery with native
+    recon binaries — nltest, net, dsquery against users and groups, nslookup, setspn — to map accounts, groups,
+    and computers before moving laterally. Three or more distinct recon binaries within fifteen minutes typically
+    indicates an automated enumeration sweep rather than ad-hoc administration.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_recon:
+        Image|endswith:
+          - '\whoami.exe'
+          - '\systeminfo.exe'
+          - '\ipconfig.exe'
+          - '\net.exe'
+          - '\net1.exe'
+          - '\nltest.exe'
+          - '\dsquery.exe'
+          - '\nbtstat.exe'
+          - '\arp.exe'
+          - '\netstat.exe'
+          - '\tasklist.exe'
+          - '\qprocess.exe'
+          - '\query.exe'
+          - '\quser.exe'
+          - '\hostname.exe'
+          - '\nslookup.exe'
+          - '\adfind.exe'
+          - '\csvde.exe'
+          - '\ldifde.exe'
+          - '\dnscmd.exe'
+          - '\cmdkey.exe'
+          - '\setspn.exe'
+      condition: selection and selection_recon
+    fields:
+      - Image
+      - User
+- source: template:discovery_recon.discovery_parent_chain
+  question: What process spawned dsquery.exe, and is that parent chain expected?
+  context: The parent process reveals how the trust query was launched. dsquery run interactively from cmd.exe or
+    powershell.exe under explorer.exe looks like a hands-on administrator; dsquery spawned by an Office application,
+    a script host (wscript.exe, cscript.exe, mshta.exe), wmiprvse.exe (WMI remote execution), or wsmprovhost.exe
+    (WinRM remote execution) points to automated or remote post-exploitation enumeration. Tune expectations to
+    the script hosts and automation that legitimately drive trust queries in this environment.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+- source: template:cue_process_tool.process_chain
+  question: What spawned the parent process, and what else did that parent launch?
+  context: The immediate parent is visible in the alert; walking one level up shows the broader launch context. A
+    parent that is itself a long-running interactive shell or a remote-execution host, and that also spawned other
+    discovery tooling, reframes a single trust query as one step in a hands-on session. Long-running parents
+    frequently start hours or days before the alert, so this lookup uses a wide window.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host previously matched the rule's pattern, what parents and users drove it, and does the current alert fit?
+  context: Even routine administrative tools can be abused. The query mirrors the rule's selection structure scoped
+    to this host — the resulting parent and user distribution reflects how this specific firing pattern (dsquery
+    against trustedDomain), not generic dsquery usage, has run here before. A new parent process, an unexpected
+    user account, or an unusual launch shape is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \dsquery.exe
+      - OriginalFileName: dsquery.exe
+      selection_cli:
+        CommandLine|contains: trustedDomain
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.scope
+  question: Have other hosts matched the rule's pattern in the past week, and does the cross-host spread look like automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count
+    of the rule's firing pattern (dsquery against trustedDomain) rather than generic dsquery usage. Many hosts
+    matching the same pattern points to scripted deployment or vendor automation; one host or a small unrelated set
+    points to manual operator activity. Use the host distribution and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \dsquery.exe
+      - OriginalFileName: dsquery.exe
+      selection_cli:
+        CommandLine|contains: trustedDomain
+      condition: all of selection_*
+    fields:
+    - host.name
+- source: attack:T1482.image_load
+  question: Did a process on this host load the directory-services or netlogon trust-enumeration libraries without running dsquery.exe?
+  context: Trust enumeration is not limited to dsquery. A process can call DsEnumerateDomainTrusts or the .NET
+    trust APIs directly, loading netapi32.dll, logoncli.dll, ntdsapi.dll, or System.DirectoryServices assemblies to
+    list trusts in memory without launching dsquery.exe. Reviewing module loads for these libraries from a process
+    that is not a normal directory tool — especially one running from a user-writable path — surfaces the API-based
+    enumeration path that a command-line-only view would miss. If image-load events are not collected in this
+    environment, treat zero results as a visibility gap rather than evidence nothing ran.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ImageLoaded|endswith:
+          - '\netapi32.dll'
+          - '\logoncli.dll'
+          - '\ntdsapi.dll'
+          - '\System.DirectoryServices.dll'
+          - '\System.DirectoryServices.Protocols.dll'
+      condition: selection
+    fields:
+      - Image
+      - ImageLoaded
+      - Signed
+- source: attack:T1482.process_access
+  question: Did any process open a cross-process handle associated with API-based directory or trust enumeration around the alert?
+  context: API-based trust enumeration (DsEnumerateDomainTrusts, GetAllTrustRelationships) and the credential or
+    authentication staging that often follows discovery can show up as one process opening a handle into another —
+    notably lsass.exe — with read or duplicate access. A handle-open into lsass.exe granting access such as 0x1010
+    or 0x1fffff, from a process that is not a known security or backup product, in the same window as the trust
+    query, indicates the enumeration was part of a broader hands-on operation rather than an isolated administrative
+    lookup. If process-access events are not collected, treat zero results as a visibility gap.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_access
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetImage|endswith: '\lsass.exe'
+      condition: selection
+    fields:
+      - SourceImage
+      - GrantedAccess
+      - CallTrace
+- source: attack:T1482.security
+  question: Did directory service object access tied to trust enumeration appear in the security log around the alert?
+  context: When an account reads trust objects through LDAP or directory service calls, directory service access
+    auditing records the read against the accessed objects, giving a server-side view of the enumeration that is
+    independent of the endpoint command line. This corroborates the dsquery activity and catches API-based trust
+    reads (DsEnumerateDomainTrusts) that never spawn dsquery.exe. Correlate any directory service access from the
+    alerting user or host with the trust query seen in the process command line; the accessed object name and
+    properties identify what was read.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: security
+    detection:
+      selection:
+        EventID: 4662
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - SubjectUserName
+      - ObjectName
+      - AccessMask
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run dsquery.exe?
+  context: Compare this user's current action against their history. A user who has never run dsquery is more
+    suspicious than an administrator who does so regularly as part of their role. The query counts prior dsquery
+    executions under this user across all hosts over ninety days; align low or zero counts with what is known about
+    the account's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent+binary combination historically routine on this host or across the environment, or is the parent unusual for dsquery?
+  context: 'When the alert fires under a service principal (SYSTEM, LOCAL SERVICE, NETWORK SERVICE, or a computer
+    account), user identity does not attribute behavior. The meaningful pivot is the launch mechanism: which parent
+    process spawned dsquery.exe, and whether that pair is historically common. A new or rare parent for dsquery on
+    this host or across the environment is the deviation worth chasing; a pair that already accounts for many prior
+    events is automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts in the surrounding window reveals lateral movement or
+    activity spanning multiple endpoints. If the same user ran trust enumeration, other discovery commands, or
+    hands-on-keyboard tooling on more than one host, the scope of the activity may be larger than this single alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent+binary combination fire on other hosts in the same window — coordinated rollout or isolated activity?
+  context: Under a service principal, asking what else the user did across the network returns agent-telemetry
+    noise because every host runs SYSTEM-owned agents constantly. The meaningful question is whether the same launch
+    mechanism — parent process plus dsquery.exe — fired on other hosts in the alert window. Multiple hosts in the
+    same window points to scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering, credential
+    access, or other discovery activity — may reveal the attack stages that preceded this trust query and help
+    reconstruct the timeline leading up to the enumeration.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1482
+      name: Domain Trust Discovery
+      role: primary
+  attack_chain_coverage:
+    - stage: 1
+      label: trust_enumeration
+      description: "Adversary enumerates domain trust relationships via dsquery (objectClass=trustedDomain), nltest, PowerShell, or the Win32/.NET trust APIs (DSEnumerateDomainTrusts, GetAllTrustRelationships, LDAP) — the detection point"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: query_decode
+      description: "The full dsquery filter and attribute list is decoded to recover exactly which trust objects and attributes were read"
+      mapped_to: Q3
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 3
+      label: alternative_enumeration_method
+      description: "The same trust enumeration performed via API/LDAP instead of dsquery, observable as directory-services library loads, process handle opens, and directory service object-access events"
+      mapped_to: Q9
+      source: attack:T1482.image_load
+    - stage: 4
+      label: discovery_or_authentication_staging
+      description: "Trust enumeration is followed by further discovery or authentication/credential staging within a bounded window (recon bursts, cross-process handles, directory reads)"
+      mapped_to: Q4
+      source: template:discovery_recon.discovery_burst_detection
+  dimension_coverage:
+    - dimension: time_correlation
+      technique: T1482
+      covered_by: Q4
+      source: template:discovery_recon.discovery_burst_detection
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1482
+      covered_by: Q5
+      source: template:discovery_recon.discovery_parent_chain
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1482
+      covered_by: Q2
+      source: template:universal.host_user_context
+      coverage_type: direct
+  mutable_dispositions:
+    - element: ParentImage
+      dimension: tuning_parameter
+      specific_values: "rationale only (tune for expected script hosts / authorized administrators invoking trust enumeration)"
+      disposition: context
+      target_question: Q5
+      notes: "discovery_parent_chain (Q5) surfaces ParentImage/ParentCommandLine of the alerting event and process_chain (Q6) walks one level up; the expected-script-host tuning rationale is named in Q5 context. baseline_deviation (Q7) shows the historical parent distribution for the rule pattern on this host."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "bounded window correlating enumeration with subsequent Kerberos/DC interaction or credential access"
+      disposition: query_injection
+      target_question: Q4
+      notes: "discovery_burst_detection (Q4) uses a +/-15m window; image_load (Q9), process_access (Q10), and security (Q11) all use +/-15m to bracket the trust query against alternative-method enumeration and directory reads, realizing the bounded-window correlation."
+    - element: UserContext
+      dimension: user_context
+      specific_values: "rationale only (prioritize non-admin or unexpected accounts performing enumeration)"
+      disposition: context
+      target_question: Q2
+      notes: "host_user_context (Q2) frames whether the account role and host function are consistent with trust enumeration; cue_user_actor.baseline (Q12) carries the historical per-user count."
+    - element: API_Name
+      dimension: tuning_parameter
+      specific_values: "DSEnumerateDomainTrusts, GetAllTrustRelationships (low-prevalence trust-enum APIs)"
+      disposition: new_question
+      target_question: Q9
+      notes: "API-based trust enumeration cannot be seen in the dsquery process_creation event. Authored attack:T1482.image_load (Q9, netapi32/logoncli/ntdsapi/.NET DirectoryServices loads), attack:T1482.process_access (Q10, cross-process handle), and attack:T1482.security (Q11, EID 4662 directory service object access) to surface the API path server- and host-side."
+  dedup_decisions:
+    - dropped: discovery_recon.discovery_user_context
+      reason: "Overlaps universal.host_user_context — both ask whether this user/host is expected to perform the operation, ProcessGuid-scoped to the alerting event with a User projection. host_user_context is the required must_include universal triage question and is retained; the discovery variant adds no distinct field or scope here. Per discovery_user_context notes_to_llm, the two are mergeable and one should be dropped."
+      kept: template:universal.host_user_context
+    - dropped: cue_user_actor.baseline pair / cue_user_actor.clustering pair
+      reason: "user_actor pair — non-deduplicable; the user-pivot and the parent+binary service-principal substitute are emitted as separate questions per AGENTS.md (Q12+Q13 baseline pair, Q14+Q15 clustering pair)."
+      kept: "Q12+Q13 (baseline pair), Q14+Q15 (clustering pair)"
+  skipped_templates:
+    - template: cue_process_tool.baseline
+      reason: "Host binary baseline scopes by Image|endswith|expand %Image% (all dsquery.exe on the host over 90d), which counts generic dsquery usage rather than the rule's trustedDomain pattern. The rule-pattern host history is better served by cue_process_tool.baseline_deviation (Q7), which embeds the rule's full selection (dsquery AND trustedDomain) scoped to this host. Slot reallocated to the must_include discovery technique-set questions and the three logsource-coverage questions."
+    - template: cue_process_tool.follow_on
+      reason: "Child-process follow-on scopes by ParentImage|endswith|expand %Image% (children of dsquery.exe). dsquery is a query tool that prints results to stdout and does not normally spawn children, so the follow-on view adds little. Post-query activity is covered by the recon burst (Q4) and user clustering (Q14) questions. Dropped to keep within the 14-18 budget after authoring the three logsource-coverage questions."
+    - template: cue_process_tool.clustering
+      reason: "Host-wide process clustering (host.name +/-15m, aggregated by Image) near-duplicates discovery_recon.discovery_burst_detection (Q4, same host scope and window) and cue_host_context.clustering. Dropped to budget; surrounding host activity is carried by the burst question."
+    - template: cue_host_context.clustering
+      reason: "Host-wide activity survey (host.name +/-15m, aggregated by Image+ParentImage) near-duplicates the dropped cue_process_tool.clustering and overlaps discovery_burst_detection (Q4). Dropped to budget; the burst question carries the host-context-clustering signal."
+    - template: universal.endpoint_protection_health
+      reason: "RECOMMENDED tier, not must_include. Per its notes_to_llm, safe to drop when the cue_host_context.precursor question is present AND the rule is not execution/credential-centric. This rule fires on a domain-trust DISCOVERY query (read-only LDAP enumeration), not payload execution or credential access, so tamper-as-precursor is not a live disposition driver here; the precursor question (Q16, retained) already surfaces prior tamper alerts on the host. The generic host-tamper sweep does not earn a slot under the 18-question budget for a discovery rule."
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "logsource 'image_load' (recommended by techniques: T1482) is not covered — pull in cue_image_load.* or author a custom question with `category: image_load`"
+      disposition: acted
+      reason: >-
+        Acted on — authored attack:T1482.image_load (Q9) with category: image_load,
+        keying on the directory-services and netlogon libraries (netapi32.dll,
+        logoncli.dll, ntdsapi.dll, System.DirectoryServices*) that DSEnumerateDomainTrusts
+        and the .NET trust APIs load. This surfaces API-based trust enumeration that
+        runs in-memory without spawning dsquery.exe, which the rule's process_creation
+        detection cannot see. Recorded here for audit completeness; the hint manifests
+        as the present question, not a decline.
+    - hint: "logsource 'process_access' (recommended by techniques: T1482) is not covered and no template family exists — author a custom question with `category: process_access`"
+      disposition: acted
+      reason: >-
+        Acted on — authored attack:T1482.process_access (Q10) with category:
+        process_access, surfacing cross-process handle opens into lsass.exe (EventCode 10)
+        that accompany API-based trust enumeration and the credential/authentication
+        staging that often follows discovery. Recorded here for audit completeness; the
+        hint manifests as the present question.
+    - hint: "logsource 'security' (recommended by techniques: T1482) is not covered and no template family exists — author a custom question with `category: security`"
+      disposition: acted
+      reason: >-
+        Acted on — authored attack:T1482.security (Q11) with service: security, querying
+        directory service object access (EventID 4662) to give a server-side view of the
+        trust-object reads that is independent of the endpoint command line and catches
+        API/LDAP trust enumeration that never spawns dsquery.exe. Recorded here for audit
+        completeness; the hint manifests as the present question.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - discovery_recon
+    - cue_process_tool
+    - cue_user_actor
+    - cue_host_context
+  generation_stats:
+    total_questions: 16
+    source_counts:
+      template: 13
+      attack: 3
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 13
+    logsource_diversity:
+      process_creation: 12
+      image_load: 1
+      process_access: 1
+      security: 1
+      sigma_alert: 1

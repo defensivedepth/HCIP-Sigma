@@ -1,0 +1,531 @@
+name: Non-privileged Usage of Reg or Powershell
+id: 898d7146-c249-4756-9451-4a1804481b11
+description: |
+  Detects a non-privileged (Medium integrity) process using reg.exe or PowerShell cmdlets to modify
+  service configuration in the registry. The rule fires when the command line contains a reg add or a
+  PowerShell item-property write (set-itemproperty, sp, new-itemproperty) AND targets a CurrentControlSet
+  Services subtree value such as ImagePath, FailureCommand, or ServiceDLL. Writing these values lets a
+  user redirect what a service executes, which is a common route to persistence or privilege escalation;
+  legitimate service configuration is normally done by installers or management tooling running at higher
+  integrity. Investigation should confirm exactly which service and value were changed, what the new data
+  points to, whether the change survives reboot, and whether the user, parent process, and timing are
+  consistent with sanctioned administration.
+type: detection
+detection_id: 8f02c935-effe-45b3-8fc9-ef8696a9e41d
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line show a reg add or PowerShell item-property write targeting a service registry value at Medium integrity?
+  context: Before investing investigation time, confirm the alert is a true positive. The rule requires
+    both halves to match the same event, a reg add or a PowerShell write (set-itemproperty, sp, new-itemproperty)
+    AND a path under CurrentControlSet Services touching ImagePath, FailureCommand, or ServiceDLL, all at
+    Medium integrity. Read the full command line and confirm both the write verb and the targeted service
+    value are present.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+      - IntegrityLevel
+- source: template:universal.host_user_context
+  question: Is this user and host expected to modify service registry configuration from a non-privileged session?
+  context: Legitimate service configuration is normally performed by installers or management tooling at
+    higher integrity, not by an interactive Medium-integrity user. Knowing whether this account and host
+    routinely perform service registry changes is often the fastest way to separate sanctioned administration
+    from unauthorized modification.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:parent_child.parent_process_legitimacy
+  question: What process spawned this reg.exe or PowerShell instance, and what started that parent?
+  context: The launch chain reveals whether the registry write came from sanctioned tooling or from an
+    unexpected origin. A reg or PowerShell write spawned by explorer.exe or a known management agent reads
+    differently than one spawned by a script host, Office application, or a freshly dropped binary. Tracing
+    the parent's own origin distinguishes routine administration from a write driven by an upstream foothold.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- source: template:registry.registry_key_context
+  question: Which service and which value (ImagePath, FailureCommand, or ServiceDLL) were modified, and what data was written?
+  context: The specific service subtree and value name determine intent and impact. ImagePath redirects
+    what binary the service launches, ServiceDLL redirects the DLL a shared-host service loads, and FailureCommand
+    runs an arbitrary command when the service fails. Read the structured registry event linked to this
+    process to recover the exact target key path and the value data written, rather than parsing it out of
+    the command line. If registry_set events are not collected in this environment, fall back to decoding
+    the key and value directly from the alerting command line.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+- source: template:powershell.encoded_command_decode
+  question: Is the registry write obfuscated, and what does it resolve to once the obfuscation is removed?
+  context: This rule fires on readable write verbs, but the service name, value, and data can still be hidden
+    with string concatenation, backtick escaping, variable substitution, environment-variable expansion, or
+    char-code assembly. Reconstruct the effective command so the true service, value, and target path are
+    visible. A command that goes out of its way to obscure a routine configuration change is a meaningful
+    deviation from how administrators normally script these edits.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:registry.registry_related_modifications
+  question: Were other reg.exe or PowerShell registry writes made on this host in the same session?
+  context: Actors who alter one service value often alter several, or pair the service change with a Run
+    key, a Defender setting, or a firewall rule. Finding a cluster of registry writes from reg.exe or PowerShell
+    on the same host within a short window reveals the full scope of the configuration change and whether
+    multiple objectives were pursued together rather than a single isolated edit.
+  range: +/-30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_reg:
+        CommandLine|contains:
+          - 'reg add'
+          - 'reg delete'
+          - 'set-itemproperty'
+          - 'new-itemproperty'
+          - 'remove-itemproperty'
+      condition: selection and selection_reg
+    fields:
+      - CommandLine
+- source: template:registry.registry_value_persistence_check
+  question: Does the binary or DLL now referenced by the modified service value exist on disk, and what is it?
+  context: A redirected ImagePath or ServiceDLL is only effective if the referenced file is present at the
+    path written into the value. Identify the path from the command line, then confirm whether that file
+    exists on the host and analyze its hash and signing. A write that points a service at a binary in a
+    user-writable directory, or at an unsigned file, indicates an active persistence or escalation mechanism
+    rather than a benign reconfiguration.
+  range: +15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - Hashes
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired this rule's pattern, what parents and users normally drive it, and does this alert fit?
+  context: Even routine tools can be abused. This query mirrors the rule's selection structure scoped to
+    this host, so the resulting parent and user distribution reflects how this specific service-registry-write
+    pattern has historically run here, not generic reg or PowerShell usage. A new parent process, an unexpected
+    account, or a first-ever appearance of the pattern is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_cli:
+      - CommandLine|contains|all:
+        - 'reg '
+        - add
+      - CommandLine|contains:
+        - powershell
+        - set-itemproperty
+        - ' sp '
+        - new-itemproperty
+      selection_data:
+        IntegrityLevel:
+        - Medium
+        - S-1-16-8192
+        CommandLine|contains|all:
+        - ControlSet
+        - Services
+        CommandLine|contains:
+        - ImagePath
+        - FailureCommand
+        - ServiceDLL
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired this rule's pattern in the past week, and does the cross-host spread look like automation or one-off activity?
+  context: This query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide
+    count of this exact service-registry-write pattern rather than generic tool usage. Many hosts firing the
+    same pattern points to scripted deployment or vendor automation; a single host or a small unrelated set
+    points to manual operator activity. Use the host distribution and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_cli:
+      - CommandLine|contains|all:
+        - 'reg '
+        - add
+      - CommandLine|contains:
+        - powershell
+        - set-itemproperty
+        - ' sp '
+        - new-itemproperty
+      selection_data:
+        IntegrityLevel:
+        - Medium
+        - S-1-16-8192
+        CommandLine|contains|all:
+        - ControlSet
+        - Services
+        CommandLine|contains:
+        - ImagePath
+        - FailureCommand
+        - ServiceDLL
+      condition: all of selection_*
+    fields:
+    - host.name
+- source: template:cue_user_actor.baseline
+  question: Does this user normally modify service configuration in the registry?
+  context: Compare this account's current action against its historical behavior. A user who has never made
+    a service registry write of this shape is more suspicious than one who does so regularly as part of a
+    known administrative role. Zero or very low historical counts indicate first-time or rare activity for
+    this account.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        CommandLine|contains|all:
+        - ControlSet
+        - Services
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent process and registry-write combination historically routine on this host or across the environment?
+  context: When the alert fires under a service principal, user identity does not attribute the behavior.
+    The meaningful pivot is the launch mechanism, which parent process drove the service registry write, and
+    whether that pairing is historically common. A new or rare parent for this kind of write is the deviation
+    worth chasing; a pair that already accounts for many prior events is most likely management automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        CommandLine|contains|all:
+        - ControlSet
+        - Services
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the environment around the time of this alert?
+  context: Tracking the user's activity across all hosts in the alert window reveals lateral movement or
+    coordinated activity on multiple endpoints. If the same account triggered similar service or registry
+    changes elsewhere, the scope is larger than a single host and the disposition shifts accordingly.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent process and registry-write combination fire on other hosts in the same window?
+  context: Under a service principal, asking what else the user did returns broad agent telemetry that every
+    host produces constantly. The meaningful question is whether the same launch mechanism, the parent process
+    driving the service registry write, fired on other hosts in the alert window. Multiple hosts in the same
+    window points to scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        CommandLine|contains|all:
+        - ControlSet
+        - Services
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_process_tool.follow_on
+  question: Was the modified service started or restarted, or did a new process execute, shortly after the registry write?
+  context: A redirected service value only takes effect when the service runs. Look for a service restart,
+    a new svchost-hosted service load, or an unexpected child process on this host in the minutes after the
+    write. Execution following the registry change confirms the modification produced an effect rather than
+    remaining a dormant configuration edit, and it surfaces what the redirected value actually launched.
+  range: +4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining activity around the write reveals what led to it and
+    what followed, and whether it is part of a larger sequence. Aggregating by Image and ParentImage collapses
+    repetitive agent noise into high-count rows while novel parent-child pairs stand out at low counts, which
+    is what reconnaissance, privilege escalation, or additional persistence would look like here.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host, such as defense tampering, reconnaissance, or credential
+    access, may reveal the attack stages that preceded the service registry write and help reconstruct the
+    timeline. Defense tampering or credential access followed by a persistence-oriented registry change is
+    a common ordering worth confirming.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:organizational_context.change_ticket
+  question: Was there a change ticket, maintenance window, or documented approval for this service configuration change?
+  context: Many organizations require change approval for service and persistence-affecting modifications.
+    A corresponding ticket or maintenance window suggests authorized administration; absence of one when policy
+    requires it suggests the change was unauthorized. Confirming whether the timing aligns with an approved
+    window quickly closes false positives or escalates true positives.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1112
+      name: Modify Registry
+      role: primary
+  attack_chain_coverage:
+    - stage: 1
+      label: registry_write_via_cli_or_powershell
+      description: "Non-privileged process uses reg.exe or PowerShell to write a service registry value (ImagePath/FailureCommand/ServiceDLL)"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: target_key_and_value
+      description: "The specific service subtree and value modified, and the data written"
+      mapped_to: Q4
+      source: template:registry.registry_key_context
+    - stage: 3
+      label: service_restart_or_execution
+      description: "Modified service is restarted or a process executes as a result of the redirected value"
+      mapped_to: Q14
+      source: template:cue_process_tool.follow_on
+  dimension_coverage:
+    - dimension: parent_process_analysis
+      technique: T1112
+      covered_by: Q3
+      source: template:parent_child.parent_process_legitimacy
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1112
+      covered_by: Q14
+      source: template:cue_process_tool.follow_on
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1112
+      covered_by: Q4
+      source: template:registry.registry_key_context
+      coverage_type: direct
+  mutable_dispositions:
+    - element: RegistryKeyPathPatterns
+      dimension: tuning_parameter
+      specific_values: "CurrentControlSet\\Services subtree; ImagePath, FailureCommand, ServiceDLL values (rule-constrained)"
+      disposition: context
+      target_question: Q4
+      notes: "Rule already constrains these via selection_data ControlSet+Services+ImagePath/FailureCommand/ServiceDLL; verify_trigger_match and registry_key_context restate the exact targeted values in question/context."
+    - element: ParentProcessAllowList
+      dimension: parent_process_analysis
+      specific_values: "rationale only (allowlist of legitimate registry tools)"
+      disposition: new_question
+      target_question: Q3
+      notes: "No fixed values in brief; covered by parent_process_legitimacy origin-tracing and the baseline_svc parent pivot (Q11/Q13)."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only (correlate registry change with nearby process/service execution)"
+      disposition: new_question
+      target_question: Q14
+      notes: "follow_on question correlates the write with service restart / process execution in the +4h window."
+    - element: SignatureCheck
+      dimension: tuning_parameter
+      specific_values: "rationale only (flag unsigned executables / abnormal parent-child lineage)"
+      disposition: context
+      target_question: Q7
+      notes: "registry_value_persistence_check pulls Hashes of the referenced binary and prompts a signing/origin review; parent lineage covered by Q3."
+  dedup_decisions:
+    - dropped: cue_process_tool.process_chain
+      reason: "parent_child technique set active — parent_process_legitimacy (Q3) is the more specific parent-origin question"
+      kept: parent_child.parent_process_legitimacy
+    - dropped: parent_child.sibling_processes
+      reason: "ParentProcessGuid frequently NODATA for these alerts; sibling scope is covered by host_context.clustering (Q15) and follow_on (Q14) without a redundant parent-keyed question"
+      kept: cue_host_context.clustering
+    - dropped: cue_user_actor.baseline (user-pivot) vs baseline_svc pairing
+      reason: "user_actor pair — non-deduplicable; both Q10 (user pivot) and Q11 (parent+write substitute) emitted"
+      kept: both
+    - dropped: cue_user_actor.clustering vs clustering_svc pairing
+      reason: "user_actor pair — non-deduplicable; both Q12 (user pivot) and Q13 (parent+write substitute) emitted"
+      kept: both
+  skipped_templates:
+    - template: cue_process_tool.mechanism_decode
+      reason: "replaced_by: registry.registry_key_context (Q4) — hint honored"
+    - template: cue_process_tool.baseline
+      reason: "Image|endswith %Image% query unusable — CommandLine-only rule with no Image in detection (primary_binary null); rule-pattern baseline covered by baseline_deviation (Q8) and user baselines (Q10/Q11)"
+    - template: cue_process_tool.clustering
+      reason: "host-wide tool clustering duplicates cue_host_context.clustering (Q15); no added coverage"
+    - template: universal.endpoint_protection_health
+      reason: "RECOMMENDED generic tamper sweep; this is a persistence/config rule, not an execution or credential-access rule where tamper-as-precursor turns the disposition. Prior-tamper context is carried by host_context.precursor (Q16)."
+    - template: powershell.script_block_logging
+      reason: "Rule detects short reg/PowerShell item-property writes, not encoded script payloads; 4104 deobfuscation adds little for a single readable cmdlet. Obfuscation handling kept via encoded_command_decode (Q5)."
+    - template: powershell.powershell_security_bypass
+      reason: "Rule does not detect AMSI/execution-policy bypass; bypass-precursor sweep is generic for this config-change rule and overlaps host_context.precursor (Q16)."
+    - template: organizational_context.human_recall
+      reason: "Approval/legitimacy already covered by change_ticket (Q17) and host_user_context (Q2); a second organizational-recall slot would not add a distinct investigative angle"
+    - template: organizational_context.timing_alignment
+      reason: "Timing-vs-maintenance-window judgment folded into change_ticket (Q17) context; redundant as a standalone question"
+    - template: organizational_context.procedural_consistency
+      reason: "Procedure-normality judgment folded into host_user_context (Q2) and change_ticket (Q17)"
+    - template: persistence_scope.process_based_persistence
+      reason: "registry_related_modifications (Q6) already sweeps reg/PowerShell persistence writes on the host; a parallel schtasks/sc/bitsadmin sweep would not change the disposition of this registry-specific write"
+    - template: persistence_scope.file_based_persistence
+      reason: "registry_value_persistence_check (Q7) covers the on-disk payload referenced by the modified value; Startup-folder/Run-path file drops are a different mechanism not implicated by this service-value rule"
+  hint_dispositions:
+    - hint: "powershell.encoded_command_decode replaces obfuscation.encoded_payload_decode"
+      disposition: declined
+      reason: >-
+        Acted on in spirit, recorded here for audit: encoded_command_decode (Q5) is
+        included and adapted to deobfuscate the reg/PowerShell service write. The named
+        obfuscation.encoded_payload_decode template is not present in this brief's
+        templates[] list, so there is nothing to physically replace; the replacement
+        target is already the included template.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - powershell
+    - registry
+    - organizational_context
+    - parent_child
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 17
+      attack: 0
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 2
+      context: 13
+    logsource_diversity:
+      process_creation: 14
+      registry_set: 1
+      file_event: 1
+      sigma_alert: 1

@@ -1,0 +1,413 @@
+name: Suspicious Usage Of ShellExec_RunDLL
+id: 9a239eee-29e4-466e-9f56-86aa1b9f0643
+description: |
+  Detects use of the shell32.dll ShellExec_RunDLL export to launch a follow-on command, where the command line also contains a suspicious indicator such as a user-writable path (\Desktop\, \Temp\, \Users\Public\), a command interpreter reference (comspec, iex, Invoke-, msiexec), or a known proxy-execution binary (odbcconf, regsvr32). ShellExec_RunDLL is a legitimate shell helper, but invoking it through rundll32 to chain into another LOLBin is a proxy-execution pattern used to launch a malicious DLL while evading name-based and application-control detections. Confirm the full command line, identify the binary and DLL it ultimately loads, walk the parent and child process chain, and determine whether the activity is isolated or part of a multi-stage operation on the host.
+type: detection
+detection_id: d87bd452-6da1-456e-8155-7dc988157b7d
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-06
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line contain a ShellExec_RunDLL call together with a suspicious path or proxy-execution indicator?
+  context: Before investing investigation time, confirm the alert is a true positive by reviewing the exact command line. The rule fires only when the command line contains ShellExec_RunDLL AND at least one suspicious indicator (a user-writable path such as \Desktop\, \Temp\, \Users\Public\, a command-interpreter reference such as comspec, iex, Invoke-, msiexec, or a proxy-execution binary such as odbcconf or regsvr32). Confirm both halves are present and note which indicator matched.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to invoke ShellExec_RunDLL to launch other commands?
+  context: Legitimate administrative or installer activity can occasionally call shell helpers, but ShellExec_RunDLL chaining into another binary from a user-writable path is rarely normal end-user behavior. Knowing whether the user role and host function fit this activity is often the fastest way to separate a true positive from a routine operation.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What does the full ShellExec_RunDLL command line do, and which binary and DLL does it ultimately load?
+  context: The full command line reveals the operational purpose. Parse the ShellExec_RunDLL invocation to identify the target binary it launches and any DLL path it loads, decode the arguments to the chained binary (for example odbcconf -A {regsvr ...} actions or an msiexec install string), and note any embedded URL, file path, or trailing-dot DLL reference. This is the proxy-execution payload step and is distinct from confirming the alert matched.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:cue_process_tool.process_chain
+  question: What process spawned this command and is that parent chain expected?
+  context: The parent process reveals how the command was invoked. A proxy-execution chain frequently runs under an auto-elevating UAC-bypass helper or another LOLBin rather than a normal interactive shell. An unexpected parent such as fodhelper.exe, mshta.exe, or a script host is a strong reason to walk the chain upward and check what spawned the parent.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.follow_on
+  question: What child processes did this command spawn afterward?
+  context: The processes spawned afterward reveal the actual impact of the proxy-execution chain. Look for follow-on LOLBins (odbcconf.exe, regsvr32.exe, rundll32.exe, dllhost.exe), command interpreters, or processes that subsequently make external network connections with an empty command line, which is the canonical second-stage C2 pattern for this activity.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.baseline
+  question: Has this host run a ShellExec_RunDLL command before, and how often?
+  context: A ShellExec_RunDLL invocation that has never been seen on a host is more suspicious than one that recurs. Scoping the baseline to the rule's distinctive command-line token rather than to the launching binary avoids drowning the count in generic rundll32 usage. Zero or very low historical counts indicate first-time or rare execution of this specific pattern.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains: ShellExec_RunDLL
+      condition: selection
+    fields:
+      - User
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired this rule's pattern, what parents and users normally drive it, and does the current alert fit?
+  context: Even shell helpers can be invoked legitimately. The query mirrors the rule's full selection structure scoped to this host, so the resulting parent and user distribution reflects how this specific firing pattern has historically run here. A new parent process, an unexpected user account, or an unusual command-line shape is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_openasrundll:
+        CommandLine|contains: ShellExec_RunDLL
+      selection_suspcli:
+        CommandLine|contains:
+        - \Desktop\
+        - \Temp\
+        - \Users\Public\
+        - comspec
+        - iex
+        - Invoke-
+        - msiexec
+        - odbcconf
+        - regsvr32
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_user_actor.baseline
+  question: Does this user normally invoke ShellExec_RunDLL commands?
+  context: Compare this user's current action against their historical behavior. A user who has never invoked a ShellExec_RunDLL command is more suspicious than one who does so regularly. The pivot is scoped to the rule's distinctive command-line token so the count reflects this specific pattern rather than all uses of the launching binary. User role and typical toolset should align.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        CommandLine|contains: ShellExec_RunDLL
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent and binary combination historically routine on this host or environment-wide, or is the parent unusual for this binary?
+  context: When the alert fires under a service principal, user identity does not attribute the behavior, so the meaningful pivot is the launch mechanism. A new or rare parent for this binary on this host or environment-wide is the deviation worth chasing; a pair that already accounts for many prior events is more likely vendor or operating-system automation. This complements the user-identity baseline rather than replacing it.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints. If the same user triggered similar activity on more than one host, the scope of the event may be larger than a single alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent and binary combination fire on other hosts in the same window, or is the activity isolated to this host?
+  context: Under a service principal, asking what else the user did across the network returns agent-telemetry noise because every host runs service-owned processes constantly. The meaningful question is whether the same launch mechanism (parent process plus spawned binary) fired on other hosts in the alert window. Multiple hosts in the same window points to scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired this rule's pattern in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: The query mirrors the rule's full selection structure with no host scope, so the result is a fleet-wide count of this firing pattern rather than generic use of the launching binary. Many hosts firing the same pattern points to scripted deployment or vendor automation; one host or a small unrelated set points to manual operator activity. Use the host distribution and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_openasrundll:
+        CommandLine|contains: ShellExec_RunDLL
+      selection_suspcli:
+        CommandLine|contains:
+        - \Desktop\
+        - \Temp\
+        - \Users\Public\
+        - comspec
+        - iex
+        - Invoke-
+        - msiexec
+        - odbcconf
+        - regsvr32
+      condition: all of selection_*
+    fields:
+    - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: 'Alerts rarely occur in isolation. Examining the surrounding activity reveals the immediate context: what led to this event, what happened after, and whether it is part of a larger sequence. Look for reconnaissance, privilege escalation, persistence installation, or removable-media activity that may have introduced the payload.'
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host, such as removable-media execution, UAC-bypass attempts, defense tampering, or reconnaissance, may reveal the attack stages that preceded this event and help reconstruct the full timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in the hour before the alert?
+  context: Tampering typically precedes payload execution. The query surfaces direct attempts to disable AV/EDR services, flip Defender flags, add broad exclusions, clear logs, or patch AMSI/ETW. Zero rows is a useful signal that protection looks healthy; kernel-level driver tampering and in-memory patches will not appear here. Populated rows shift the disposition toward operator preparation, so review the parent process and signing chain to identify the writer.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+_generation_meta:
+  has_attack_brief: false
+  techniques: []
+  attack_chain_coverage: []
+  dimension_coverage: []
+  mutable_dispositions: []
+  dedup_decisions:
+    - dropped: cue_process_tool.clustering
+      reason: "near-identical query to cue_host_context.clustering (host.name-scoped aggregation, +/-15m); host_context version projects Image+ParentImage which is the richer view"
+      kept: cue_host_context.clustering
+    - dropped: none
+      reason: "user_actor pair — non-deduplicable: cue_user_actor.baseline + baseline_svc and clustering + clustering_svc emitted as both variants per service_principals.yaml default_behavior (rule does not meet skip_substitute_when_all_match; no user.name constraint in detection)"
+      kept: cue_user_actor.baseline, cue_user_actor.baseline_svc, cue_user_actor.clustering, cue_user_actor.clustering_svc
+  skipped_templates: []
+  reflection_overrides: []
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded:
+      - id: ransomware_impact
+        confidence: low
+        reason: "keyword match on 'ransomware' comes from references describing this worm's downstream Clop/LockBit handoffs, not from what this rule detects. The rule fires on a ShellExec_RunDLL proxy-execution command-line pattern (defense-evasion/execution), not on ransomware impact behavior. Match is incidental."
+      - id: network_scope
+        confidence: low
+        reason: "same incidental 'ransomware' keyword origin; this rule's detection is purely a process_creation CommandLine pattern with no network field. No network-scope dimension is genuinely involved in what the rule fires on."
+  technique_sets_applied:
+    - universal
+  generation_stats:
+    total_questions: 15
+    source_counts:
+      template: 15
+      attack: 0
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 12
+    logsource_diversity:
+      process_creation: 14
+      sigma_alert: 1

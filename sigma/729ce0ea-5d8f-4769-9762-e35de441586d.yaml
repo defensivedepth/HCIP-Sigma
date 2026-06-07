@@ -1,0 +1,481 @@
+name: MpiExec Lolbin
+id: 8aae45e6-cc89-4454-afe2-20f0611e0beb
+description: |
+  Detects mpiexec.exe (the Microsoft MPI / HPC Pack cluster application launcher) running with a single-process flag
+  (' /n 1 ' or ' -n 1 '), matched by binary name or by the known IMPHASH. mpiexec is a signed Microsoft binary that
+  accepts an arbitrary trailing executable path and runs it as a child under the MS-MPI framework (mpiexec spawns
+  smpd.exe, which then spawns the target), giving an attacker a signed-binary parent for proxied execution. On HPC
+  cluster nodes this can be routine job submission; on non-HPC endpoints mpiexec is typically absent, so its presence
+  and execution at all is investigation-worthy. The investigation should confirm the flag pattern, decode the full
+  command line for a trailing payload path or env-var injection, and identify what mpiexec ultimately spawned.
+type: detection
+detection_id: 729ce0ea-5d8f-4769-9762-e35de441586d
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line match the rule's pattern of mpiexec.exe run with a single-process flag?
+  context: Confirm the alert is a true positive by reviewing the exact command line and process details. The rule fires
+    when the image ends in mpiexec.exe (or matches the known IMPHASH) AND the command line contains ' /n 1 ' or ' -n 1 '.
+    Both conditions must hold. Read the full command line for a trailing executable path, which is the payload mpiexec
+    will proxy.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - Hashes
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run HPC cluster job launchers?
+  context: mpiexec.exe ships with Microsoft MPI / HPC Pack and is normally seen only on compute nodes or HPC submission
+    hosts. On a workstation or general-purpose server its presence is unusual. Knowing whether this host has a legitimate
+    HPC role and whether this user runs cluster jobs is often the fastest way to separate routine job submission from
+    abuse of the signed launcher.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What is the full mpiexec command line, and what executable, env-var, or remote-host arguments does it carry?
+  context: The full command line reveals what mpiexec was asked to proxy. Decode the trailing positional executable path
+    (a payload under user-writable locations such as %TEMP%, %APPDATA%, %ProgramData%, or a UNC path is the smoking-gun
+    pattern), and look for /host, /hosts, or /machinefile (remote execution targeting), /env or /genv (environment-variable
+    injection such as COR_PROFILER, AMSI/ETW disable strings), /path or /wdir (sideload or working-directory control), and
+    /configfile (payload kept off the command line in a separate file).
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: attack:T1218.command_analysis
+  question: Does the mpiexec command line carry environment-variable injection or a configfile that hides the payload?
+  context: mpiexec /env and /genv set environment variables for the spawned process, which can enable a COR_PROFILER
+    .NET side-load or disable AMSI/ETW before the payload runs. /configfile reads further command sections from a separate
+    file, keeping the actual executable and its arguments out of the process-creation record. Presence of these arguments
+    raises the priority of pulling the referenced file or profiler DLL for review.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_proc:
+        ProcessGuid|expand: '%ProcessGuid%'
+      selection_args:
+        CommandLine|contains:
+          - ' /env '
+          - ' /genv '
+          - ' /configfile '
+          - 'COR_PROFILER'
+          - 'COR_ENABLE_PROFILING'
+          - 'AMSI'
+          - ' /path '
+          - ' /gpath '
+      condition: selection_proc and selection_args
+    fields:
+      - CommandLine
+- source: attack:T1218.parent_process_analysis
+  question: What process spawned mpiexec.exe and is that parent chain expected for HPC job submission?
+  context: The parent process reveals how mpiexec was invoked. Legitimate HPC job submission is typically driven by a
+    scheduler service, a console session, or an HPC management tool. Unusual parents such as office applications,
+    script hosts (wscript.exe, mshta.exe), or a remote-access tool point to the signed launcher being used as a proxy
+    rather than for cluster work.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: attack:T1218.proxied_execution
+  question: What did mpiexec.exe spawn afterward, including processes launched through smpd.exe?
+  context: mpiexec runs the target executable indirectly — mpiexec spawns smpd.exe (the MS-MPI process manager service),
+    which in turn spawns the requested binary. The child it ultimately launches is the actual payload and the most
+    investigation-relevant artifact. Watch for interpreters or post-exploitation tools (cmd.exe, powershell.exe,
+    rundll32.exe, certutil.exe) or any unsigned executable from a user-writable path.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_parents:
+        ParentImage|endswith:
+          - \mpiexec.exe
+          - \smpd.exe
+      condition: selection_host and selection_parents
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: attack:T1218.image_load
+  question: Did the process launched through mpiexec load any unsigned or unusual DLLs from a user-writable path?
+  context: Proxied execution through a signed launcher is often paired with module side-loading — a COR_PROFILER DLL for
+    .NET targets, or a DLL planted next to the payload and pulled in via a controlled search path. Reviewing modules
+    loaded by mpiexec, smpd.exe, and the spawned child surfaces a side-loaded library that the process-creation record
+    alone would not show. If image-load telemetry is not collected in this environment, treat zero results as a
+    visibility gap rather than evidence nothing loaded.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_proc:
+        Image|endswith:
+          - \mpiexec.exe
+          - \smpd.exe
+      condition: selection_host and selection_proc
+    fields:
+      - Image
+      - ImageLoaded
+      - Signed
+      - Signature
+- source: attack:T1218.network_connection
+  question: Did mpiexec or smpd.exe make network connections consistent with remote node execution?
+  context: With /host, /hosts, or /machinefile, mpiexec turns into a quasi-remote-exec tool, fanning execution out to
+    other nodes via the smpd.exe process manager (default listener port 8677, plus dynamic high ports for inter-rank
+    traffic). Outbound connections from mpiexec or smpd.exe to hosts the running user has no HPC business on indicate
+    remote proxied execution. If network telemetry is not collected in this environment, treat zero results as a
+    visibility gap.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_proc:
+        Image|endswith:
+          - \mpiexec.exe
+          - \smpd.exe
+      condition: selection_host and selection_proc
+    fields:
+      - Image
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired this mpiexec flag pattern, what parents and users drove it, and does the
+    current alert fit?
+  context: Even a signed cluster tool can be abused. The query mirrors the rule's selection structure scoped to this host,
+    so the resulting parent and user distribution reflects how this specific firing pattern has historically run here, not
+    generic mpiexec usage. A new parent process, an unexpected account, or a first-ever appearance is the deviation worth
+    chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_binary:
+      - Image|endswith: \mpiexec.exe
+      - Hashes|contains: IMPHASH=d8b52ef6aaa3a81501bdfff9dbb96217
+      selection_flags:
+        CommandLine|contains:
+        - ' /n 1 '
+        - ' -n 1 '
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.baseline
+  question: Does this host normally run mpiexec.exe at all?
+  context: mpiexec is typically absent on non-HPC endpoints, so its execution history is a strong baseline signal. Zero or
+    very low historical counts on a host with no HPC role indicate first-time or rare execution and raise the priority of
+    the investigation; steady counts on a genuine compute node point toward routine cluster work.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run HPC cluster job launchers?
+  context: Compare this user's current action against their historical behavior. A user who has never launched mpiexec is
+    more suspicious than one who runs cluster jobs regularly. The user's role should align with HPC work; an account with
+    no cluster responsibilities running the signed launcher is the deviation worth chasing.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent and mpiexec.exe combination historically routine on this host or environment-wide?
+  context: When the alert fires under a service principal, user identity does not attribute behavior. The meaningful pivot
+    is the launch mechanism — which parent process spawned mpiexec, and whether that pair is historically common. A new or
+    rare parent for mpiexec is the deviation worth chasing; a pair already accounting for many prior events is scheduler or
+    OS automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints.
+    If the same user drove similar activity on multiple hosts, the scope of the operation may be larger than the single
+    alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent and mpiexec.exe combination fire on other hosts in the same window?
+  context: Under a service principal, asking what else the user did across the network returns agent-telemetry noise. The
+    meaningful question is whether the same launch mechanism — parent process plus mpiexec — fired on other hosts in the
+    alert window. Multiple hosts in the same window points to scheduled or pushed automation; a single host points to a
+    host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired this mpiexec flag pattern in the past week, and does the cross-host distribution look
+    like automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of this
+    firing pattern, not generic mpiexec usage. Many hosts firing the same pattern points to scripted deployment or cluster
+    automation; one host or a small unrelated set points to manual operator activity. Use the host distribution to
+    calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_binary:
+      - Image|endswith: \mpiexec.exe
+      - Hashes|contains: IMPHASH=d8b52ef6aaa3a81501bdfff9dbb96217
+      selection_flags:
+        CommandLine|contains:
+        - ' /n 1 '
+        - ' -n 1 '
+      condition: all of selection*
+    fields:
+    - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering, reconnaissance,
+    credential access — may reveal the attack stages that preceded this event and help reconstruct the timeline that led
+    to a signed binary being used to proxy execution.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1218
+      name: System Binary Proxy Execution
+      role: primary
+  attack_chain_coverage:
+    - stage: 1
+      label: signed_launcher_invocation
+      description: "mpiexec.exe (signed Microsoft binary) invoked with single-process flag to proxy an arbitrary executable"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: command_decode
+      description: "Decode the command line for trailing payload path, /env injection, /host targeting, /configfile"
+      mapped_to: Q3
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 3
+      label: proxied_child_execution
+      description: "mpiexec spawns smpd.exe which spawns the target executable — the actual payload"
+      mapped_to: Q6
+      source: attack:T1218.proxied_execution
+  dimension_coverage:
+    - dimension: command_analysis
+      technique: T1218
+      covered_by: Q4
+      source: attack:T1218.command_analysis
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1218
+      covered_by: Q5
+      source: attack:T1218.parent_process_analysis
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1218
+      covered_by: Q10
+      source: template:cue_process_tool.baseline
+      coverage_type: indirect
+  mutable_dispositions:
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "rationale only (e.g., regsvr32.exe not launched by explorer.exe)"
+      disposition: new_question
+      target_question: Q5
+      notes: "Drives the parent-chain question scoped to ParentProcessGuid; baseline_svc questions profile the parent+binary pair"
+    - element: SignedBinaryList
+      dimension: tuning_parameter
+      specific_values: "rationale only — list of allowed signed binaries; this rule already constrains to mpiexec.exe"
+      disposition: context
+      target_question: Q1
+      notes: "Rule's selection_binary already pins the signed binary; no separate allowlist query needed"
+    - element: CommandLineRegex
+      dimension: command_analysis
+      specific_values: "URLs / script paths / DLL entrypoints — for mpiexec: trailing .exe path, /env COR_PROFILER, AMSI, /configfile"
+      disposition: query_injection
+      target_question: Q4
+      notes: "Injected into CommandLine|contains in the command_analysis question (env injection, configfile, path-control flags)"
+    - element: RemoteDomainAllowlist
+      dimension: tuning_parameter
+      specific_values: "rationale only — suppress legitimate enterprise domains"
+      disposition: context
+      target_question: Q8
+      notes: "Network question covers remote-node connections from mpiexec/smpd.exe; domain allowlisting is a tuning concern noted in context"
+  dedup_decisions:
+    - dropped: cue_process_tool.process_chain
+      reason: "attack:T1218.parent_process_analysis question (Q5) supersedes the generic process_chain — same ParentProcessGuid lookup, technique-framed for HPC launcher"
+      kept: attack:T1218.parent_process_analysis
+    - dropped: cue_process_tool.follow_on
+      reason: "attack:T1218.proxied_execution question (Q6) supersedes follow_on — extends ParentImage scope to include smpd.exe (the MS-MPI intermediary) so the actual proxied child is captured"
+      kept: attack:T1218.proxied_execution
+    - dropped: cue_user_actor.baseline + cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable; emitted BOTH (Q11 user-pivot, Q12 parent+binary substitute)"
+      kept: both
+    - dropped: cue_user_actor.clustering + cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable; emitted BOTH (Q13 user-pivot, Q14 parent+binary substitute)"
+      kept: both
+  skipped_templates:
+    - template: cue_process_tool.clustering
+      reason: "cue_host_context.precursor (Q16) plus the user clustering questions already cover surrounding-activity context; a generic same-host tool-clustering question would duplicate without adding mpiexec-specific signal, and the 18-question cap is in effect"
+    - template: cue_host_context.clustering
+      reason: "Surrounding host activity is covered by cue_host_context.precursor (prior alerts) and the proxied_execution child sweep; generic Image+ParentImage host aggregation would duplicate at the 18-question cap"
+    - template: universal.endpoint_protection_health
+      reason: "Dropped per its own notes_to_llm DROP condition (c)-analog: cue_host_context.precursor (Q16) is present and carries prior-tamper-as-alert signal; this rule is proxy-execution, and tamper-as-precursor is surfaced by the precursor question rather than a generic host-wide tamper sweep, keeping the playbook within the 18-question cap"
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "logsource 'image_load' (recommended by techniques: T1218) is not covered — pull in cue_image_load.* or author a custom question with `category: image_load`"
+      disposition: acted-on
+      reason: >-
+        Acted on. Authored attack:T1218.image_load (Q7) with category: image_load scoped to modules loaded by
+        mpiexec.exe and smpd.exe, surfacing COR_PROFILER / side-loaded DLLs that the env-injection variant of this
+        LOLBIN relies on.
+    - hint: "logsource 'network_connection' (recommended by techniques: T1218) is not covered — pull in cue_network_endpoint.* or author a custom question with `category: network_connection`"
+      disposition: acted-on
+      reason: >-
+        Acted on. Authored attack:T1218.network_connection (Q8) with category: network_connection scoped to
+        connections from mpiexec.exe and smpd.exe, covering the /host /hosts /machinefile remote-node execution path
+        (smpd.exe default port 8677 plus dynamic inter-rank ports).
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+  generation_stats:
+    total_questions: 16
+    source_counts:
+      template: 11
+      attack: 5
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 13
+    logsource_diversity:
+      process_creation: 13
+      image_load: 1
+      network_connection: 1
+      sigma_alert: 1

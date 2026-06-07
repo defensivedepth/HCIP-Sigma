@@ -1,0 +1,429 @@
+name: Potentially Suspicious File Download From File Sharing Domain Via PowerShell.EXE
+id: b63aa23f-17cc-4f4c-a695-57e93a401546
+description: |
+  Detects powershell.exe or pwsh.exe invoking a download cmdlet (.DownloadString(, .DownloadFile(, Invoke-WebRequest, iwr, wget) against a known file-sharing or paste/CDN domain. The rule fires only when all three conditions hold together: the binary is PowerShell, the command line references one of the listed sharing domains, and a download primitive is present. Legitimate use exists (developers pulling scripts from a paste/CDN, IT automation fetching tooling), but these domains are also common staging points for second-stage payloads delivered through PowerShell download cradles. Investigation should establish what was fetched, whether it landed on disk, what spawned PowerShell, and whether security controls were weakened beforehand.
+type: detection
+detection_id: b6e04788-29e1-4557-bb14-77f761848ab8
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-06
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line show PowerShell fetching from a file-sharing domain with a download cmdlet?
+  context: Confirm the alert is a true positive. The rule fires only when PowerShell (powershell.exe or pwsh.exe) AND a listed file-sharing or paste/CDN domain AND a download primitive (.DownloadString(, .DownloadFile(, Invoke-WebRequest, iwr, wget) all appear together in one command line. Read the exact command line and verify all three elements are present, and note which domain and which download primitive fired.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to download files from external sharing domains via PowerShell?
+  context: Legitimate administrative or developer activity can pull scripts and tooling from paste sites and CDNs. Knowing whether this user's role and this host's function involve command-line downloads from external sharing domains is often the fastest way to separate routine work from a delivery attempt.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What did this PowerShell download command do? Decode the full command line, the source URL, and the destination.
+  context: Decode every argument of the alerting command line. Identify the full source URL on the sharing domain, the download primitive used, the local destination path, and whether the fetched content is executed inline (for example a download-and-run cradle) or only saved. The query scopes to PowerShell download invocations on this host within the window so a multi-step fetch-then-execute sequence is visible together rather than as a single isolated event.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+        CommandLine|contains:
+          - .DownloadString(
+          - .DownloadFile(
+          - 'Invoke-WebRequest '
+          - 'iwr '
+          - 'wget '
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:powershell.encoded_command_decode
+  question: Was the command encoded or obfuscated, and what does the download cradle decode to?
+  context: PowerShell download cradles are frequently wrapped in -EncodedCommand (-enc) base64, string concatenation, backtick escaping, or variable substitution to hide the source URL and the executed payload. Decode any encoding to recover the actual fetch-and-run logic. For readable cradles such as IEX(IWR(...)) or Net.WebClient.DownloadString, identify the source URL being fetched and executed and check its reputation.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:powershell.script_block_logging
+  question: Did PowerShell script block logging capture the full deobfuscated download script?
+  context: Script block logging records the deobfuscated script content PowerShell actually executed, even when the command line is encoded or obfuscated. This gives ground truth on the download URL and any follow-on execution. If PowerShell operational logs are not ingested in this environment, treat zero results as a visibility gap rather than evidence nothing ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- source: template:powershell.powershell_security_bypass
+  question: Were PowerShell or endpoint security controls bypassed or weakened before this download?
+  context: Operators often disable or bypass protections before running a download cradle. Common precursors include AMSI bypass, execution-policy changes (-ExecutionPolicy Bypass or -ep bypass), real-time monitoring changes via Set-MpPreference, and PowerShell version-2 downgrade to evade logging. Finding these before the download strengthens the case for malicious activity.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- source: template:cue_artifact.mechanism_decode
+  question: What is the content of the downloaded file? Check for obfuscation, encoded strings, and known malware indicators.
+  context: Read and analyze the fetched file's actual content. For scripts and text payloads check for base64 encoding, obfuscated strings, embedded URLs or IPs, and known malware string patterns. For binaries check imports, embedded strings, packer signatures, and signing status. This content analysis answers what is in the file, separate from any hash-reputation lookup. Retrieval typically requires pulling the file from the endpoint.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: template:universal.evidence_preservation
+  question: Is the downloaded file still on disk for analysis?
+  context: If the command references a downloaded payload or output file, checking whether it still exists on disk enables deeper analysis such as hash lookups, sandbox submission, or content review. A missing file may indicate cleanup or in-memory-only execution.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: template:download_tool.download_success_verification
+  question: Was the download successful? Check for file creation at the destination.
+  context: A download command does not guarantee the file was retrieved. Network errors, blocked URLs, or security controls may have stopped the transfer. Confirming file creation at the target path establishes whether the activity progressed past the delivery stage.
+  range: +15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: template:download_tool.payload_analysis
+  question: Can you retrieve the downloaded payload and check its hash against threat intelligence or detonate it in a safe environment?
+  context: If the fetched file is still on disk, submitting its hash to threat intelligence services or detonating it in a sandbox reveals whether it is a known malicious payload, a legitimate tool, or something novel that requires deeper analysis. This is the reputation and behavioral check, distinct from reading the file's raw content.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Hashes
+- source: template:download_tool.directory_activity
+  question: What other file activity occurred in the download target directory?
+  context: Download cradles often pull multiple files into the same staging directory, or the fetched file triggers further writes such as extraction, decompression, or additional downloads. Examining directory-level file activity reveals the broader scope of the delivery operation.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains|expand: '%file_dirs%'
+      filter_self:
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection and not filter_self
+    fields:
+      - TargetFilename
+      - Image
+- source: template:cue_process_tool.process_chain
+  question: What process spawned this PowerShell instance, and is that parent chain expected?
+  context: The parent process reveals how PowerShell was invoked. User-driven downloads usually descend from explorer.exe or a terminal; downloads launched by an unusual parent such as a server process, an Office application, mshta.exe, wscript.exe, or an exploited service point toward delivery through another foothold. The parent is visible in the alert, so also consider what spawned the parent and what else the parent launched.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired this rule's pattern in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: This counts fleet-wide firings of the rule's exact pattern (PowerShell plus a listed sharing domain plus a download primitive), not generic PowerShell use. Many hosts firing the same pattern points to scripted deployment or vendor automation; one host or a small unrelated set points to manual operator activity. Use the host distribution to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+      - OriginalFileName:
+        - PowerShell.EXE
+        - pwsh.dll
+      selection_websites:
+        CommandLine|contains:
+        - anonfiles.com
+        - cdn.discordapp.com
+        - ddns.net
+        - dl.dropboxusercontent.com
+        - ghostbin.co
+        - glitch.me
+        - gofile.io
+        - hastebin.com
+        - mediafire.com
+        - mega.nz
+        - onrender.com
+        - pages.dev
+        - paste.ee
+        - pastebin.com
+        - pastebin.pl
+        - pastetext.net
+        - pixeldrain.com
+        - privatlab.com
+        - privatlab.net
+        - send.exploit.in
+        - sendspace.com
+        - storage.googleapis.com
+        - storjshare.io
+        - supabase.co
+        - temp.sh
+        - transfer.sh
+        - trycloudflare.com
+        - ufile.io
+        - w3spaces.com
+        - workers.dev
+      selection_download:
+        CommandLine|contains:
+        - .DownloadString(
+        - .DownloadFile(
+        - 'Invoke-WebRequest '
+        - 'iwr '
+        - 'wget '
+      condition: all of selection_*
+    fields:
+    - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host such as defense tampering, reconnaissance, or credential access may reveal the stages that preceded this download and help reconstruct the timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run PowerShell downloads from external sharing domains?
+  context: Compare this user's current action against their historical behavior. A user who has never run command-line downloads from external sharing domains is more suspicious than one who does so routinely. The user's role and typical toolset should align with the activity.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent-plus-PowerShell launch combination historically routine on this host or across the environment?
+  context: When the alert fires under a service principal, user identity does not attribute the behavior; the meaningful pivot is the launch mechanism. A new or rare parent process for PowerShell on this host or environment-wide is the deviation worth chasing, while a pair that already accounts for many prior events is more likely vendor or OS automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints. If the same user triggered similar activity on several hosts, the scope of the incident may be larger than this single alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent-plus-PowerShell combination fire on other hosts in the same window, indicating a coordinated rollout?
+  context: Under a service principal, asking what else the user did across the network returns agent-telemetry noise. The meaningful question is whether the same launch mechanism (parent process plus spawned PowerShell) fired on other hosts in the alert window. Multiple hosts in the same window points to scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+_generation_meta:
+  has_attack_brief: false
+  techniques: []
+  attack_chain_coverage: []
+  dimension_coverage: []
+  mutable_dispositions: []
+  dedup_decisions:
+    - dropped: cue_process_tool.clustering
+      reason: "Host-wide same-time activity overlaps cue_host_context.clustering; that supporting-cue version is preferred for the broad host-context sweep."
+      kept: cue_host_context.precursor
+    - dropped: cue_artifact.artifact_verification
+      reason: "Hash/reputation lookup overlaps download_tool.payload_analysis, which is more specific to the downloaded payload."
+      kept: download_tool.payload_analysis
+    - dropped: cue_artifact.baseline
+      reason: "File-presence baseline overlaps download_success_verification and evidence_preservation, which already establish whether the fetched file exists on disk."
+      kept: download_tool.download_success_verification
+    - dropped: cue_process_tool.baseline
+      reason: "Generic powershell.exe host baseline is uninformative for a near-ubiquitous binary; the parent+binary baseline (cue_user_actor.baseline_svc) and the rule-pattern fleet scope give meaningful baselines instead."
+      kept: cue_user_actor.baseline
+    - dropped: "user_actor pair (cue_user_actor.baseline + cue_user_actor.baseline_svc)"
+      reason: "user_actor pair — non-deduplicable; both emitted as separate always_include questions (user-pivot and parent+binary substitute)."
+      kept: both
+    - dropped: "user_actor pair (cue_user_actor.clustering + cue_user_actor.clustering_svc)"
+      reason: "user_actor pair — non-deduplicable; both emitted as separate always_include questions (user-pivot and parent+binary substitute)."
+      kept: both
+  skipped_templates:
+    - template: cue_process_tool.baseline_deviation
+      reason: "Reflected host-pattern baseline dropped at the 18-question cap; cue_process_tool.scope (reflected fleet-pattern) plus the parent+binary baseline already provide rule-pattern baseline context, and the user_actor pairs are mandatory."
+    - template: cue_process_tool.follow_on
+      reason: "Dropped at the 18-question cap; child-process impact is partially carried by host-context and the directory_activity follow-on file writes, and the four mandatory user_actor questions consume the available slots."
+    - template: cue_host_context.clustering
+      reason: "Dropped at the 18-question cap; cue_host_context.precursor carries prior-host context and the four mandatory user_actor questions consume the slots."
+    - template: universal.endpoint_protection_health
+      reason: "Recommended (not must_include) generic tamper sweep; powershell.powershell_security_bypass covers AV/PowerShell-control tampering before this execution and cue_host_context.precursor surfaces prior tamper alerts, so the generic sweep adds no coverage."
+  reflection_overrides: []
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - powershell
+    - download_tool
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 18
+      attack: 0
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 3
+      context: 13
+    logsource_diversity:
+      process_creation: 11
+      file_event: 5
+      powershell: 1
+      sigma_alert: 1

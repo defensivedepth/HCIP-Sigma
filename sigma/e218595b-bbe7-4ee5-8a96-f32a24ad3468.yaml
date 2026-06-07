@@ -1,0 +1,533 @@
+name: Suspicious Curl.EXE Download
+id: dc0f2b2a-df08-475a-b8b9-26260b73e3ca
+description: |
+  Detects curl.exe started in a way that downloads a remote resource to a local file in a user-writable or staging
+  location, or with an output filename whose extension is commonly used to disguise a payload. The rule fires when the
+  process is curl AND the command line references EITHER a suspicious location (AppData, Public, Temp, ProgramData,
+  PerfLogs, Windows\Temp, Desktop) OR a suspicious output extension (.dll, .png, .jpg, .txt, .vbs, .tmp, and similar) -
+  the Git-for-Windows update helper invocation is excluded. curl is a signed, built-in Windows binary, so legitimate
+  developer and automation use is common; the investigation should establish where the file came from, whether it
+  landed on disk, what it contains, and whether the launch mechanism and host fit normal patterns.
+type: detection
+detection_id: e218595b-bbe7-4ee5-8a96-f32a24ad3468
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-06
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the curl command line match what this rule detects - curl writing to a staging location OR using a disguised output extension?
+  context: >-
+    Confirm the alert is a true positive before investing time. The rule fires when the process is curl AND the command
+    line either references a suspicious download location (AppData, Public, Temp, ProgramData, PerfLogs, Windows\Temp,
+    Desktop) OR ends in a suspicious output extension (.dll, .png, .jpg, .gif, .jpeg, .txt, .temp, .tmp, .vbs, .vbe).
+    Note which branch fired - a disguised extension and a staging path carry different downstream weight when judging
+    the output file.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - Product
+- source: template:universal.host_user_context
+  question: Is this user and host expected to download files with command-line tools like curl?
+  context: >-
+    Legitimate developer workflows, build agents, and IT automation routinely use curl to fetch files. Knowing whether
+    this user role and host function normally pull remote resources via the command line is often the fastest way to
+    separate routine activity from operator-driven download.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What exactly did this curl invocation do? Decode the full command line - URL, output path, and transfer flags.
+  context: >-
+    The full command line reveals the source URL, the output file path and name, and any flags (-o/--output, -O,
+    --silent, headers, proxy, or insecure transport). Identify the remote host the file was pulled from and the exact
+    destination on disk; these drive the download-success, content, and file-baseline questions.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:universal.evidence_preservation
+  question: Is the downloaded file still on disk at the destination path for analysis?
+  context: >-
+    The command references an output file. Checking whether that file still exists enables hash lookups, sandbox
+    submission, or content review. If it is already gone, the download may have been staged-and-deleted, or the file
+    may have been moved or executed.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: attack:T1105.network_connection
+  question: What external destination did this curl process connect to, and is it an internal or external address?
+  context: >-
+    Ingress tool transfer pairs a downloading process with an outbound connection to the resource host. Pivot from the
+    curl process to its network connections to recover the destination address and port. An external address pulling
+    content into a staging path is the core transfer; a purely internal destination may indicate intra-environment
+    staging or a benign internal mirror. Compare the destination against known-good update or repository endpoints.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+      - Initiated
+- source: template:download_tool.download_success_verification
+  question: Was the download successful? Check for file creation at the destination path.
+  context: >-
+    A curl command does not guarantee the file arrived. Network errors, blocked URLs, or security controls may have
+    prevented the transfer. Confirming a file-creation event at the target path establishes whether the activity
+    progressed past delivery into a payload on disk.
+  range: +15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: template:cue_artifact.mechanism_decode
+  question: What is the content of the downloaded file? Check for obfuscation, encoded strings, and known malware indicators.
+  context: >-
+    Read and analyze the file the command wrote. A suspicious extension or staging path is a disguise hint, not proof -
+    a .png or .txt output may actually be a script, DLL, or encoded payload. Check for base64 or other encoding,
+    embedded URLs or IP addresses, script content, and packer or signing characteristics for binaries. Content analysis
+    requires retrieving the file from the endpoint or an EDR console.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: template:download_tool.payload_analysis
+  question: Can you retrieve the downloaded payload and check its hash against threat intelligence or detonate it in a sandbox?
+  context: >-
+    If the file is still on disk, submitting its hash to reputation services or detonating it in a safe environment
+    reveals whether it is a known malicious payload, a legitimate tool, or something novel. This answers "is this file
+    known?" and is distinct from reading what is inside it.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Hashes
+- source: template:download_tool.directory_activity
+  question: What other file activity occurred in the same staging directory?
+  context: >-
+    Attackers often download multiple files to one staging directory, or the downloaded file triggers further writes -
+    extraction, decompression, or additional downloads. Directory-level file activity reveals the broader scope of the
+    delivery, with the known downloaded file filtered out.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains|expand: '%file_dirs%'
+      filter_self:
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection and not filter_self
+    fields:
+      - TargetFilename
+      - Image
+- source: template:cue_process_tool.process_chain
+  question: What process spawned curl, and is that parent chain expected?
+  context: >-
+    The parent process reveals how curl was invoked. Build agents, scripts, and IT automation have predictable parents;
+    curl spawned by Office applications, mshta.exe, wscript.exe, or a freshly written script in a user-writable path
+    points toward operator or malware-driven download. Note that the Git-for-Windows updater parent is already filtered
+    out by the rule.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run curl to download files?
+  context: >-
+    Compare this user's current action against their historical behavior. A user who has never run curl, or never used
+    it to fetch remote resources, is more notable than one who does so regularly. User role and typical toolset should
+    align with command-line download activity.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent+curl combination historically routine on this host or across the environment, or is the parent unusual for curl?
+  context: >-
+    When the alert fires under a service principal, user identity does not attribute behavior; the meaningful pivot is
+    the launch mechanism. A new or rare parent for curl on this host (or environment-wide) is the deviation worth
+    chasing, whereas a parent that already accounts for thousands of prior curl events is vendor or OS automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: >-
+    Tracking the user's activity across all hosts reveals lateral movement or staging across multiple endpoints. If the
+    same user drove similar download activity on more than one host, the scope may be larger than a single alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent+curl combination fire on other hosts in the same window - a coordinated automation rollout, or activity isolated to this host?
+  context: >-
+    Under a service principal, asking what else the user did network-wide returns agent-telemetry noise. The meaningful
+    question is whether the same launch mechanism - parent process plus curl - fired on other hosts in the alert window.
+    Multiple hosts in the same window points to scheduled or pushed automation; a single host points to a host-local
+    trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:lolbin.renamed_binary_check
+  question: Was curl executed from its expected system path, or from an unusual location?
+  context: >-
+    curl shipped with Windows lives in System32. A curl.exe running from a user temp directory, a download folder, or
+    another non-standard path may be a copied or renamed binary placed to evade path-based allowlists or to run a
+    modified build. Compare the Image path and OriginalFileName against the expected system location.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- source: template:lolbin.technique_class_lateral
+  question: Were any other download or transfer LOLBins used on this host recently?
+  context: >-
+    Attackers who use one download LOLBin often use several. If curl pulled a file, check whether certutil, bitsadmin,
+    esentutl, or similar transfer utilities were also used on this host. Multiple LOLBins performing the same fetch-to-disk
+    action strengthens the case for operator-driven activity over a one-off legitimate download.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_img:
+        Image|endswith:
+          - '\certutil.exe'
+          - '\bitsadmin.exe'
+          - '\esentutl.exe'
+          - '\expand.exe'
+          - '\extrac32.exe'
+          - '\makecab.exe'
+          - '\replace.exe'
+          - '\hh.exe'
+      condition: selection and selection_img
+    fields:
+      - Image
+      - CommandLine
+- source: template:lolbin.historical_lolbin_baseline
+  question: How often has this host fired the curl download pattern over the past 90 days, and what command-line shapes are typical?
+  context: >-
+    A download pattern with no prior history on a host is more notable than one used daily under stable parents. This
+    query mirrors the rule's selection structure scoped to this host, so the count reflects the rule's specific firing
+    pattern rather than generic curl usage. The command-line projection lets the analyst compare typical invocation
+    shapes against the alerting one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_curl:
+      - Image|endswith: \curl.exe
+      - Product: The curl executable
+      selection_susp_locations:
+        CommandLine|contains:
+        - '%AppData%'
+        - '%Public%'
+        - '%Temp%'
+        - '%tmp%'
+        - \AppData\
+        - \Desktop\
+        - \Temp\
+        - \Users\Public\
+        - C:\PerfLogs\
+        - C:\ProgramData\
+        - C:\Windows\Temp\
+      selection_susp_extensions:
+        CommandLine|endswith:
+        - .dll
+        - .gif
+        - .jpeg
+        - .jpg
+        - .png
+        - .temp
+        - .tmp
+        - .txt
+        - .vbe
+        - .vbs
+      filter_optional_git_windows:
+        ParentImage: C:\Program Files\Git\usr\bin\sh.exe
+        Image: C:\Program Files\Git\mingw64\bin\curl.exe
+        CommandLine|contains|all:
+        - '--silent --show-error --output '
+        - gfw-httpget-
+        - AppData
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection_curl and 1 of selection_susp_* and not 1 of filter_optional_*) and _pb_scope
+    fields:
+    - CommandLine
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Alerts rarely happen in isolation. Earlier detections on the same host - defense tampering, reconnaissance, or
+    initial access - may reveal the stages that preceded a download and help reconstruct the timeline. A download that
+    follows earlier suspicious activity carries more weight than an isolated one.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1105
+      name: Ingress Tool Transfer
+      role: primary
+  attack_chain_coverage:
+    - stage: 1
+      label: download_invocation
+      description: "curl process started with a command line referencing a remote resource and a local output path"
+      mapped_to: Q3
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 2
+      label: network_transfer
+      description: "Downloading process initiates an outbound connection to the external resource host"
+      mapped_to: Q5
+      source: attack:T1105.network_connection
+    - stage: 3
+      label: file_creation
+      description: "Downloaded tool/payload is written to disk at the drop path"
+      mapped_to: Q6
+      source: template:download_tool.download_success_verification
+  dimension_coverage:
+    - dimension: file_path_analysis
+      technique: T1105
+      covered_by: Q4
+      source: template:universal.evidence_preservation
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1105
+      covered_by: Q10
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1105
+      covered_by: Q5
+      source: attack:T1105.network_connection
+      coverage_type: direct
+  mutable_dispositions:
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "rationale only (tune for known-good updaters e.g. ChromeUpdate, OneDrive)"
+      disposition: context
+      target_question: Q10
+      notes: "Parent-chain question prompts the analyst to judge the launching parent; rule already filters the Git-for-Windows updater parent"
+    - element: DestinationIPCategory
+      dimension: tuning_parameter
+      specific_values: "internal vs external IP blocks"
+      disposition: context
+      target_question: Q5
+      notes: "Network-connection question surfaces DestinationIp/Port and asks the analyst to classify internal vs external destination"
+    - element: FilePathRegex
+      dimension: file_path_analysis
+      specific_values: "uncommon drop paths e.g. C:\\Users\\Public\\"
+      disposition: context
+      target_question: Q4
+      notes: "Staging-path values are already enforced by the rule's selection_susp_locations; evidence/directory questions scope to %file_paths%/%file_dirs%"
+  dedup_decisions:
+    - dropped: cue_artifact.artifact_verification
+      reason: "hash/reputation lookup on %file_paths% is near-identical to the technique-set download_tool.payload_analysis question; technique-set version preferred"
+      kept: download_tool.payload_analysis
+    - dropped: cue_process_tool.baseline_deviation
+      reason: "REFLECTED host_pattern query is structurally identical to lolbin.historical_lolbin_baseline (same rule-pattern, host-scoped, -14d vs -90d); historical_lolbin_baseline kept with longer window and CommandLine projection"
+      kept: lolbin.historical_lolbin_baseline
+    - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc
+      reason: "user_actor pair - non-deduplicable"
+      kept: both emitted (Q11, Q12)
+    - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc
+      reason: "user_actor pair - non-deduplicable"
+      kept: both emitted (Q13, Q14)
+  skipped_templates:
+    - template: cue_process_tool.baseline
+      reason: "host-level curl frequency is subsumed by lolbin.historical_lolbin_baseline (rule-pattern, host-scoped) and the user baseline; would add a third near-duplicate frequency count under the 18-question cap"
+    - template: cue_process_tool.follow_on
+      reason: "curl children rarely carry the investigation for a download rule; payload content and directory-activity questions cover post-download impact within the cap"
+    - template: cue_process_tool.clustering
+      reason: "host-wide tool clustering overlaps cue_host_context.precursor (prior alerts) and lolbin.technique_class_lateral (other download LOLBins); dropped to stay at cap"
+    - template: cue_host_context.clustering
+      reason: "near-duplicate of cue_process_tool.clustering host-activity sweep; precursor question carries host-context coverage under the cap"
+    - template: cue_artifact.baseline
+      reason: "file-baseline overlaps evidence_preservation and download_success_verification on %file_paths%; first-seen judgment folded into those file-event questions under the cap"
+    - template: universal.endpoint_protection_health
+      reason: "rule fires on file download, not execution/credential-access/impact; defense_tampering not confirmed and cue_host_context.precursor already surfaces prior tamper alerts on the host, so the generic tamper sweep does not earn a slot per its own RECOMMENDED guidance"
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - download_tool
+    - lolbin
+    - cue_process_tool
+    - cue_artifact
+    - cue_user_actor
+    - cue_host_context
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 17
+      attack: 1
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 2
+      context: 14
+    logsource_diversity:
+      process_creation: 11
+      file_event: 5
+      network_connection: 1
+      sigma_alert: 1

@@ -1,0 +1,423 @@
+name: Persistence Via TypedPaths - CommandLine
+id: 017d70b6-0b5a-4a78-a6d3-dc09c8af6cf9
+description: |
+  Detects a command line that writes to the per-user TypedPaths key
+  (\Software\Microsoft\Windows\CurrentVersion\Explorer\TypedPaths), the registry
+  list that backs File Explorer's address-bar autocomplete. The rule fires when a
+  process's command line contains that key path. Legitimate updates to TypedPaths
+  happen interactively when a user types a path into the Explorer address bar and
+  closes the window, so a process-driven write via reg.exe, PowerShell, or a script
+  is anomalous. Adversaries plant a urlN value (url1 is the most recent path) to seed
+  a UNC or lateral-movement target that auto-completes for the next person who opens
+  Explorer, or to bias forensic readout. Determine which process performed the write,
+  what path was planted, and whether the writing process and user are expected to edit
+  this key.
+type: detection
+detection_id: ec88289a-7e1a-4cc3-8d18-bd1f60e4b9ba
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-06
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line write to the Explorer TypedPaths registry key?
+  context: Confirm the alert is a true positive by reviewing the exact command line. The
+    rule fires on any command line containing \Software\Microsoft\Windows\CurrentVersion\Explorer\TypedPaths.
+    Read the full command to see which value name (url1 through url25) was set and what
+    path string was written before investing further analysis time.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to modify Explorer autocomplete paths from the command line?
+  context: Legitimate TypedPaths updates occur interactively through the Explorer address bar,
+    not via a command-line registry write. A user or host with no reason to script Explorer
+    settings points toward misuse; an administrator running a profile-customization script or a
+    known deployment job is a routine explanation. Knowing the user role and host function is
+    often the fastest way to separate the two.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:registry.registry_key_context
+  question: What exact TypedPaths value name and data were written to the registry?
+  context: The registry_set event linked to this process exposes the key path (TargetObject)
+    and the data written (Details) as structured fields instead of parsing them from the
+    command line. TypedPaths uses url1 through url25 with url1 holding the most recent path;
+    the data written is the path that will auto-complete in Explorer. Inspect the data for a
+    UNC path, a remote share, or a path to a payload rather than an ordinary local folder.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+- source: template:cue_process_tool.process_chain
+  question: What process spawned the writer and is that parent chain expected?
+  context: The parent process reveals how the registry write was invoked. An interactive
+    administrative session or a known deployment agent is a routine explanation; parents
+    such as mshta.exe, wscript.exe, an Office application, or a freshly written script host
+    point to scripted or macro-driven execution. Walking up the tree shows whether the write
+    was part of a larger sequence.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has written to TypedPaths before, what parents and users normally drive it, and does the current alert fit that pattern?
+  context: The query mirrors the rule's selection scoped to this host, so the resulting
+    parent and user distribution reflects how command-line TypedPaths writes have historically
+    run here, not generic process activity. A new parent process, an unexpected user account,
+    or a first-time appearance of this pattern on the host is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains: \Software\Microsoft\Windows\CurrentVersion\Explorer\TypedPaths
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:registry.registry_related_modifications
+  question: Were other registry modifications made on this host in the same session?
+  context: A process that edits TypedPaths often edits other keys in the same run. Finding a
+    cluster of registry writes from the same host within a short window reveals whether the
+    TypedPaths change was isolated or one of several configuration changes (for example a Run
+    key for persistence alongside a Defender or firewall change), which shifts the disposition
+    toward intentional tampering rather than a one-off edit.
+  range: +/-30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_reg:
+        Image|endswith:
+          - '\reg.exe'
+          - '\regedit.exe'
+        CommandLine|contains:
+          - ' add '
+          - ' delete '
+          - ' import '
+          - '/s '
+      condition: selection and selection_reg
+    fields:
+      - CommandLine
+- source: template:registry.registry_value_persistence_check
+  question: What path was planted in the TypedPaths value, and does it reference a remote share or a local payload?
+  context: Unlike a Run key, TypedPaths does not directly execute the path it stores; it makes
+    the path auto-complete in the Explorer address bar so the next user who opens Explorer is
+    nudged toward it. A planted UNC path or remote share seeds a lateral-movement destination,
+    while a local path may point at a dropped file. Examine the value data, then check whether
+    any file at the referenced path exists on disk to determine what the planted entry leads to.
+  range: +15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - Hashes
+- source: template:cue_user_actor.baseline
+  question: Has this user written to the TypedPaths key from the command line before?
+  context: Compare this user's current action against their history of command-line TypedPaths
+    writes across all hosts. A user who has never scripted this key is more notable than one
+    who does it routinely as part of profile setup or deployment work. Combine the count with
+    knowledge of the user's role.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        CommandLine|contains: \Software\Microsoft\Windows\CurrentVersion\Explorer\TypedPaths
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is the parent process that performed this write historically routine on this host or environment-wide?
+  context: When the alert fires under a service principal, the user identity does not attribute
+    behavior, so the meaningful pivot is the launch mechanism — which parent process drove the
+    command-line TypedPaths write, and whether that parent has driven this pattern before. A
+    new or rare parent for this pattern is the deviation worth chasing; a parent that already
+    accounts for many prior writes is automation or profile management.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        CommandLine|contains: \Software\Microsoft\Windows\CurrentVersion\Explorer\TypedPaths
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts in the alert window reveals whether
+    the same account drove activity on multiple endpoints. The same user touching several
+    hosts at once widens the scope; activity confined to one host narrows it.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did the same parent process write to TypedPaths on other hosts in the same window?
+  context: Under a service principal, asking what the user did network-wide returns agent
+    telemetry noise because every host runs service-owned processes constantly. The meaningful
+    question is whether the same launch mechanism — the parent process performing this
+    command-line write — fired on other hosts in the alert window. Multiple hosts point to a
+    scheduled or pushed rollout; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        CommandLine|contains: \Software\Microsoft\Windows\CurrentVersion\Explorer\TypedPaths
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_process_tool.clustering
+  question: What other tools ran on this host around the same time?
+  context: Activity surrounding the registry write may reveal reconnaissance, privilege
+    escalation, other persistence installation, or staging that frames the broader context.
+    Aggregating by binary collapses repetitive noise so novel tools stand out at low counts.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+- source: template:cue_process_tool.scope
+  question: Have other hosts written to TypedPaths from the command line in the past week, and does the spread look like automation or one-off activity?
+  context: The query mirrors the rule's selection with no host scope, giving a fleet-wide count
+    of the command-line TypedPaths pattern rather than generic process usage. Many hosts firing
+    the same pattern points to scripted deployment or profile-management automation; one host
+    or a small unrelated set points to manual operator activity. Use the host distribution to
+    calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains: \Software\Microsoft\Windows\CurrentVersion\Explorer\TypedPaths
+      condition: selection
+    fields:
+    - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining activity around the registry write shows
+    what led to it and what followed, and whether it is part of a larger sequence. Aggregating
+    by Image and ParentImage collapses agent-telemetry noise so novel parent-child pairs stand
+    out at low counts.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host — defense tampering, reconnaissance, credential
+    access — may reveal the stages that preceded this registry write and help reconstruct the
+    timeline. Persistence is usually installed after an initial foothold, so prior alerts often
+    explain how the writer got there.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:persistence_scope.process_based_persistence
+  question: Were other process-based persistence mechanisms installed on this host?
+  context: Attackers rarely rely on a single persistence mechanism. After seeding TypedPaths,
+    they commonly install backup footholds with different techniques — scheduled tasks,
+    services, registry Run keys, BITS jobs, or WMI subscriptions. Several persistence
+    installations in the same timeframe indicate intentional stacking rather than an isolated
+    administrative change.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine
+- source: template:persistence_scope.file_based_persistence
+  question: Were files dropped to persistence locations such as the Startup folder or Run key paths on this host?
+  context: File-based persistence bypasses command-line detection entirely. Dropping an
+    executable or script into a Startup folder or a path referenced by a registry Run key
+    achieves persistence without running reg, sc, or schtasks. File event monitoring captures
+    these drops even when the writer avoids standard persistence tooling, which is relevant when
+    the TypedPaths edit may be one of several footholds.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist_paths:
+        TargetFilename|contains:
+          - '\Start Menu\Programs\Startup\'
+          - '\CurrentVersion\Run'
+          - '\CurrentVersion\RunOnce'
+      condition: selection and selection_persist_paths
+    fields:
+      - TargetFilename
+      - Image
+_generation_meta:
+  has_attack_brief: false
+  techniques: []
+  attack_chain_coverage: []
+  dimension_coverage: []
+  mutable_dispositions: []
+  dedup_decisions:
+    - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable (user-pivot vs. parent+pattern substitute pivot on different identity dimensions)"
+      kept: both
+    - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable (user-pivot vs. parent+pattern substitute pivot on different identity dimensions)"
+      kept: both
+  skipped_templates:
+    - template: cue_process_tool.mechanism_decode
+      reason: "replaced_by: registry.registry_key_context (hint acted on) — registry_set TargetObject/Details give the planted TypedPaths value name and data as structured fields instead of parsing reg.exe CommandLine; registry_key_context is the Phase 2 analysis question"
+    - template: cue_process_tool.baseline
+      reason: "Generic Image|endswith baseline contradicts the CommandLine-only-detection hint (rule has no Image/primary_binary; a plain binary-frequency baseline measures the writer binary, not the TypedPaths write pattern). The reflected baseline_deviation question scopes the rule's CommandLine pattern to this host and supersedes it"
+    - template: cue_process_tool.follow_on
+      reason: "Child-process follow-on is low-value for a registry-write persistence rule whose action is the key edit itself, and its Image|endswith|expand scoping contradicts the CommandLine-only-detection hint (no Image in the rule). Process-tree context is covered by the parent-chain question; cross-tool activity by the host clustering question"
+    - template: universal.endpoint_protection_health
+      reason: "Recommended generic host-tamper sweep — droppable per its own guidance when the rule is not execution/credential-centric and prior-alert context is already present. This is a persistence registry-write rule, and the precursor question already surfaces prior tamper alerts on the host in the lead-up window"
+  reflection_overrides: []
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - registry
+    - persistence_scope
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 17
+      attack: 0
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 14
+    logsource_diversity:
+      process_creation: 13
+      registry_set: 1
+      file_event: 2
+      sigma_alert: 1

@@ -1,0 +1,446 @@
+name: Uncommon Child Process Of AddinUtil.EXE
+id: 1cbb9ec2-43a9-4a73-92ac-c1ea33b72db9
+description: |
+  Detects an uncommon child process spawned by addinutil.exe, the .NET Add-In deployment cache updating utility. The rule
+  fires when addinutil.exe is the parent AND the child process is not one of the benign helpers conhost.exe or werfault.exe.
+  addinutil.exe is a Microsoft-signed binary on recommended block lists; it can be coerced into proxy execution by pointing
+  an -AddInRoot or -PipelineRoot flag at a working directory containing a crafted AddIns.store file, which is deserialized via
+  BinaryFormatter and runs the embedded payload. Legitimate invocations run from the .NET Framework directories and spawn no
+  general child processes, so any unexpected child is the artifact worth explaining. Investigate the parent command line for
+  user-controlled add-in roots, decode what the child process did, and confirm whether this user and host legitimately run
+  add-in cache maintenance.
+type: detection
+detection_id: b5746143-59d6-4603-8d06-acbd60e166ee
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Did addinutil.exe spawn this child process, and is the child something other than conhost.exe or werfault.exe?
+  context: Before investing investigation time, confirm the alert is a true positive. The rule fires when the parent image
+    ends in addinutil.exe AND the child is not the benign conhost.exe or werfault.exe helpers. Review the triggering event to
+    verify the parent is genuinely addinutil.exe and identify exactly which child binary was launched.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run add-in cache maintenance via addinutil.exe?
+  context: Legitimate addinutil.exe use is rare and typically tied to Office add-in deployment from the .NET Framework
+    directories. Knowing whether the user role and host function involve add-in management is often the fastest way to separate
+    routine maintenance from coerced proxy execution.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_parent_process.mechanism_decode
+  question: What was the full command line of the parent addinutil.exe, and did it point an add-in root at a user-controlled
+    directory?
+  context: The parent command line reveals how addinutil.exe was invoked. Proxy execution is triggered by an -AddInRoot or
+    -PipelineRoot flag whose path resolves to a user-writable directory (Desktop, Downloads, Temp, Public, Windows\Temp)
+    or to "." with a matching working directory. Legitimate runs resolve under C:\Windows\Microsoft.NET\Framework, Framework64,
+    or WinSxS. Decode the flags and the resolved path; a user-controlled add-in root is the configuration that loads and runs
+    the crafted AddIns.store payload.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - CurrentDirectory
+- source: template:cue_process_tool.mechanism_decode
+  question: What exactly did the child process do? Decode its command-line arguments.
+  context: The child process is the payload that addinutil.exe proxied into execution. Decode every flag, parameter, encoded
+    content, file path, and URL in its command line to determine the operational purpose. Multi-command tooling may span
+    several sequential invocations on the host that together form one logical operation.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%ParentImage%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - CurrentDirectory
+- source: attack:T1218.command_analysis
+  question: Did the addinutil.exe command line carry an -AddInRoot or -PipelineRoot flag resolving to a user-writable path?
+  context: Proxy execution through addinutil.exe depends on an add-in root that points at attacker-controlled content. The
+    suspicious argument patterns are -AddInRoot, -PipelineRoot, and their "." variants combined with a working directory
+    under Desktop, Downloads, Temp, Public, or Windows\Temp. Legitimate add-in roots live under the .NET Framework
+    directories. Confirm whether this invocation matches the abuse pattern across recent executions on the host.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_binary:
+        Image|endswith: \addinutil.exe
+      selection_flags:
+        CommandLine|contains:
+          - '-AddInRoot:'
+          - '-PipelineRoot:'
+      condition: selection_binary and selection_flags
+    fields:
+      - CommandLine
+      - CurrentDirectory
+      - host.name
+- source: attack:T1218.image_load
+  question: What modules did addinutil.exe load, and do they show .NET deserialization or unexpected assemblies for this
+    binary?
+  context: Coerced add-in loading drives addinutil.exe through System.AddIn.Hosting.AddInStore.ReadCache, which instantiates
+    BinaryFormatter and deserializes the AddIns.store contents — equivalent to running the payload as a binary. Loaded
+    modules can reveal serialization assemblies or gadget DLLs that a benign cache update would never pull in. If image-load
+    telemetry is not collected in this environment, treat zero results as a visibility gap rather than evidence nothing loaded.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%ParentImage%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - CommandLine
+- source: attack:T1218.network_connection
+  question: Did addinutil.exe initiate any network connections around the time of the alert?
+  context: A legitimate add-in cache update does not reach the network. Outbound connections from addinutil.exe point to a
+    payload that retrieves remote content or establishes command-and-control after deserialization. Review the destinations
+    and whether they correspond to enterprise infrastructure or to an external, unexpected endpoint.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%ParentImage%'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+- source: template:cue_parent_process.baseline
+  question: Does addinutil.exe normally spawn this child binary on this host?
+  context: Legitimate addinutil.exe runs perform cache maintenance and do not launch general child processes, so any
+    parent-child pairing here is inherently uncommon by the rule's design. Historical frequency of addinutil.exe spawning
+    this specific child distinguishes a never-before-seen relationship from a recurring local pattern worth a baseline
+    explanation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:cue_parent_process.follow_on
+  question: What other child processes did this addinutil.exe instance spawn?
+  context: An operator using addinutil.exe as a proxy launcher may chain several tools — reconnaissance, credential access,
+    or lateral movement — from the same parent. Enumerating every child of this addinutil.exe reveals the full scope of
+    activity initiated through the proxy execution chain rather than just the one child that tripped the rule.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        process.parent.name|expand: '%ParentName%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_parent_process.clustering
+  question: What other activity is associated with this addinutil.exe process around the same time?
+  context: Beyond child processes, the addinutil.exe instance may have produced file events or network activity tied to the
+    crafted AddIns.store payload. Activity clustered around the same window helps reconstruct what the proxy execution
+    actually accomplished and whether it staged additional artifacts.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        process.parent.name|expand: '%ParentName%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run addinutil.exe or perform add-in cache maintenance?
+  context: Compare this user's current action against their historical behavior. A user who has never invoked addinutil.exe
+    is more suspicious than one whose role routinely involves Office add-in deployment. User role and typical toolset should
+    align with running a .NET add-in utility.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        ParentImage|endswith|expand: '%ParentImage%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is the addinutil.exe parent and this child binary a historically routine pairing on this host or across the
+    environment?
+  context: When the alert fires under a service principal, user identity does not attribute behavior. The meaningful pivot is
+    the launch mechanism — addinutil.exe spawning this specific child. A new or rare parent-child pairing on this host or
+    environment-wide is the deviation worth chasing; a pairing that already accounts for many prior events is more likely
+    OS or vendor automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints. If
+    the same user triggered similar activity on other hosts, the scope of the operation may be larger than this single alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did the same addinutil.exe parent and child binary fire on other hosts in the same window?
+  context: Under a service principal, asking what else the user did returns agent-telemetry noise. The meaningful question is
+    whether the same launch mechanism — addinutil.exe spawning this child — fired on other hosts in the alert window. Multiple
+    hosts in the same window points to scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_parent_process.scope
+  question: Is this addinutil.exe parent-child spawning pattern occurring on other hosts?
+  context: The same addinutil.exe parent spawning the same child across multiple hosts may indicate a coordinated operation
+    or a pushed payload rather than an isolated event. A single occurrence is more likely targeted or local. Environment-wide
+    comparison helps calibrate scope.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+      - CommandLine
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: 'Alerts rarely occur in isolation. Examining activity around the alert reveals the immediate context: what led to
+    this event, what happened after, and whether it is part of a larger sequence. Look for reconnaissance, privilege
+    escalation, or persistence mechanisms in the surrounding window.'
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host — defense tampering, reconnaissance, credential access — may reveal the attack
+    stages that preceded this event and help reconstruct the full timeline leading up to the proxy execution.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1218
+      name: System Binary Proxy Execution
+      role: primary
+  attack_chain_coverage:
+    - stage: 1
+      label: proxy_binary_invocation
+      description: "addinutil.exe invoked with an add-in root pointing at attacker-controlled content (-AddInRoot:/-PipelineRoot:)"
+      mapped_to: Q3
+      source: template:cue_parent_process.mechanism_decode
+    - stage: 2
+      label: payload_deserialization
+      description: "AddInStore.ReadCache instantiates BinaryFormatter and deserializes AddIns.store, loading the payload assemblies"
+      mapped_to: Q6
+      source: attack:T1218.image_load
+    - stage: 3
+      label: proxied_execution
+      description: "Deserialized payload runs as a child process and/or initiates network activity"
+      mapped_to: Q4
+      source: template:cue_process_tool.mechanism_decode
+  dimension_coverage:
+    - dimension: command_analysis
+      technique: T1218
+      covered_by: Q5
+      source: attack:T1218.command_analysis
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1218
+      covered_by: Q8
+      source: template:cue_parent_process.baseline
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1218
+      covered_by: Q5
+      source: attack:T1218.command_analysis
+      coverage_type: partial
+  mutable_dispositions:
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "addinutil.exe (parent in detection)"
+      disposition: query_injection
+      target_question: Q8
+      notes: "Parent baseline scopes process.parent.name to addinutil.exe; follow_on and scope reuse the same parent pivot."
+    - element: SignedBinaryList
+      dimension: tuning_parameter
+      specific_values: "addinutil.exe (the proxied signed binary for this rule)"
+      disposition: context
+      target_question: Q3
+      notes: "Rule is fixed to addinutil.exe; the allow/deny-list framing is described in context rather than queried."
+    - element: CommandLineRegex
+      dimension: command_analysis
+      specific_values: "-AddInRoot:, -PipelineRoot: and . variants pointing to Desktop/Downloads/Temp/Public/Windows\\Temp"
+      disposition: query_injection
+      target_question: Q5
+      notes: "Injected as CommandLine|contains on -AddInRoot:/-PipelineRoot: in the attack:T1218.command_analysis question; user-writable path patterns described in context."
+    - element: RemoteDomainAllowlist
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q7
+      notes: "Enterprise-domain allowlisting is a tuning rationale; surfaced in the network_connection question context, not queryable from the rule's fields."
+  dedup_decisions:
+    - dropped: cue_process_tool.baseline
+      reason: "host-runs-this-tool baseline overlaps cue_parent_process.baseline (addinutil parent frequency on this host) and the user/svc baselines; parent-scoped baseline is more specific for a parent-in-detection rule"
+      kept: cue_parent_process.baseline
+    - dropped: cue_user_actor.baseline user-pivot vs baseline_svc parent+binary substitute
+      reason: "user_actor pair — non-deduplicable; emit both (Q11 user-pivot subject, Q12 launch-mechanism substitute) per service-principal degeneration"
+      kept: cue_user_actor.baseline + cue_user_actor.baseline_svc
+    - dropped: cue_user_actor.clustering user-pivot vs clustering_svc parent+binary substitute
+      reason: "user_actor pair — non-deduplicable; emit both (Q13 user-pivot subject, Q14 launch-mechanism substitute) per service-principal degeneration"
+      kept: cue_user_actor.clustering + cue_user_actor.clustering_svc
+  skipped_templates:
+    - template: cue_process_tool.process_chain
+      reason: "parent_process is primary cue and ParentImage is the detection field — parent-process mechanism_decode/baseline/follow_on subsume the process_chain pivot (hint: drop cue_process_tool:process_chain)"
+    - template: universal.endpoint_protection_health
+      reason: "RECOMMENDED, not must_include; rule is proxy-execution/defense-evasion, not a credential-access or payload-execution rule where disposition turns on prior tamper, and cue_host_context.precursor (Q17) already surfaces prior tamper alerts on the host"
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 14
+      attack: 3
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 2
+      context: 13
+    logsource_diversity:
+      process_creation: 14
+      image_load: 1
+      network_connection: 1
+      sigma_alert: 1

@@ -1,0 +1,464 @@
+name: HackTool - LocalPotato Execution
+id: 7101790d-1fd3-4fa0-9832-2df74a046443
+description: |
+  Detects execution of the LocalPotato local privilege-escalation tool, which abuses
+  NTLM reflection over loopback to gain an arbitrary file write/read as SYSTEM and is
+  typically weaponized into user-to-SYSTEM escalation via DLL hijacking. The rule fires
+  when EITHER the process image ends in LocalPotato.exe, OR the command line contains the
+  default arbitrary-write argument pair (an "-i" source and an "-o" output under Windows\),
+  OR the binary's import hash matches a known LocalPotato build. Confirm which branch
+  matched, decode the file-copy arguments to identify the source and target paths, verify
+  the binary is the real tool rather than a renamed one, and reconstruct surrounding host
+  activity to determine whether a SYSTEM-level escalation was achieved and what was done
+  with it.
+type: detection
+detection_id: 6bd75993-9888-4f91-9404-e1e4e4e34b77
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Did this alert fire on the LocalPotato image name, its default copy arguments, or a known build hash?
+  context: This rule matches when EITHER the image ends in LocalPotato.exe, OR the command
+    line contains both an "-i C:\" source argument and an "-o Windows\" output argument,
+    OR the file's import hash matches a known LocalPotato build. Note which branch fired,
+    because a hash-only or arguments-only match on a renamed binary means the image name
+    will not say LocalPotato, while a name-only match may carry non-default arguments worth
+    decoding.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - Hashes
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run a local privilege-escalation tool?
+  context: LocalPotato is an offensive escalation tool with essentially no legitimate
+    administrative use. Knowing whether this user and host belong to a security tester or
+    are an ordinary endpoint is often the fastest path to distinguishing an authorized
+    assessment from a real escalation attempt.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:hacking_tool.authorized_engagement
+  question: Is this LocalPotato execution part of an authorized penetration test or red team engagement?
+  context: Offensive escalation tools are used in authorized security assessments. Before
+    investing investigation time, check whether a pentest or red team exercise is currently
+    active on this host or network segment. An authorized engagement with matching tool
+    usage and timing resolves the alert without further analysis.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:hacking_tool.tool_capability_used
+  question: Which LocalPotato mode and target paths were used in this invocation?
+  context: LocalPotato supports an SMB arbitrary-write mode (-i source file, -o output path
+    under a share) and an HTTP/WebDAV mode (-r listener host, -u WebDAV URL), with optional
+    -c CLSID and -p port overrides. The specific arguments reveal which file was written
+    where, and whether the write targeted a high-value DLL load path that would yield SYSTEM
+    code execution.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:cue_process_tool.mechanism_decode
+  question: Decode the full LocalPotato command line - what source file is being copied to what SYSTEM-writable target?
+  context: The full command line reveals the arbitrary-write operation. Decode the -i source
+    path and the -o output path; an output path under Windows\System32 (for example a DLL
+    that an auto-elevated COM object loads) indicates an attempt to plant SYSTEM-executed
+    code rather than a benign file copy. Optional -c and -p values name the COM trigger
+    CLSID and listener port.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:cue_artifact.mechanism_decode
+  question: Confirm the binary is the real LocalPotato tool - check its size, hash, signing status, and strings.
+  context: The rule can match on filename or import hash, so the on-disk binary may be the
+    genuine tool, a renamed copy, or a decoy. Retrieve the executable and verify it against
+    the known build by checking file size, full hash, whether it is signed, and
+    characteristic strings. Confirming the real tool firms up the disposition; a mismatch suggests a
+    renamed or modified variant worth deeper analysis.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - Hashes
+      - CommandLine
+- source: template:cue_artifact.artifact_verification
+  question: What is the file hash and does it have known AV or threat intel detections?
+  context: The import hashes the rule keys on identify specific LocalPotato builds, but the
+    exact on-disk binary may differ. Submit the full file hash to reputation services to
+    determine whether this specific sample is known malicious, a known tool build, or
+    previously unseen, which calibrates how widely this binary may be circulating.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - Hashes
+- source: template:universal.evidence_preservation
+  question: Is the file written by LocalPotato still on disk for analysis?
+  context: LocalPotato's arbitrary write places attacker-controlled content at a SYSTEM-writable
+    path, commonly a DLL that an auto-elevated process loads. Checking whether that written
+    file still exists enables hash lookup, sandbox submission, and content review, and tells
+    you whether the planted payload is still staged for execution.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: template:cue_process_tool.process_chain
+  question: What process spawned LocalPotato and is that parent chain expected?
+  context: The parent process reveals how the tool was launched. An interactive shell
+    (cmd.exe, powershell.exe) under a logged-on user points to hands-on-keyboard operation,
+    while a script host, scheduled task, or remote-execution parent points to automated or
+    remote delivery. Walk up the chain to see what spawned the parent and what else it
+    launched.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:uac_bypass.elevated_action_after_bypass
+  question: What ran at High or System integrity on this host after the escalation attempt?
+  context: LocalPotato is a means to obtain SYSTEM. Processes appearing at High or System
+    integrity shortly after the tool ran reveal what the operator did with the elevated
+    context - installing persistence, dumping credentials, tampering with security tools,
+    or accessing protected resources. Correlate the timing and parent of any such process
+    with the LocalPotato execution.
+  range: +30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        IntegrityLevel:
+          - 'High'
+          - 'System'
+          - 'S-1-16-16384'
+          - 'S-1-16-12288'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - IntegrityLevel
+- source: template:cue_process_tool.follow_on
+  question: What child processes did LocalPotato spawn afterward?
+  context: Processes spawned by the tool reveal its hands-on impact. Post-escalation
+    activity often includes command interpreters, credential-access utilities, or
+    persistence tooling launched immediately after the SYSTEM write succeeds.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:hacking_tool.tool_specific_artifacts
+  question: What files did the LocalPotato process create on this host?
+  context: The tool's arbitrary-write primitive leaves file-creation artifacts - the copied
+    payload at its SYSTEM-writable destination and any staging files. Enumerating files
+    created by the tool's process confirms what was written even if the original process
+    has exited.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: template:uac_bypass.bypass_technique_registry_artifacts
+  question: Were registry-based UAC bypass attempts also made on this host around this time?
+  context: An operator pursuing SYSTEM may try several escalation methods in sequence.
+    Registry-key UAC bypasses write a command to a key that an auto-elevated process reads,
+    targeting locations such as ms-settings\Shell, mscfile\shell, or Environment. Finding
+    such writes alongside the LocalPotato execution shows a deliberate, multi-method
+    escalation effort rather than an isolated event.
+  range: -15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - '\reg.exe'
+          - '\powershell.exe'
+          - '\cmd.exe'
+        CommandLine|contains:
+          - 'ms-settings'
+          - 'mscfile'
+          - 'Classes\exefile'
+          - 'Classes\Folder'
+          - 'Environment'
+          - 'Shell\Open\command'
+          - 'DelegateExecute'
+      condition: selection
+    fields:
+      - CommandLine
+      - Image
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run LocalPotato or similar escalation tools?
+  context: Compare this user's current action against their historical behavior. A user who
+    has never run this tool is more notable than one who runs it as part of routine security
+    testing. User role and typical toolset should align with running a local escalation
+    exploit.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent and binary combination historically routine on this host or environment, or is the parent unusual for this binary?
+  context: When the alert fires under a service principal rather than a named user, user
+    identity does not attribute behavior. The meaningful pivot is the launch mechanism -
+    which parent spawned this binary, and whether that pair is historically common. A new
+    or rare parent for this binary is the deviation worth chasing; a pair already responsible
+    for many prior events points to existing automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or
+    parallel escalation attempts. If the same user triggered similar activity on multiple
+    endpoints, the scope of the operation may be larger than this single host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Escalation tools rarely run in isolation. Earlier detections on the same host -
+    initial access, reconnaissance, or defense tampering - may reveal the stages that
+    preceded this attempt and help reconstruct the full timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: false
+  techniques: []
+  attack_chain_coverage: []
+  dimension_coverage: []
+  mutable_dispositions: []
+  dedup_decisions:
+    - dropped: cue_user_actor.clustering_svc
+      reason: >-
+        service-principal clustering substitute omitted to stay within the 18-question
+        cap; LocalPotato is operator-run rather than a SYSTEM-scheduled binary, so the
+        user-pivot clustering question is the load-bearing variant. Parent+binary
+        scoping is already provided by the cue_user_actor.baseline_svc question.
+      kept: cue_user_actor.clustering
+  skipped_templates:
+    - template: cue_process_tool.baseline
+      reason: >-
+        Host baseline of this binary is redundant for a tool with no legitimate use - any
+        execution is notable. cue_user_actor.baseline and cue_user_actor.baseline_svc
+        cover historical frequency by user and by parent/binary respectively.
+    - template: cue_process_tool.baseline_deviation
+      reason: >-
+        REFLECTED host-pattern deviation question adds little for a hacktool whose every
+        firing is anomalous by construction; parent/user baselining is covered by the
+        cue_user_actor baseline pair without the heavier reflected block.
+    - template: cue_process_tool.clustering
+      reason: >-
+        Generic "other tools around this time" host clustering is subsumed by the richer
+        host-context precursor (prior alerts) and the user clustering question.
+    - template: cue_process_tool.scope
+      reason: >-
+        REFLECTED fleet-pattern scope (cross-host count of this rule's pattern) is low value
+        for a rare hacktool - a fleet of hosts running LocalPotato would each alert
+        individually; cross-host coordination is instead covered by the user clustering
+        question.
+    - template: cue_artifact.baseline
+      reason: >-
+        File baseline of the written artifact is covered by the evidence_preservation and
+        tool_specific_artifacts questions, which surface the dropped/created files directly;
+        a 90-day file-seen-before aggregation adds no triage value for a first-write payload.
+    - template: cue_host_context.clustering
+      reason: >-
+        Host-wide process clustering overlaps the user-clustering and precursor questions;
+        dropped to stay within the 18-question cap.
+    - template: universal.endpoint_protection_health
+      reason: >-
+        Generic tamper sweep dropped under the 18-question cap. LocalPotato is an
+        escalation primitive, not a payload that an operator necessarily precedes with
+        AV/EDR tampering, and prior-alert tamper context is already surfaced by the
+        cue_host_context.precursor question on this host.
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "cue_artifact: derived: [A-Za-z]:\\ in CommandLine"
+      disposition: declined
+      reason: >-
+        Acted-on, not declined in substance - recorded here only to close the audit loop.
+        The derived file-artifact cue drove the artifact mechanism_decode, artifact
+        verification, and evidence_preservation questions; the file path derived from the
+        command line is queried via the %file_paths% placeholder in evidence_preservation.
+    - hint: "File paths derived from CommandLine — use %file_paths% placeholder"
+      disposition: declined
+      reason: >-
+        Acted-on, not declined in substance. The evidence_preservation question's
+        file_event query uses TargetFilename|endswith|expand '%file_paths%' to locate the
+        file written from the LocalPotato -o argument; no separate declined action needed.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - hacking_tool
+    - uac_bypass
+    - cue_process_tool
+    - cue_artifact
+    - cue_user_actor
+    - cue_host_context
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 17
+      attack: 0
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 3
+      context: 12
+    logsource_diversity:
+      process_creation: 14
+      file_event: 2
+      sigma_alert: 1

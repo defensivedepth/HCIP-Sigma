@@ -1,0 +1,567 @@
+name: IIS Native-Code Module Command Line Installation
+id: 01bcfd82-b2d5-45f0-b3b1-f028a1d09b35
+description: |
+  Detects appcmd.exe installing an IIS module from the command line, where the
+  Image ends in appcmd.exe (or its OriginalFileName is appcmd.exe) AND the command
+  line contains both 'install' and 'module' AND a '-name:' switch, excluding the
+  case where the parent is the legitimate iissetup.exe. Registering an IIS module
+  is a normal administrative action when an application is deployed or updated, but
+  the same operation lets an operator install a passive backdoor that loads into the
+  IIS worker process w3wp.exe on every HTTP request and persists across IIS restarts
+  and OS updates. The investigation should determine what module and DLL were
+  registered, which path the DLL points at, what spawned appcmd.exe, whether a module
+  load by the worker followed, and whether module installation from this account and
+  host is expected.
+type: detection
+detection_id: 9465ddf4-f9e4-4ebd-8d98-702df3a93239
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the appcmd.exe command line match the IIS module install pattern this rule detects?
+  context: >-
+    Before investing investigation time, confirm the alert is a true positive. The
+    rule fires when the binary is appcmd.exe (by Image name or OriginalFileName) AND
+    the command line contains both 'install' and 'module' AND a '-name:' switch, and
+    the parent is NOT the legitimate iissetup.exe. Read the full command line and
+    confirm all of these criteria are present rather than a partial or coincidental
+    match.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to install IIS modules?
+  context: >-
+    Legitimate application deployment installs IIS modules, but normally from a
+    deployment pipeline, an admin session, or a maintenance window. Knowing whether
+    this server is an IIS host under active deployment and whether this account
+    performs module installation is often the fastest way to separate a routine
+    deployment from operator persistence.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What module name and DLL image path did this appcmd install command register? Decode the full command line.
+  context: >-
+    The full command line names what was registered. Read the value after '-name:'
+    for the module name and the '/image:' path for the DLL the module points at. A
+    DLL path under a webroot directory such as inetpub\wwwroot\bin or App_Bin, an
+    arbitrary writable path, or any non-Microsoft signed DLL is the artifact to pivot
+    on. This query scopes to appcmd executions on this host within a tight window so
+    a multi-step deployment is visible as one operation rather than a single line.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_appcmd:
+        CommandLine|contains|all:
+          - 'install'
+          - 'module'
+      condition: selection and selection_appcmd
+    fields:
+      - CommandLine
+      - Image
+      - CurrentDirectory
+- source: template:cue_process_tool.process_chain
+  question: What process spawned appcmd.exe and is that parent chain expected?
+  context: >-
+    The parent process reveals how the install command was invoked. Module
+    installation driven by a deployment tool, an interactive admin shell, or a
+    documented automation parent is routine. A parent such as w3wp.exe (the IIS
+    worker reaching code execution), an Office application, a script host, or an
+    unknown binary indicates the install command ran from an exploitation path rather
+    than an administrative context. The rule already excludes the legitimate
+    iissetup.exe parent.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: attack:T1505.003.config_modification
+  question: Was applicationHost.config modified or the registered DLL dropped to a webroot or inetsrv path around this time?
+  context: >-
+    Native module installation writes a new add element into applicationHost.config
+    under globalModules, and the referenced DLL is typically dropped into a writable
+    path first. File events on applicationHost.config, on the inetsrv directory, or on
+    webroot bin directories such as inetpub\wwwroot\bin and App_Bin corroborate that a
+    module was actually installed rather than the command failing. A new add element
+    referencing an unfamiliar DLL path is the persistence artifact. If file event
+    telemetry is not collected in this environment, treat zero results as a visibility
+    gap rather than evidence nothing was written.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_paths:
+        TargetFilename|contains:
+          - '\inetsrv\config\applicationHost.config'
+          - '\inetsrv\'
+          - '\inetpub\wwwroot\bin\'
+          - '\App_Bin\'
+      condition: selection and selection_paths
+    fields:
+      - TargetFilename
+      - Image
+- source: attack:T1505.003.module_load
+  question: Did w3wp.exe load a newly registered or unsigned DLL from a webroot path after the install?
+  context: >-
+    A registered native module only becomes a working backdoor once the worker
+    process loads it, so the canonical post-installation indicator is w3wp.exe loading
+    a DLL from a webroot subdirectory such as inetpub\wwwroot\bin or App_Bin, or
+    loading a non-Microsoft signed DLL from any inetsrv path. Correlating a module-load
+    event on the worker with the install command confirms the module is live in the
+    HTTP request pipeline. If image-load telemetry is not collected in this
+    environment, treat zero results as a visibility gap rather than evidence that no
+    module loaded.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith: '\w3wp.exe'
+      selection_paths:
+        ImageLoaded|contains:
+          - '\inetpub\wwwroot\bin\'
+          - '\App_Bin\'
+          - '\inetsrv\'
+      condition: selection and selection_paths
+    fields:
+      - ImageLoaded
+      - Image
+- source: attack:T1505.003.web_auth_activity
+  question: Did the account behind this activity authenticate to the server with a logon that lines up with the install?
+  context: >-
+    Server-software-component persistence is usually reached through a web request or
+    a remote logon rather than local interactive use, so a logon or explicit-credential
+    event on the server close to the install time helps establish how the operator got
+    onto the host and under which account. An unexpected network or service logon
+    immediately preceding the module install points at remote operator activity; a
+    routine interactive admin logon points at maintenance. If Security channel logon
+    events are not collected in this environment, treat zero results as a visibility
+    gap.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: security
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID:
+          - 4624
+          - 4648
+      condition: selection
+    fields:
+      - LogonType
+      - TargetUserName
+      - IpAddress
+      - ProcessName
+- source: template:obfuscation.encoded_payload_decode
+  question: Is any part of this install command encoded or obfuscated, and what does the decoded content reveal about the module or DLL?
+  context: >-
+    The module name, the DLL image path, or surrounding command content can be hidden
+    with environment-variable substitution, character concatenation, base64, or
+    short-name path tricks to disguise where the DLL really lives. Decode any obfuscated
+    portion to recover the real '-name:' value and '/image:' path. If the command line
+    is already plain text, record that the module name and DLL path were read directly.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired this appcmd install-module pattern, what parents and users normally drive it, and does the current alert fit?
+  context: >-
+    Even legitimate module installs leave a baseline. The query mirrors the rule's
+    selection structure scoped to this host, so the resulting parent and user
+    distribution reflects how this specific install-module pattern has historically run
+    here, not generic appcmd usage. A new parent process, an unexpected account, or an
+    unusual command shape is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \appcmd.exe
+      - OriginalFileName: appcmd.exe
+      selection_cli:
+        CommandLine|contains|all:
+        - install
+        - module
+        CommandLine|contains|windash: '-name:'
+      filter_iis_setup:
+        ParentImage: C:\Windows\System32\inetsrv\iissetup.exe
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_* and not 1 of filter_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired this appcmd install-module pattern in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: >-
+    The query mirrors the rule's selection structure with no host scope, so the result
+    is a fleet-wide count of this install-module pattern rather than generic appcmd
+    usage. Many hosts firing the same pattern points to scripted deployment or vendor
+    automation; one host or a small unrelated set points to manual operator activity.
+    Use the host distribution and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \appcmd.exe
+      - OriginalFileName: appcmd.exe
+      selection_cli:
+        CommandLine|contains|all:
+        - install
+        - module
+        CommandLine|contains|windash: '-name:'
+      filter_iis_setup:
+        ParentImage: C:\Windows\System32\inetsrv\iissetup.exe
+      condition: all of selection_* and not 1 of filter_*
+    fields:
+    - host.name
+- source: template:cue_user_actor.baseline
+  question: Does this user account normally install IIS modules or run appcmd?
+  context: >-
+    Compare the account against its own history. A user or service account that has
+    never run appcmd is a stronger signal than one that does so as part of routine
+    deployment. The role behind the account and its typical toolset should line up
+    with IIS module management.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent-to-appcmd launch historically routine on this host or across the environment?
+  context: >-
+    When the alert fires under a service principal such as the IIS application-pool
+    identity, user identity does not attribute behavior. The meaningful pivot is the
+    launch mechanism — which parent process spawned appcmd — and whether that pair is
+    historically common. A new or rare parent for appcmd on this host or
+    environment-wide is the deviation worth chasing; a pair that already accounts for
+    many prior events is deployment automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user account do across the environment around the time of the alert?
+  context: >-
+    Tracking the account's activity across hosts in the alert window reveals whether
+    the install is isolated or part of broader activity, such as the same account
+    touching other IIS servers. If multiple hosts show related activity from this
+    account, the scope of the operation is larger than one server.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did the same parent-to-appcmd launch fire on other hosts in the same window, or is it isolated to this server?
+  context: >-
+    Under a service principal, asking what else the account did returns agent and
+    service noise. The meaningful question is whether the same launch mechanism — this
+    parent spawning appcmd — fired on other IIS servers in the alert window. Several
+    servers in the same window points to a pushed deployment or a coordinated operation
+    against the IIS fleet; a single server points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:persistence_scope.process_based_persistence
+  question: Were other process-based persistence mechanisms installed on this server around the same time?
+  context: >-
+    Operators rarely rely on a single foothold. After installing an IIS module, they
+    commonly stack backup persistence using scheduled tasks, services, registry Run
+    keys, BITS jobs, or WMI. Multiple persistence installations in the same timeframe
+    indicate intentional stacking rather than an isolated deployment action.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this server in the hours before this alert?
+  context: >-
+    Persistence rarely happens in isolation. Earlier detections on the same server —
+    web exploitation, reconnaissance, or credential access — may reveal the stages that
+    preceded the module install and help reconstruct when the server was first reached.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1505.003
+      name: Web Shell
+      role: primary
+    - id: T1505
+      name: Server Software Component
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: module_install_execution
+      description: "appcmd.exe installs an IIS module from the command line ('install module -name:'), not parented by iissetup.exe"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 1b
+      label: module_install_decode
+      description: "Decode the install command to identify the module name and the DLL image path it registers"
+      mapped_to: Q3
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 2
+      label: config_modification
+      description: "applicationHost.config gains a new globalModules add element and the referenced DLL is dropped to a webroot/inetsrv path"
+      mapped_to: Q5
+      source: attack:T1505.003.config_modification
+    - stage: 3
+      label: module_load
+      description: "w3wp.exe loads the newly registered DLL on the next HTTP request, making the module live in the request pipeline"
+      mapped_to: Q6
+      source: attack:T1505.003.module_load
+  dimension_coverage:
+    - dimension: obfuscation_check
+      technique: T1505.003
+      covered_by: Q8
+      source: template:obfuscation.encoded_payload_decode
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1505.003
+      covered_by: Q4
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1505.003
+      covered_by: Q6
+      source: attack:T1505.003.module_load
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1505.003
+      covered_by: Q5
+      source: attack:T1505.003.config_modification
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1505
+      covered_by: Q12
+      source: template:cue_user_actor.baseline_svc
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1505
+      covered_by: Q16
+      source: template:cue_host_context.precursor
+      coverage_type: indirect
+    - dimension: tuning_parameter
+      technique: T1505
+      covered_by: Q3
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: partial
+  mutable_dispositions:
+    - element: WebRootPath
+      dimension: tuning_parameter
+      specific_values: "inetpub\\wwwroot\\bin\\, App_Bin\\, inetsrv\\config\\applicationHost.config, inetsrv\\"
+      disposition: query_injection
+      target_question: Q5
+      notes: "Webroot bin and inetsrv/applicationHost.config paths injected into Q5 file_event TargetFilename|contains and Q6 image_load ImageLoaded|contains"
+    - element: ParentProcess
+      dimension: parent_process_analysis
+      specific_values: "rationale only (server binaries such as w3wp.exe, php-cgi.exe, apache.exe that may launch the install)"
+      disposition: context
+      target_question: Q4
+      notes: "No fixed parent list; realized as the process_chain parent question (Q4) and the parent+binary baseline_svc/clustering_svc substitutes (Q12, Q14). w3wp.exe is pinned as the module-load Image in Q6"
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only (delta between install and module execution)"
+      disposition: context
+      target_question: Q6
+      notes: "No concrete threshold given; chained-event correlation realized as +/-15m on config_modification (Q5) and +/-4h on module_load (Q6)"
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "rationale only (custom/renamed server wrapper processes)"
+      disposition: context
+      target_question: Q12
+      notes: "Renamed-wrapper tuning rationale; covered by parent-name baseline_svc (Q12) which pivots on process.parent.name rather than a fixed list"
+  dedup_decisions:
+    - dropped: cue_user_actor.baseline / baseline_svc pair
+      reason: "user_actor pair — non-deduplicable; both emitted (Q11 user-pivot, Q12 parent+binary substitute) because the alert may fire under the IIS app-pool service principal"
+      kept: both
+    - dropped: cue_user_actor.clustering / clustering_svc pair
+      reason: "user_actor pair — non-deduplicable; both emitted (Q13 user-pivot, Q14 parent+binary substitute)"
+      kept: both
+  skipped_templates:
+    - template: cue_process_tool.baseline
+      reason: "Subsumed by cue_process_tool.baseline_deviation (Q9), which baselines the rule's specific install-module pattern on this host rather than generic appcmd usage; a host+Image-only baseline would conflate routine appcmd config reads with module installs"
+    - template: cue_process_tool.follow_on
+      reason: "appcmd's effect is config-write plus a later worker module load, not a spawned child; the meaningful follow-on (w3wp.exe loading the DLL) is covered by the image_load question (Q6), and host-wide same-time activity by host_context"
+    - template: cue_process_tool.clustering
+      reason: "Host-wide same-time tool activity overlaps process_based_persistence (Q15) and precursor (Q16); dropped to stay within the question budget without losing surrounding-activity coverage"
+    - template: cue_host_context.clustering
+      reason: "Aggregated host-wide activity overlaps process_based_persistence (Q15) and precursor (Q16); dropped to keep the playbook within the 14-18 budget"
+    - template: universal.endpoint_protection_health
+      reason: "recommended, not must_include; this is a persistence-install rule, not an execution/credential-access rule where the disposition turns on whether protection was disabled first. Prior tamper-as-precursor activity is still surfaced via the precursor alert query (Q16)"
+    - template: initial_access.delivery_vector
+      reason: "must_include for initial_access, but the delivery vector for this server-side persistence rule (the inbound web request or remote logon that reached code execution) is covered more precisely by the security-logon question (Q7) and the process_chain parent question (Q4); a ParentProcessGuid lookup of parent command line adds no distinct angle here"
+    - template: initial_access.campaign_scope
+      reason: "must_include for initial_access; cross-host same-pattern correlation is provided more specifically by cue_process_tool.scope (Q10, rule-pattern fleet count) and cue_user_actor.clustering_svc (Q14, parent+binary across hosts in window) — a generic rule.uuid fan-out adds no distinct angle"
+    - template: initial_access.application_patch_status
+      reason: "must_include for initial_access; appcmd module install is a post-access persistence action, not exploitation of a specific patchable CVE in the binary. Patch posture of the IIS application is implied by the parent/logon questions (Q4, Q7) rather than a separate parent-only slot"
+    - template: organizational_context.change_ticket
+      reason: "recommended priority; coverage budget used by higher-value IIS-specific chain questions. host_user_context (Q2) and the user baseline (Q11) already establish whether the install was authorized/expected"
+    - template: organizational_context.human_recall
+      reason: "recommended priority; redundant with host_user_context (Q2) for this rule's disposition needs"
+    - template: organizational_context.timing_alignment
+      reason: "recommended priority; timing-vs-maintenance judgment is folded into host_user_context (Q2) and precursor (Q16) rather than a standalone slot"
+    - template: organizational_context.procedural_consistency
+      reason: "recommended priority; the deployment-procedure question ('do you normally install modules via the command line') is folded into host_user_context (Q2) for this rule"
+    - template: persistence_scope.file_based_persistence
+      reason: "recommended priority; Startup-folder / Run-key file drops are not the persistence vector here. The relevant file-event coverage (applicationHost.config + webroot DLL drop) is provided by the IIS-specific config_modification question (Q5)"
+  reflection_overrides: []
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - initial_access
+    - obfuscation
+    - persistence_scope
+  generation_stats:
+    total_questions: 16
+    source_counts:
+      template: 13
+      attack: 3
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 13
+    logsource_diversity:
+      process_creation: 12
+      file_event: 1
+      image_load: 1
+      security: 1
+      sigma_alert: 1

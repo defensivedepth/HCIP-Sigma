@@ -1,0 +1,474 @@
+name: Suspicious File Encoded To Base64 Via Certutil.EXE
+id: b4056095-a687-4c78-b192-8f44ca1a2074
+description: |
+  Detects certutil.exe (or a binary whose OriginalFileName is CertUtil.exe) invoked with the -encode flag against a file whose extension is one of a suspicious set (.acl, .bat, .doc, .gif, .jpeg, .jpg, .mp3, .pdf, .png, .ppt, .tmp, .xls, .xml). The rule fires only when the certutil identity, the -encode flag, and a suspicious extension all appear in the same command line. certutil -encode turns arbitrary file content into Base64 text using a Microsoft-signed system binary with no encryption keys, no network calls, and no extra tooling; the same primitive is used legitimately for certificate handling but is abused to stage recon output for exfiltration, to obfuscate payloads on disk, and as a pseudo-ransomware effect that renders user files unreadable. Determine what file was encoded, where the Base64 output went, what process drove the invocation, and whether the encode was a one-off or part of a loop or staging sequence.
+type: detection
+detection_id: ea0cdc3e-2239-4f26-a947-4e8f8224e464
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-06
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line show certutil run with the -encode flag against a file with one of the suspicious extensions?
+  context: Confirm the alert is a true positive by reviewing the exact command line and process details. The rule requires the certutil identity (Image ending in certutil.exe or OriginalFileName CertUtil.exe), the -encode flag, and one of the suspicious extensions (.acl, .bat, .doc, .gif, .jpeg, .jpg, .mp3, .pdf, .png, .ppt, .tmp, .xls, .xml) all in the same command. Note the source file being encoded and the output path.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to Base64-encode files with certutil?
+  context: certutil -encode has legitimate uses around certificate and data handling, but most users and endpoints never run it. Knowing whether the account role and host function are consistent with command-line Base64 encoding is often the fastest way to separate sanctioned activity from operator staging or obfuscation.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:obfuscation.encoded_payload_decode
+  question: What is the source file certutil encoded, what is the Base64 output path, and what does the source content turn out to be?
+  context: certutil -encode takes a source file and writes a Base64 copy to an output path; both appear in the command line as the first and second positional arguments. Identify the source file (its location and likely contents) and the output path. Staging recon output for exfiltration writes from temp or AppData paths; an obfuscated payload encodes an executable or script; a pseudo-ransomware effect encodes user documents in place and leaves Base64 copies alongside the originals. Read the source file if it is still on disk to confirm what was encoded.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:cue_process_tool.mechanism_decode
+  question: How many certutil -encode invocations ran on this host in the same window, and do they form a single operation or a loop over many files?
+  context: A single certutil -encode is one event; a recon-staging or pseudo-ransomware pattern drives certutil -encode repeatedly, once per enumerated file, often with output names sharing a fixed suffix. Listing every certutil execution on the host in a tight window around the alert shows whether this is an isolated encode or one iteration of a loop, and reveals the full set of source and output paths touched.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:cue_process_tool.process_chain
+  question: What process spawned certutil, and is that parent chain expected?
+  context: The parent process reveals how the encode was invoked. A user-driven action typically has explorer.exe or a console session as the parent, while cmd.exe or a script host (wscript.exe, mshta.exe) running a batch or macro points to scripted orchestration. Office applications, script hosts, or unsigned parents driving certutil are consistent with recon staging or payload obfuscation rather than administration.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:universal.evidence_preservation
+  question: Is the Base64 output file still on disk for analysis?
+  context: The encode writes a Base64 copy to the output path named in the command line. If that file still exists, it can be decoded back to the original content for review, hashed, or submitted for analysis. The presence of the output alongside an untouched original is the side-by-side artifact left by the pseudo-ransomware effect; its absence may mean a follow-on step deleted staged files after exfiltration.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: template:cue_process_tool.follow_on
+  question: What child processes did certutil spawn afterward?
+  context: certutil performing a single encode normally spawns no children. Processes spawned by the same binary on this host after the alert can reveal follow-on staging — a shell deleting the cleartext source, a transfer utility moving the Base64 output, or further encoding iterations — that places the encode inside a larger operation.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:lolbin.renamed_binary_check
+  question: Was certutil executed from its expected System32 or SysWOW64 path?
+  context: certutil running from outside System32 or SysWOW64 — a user temp directory, AppData, or a download folder — may indicate the binary was copied or renamed to evade path-based allowlists. The OriginalFileName field still reads CertUtil.exe even when the on-disk name was changed, so compare Image against OriginalFileName to spot a renamed copy.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- source: template:lolbin.technique_class_lateral
+  question: Were other encode or decode LOLBins used on this host recently?
+  context: An operator who uses certutil to encode files often pairs it with the reverse direction or with adjacent cabinet and archive primitives. Finding certutil -decode, or expand, extrac32, or makecab being used to pack or unpack content on the same host strengthens the case that the encode is part of a staging or obfuscation workflow rather than an isolated event.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_img:
+        Image|endswith:
+          - '\expand.exe'
+          - '\extrac32.exe'
+          - '\makecab.exe'
+          - '\esentutl.exe'
+      condition: selection and selection_img
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously matched the rule's pattern, what parents and users drove it, and does the current alert fit?
+  context: The query mirrors the rule's selection structure scoped to this host, so the parent and user distribution reflects how this exact certutil -encode pattern has run here before — not generic certutil usage. A new parent process, an unexpected account, or an unusual command shape is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \certutil.exe
+      - OriginalFileName: CertUtil.exe
+      selection_cli:
+        CommandLine|contains|windash: -encode
+      selection_extension:
+        CommandLine|contains:
+        - .acl
+        - .bat
+        - .doc
+        - .gif
+        - .jpeg
+        - .jpg
+        - .mp3
+        - .pdf
+        - .png
+        - .ppt
+        - .tmp
+        - .xls
+        - .xml
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_user_actor.baseline
+  question: Has this user Base64-encoded files with certutil before across the environment?
+  context: Compare this account's current action against its history. A user who routinely encodes files with certutil as part of their role is expected; one who has never run the tool is the anomaly. User role and typical toolset should align with command-line Base64 encoding.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent-plus-certutil combination historically routine on this host or environment-wide, or is the parent unusual for certutil?
+  context: When the alert fires under a service principal, user identity does not attribute behavior; the meaningful pivot is the launch mechanism. A parent process that has spawned certutil thousands of times before looks like vendor or OS automation, while a new or rare parent for certutil on this host or environment-wide is the deviation worth chasing.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around the time of the alert?
+  context: Tracking the account's activity across all hosts reveals lateral movement or coordinated activity on multiple endpoints. If the same user triggered similar encoding or staging actions elsewhere, the scope of the activity may be larger than this single host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent-plus-certutil combination fire on other hosts in the alert window?
+  context: Under a service principal, a user-wide network sweep returns agent-telemetry noise. The meaningful question is whether the same launch mechanism — the parent process spawning certutil — fired on other hosts in the same window. Multiple hosts point to scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining surrounding activity reveals what led to the encode and what followed it — file enumeration, recon commands, or transfer utilities. Aggregating by parent and child collapses repetitive agent telemetry into high-count rows while novel parent-child pairs stand out at low counts.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:lolbin.historical_lolbin_baseline
+  question: How often has this host matched the rule's certutil -encode pattern over the past 90 days, and what command-line shapes are typical?
+  context: A certutil -encode pattern with no prior history on a host is more suspicious than one used regularly under stable parents. The query mirrors the rule's selection structure scoped to this host, so the count reflects this exact pattern rather than generic certutil usage. The command-line projection lets typical source and output path shapes be compared against the alerting one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \certutil.exe
+      - OriginalFileName: CertUtil.exe
+      selection_cli:
+        CommandLine|contains|windash: -encode
+      selection_extension:
+        CommandLine|contains:
+        - .acl
+        - .bat
+        - .doc
+        - .gif
+        - .jpeg
+        - .jpg
+        - .mp3
+        - .pdf
+        - .png
+        - .ppt
+        - .tmp
+        - .xls
+        - .xml
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - CommandLine
+- source: template:cue_process_tool.scope
+  question: Have other hosts matched the rule's pattern in the past week, and does the distribution look like automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, giving a fleet-wide count of this certutil -encode pattern rather than generic certutil usage. Many hosts matching the same pattern points to scripted deployment or vendor automation; one host or a small unrelated set points to manual operator activity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \certutil.exe
+      - OriginalFileName: CertUtil.exe
+      selection_cli:
+        CommandLine|contains|windash: -encode
+      selection_extension:
+        CommandLine|contains:
+        - .acl
+        - .bat
+        - .doc
+        - .gif
+        - .jpeg
+        - .jpg
+        - .mp3
+        - .pdf
+        - .png
+        - .ppt
+        - .tmp
+        - .xls
+        - .xml
+      condition: all of selection_*
+    fields:
+    - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host — reconnaissance, defense tampering, or credential access — may reveal the stages that preceded the encode and help reconstruct the timeline. Recon staging often follows file and directory enumeration; the alert timeline helps distinguish an isolated action from one step in a sequence.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+  - id: T1027
+    name: Obfuscated Files or Information
+    role: primary
+  attack_chain_coverage:
+  - stage: 1
+    label: orchestration_parent
+    description: A script or suspicious parent process drives the encoding (correlate suspicious parent with encoded-file activity)
+    mapped_to: Q5
+    source: template:cue_process_tool.process_chain
+  - stage: 2
+    label: encoded_file_creation
+    description: certutil writes an encoded (Base64) copy of a file with abnormal command-line syntax
+    mapped_to: Q3
+    source: template:obfuscation.encoded_payload_decode
+  - stage: 3
+    label: encoded_output_on_disk
+    description: The encoded output file is created on disk at the destination path
+    mapped_to: Q6
+    source: template:universal.evidence_preservation
+  dimension_coverage:
+  - dimension: obfuscation_check
+    technique: T1027
+    covered_by: Q3
+    source: template:obfuscation.encoded_payload_decode
+    coverage_type: direct
+  - dimension: time_correlation
+    technique: T1027
+    covered_by: Q16
+    source: template:cue_host_context.clustering
+    coverage_type: direct
+  - dimension: tuning_parameter
+    technique: T1027
+    covered_by: Q10
+    source: template:cue_process_tool.baseline_deviation
+    coverage_type: direct
+  - dimension: user_context
+    technique: T1027
+    covered_by: Q11
+    source: template:cue_user_actor.baseline
+    coverage_type: direct
+  mutable_dispositions:
+  - element: PayloadEntropyThreshold
+    dimension: obfuscation_check
+    specific_values: rationale only
+    disposition: context
+    target_question: Q3
+    notes: No queryable threshold value; the analytic describes entropy tuning to separate obfuscation from legitimate compression. The encode-decode decode question carries the obfuscation determination via the source/output content review.
+  - element: TimeWindow
+    dimension: time_correlation
+    specific_values: rationale only
+    disposition: context
+    target_question: Q16
+    notes: No fixed value; correlation between script execution and encoded-file creation is realized by the +/-15m host clustering window and the +/-5m mechanism-decode loop window.
+  - element: SuspiciousParentProcessList
+    dimension: tuning_parameter
+    specific_values: rationale only
+    disposition: context
+    target_question: Q5
+    notes: No fixed list; parent-process legitimacy is investigated by the process-chain question and the rule-pattern parent distribution in baseline_deviation.
+  dedup_decisions:
+  - dropped: cue_process_tool.baseline
+    reason: "host+binary 90d baseline of generic certutil usage is superseded by lolbin.historical_lolbin_baseline, which scopes the same 90d host count to the rule's specific -encode pattern (REFLECTED) and projects CommandLine for shape comparison"
+    kept: lolbin.historical_lolbin_baseline
+  - dropped: cue_process_tool.clustering
+    reason: "host.name-scoped clustering aggregating by Image overlaps cue_host_context.clustering, which aggregates by Image+ParentImage on the same scope and surfaces strictly more context"
+    kept: cue_host_context.clustering
+  - dropped: ''
+    reason: "user_actor pair (baseline / baseline_svc) — non-deduplicable, both emitted"
+    kept: cue_user_actor.baseline + cue_user_actor.baseline_svc
+  - dropped: ''
+    reason: "user_actor pair (clustering / clustering_svc) — non-deduplicable, both emitted"
+    kept: cue_user_actor.clustering + cue_user_actor.clustering_svc
+  skipped_templates:
+  - template: download_tool.download_success_verification
+    reason: "Rule detects certutil -encode of a local file, not a network download; there is no remote source or download destination to confirm. The encode-output-on-disk question (universal.evidence_preservation, Q6) covers the equivalent file-creation check for this rule's actual artifact."
+  - template: download_tool.payload_analysis
+    reason: "No downloaded remote payload exists for an encode operation; the artifact is a locally-produced Base64 copy. Retrieval and decode of that output is covered by Q6 (file on disk) and Q3 (decode source/output content), so a sandbox/hash question framed around a downloaded payload would mislead."
+  - template: download_tool.directory_activity
+    reason: "Download staging-directory framing does not match an in-place encode; the relevant directory-level scope (multiple files encoded in a loop) is covered by Q4 (all certutil -encode invocations on the host) rather than a download-destination directory sweep."
+  - template: universal.endpoint_protection_health
+    reason: "RECOMMENDED generic host tamper-sweep, not must_include. This rule fires on an obfuscation/staging primitive, not a hands-on-keyboard execution or credential-access action where the disposition turns on whether AV/EDR was disabled first; prior-stage context is already carried by cue_host_context.precursor (Q19, sigma alerts -6h on this host). No defense_tampering technique set is confirmed for this rule, so no more-specific tamper question is displaced."
+  reflection_overrides: []
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+  - universal
+  - obfuscation
+  - lolbin
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 18
+      attack: 0
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 15
+    logsource_diversity:
+      process_creation: 16
+      file_event: 1
+      sigma_alert: 1

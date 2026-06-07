@@ -1,0 +1,544 @@
+name: AspNetCompiler Execution
+id: 76333dcd-8925-4da3-8eca-9be174167ca9
+description: |
+  Detects execution of aspnet_compiler.exe from the .NET Framework directories. This Microsoft-signed
+  ASP.NET compilation utility can be abused to compile and run attacker-supplied C# code: when pointed
+  with -p at a directory containing a crafted web.config that registers a custom buildProvider, the
+  compiler loads and executes a local DLL under its own process, bypassing application-control policies.
+  Legitimate use is rare outside build/developer systems, so the investigation should determine whether
+  this host is a build host, what directory the compiler was pointed at, whether attacker-supplied
+  web.config/DLL/App_Code artifacts are present, and whether the process spawned children or made
+  outbound connections consistent with proxied code execution.
+type: detection
+detection_id: a01b8329-5953-4f73-ae2d-aa01e1f35f00
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the alerting process match this rule — aspnet_compiler.exe running from a .NET Framework directory?
+  context: Before investing investigation time, confirm the alert is a true positive by reviewing the full Image path and command line against the rule's criteria — the binary name ends in aspnet_compiler.exe and the Image path is under one of the Microsoft.NET\Framework directories. Note the -p target directory and -f output path in the command line, since they point at the content the compiler was asked to build.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+- source: template:universal.host_user_context
+  question: Is this user and host expected to compile .NET applications?
+  context: aspnet_compiler.exe is a developer/build utility that is rarely run on standard endpoints. If this is a build server or a developer workstation and the user is a developer or a CI/CD service account, the execution may be routine; on a general-purpose endpoint or under an unexpected user, it is far more likely to be proxy execution. Confirm the host's role and the user's function before proceeding.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What directory was aspnet_compiler.exe pointed at, and what do its full arguments reveal?
+  context: The full command line reveals the operation. Decode the -p (physical/source directory), -f (target output directory), -v (virtual path), and -u flags. A -p path under a user-writable location such as Desktop, Temp, AppData, or the public profile, rather than an IIS site root, is the abuse pattern — the compiler is being asked to build content the operator dropped, which can register a custom buildProvider and execute a local DLL.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:cue_process_tool.process_chain
+  question: What process spawned aspnet_compiler.exe, and is that parent chain expected?
+  context: The parent process shows how the compiler was launched. A build pipeline, an IDE, or a service-control parent fits legitimate use; a parent such as an Office application, a script host, mshta.exe, an unexpected shell, or a freshly written binary points toward operator-driven proxy execution. Walk the chain up to see what spawned the parent.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.follow_on
+  question: What child processes did aspnet_compiler.exe spawn afterward?
+  context: A trusted developer utility used for proxy execution frequently spawns follow-on processes that carry out the actual payload. Children such as powershell.exe, cmd.exe, rundll32.exe, regsvr32.exe, wscript.exe, or mshta.exe spawned by the compiler are a strong sign the build step was a delivery vehicle rather than a real compilation. Routine compilation typically spawns no such children.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: attack:T1127.image_load
+  question: Did aspnet_compiler.exe load an unsigned or user-writable DLL?
+  context: The proxy-execution technique works by registering a custom buildProvider in web.config that points at an attacker-supplied DLL (for example dropped in a bin\ subfolder); the compiler then loads that DLL and runs its GenerateCode override under its own process. A module loaded by aspnet_compiler.exe from a user-writable path, or that is unsigned or has an invalid signature, is the loaded payload. Legitimate compilation loads framework assemblies from system locations.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+      - SignatureStatus
+- source: attack:T1127.payload_drop
+  question: Were web.config, a bin\ DLL, or App_Code files written into the directory the compiler was pointed at?
+  context: The abuse pattern requires a specific on-disk layout under the target directory — a web.config that registers the custom buildProvider, an App_Code file with the registered extension, and a bin\ DLL implementing the build provider. Files written into the compiler's -p directory shortly before or during execution, especially a web.config plus a bin\*.dll, are the staged payload. Scope the file query to the directories surfaced by the command-line decode.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        file.directory|contains|expand: '%file_dirs%'
+      filter_config:
+        file.name|endswith:
+          - \web.config
+          - .dll
+          - .wtf
+      condition: selection and filter_config
+    fields:
+      - file.path
+      - Image
+      - User
+- source: attack:T1127.network_connection
+  question: Did aspnet_compiler.exe make any outbound network connections?
+  context: A compilation utility has no legitimate reason to initiate outbound network traffic. Proxied code running under aspnet_compiler.exe commonly reaches out to retrieve a second stage or to call back to operator infrastructure. Any outbound connection attributed to this binary is anomalous; review the destination address, port, and reputation, and treat rare or newly seen destinations as higher risk.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        Image|endswith|expand: '%Image%'
+        Initiated: 'true'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired this rule's pattern, what parents and users drove it, and does the current alert fit?
+  context: Even on hosts where aspnet_compiler.exe runs occasionally, the parent/user distribution of prior firings shows the normal launch profile. The query mirrors the rule's selection scoped to this host, so the result reflects how this specific pattern has historically run here. A new parent process, an unexpected user account, or a first-ever appearance is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|contains:
+        - :\Windows\Microsoft.NET\Framework\
+        - :\Windows\Microsoft.NET\Framework64\
+        - :\Windows\Microsoft.NET\FrameworkArm\
+        - :\Windows\Microsoft.NET\FrameworkArm64\
+        Image|endswith: \aspnet_compiler.exe
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired this rule's pattern in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: The query mirrors the rule's selection with no host scope, giving a fleet-wide count of this firing pattern rather than generic binary usage. Many hosts firing the same pattern points to scripted deployment or build automation; a single host or a small unrelated set points to manual operator activity. Use the host distribution to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|contains:
+        - :\Windows\Microsoft.NET\Framework\
+        - :\Windows\Microsoft.NET\Framework64\
+        - :\Windows\Microsoft.NET\FrameworkArm\
+        - :\Windows\Microsoft.NET\FrameworkArm64\
+        Image|endswith: \aspnet_compiler.exe
+      condition: selection
+    fields:
+    - host.name
+- source: template:cue_process_tool.clustering
+  question: What other tools ran on this host around the same time?
+  context: Proxy execution via a developer utility is usually one step in a larger sequence. Activity surrounding the alert may reveal reconnaissance, credential access, persistence, or staging that provides broader context for the disposition.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run aspnet_compiler.exe or other .NET build tooling?
+  context: Compare this user's current action against their historical behavior. A user who has never run the compiler before is more suspicious than a developer who does so regularly. The user's role and typical toolset should align with .NET compilation activity.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent+aspnet_compiler.exe combination historically routine on this host or environment-wide, or is the parent unusual for this binary?
+  context: When the alert fires under a service principal, user identity does not attribute behavior; the meaningful pivot is the launch mechanism. Check whether the parent process that spawned the compiler is historically common for this binary. A new or rare parent on this host or environment-wide is the deviation worth chasing; a pair already accounting for many prior events is build or vendor automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints. If the same user triggered similar activity elsewhere, the scope may be larger than this single host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent+aspnet_compiler.exe combination fire on other hosts in the same window — a coordinated automation rollout, or activity isolated to this host?
+  context: Under a service principal, asking what else the user did across the network returns agent-telemetry noise. The meaningful question is whether the same launch mechanism — parent process plus spawned binary — fired on other hosts in the alert window. Multiple hosts in the same window points to scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering, reconnaissance, or credential access — may reveal the stages that preceded this event and help reconstruct the timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in the hour before the alert?
+  context: Tampering often precedes payload execution. The query surfaces direct attempts to disable AV/EDR services, flip Defender flags, add broad exclusions, clear logs, or patch AMSI/ETW. Zero rows is a useful "protection looks healthy" signal — kernel-level driver tampering and in-memory patches will not appear here. Populated rows shift the disposition toward operator preparation; review the parent process and signing chain to identify the writer.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1127
+      name: Trusted Developer Utilities Proxy Execution
+      role: primary
+  attack_chain_coverage:
+    - stage: 1
+      label: utility_execution_non_dev_context
+      description: A trusted/signed developer utility (aspnet_compiler.exe) is executed in a non-developer context.
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: spawns_suspicious_children
+      description: Utility spawns suspicious children (powershell.exe, cmd.exe, rundll32.exe, regsvr32.exe, wscript.exe).
+      mapped_to: Q5
+      source: template:cue_process_tool.follow_on
+    - stage: 3
+      label: loads_unsigned_user_writable_dll
+      description: Utility loads unsigned/user-writable DLLs (the BuildProvider payload DLL).
+      mapped_to: Q6
+      source: attack:T1127.image_load
+    - stage: 4
+      label: writes_then_runs_pe_from_user_writable
+      description: Utility writes and then runs a new PE/DLL from user-writable paths (web.config, bin\*.dll, App_Code\*).
+      mapped_to: Q7
+      source: attack:T1127.payload_drop
+    - stage: 5
+      label: outbound_network_connection
+      description: Utility immediately makes outbound network connections.
+      mapped_to: Q8
+      source: attack:T1127.network_connection
+  dimension_coverage:
+    - dimension: parent_process_analysis
+      technique: T1127
+      covered_by: Q4
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1127
+      covered_by: Q11
+      source: template:cue_process_tool.clustering
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1127
+      covered_by: Q9
+      source: template:cue_process_tool.baseline_deviation
+      coverage_type: indirect
+  mutable_dispositions:
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "0-30 minutes (utility execution to payload write/egress)"
+      disposition: context
+      target_question: Q7
+      notes: "Correlation window between compiler execution, payload write, and egress reflected in -1h file-drop and +4h network ranges; threshold not directly queryable."
+    - element: SuspiciousChildList
+      dimension: tuning_parameter
+      specific_values: "powershell.exe, rundll32.exe, regsvr32.exe, cmd.exe, wscript.exe, mshta.exe"
+      disposition: context
+      target_question: Q5
+      notes: "Child names enumerated in follow_on context; query is ParentImage-scoped so it surfaces all children including these."
+    - element: RarePathRegex
+      dimension: tuning_parameter
+      specific_values: "%TEMP%, %APPDATA%, public profile, Desktop"
+      disposition: context
+      target_question: Q3
+      notes: "User-writable -p target paths called out in mechanism_decode context; the file-drop query scopes to the decoded directories."
+    - element: UnsignedOrInvalidSignatureOnly
+      dimension: tuning_parameter
+      specific_values: "unsigned / invalid-signature toggle"
+      disposition: query_injection
+      target_question: Q6
+      notes: "image_load query projects Signed/Signature/SignatureStatus so analyst can judge signing of the loaded DLL."
+    - element: ParentProcessAllowList
+      dimension: parent_process_analysis
+      specific_values: "rationale only (CI/CD agents)"
+      disposition: context
+      target_question: Q4
+      notes: "Legitimate orchestrator parents (build pipelines/CI-CD) described in process_chain context."
+    - element: AllowedUtilitiesList
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q2
+      notes: "Dev-host/dev-user expectation captured in host_user_context; not queryable per-rule."
+    - element: DeveloperHosts
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q2
+      notes: "Build/dev host scoping captured in host_user_context and scope distribution."
+    - element: NetworkReputationThreshold
+      dimension: tuning_parameter
+      specific_values: "rationale only (rare/unknown destination heuristic)"
+      disposition: context
+      target_question: Q8
+      notes: "Rare/newly-seen destination heuristic described in network_connection context; reputation not queryable in sigma."
+  dedup_decisions:
+    - dropped: cue_user_actor.baseline + cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable (subject vs. launch-mechanism identity)"
+      kept: both
+    - dropped: cue_user_actor.clustering + cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable (subject vs. launch-mechanism identity)"
+      kept: both
+    - dropped: cue_host_context.clustering
+      reason: "redundant with cue_process_tool.clustering (Q11) — both aggregate host process_creation in a +/-15m window; process_tool version retained"
+      kept: cue_process_tool.clustering
+  skipped_templates:
+    - template: cue_process_tool.baseline
+      reason: "superseded by cue_process_tool.baseline_deviation (Q9), which mirrors the rule's selection scoped to host — more specific than a generic Image|endswith host-frequency count"
+  reflection_overrides: []
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 14
+      attack: 3
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 14
+    logsource_diversity:
+      process_creation: 13
+      image_load: 1
+      file_event: 1
+      network_connection: 1
+      sigma_alert: 1

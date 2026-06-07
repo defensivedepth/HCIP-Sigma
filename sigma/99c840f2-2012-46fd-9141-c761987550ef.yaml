@@ -1,0 +1,621 @@
+name: Suspicious Download From Direct IP Via Bitsadmin
+id: 59cb99b9-9482-4a7b-8db8-7bf628e8a98b
+description: |
+  Detects bitsadmin.exe (or a binary whose PE metadata is bitsadmin.exe) invoked with a job
+  flag (/transfer, /create, or /addfile) AND a command line containing a URL that points at a
+  raw IP address (://1 through ://9), excluding 7-Zip's ://7- archive paths. bitsadmin uses the
+  Background Intelligent Transfer Service to download files under the calling user's profile with
+  only user-level privileges; jobs can persist across reboots and survive logoff. Direct-IP
+  download URLs bypass DNS-based controls and are a common stager pattern for second-stage
+  payload retrieval. Legitimate use is typically vendor/CDN updaters using hostnames, not bare
+  IPs; investigation should confirm whether the transfer is an approved download, identify the
+  remote endpoint and destination path, and look for download-then-execute follow-on activity.
+type: detection
+detection_id: 99c840f2-2012-46fd-9141-c761987550ef
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the bitsadmin command line carry a job flag and a direct-IP download URL?
+  context: Confirm the alert is a true positive before investing time. Verify the process is
+    bitsadmin.exe (by Image path or OriginalFileName metadata), that the command line contains a
+    job flag (/transfer, /create, or /addfile), AND that it contains a URL pointing at a raw IP
+    address rather than a hostname. All three must be present for the rule to fire; the 7-Zip
+    ://7- archive path is excluded.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to download files from raw IP addresses via command-line transfer tools?
+  context: Legitimate administrative downloads typically use vendor hostnames and managed updaters,
+    not bitsadmin pointed at a bare IP. Knowing whether this user role and host function routinely
+    perform command-line file transfers is often the fastest way to separate an approved download
+    from operator activity.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:defense_tampering.what_was_disabled
+  question: Decode the full bitsadmin command line — what URL, remote IP, and local destination path were specified?
+  context: The command line carries the operational detail. Identify the job flag in use
+    (/transfer, /create, /addfile), the full download URL and its raw IP, and the destination
+    path the file was written to (often under the user profile or %TEMP%). The destination path is
+    the file to hunt for downstream; the IP is the remote endpoint to scope against other hosts.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:masquerading.true_identity
+  question: Does the binary's on-disk name match its PE metadata, and what does its hash resolve to?
+  context: The rule fires on either the bitsadmin.exe filename OR an OriginalFileName of
+    bitsadmin.exe, so a renamed copy still triggers. Compare the Image path against OriginalFileName
+    to spot a renamed binary, and submit the hash for reputation lookup to confirm whether this is
+    the genuine Microsoft-signed bitsadmin or a tampered or substituted binary.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - Hashes
+- source: template:cue_process_tool.process_chain
+  question: What process spawned bitsadmin, and is that parent chain expected?
+  context: The parent reveals how the transfer was invoked. Interactive admin use typically has
+    explorer.exe or a shell in the chain; bitsadmin spawned by a script host (wscript.exe,
+    mshta.exe), an Office application, or an exploited service process points to scripted or
+    exploitation-driven execution rather than a human running a download.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: attack:T1197.network_transfer
+  question: Did a network connection to the download endpoint follow the bitsadmin job on this host?
+  context: BITS performs the actual HTTP(S)/SMB transfer asynchronously, often from a service
+    context rather than bitsadmin.exe itself. Correlating outbound connections from this host
+    around the alert confirms whether the transfer executed and to which remote IP, and whether the
+    destination matches the raw IP seen in the command line. If network connection telemetry is not
+    collected in this environment, treat zero results as a visibility gap rather than evidence the
+    transfer did not run.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'true'
+      filter_local:
+        DestinationIp|cidr:
+          - '10.0.0.0/8'
+          - '172.16.0.0/12'
+          - '192.168.0.0/16'
+          - '127.0.0.0/8'
+      condition: selection and not filter_local
+    fields:
+      - Image
+      - DestinationIp
+      - DestinationPort
+- source: template:masquerading.binary_origin
+  question: How and when did this bitsadmin binary arrive at its current path on the host?
+  context: The genuine bitsadmin lives in System32 or SysWOW64 and ships with the OS. If this copy
+    was dropped, downloaded, or copied elsewhere, the file-creation event names the process that
+    placed it (an installer, a dropper, a copy via remote admin tooling). Matching by basename over
+    a long window surfaces every install or replacement of this binary on the host.
+  range: -30d
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains|expand: '%file_name%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: template:masquerading.renamed_binary_activity
+  question: What did bitsadmin spawn afterward on this host, and what does its activity reveal?
+  context: bitsadmin can chain a download into execution, and post-transfer child processes reveal
+    the actual objective — a dropped payload being run, a rundll32/cmd/powershell launch, or
+    follow-on staging. A binary that downloads a file and then immediately executes it is a
+    download-then-execute primitive worth treating as hands-on activity.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:lolbin.renamed_binary_check
+  question: Was bitsadmin executed from its expected System32 or SysWOW64 path?
+  context: bitsadmin running from a user-writable directory (Desktop, Downloads, %TEMP%, AppData)
+    rather than System32 or SysWOW64 suggests the binary was copied or relocated to dodge
+    path-based allowlisting. The expected install paths are well known, so an off-path execution is
+    a meaningful deviation.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run bitsadmin transfers?
+  context: Compare this user's current action against their history. A user who has never invoked
+    bitsadmin to move files is more suspicious than one who does so regularly as part of a known
+    role. Zero or very low counts over 90 days indicate first-time or rare use for this account.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent-plus-bitsadmin launch mechanism historically routine on this host or environment-wide?
+  context: When the alert fires under a service principal (SYSTEM, LOCAL SERVICE, NETWORK SERVICE,
+    or a computer account), user identity does not attribute the behavior. The meaningful pivot is
+    the launch mechanism — which parent spawned bitsadmin, and whether that pair is historically
+    common here. A new or rare parent for bitsadmin is the deviation; a pair accounting for
+    thousands of prior events is automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around the time of the alert?
+  context: Tracking the user's activity across all hosts reveals lateral movement or staging on
+    multiple endpoints. If the same account drove similar transfers or tooling on other hosts in
+    this window, the scope of the activity is broader than a single download.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did the same parent-plus-bitsadmin combination fire on other hosts in the same window?
+  context: Under a service principal, asking what the user did network-wide returns agent-telemetry
+    noise. The meaningful question is whether the same launch mechanism — parent process plus
+    bitsadmin — fired on other hosts in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:lolbin.technique_class_lateral
+  question: Were other download or transfer LOLBins used on this host recently?
+  context: Operators who reach for one download LOLBin often use several. If bitsadmin moved a file,
+    check whether certutil, curl, esentutl, expand, or extrac32 were also used to fetch or stage
+    payloads in the same timeframe. Multiple download utilities performing the same objective
+    strengthens the case for deliberate tooling.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_img:
+        Image|endswith:
+          - '\certutil.exe'
+          - '\curl.exe'
+          - '\esentutl.exe'
+          - '\expand.exe'
+          - '\extrac32.exe'
+          - '\makecab.exe'
+          - '\replace.exe'
+          - '\hh.exe'
+      condition: selection and selection_img
+    fields:
+      - Image
+      - CommandLine
+- source: template:persistence_scope.process_based_persistence
+  question: Were process-based persistence mechanisms installed on this host around the alert?
+  context: BITS jobs themselves can persist across reboots and survive logoff, and operators
+    commonly stack persistence after gaining a foothold. Look for scheduled tasks, services,
+    registry Run-key writes, additional bitsadmin jobs, or WMI subscriptions created in the same
+    window. To enumerate persistent BITS jobs directly, run "bitsadmin /list /allusers /verbose".
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining the activity surrounding the transfer reveals
+    what led to it and what followed — reconnaissance, privilege escalation, or staging — and
+    whether the download is one step in a larger sequence. Novel parent-child pairs at low counts
+    are what to scan for against the high-count background noise.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:lolbin.historical_lolbin_baseline
+  question: How often has this host fired this bitsadmin direct-IP pattern over the past 90 days, and what command shapes are typical?
+  context: A LOLBin pattern with no prior history on a host is more suspicious than one seen
+    regularly under stable parents. This query mirrors the rule's selection scoped to this host, so
+    the count reflects the rule's specific firing pattern rather than generic bitsadmin usage. The
+    command-line projection lets you compare typical invocation shapes against the alerting one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \bitsadmin.exe
+      - OriginalFileName: bitsadmin.exe
+      selection_flags:
+        CommandLine|contains:
+        - ' /transfer '
+        - ' /create '
+        - ' /addfile '
+      selection_extension:
+        CommandLine|contains:
+        - ://1
+        - ://2
+        - ://3
+        - ://4
+        - ://5
+        - ://6
+        - ://7
+        - ://8
+        - ://9
+      filter_seven_zip:
+        CommandLine|contains: ://7-
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_* and not 1 of filter_*) and _pb_scope
+    fields:
+    - CommandLine
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired this bitsadmin direct-IP pattern in the past week, and does the spread look like automation or one-off activity?
+  context: This query mirrors the rule's selection with no host scope, giving a fleet-wide count of
+    the rule's firing pattern rather than generic bitsadmin usage. Many hosts firing the same
+    pattern points to scripted deployment or vendor automation; one host or a small unrelated set
+    points to manual operator activity. Use the host distribution to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \bitsadmin.exe
+      - OriginalFileName: bitsadmin.exe
+      selection_flags:
+        CommandLine|contains:
+        - ' /transfer '
+        - ' /create '
+        - ' /addfile '
+      selection_extension:
+        CommandLine|contains:
+        - ://1
+        - ://2
+        - ://3
+        - ://4
+        - ://5
+        - ://6
+        - ://7
+        - ://8
+        - ://9
+      filter_seven_zip:
+        CommandLine|contains: ://7-
+      condition: all of selection_* and not 1 of filter_*
+    fields:
+    - host.name
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1197
+      name: BITS Jobs
+      role: primary
+    - id: T1036.003
+      name: Rename Legitimate Utilities
+      role: secondary
+    - id: T1036
+      name: Masquerading
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: job_creation_configuration
+      description: "Actor creates/configures a BITS job via bitsadmin with /transfer, /create, or /addfile pointing at a direct-IP URL"
+      mapped_to: Q3
+      source: template:defense_tampering.what_was_disabled
+    - stage: 2
+      label: network_transfer
+      description: "BITS performs the HTTP(S)/SMB transfer to the remote endpoint while the owning user is logged on"
+      mapped_to: Q6
+      source: attack:T1197.network_transfer
+    - stage: 3
+      label: notify_or_followon_execution
+      description: "Job completion triggers a notify command or the downloaded payload is executed (download-then-execute)"
+      mapped_to: Q8
+      source: template:masquerading.renamed_binary_activity
+  dimension_coverage:
+    - dimension: time_correlation
+      technique: T1197
+      covered_by: Q6
+      source: attack:T1197.network_transfer
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1197
+      covered_by: Q1
+      source: template:universal.verify_trigger_match
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1197
+      covered_by: Q2
+      source: template:universal.host_user_context
+      coverage_type: direct
+    - dimension: command_analysis
+      technique: T1036.003
+      covered_by: Q3
+      source: template:defense_tampering.what_was_disabled
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1036.003
+      covered_by: Q16
+      source: template:cue_host_context.clustering
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1036.003
+      covered_by: Q9
+      source: template:lolbin.renamed_binary_check
+      coverage_type: direct
+    - dimension: execution_context
+      technique: T1036
+      covered_by: Q8
+      source: template:masquerading.renamed_binary_activity
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1036
+      covered_by: Q16
+      source: template:cue_host_context.clustering
+      coverage_type: indirect
+    - dimension: tuning_parameter
+      technique: T1036
+      covered_by: Q4
+      source: template:masquerading.true_identity
+      coverage_type: direct
+  mutable_dispositions:
+    - element: SuspiciousCliSwitches
+      dimension: tuning_parameter
+      specific_values: "/transfer, /create, /addfile (rule's selection_flags)"
+      disposition: query_injection
+      target_question: Q1
+      notes: "Job-flag values are the rule's own selection_flags; verify_trigger_match is ProcessGuid-scoped so it returns the matching event. Reflected baseline/scope queries (Q17/Q18) embed these flags verbatim."
+    - element: ExternalNetCIDRs
+      dimension: tuning_parameter
+      specific_values: "external/non-corp destination definition for network correlation"
+      disposition: query_injection
+      target_question: Q6
+      notes: "RFC1918 + loopback excluded via filter_local cidr so the network correlation surfaces external destinations matching the direct-IP download pattern."
+    - element: NotifyCmdBlockList
+      dimension: tuning_parameter
+      specific_values: "%TEMP%\\*.exe, powershell.exe, cmd.exe used as BITS notify/follow-on"
+      disposition: context
+      target_question: Q8
+      notes: "Follow-on execution covered by renamed_binary_activity child-process query; risky-binary list described in context rather than injected to avoid over-narrowing the child search."
+    - element: ExpectedUpdateHosts
+      dimension: tuning_parameter
+      specific_values: "WSUS/MEMCM/vendor updater allow-list"
+      disposition: context
+      target_question: Q2
+      notes: "Allow-list is environment-specific organizational knowledge, not directly queryable; surfaced as the 'approved download vs operator' framing in host_user_context."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "30m-24h correlation window (rationale only)"
+      disposition: context
+      target_question: Q6
+      notes: "Correlation-window rationale; realized as the +/-1h range on the network-transfer question."
+    - element: UserContext
+      dimension: user_context
+      specific_values: "interactive users vs service accounts vs admins (rationale only)"
+      disposition: context
+      target_question: Q2
+      notes: "Realized via host_user_context plus the user_actor user-pivot / service-principal pair."
+    - element: JobLifetimeThreshold
+      dimension: tuning_parameter
+      specific_values: ">3 days or retry>20 (threshold, not directly queryable)"
+      disposition: context
+      target_question: Q15
+      notes: "Persistence-via-long-lived-job rationale; process_based_persistence context directs the analyst to enumerate BITS jobs via 'bitsadmin /list /allusers /verbose'."
+    - element: CommandLinePattern
+      dimension: command_analysis
+      specific_values: "rare argument combinations for LOLBAS-like tools (rationale only)"
+      disposition: context
+      target_question: Q3
+      notes: "Decode question parses the full bitsadmin argument set."
+  dedup_decisions:
+    - dropped: cue_user_actor.baseline + cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable (user-pivot vs service-principal launch-mechanism pivot)"
+      kept: both
+    - dropped: cue_user_actor.clustering + cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable (user-pivot vs service-principal launch-mechanism pivot)"
+      kept: both
+    - dropped: cue_process_tool.process_chain
+      reason: "kept — no parent_process cue active (parent_binaries empty), so process_chain is the parent-context question and is retained"
+      kept: cue_process_tool.process_chain
+  skipped_templates:
+    - template: cue_process_tool.mechanism_decode
+      reason: "replaced_by: defense_tampering.what_was_disabled (Q3 is the Phase-2 decode question)"
+    - template: defense_tampering.protection_status
+      reason: "Cap pressure (18). Rule detects a download, not disabling of a security control — there is no tampered control whose 'restored vs still-disabled' status applies. Decode/identity covered by Q3/Q4."
+    - template: defense_tampering.activity_after_tampering
+      reason: "Cap pressure (18). No control was disabled; post-event host activity is covered by cue_host_context.clustering (Q16) and the renamed_binary_activity follow-on (Q8)."
+    - template: defense_tampering.other_tampering_activity
+      reason: "Cap pressure (18). Its BITS-job-enumeration guidance is folded into process_based_persistence (Q15); the generic tamper sweep is not load-bearing for a download rule."
+    - template: persistence_scope.file_based_persistence
+      reason: "Cap pressure (18). Startup/Run-key file drops are a parallel mechanism not implicated by a bitsadmin download; process_based_persistence (Q15) and binary_origin file_event (Q7) cover the relevant file/persistence angles."
+    - template: cue_process_tool.baseline
+      reason: "Cap pressure (18). Generic Image-only host baseline is superseded by the reflected pattern-specific baseline historical_lolbin_baseline (Q17)."
+    - template: cue_process_tool.baseline_deviation
+      reason: "Cap pressure (18). Reflected host-pattern baseline overlaps historical_lolbin_baseline (Q17), which is the kept reflected host-scoped pattern question."
+    - template: cue_process_tool.follow_on
+      reason: "Cap pressure (18). Child-process follow-on covered by masquerading.renamed_binary_activity (Q8), same ParentImage->Image shape."
+    - template: cue_process_tool.clustering
+      reason: "Cap pressure (18). 'Other tools around the same time' covered by cue_host_context.clustering (Q16)."
+    - template: universal.endpoint_protection_health
+      reason: "Cap pressure (18). RECOMMENDED, not must_include. Rule fires on a download, not execution/credential-access; tamper-as-precursor is not the live question and no operator-disable signal is being adjudicated here."
+    - template: organizational_context.change_ticket
+      reason: "Cap pressure (18). RECOMMENDED. Approved-download framing carried by host_user_context (Q2)."
+    - template: organizational_context.human_recall
+      reason: "Cap pressure (18). RECOMMENDED. Human confirmation folded into host_user_context (Q2)."
+    - template: organizational_context.timing_alignment
+      reason: "Cap pressure (18). RECOMMENDED. Timing context carried by host_context.clustering (Q16) and the cross-host window questions."
+    - template: organizational_context.procedural_consistency
+      reason: "Cap pressure (18). RECOMMENDED. Normal-procedure framing carried by host_user_context (Q2)."
+    - template: cue_host_context.precursor
+      reason: "Cap pressure (18). Prior-alert timeline is valuable but lower priority than the must_include masquerading/lolbin coverage; the cross-host and host-clustering questions carry the surrounding-activity signal."
+  reflection_overrides: []
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - defense_tampering
+    - masquerading
+    - lolbin
+    - persistence_scope
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 17
+      attack: 1
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 15
+    logsource_diversity:
+      process_creation: 16
+      network_connection: 1
+      file_event: 1

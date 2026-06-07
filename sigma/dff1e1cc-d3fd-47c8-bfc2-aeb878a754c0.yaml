@@ -1,0 +1,433 @@
+name: Shell Process Spawned by Java.EXE
+id: be81b5b9-f30b-45bb-acfa-4bbd3382847d
+description: |
+  Detects a command shell or script interpreter (bash.exe, cmd.exe, powershell.exe, or pwsh.exe) spawned with java.exe as the
+  immediate parent, excluding build-tooling invocations. A Java application server launching a shell is a common post-exploitation
+  signal for deserialization or injection flaws in public-facing Java applications, where the web request reaches code execution
+  and the JVM spawns an interactive shell. Legitimate causes exist (build scripts, developer tooling, application wrappers that
+  shell out), so the investigation should establish what the shell did, what reached the JVM to trigger it, and whether the Java
+  application is exposed and unpatched.
+type: detection
+detection_id: dff1e1cc-d3fd-47c8-bfc2-aeb878a754c0
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-06
+questions:
+- source: template:universal.verify_trigger_match
+  question: Did java.exe spawn a shell or script interpreter that this rule detects, and which child binary ran?
+  context: Confirm the alert before investing investigation time. The rule fires when java.exe is the immediate parent AND the
+    child is bash.exe, cmd.exe, powershell.exe, or pwsh.exe, with build-tooling invocations excluded. Verify the parent is genuinely
+    java.exe and note which shell ran, since that determines which downstream decode and logging questions apply.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+- source: template:universal.host_user_context
+  question: Is this host expected to run a Java application that shells out to a command interpreter?
+  context: A Java application server shelling out to bash, cmd, or PowerShell is unusual outside of build pipelines and a small
+    set of application wrappers. Knowing whether this host runs a public-facing Java service, an internal build agent, or a
+    developer workstation is often the fastest way to separate exploitation from routine activity.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:parent_child.parent_process_legitimacy
+  question: What started the java.exe parent, and is that JVM expected to spawn a shell on this host?
+  context: The parent-child relationship is the core signal here. Tracing the JVM's own origin (the grandparent) shows whether
+    this is an application server reached over the network, a build orchestrator, or an interactive developer session. An
+    internet-facing application server spawning a shell is the high-concern case for injection or deserialization exploitation.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- source: template:initial_access.delivery_vector
+  question: What web request or input reached the Java application immediately before it spawned the shell?
+  context: When a Java application server spawns a shell, the trigger is typically an inbound request whose content reaches code
+    execution -- a crafted HTTP header, URL parameter, form field, or user-agent that lands in a vulnerable code path. Correlate
+    the spawn time against the application's web access and request logs to find the originating request and source address,
+    which enables perimeter blocking and a search for additional targets.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+- source: template:cue_process_tool.mechanism_decode
+  question: What did the spawned shell actually do? Decode its full command line and arguments.
+  context: The shell's command line reveals the operational purpose -- a download cradle pulling a second-stage payload, a reverse
+    shell, reconnaissance commands, or hands-on-keyboard activity. Decode any flags, encoded content, file paths, and remote
+    hosts. The query returns all executions of this shell binary on the host within a few minutes of the alert, so a multi-step
+    operation spread across sequential invocations is visible as a whole.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:powershell.encoded_command_decode
+  question: If the child was PowerShell, was its command encoded or obfuscated, and what does it decode to?
+  context: PowerShell spawned from an exploited application frequently uses the -EncodedCommand (-enc) parameter, string concatenation,
+    backtick escaping, or variable substitution to hide intent. Base64-encoded commands are the most common form. Decoding
+    reveals the actual payload -- download cradles, reverse shells, or in-memory loading of .NET assemblies. This question is
+    moot if the detected child was bash or cmd rather than PowerShell.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:powershell.script_block_logging
+  question: Did PowerShell script block logging capture the deobfuscated script content?
+  context: Script block logging records the deobfuscated script content PowerShell actually executes, even when the command line
+    is encoded or obfuscated, giving ground truth about what ran. If PowerShell operational logs are not ingested in this environment,
+    treat zero results as a visibility gap rather than evidence nothing ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- source: template:powershell.powershell_security_bypass
+  question: Were PowerShell or endpoint security controls bypassed or weakened on this host before the shell spawned?
+  context: Operators commonly disable or bypass security controls before running a payload -- AMSI bypass, execution policy changes,
+    constrained language mode escape, or a PowerShell v2 downgrade that lacks logging. Finding these precursor events in the
+    hour before the spawn strengthens the case that the shell execution was malicious rather than incidental.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- source: template:initial_access.application_patch_status
+  question: Is the Java application server up to date with security patches?
+  context: Java application servers shelling out is a recurring outcome of unpatched deserialization and injection vulnerabilities
+    in public-facing services. Confirming the running version against known remote-code-execution advisories establishes whether
+    the exploitation was possible and identifies other similarly unpatched hosts at risk. Patch status also distinguishes exploitation
+    of a known fixed flaw from a zero-day.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+- source: template:parent_child.sibling_processes
+  question: What other child processes did this same java.exe instance spawn?
+  context: If the JVM was driven to spawn one shell, it may have spawned others -- staged tooling for reconnaissance, credential
+    access, or download. Examining siblings of the exact parent instance reveals the full scope of activity initiated through
+    this execution chain; multiple suspicious children from one parent points to deliberate orchestration.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_parent_process.baseline
+  question: How often has java.exe spawned this shell binary on this host historically?
+  context: Some Java-to-shell pairings are routine on a given host (a build agent that shells out constantly, an application
+    wrapper). A novel or rare pairing is the deviation worth chasing. Zero or very low historical counts indicate a first-time
+    spawning relationship, which is more consistent with exploitation than with established automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:cue_user_actor.baseline
+  question: Does the user account that owns this process normally run command interpreters from a Java parent?
+  context: Compare this account's current action against its historical behavior. An account that has never spawned a shell under
+    java.exe is more suspicious than one that does so regularly as part of a known role. If the alert fires under a named user,
+    confirm that user's role aligns with running interactive shells from an application server.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is the java.exe-to-shell launch mechanism historically routine on this host or across the environment, or is it new?
+  context: When the alert fires under a service principal, user identity does not attribute behavior. The meaningful pivot is
+    the launch mechanism -- which parent spawned this binary, and whether that pair is historically common. A new or rare java.exe
+    parent for this shell on this host or environment-wide is the deviation; a pair that already accounts for many prior events
+    is established application or build automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user account do across the environment around the time of the alert?
+  context: Tracking the account's activity across all hosts in the alert window reveals lateral movement or coordinated activity
+    on multiple endpoints. If the same account triggered similar shell spawns elsewhere, the scope of compromise may be larger
+    than the single host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did the same java.exe-to-shell launch fire on other hosts in the same window, indicating a coordinated rollout or wave?
+  context: Under a service principal, asking what else the user did returns agent-telemetry noise. The meaningful question is
+    whether the same launch mechanism -- java.exe spawning this shell -- fired on other hosts in the alert window. Multiple
+    hosts in the same window points to a coordinated exploitation wave against a common Java service; a single host points to
+    a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_parent_process.scope
+  question: Is the java.exe-to-shell spawning pattern occurring on other hosts right now?
+  context: The same parent-child relationship appearing on multiple hosts may indicate an exploitation wave hitting a fleet of
+    Java application servers running the same vulnerable software. A single occurrence is more likely targeted or incidental.
+    Environment-wide comparison calibrates severity and identifies the scope of exposure.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+      - CommandLine
+- source: template:initial_access.campaign_scope
+  question: Did this same detection fire on other hosts, and which systems were affected?
+  context: Exploitation attempts against a Java service rarely target a single host. Correlating this same detection rule across
+    all hosts reveals the breadth of the activity and identifies additional systems running the same exposed application that
+    need investigation.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        rule.uuid|expand: '%rule.uuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host -- reconnaissance, defense tampering, or credential
+    access -- may reveal the attack stages that preceded the shell spawn and help reconstruct the timeline from initial access
+    to hands-on activity.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: false
+  techniques: []
+  attack_chain_coverage: []
+  dimension_coverage: []
+  mutable_dispositions: []
+  dedup_decisions:
+    - dropped: cue_parent_process.mechanism_decode
+      reason: "parent_child technique set active — parent_child.parent_process_legitimacy is the more specific parent-origin question (adds ParentCommandLine/grandparent walk)"
+      kept: parent_child.parent_process_legitimacy
+    - dropped: cue_parent_process.follow_on
+      reason: "parent_child.sibling_processes covers children-of-parent more precisely (ParentProcessGuid exact-instance scope vs parent.name all-instances)"
+      kept: parent_child.sibling_processes
+    - dropped: cue_parent_process.clustering
+      reason: "proximate parent activity already covered — sibling_processes (children of exact parent) plus host precursor; parent.name-scoped process clustering adds no distinct angle"
+      kept: parent_child.sibling_processes
+    - dropped: cue_process_tool.process_chain
+      reason: "parent_process is primary cue (hint) — parent_child.parent_process_legitimacy subsumes the process-chain question"
+      kept: parent_child.parent_process_legitimacy
+    - dropped: cue_process_tool.baseline
+      reason: "binary-only baseline is near-useless for shell binaries (powershell/cmd run constantly); cue_parent_process.baseline (parent+child specific) is the discriminating frequency question"
+      kept: cue_parent_process.baseline
+    - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable (both emitted)"
+      kept: both
+    - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable (both emitted)"
+      kept: both
+  skipped_templates:
+    - template: cue_host_context.clustering
+      reason: "host-wide process clustering redundant with sibling_processes (exact-parent children) and host precursor; dropped to keep the user_actor pairs and initial_access.campaign_scope under the 18-question cap"
+    - template: universal.endpoint_protection_health
+      reason: "powershell.powershell_security_bypass already surfaces pre-execution AV/EDR and PowerShell tamper on this host in the -1h window, and cue_host_context.precursor carries prior-alert tamper context; the generic host-tamper sweep adds no distinct angle for this exploitation-driven rule"
+    - template: organizational_context.change_ticket
+      reason: "rule fires on Java-application exploitation, not a deliberate admin change; change-ticket framing does not apply"
+    - template: organizational_context.human_recall
+      reason: "exploitation reaches code execution via an inbound request, not a human-initiated action; user recall does not establish legitimacy for this rule"
+    - template: organizational_context.timing_alignment
+      reason: "work-hours/maintenance-window framing fits deliberate admin changes; a server compromised via an inbound request fires independent of business hours"
+    - template: organizational_context.procedural_consistency
+      reason: "no standard-procedure comparison applies — the shell is spawned by the JVM in response to a request, not by an admin choosing a tool"
+    - template: persistence_scope.process_based_persistence
+      reason: "persistence tactic tag is speculative for this rule; the driving tactic is initial-access (Java RCE). Slot allocated to initial_access.campaign_scope / application_patch_status which match the actual behavior"
+    - template: persistence_scope.file_based_persistence
+      reason: "same — persistence is downstream and speculative; file-drop coverage deprioritized in favor of initial-access and exploitation-scope questions for this exploitation rule"
+  reflection_overrides: []
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - parent_child
+    - powershell
+    - initial_access
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 18
+      attack: 0
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 2
+      context: 14
+    logsource_diversity:
+      process_creation: 15
+      powershell: 1
+      sigma_alert: 2

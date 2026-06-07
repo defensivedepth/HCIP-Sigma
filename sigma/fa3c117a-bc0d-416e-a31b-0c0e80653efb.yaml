@@ -1,0 +1,515 @@
+name: Chopper Webshell Process Pattern
+id: f1301ba3-5419-4a26-ba43-19e7e8ee119a
+description: |
+  Detects the process-execution pattern left by China Chopper-style ASPX web shells: the IIS worker process w3wp.exe (as the process or the parent) running a command line that contains the Chopper command-chaining signatures (&ipconfig&echo, &quser&echo, &whoami&echo, &c:&echo, &cd&echo, &dir&echo, &echo [E], &echo [S]). The rule fires only when BOTH the w3wp.exe origin AND one of the Chopper command signatures are present. A web server worker process spawning command interpreters that run host and account enumeration is a hands-on-keyboard post-exploitation pattern; legitimate IIS applications rarely shell out to run whoami, ipconfig, or directory listings. Investigation should confirm the command pattern, identify the web request that drove it, decode any encoded parameters, and scope concurrent reconnaissance and additional compromised servers.
+type: detection
+detection_id: fa3c117a-bc0d-416e-a31b-0c0e80653efb
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: '2026-06-06'
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line show the w3wp.exe origin AND one of the Chopper command-chaining signatures?
+  context: Confirm the alert is a true positive before investing time. The rule fires only when both conditions hold together - the process or its parent is w3wp.exe AND the command line contains a Chopper signature such as '&whoami&echo', '&ipconfig&echo', or '&echo [S]'. Review the exact command line and the Image/ParentImage to verify both halves matched rather than an incidental string.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:parent_child.parent_process_legitimacy
+  question: Is the w3wp.exe worker expected to spawn this child process, and what started the worker?
+  context: A web server worker shelling out to a command interpreter is the core signal for this detection. Tracing the worker's own origin and the application pool it serves reveals whether the chain is a normal IIS-hosted application launching a helper, or post-exploitation execution driven through a deployed web shell. Note the parent command line and grandparent to see how the worker was invoked.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- source: template:cue_process_tool.mechanism_decode
+  question: What did the full Chopper command chain do? Parse each '&'-delimited segment and identify the enumeration performed.
+  context: The Chopper command-chaining pattern strings multiple commands together with '&' and echoes delimiters such as '[S]' and '[E]' to frame the output the web shell returns to the operator. Parse every segment - whoami, ipconfig, quser, dir, cd - to enumerate exactly what host, network, and session information was collected. Scoping to all w3wp.exe executions on the host within a few minutes captures sequential commands that together form one interactive session.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:obfuscation.encoded_payload_decode
+  question: Are any web shell parameters or command segments encoded or obfuscated, and what do they decode to?
+  context: Chopper-style web shells frequently pass base64- or URL-encoded parameters and may layer character concatenation or environment-variable substitution to hide the operator's intent. Decode any encoded segment in the command line to reveal the actual operation - download cradle, reverse shell, credential theft, in-memory loader, or data exfiltration. For multi-layer encoding, iterate decoding until the payload is readable.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:initial_access.delivery_vector
+  question: What web request drove this execution through the IIS worker?
+  context: Web shell execution begins with an HTTP request reaching the deployed shell or a crafted request exploiting a server vulnerability. Identifying the originating request - the URL path, source IP, and user-agent in the web server access logs around this timestamp - enables blocking at the perimeter and finding additional targeted endpoints. The query retrieves the parent context; the actual request analysis requires the web server access and proxy logs.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+- source: template:initial_access.application_patch_status
+  question: Is the IIS or Exchange application on this server up to date with security patches?
+  context: Web shells are commonly dropped after exploitation of a known server vulnerability, including the chained Exchange SSRF and PowerShell RCE flaws (CVE-2022-41040, CVE-2022-41082) that ran code under w3wp.exe. An unpatched server confirms exploitation was possible and indicates which other similarly unpatched servers are at risk. Patch status also distinguishes exploitation of a known CVE from a zero-day.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+- source: template:initial_access.campaign_scope
+  question: Did the same web shell process pattern fire on other servers?
+  context: Exploitation of public-facing servers rarely targets a single host. If one server shows the Chopper pattern, others reachable by the same exploit likely do too. Correlating the same rule across all hosts reveals the breadth of the intrusion and identifies additional compromised servers that need investigation.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        rule.uuid|expand: '%rule.uuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:discovery_recon.discovery_burst_detection
+  question: Did other reconnaissance commands run on this server around the same time?
+  context: A single discovery command may be incidental, but multiple reconnaissance commands in rapid succession - whoami, ipconfig, net user, nltest, quser - is a signature of post-compromise enumeration. Operators run these to understand their context before moving to the next stage. On a web server, native recon binaries spawned around the web shell execution strengthen the case for hands-on-keyboard activity.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_recon:
+        Image|endswith:
+          - '\whoami.exe'
+          - '\systeminfo.exe'
+          - '\ipconfig.exe'
+          - '\net.exe'
+          - '\net1.exe'
+          - '\nltest.exe'
+          - '\dsquery.exe'
+          - '\nbtstat.exe'
+          - '\arp.exe'
+          - '\netstat.exe'
+          - '\tasklist.exe'
+          - '\qprocess.exe'
+          - '\query.exe'
+          - '\quser.exe'
+          - '\hostname.exe'
+          - '\nslookup.exe'
+          - '\adfind.exe'
+          - '\csvde.exe'
+          - '\ldifde.exe'
+          - '\dnscmd.exe'
+          - '\cmdkey.exe'
+          - '\setspn.exe'
+      condition: selection and selection_recon
+    fields:
+      - Image
+      - User
+- source: template:discovery_recon.discovery_parent_chain
+  question: What process spawned the reconnaissance commands, and is that parent chain normal?
+  context: Legitimate discovery commands typically run from cmd.exe spawned by explorer.exe or from automation scripts. Discovery commands spawned by a web server worker (w3wp.exe), a script interpreter, or wmiprvse.exe indicate automated post-exploitation rather than an interactive administrator. Confirm whether the enumeration descends from the IIS worker chain.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+- source: template:discovery_recon.discovery_user_context
+  question: Is the account running these commands expected to perform administrative discovery on this server?
+  context: IIS application pools normally run under a service identity (an application pool account, NETWORK SERVICE, or similar) that has no reason to run whoami, quser, or net user interactively. Standard users rarely need these either. Identify the account behind the execution and whether its role and typical behavior make this enumeration routine or anomalous.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - User
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run command interpreters or enumeration tools under the IIS worker on this server?
+  context: Compare the alerting account's current action against its historical behavior. An identity that has never spawned shells or enumeration tools from the web server is more suspicious than one that does so regularly. The user role and typical toolset should align with the detected activity.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is the w3wp.exe parent spawning this binary historically routine on this host or across the environment, or is the pairing new?
+  context: When the alert fires under a service identity, user name does not attribute behavior - the meaningful pivot is the launch mechanism. Check how often w3wp.exe has spawned this binary historically. A new or rare w3wp.exe parent for this binary on this host or environment-wide is the deviation worth chasing; a pairing that already accounts for thousands of prior events is application or OS automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the account's activity across all hosts reveals lateral movement or activity spanning multiple endpoints. If the same identity drove similar activity on other servers, the scope of compromise is larger than the single alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did the w3wp.exe parent spawn this binary on other hosts in the same window, or is the activity isolated to this server?
+  context: Under a service identity, network-wide user activity returns agent-telemetry noise. The meaningful question is whether the same launch mechanism - w3wp.exe spawning this binary - fired on other hosts in the alert window. Multiple hosts in the same window points to a coordinated push against the server estate; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this server in the hours before this alert?
+  context: Web shell command execution rarely happens in isolation. Earlier detections on the same host - exploitation attempts, file drops into web directories, or other reconnaissance - may reveal the stages that preceded this event and help reconstruct the intrusion timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: attack:T1018.network_indicators
+  question: Did the IIS worker make outbound or remote network connections around the time of the web shell commands?
+  context: Remote system discovery and exfiltration leave network artifacts. After enumerating the host, an operator commonly pivots to reach other systems or sends collected data outbound. Network connections initiated by w3wp.exe or by the spawned interpreters around the alert window distinguish local-only enumeration from active lateral movement or exfiltration.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - '\w3wp.exe'
+          - '\cmd.exe'
+          - '\powershell.exe'
+          - '\net.exe'
+          - '\nltest.exe'
+      condition: selection
+    fields:
+      - Image
+      - DestinationIp
+      - DestinationPort
+- source: attack:T1505.003.auth_correlation
+  question: What interactive or remote logons preceded this web shell activity on the server?
+  context: Web shell exploitation against a server is often preceded by authentication to a public-facing service, sometimes with ordinary standard-user credentials obtained through spraying or theft. Correlating logon events on this host in the window before the execution helps identify the account and source that established access, and whether the logon source matches the web request origin.
+  range: -1h
+  query: |
+    aggregation: true
+    logsource:
+      category: authentication
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - User
+      - LogonType
+      - SourceIp
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1505.003
+      name: Web Shell
+      role: primary
+    - id: T1018
+      name: Remote System Discovery
+      role: secondary
+    - id: T1033
+      name: System Owner/User Discovery
+      role: secondary
+    - id: T1087
+      name: Account Discovery
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: webshell_command_pattern
+      description: "IIS worker w3wp.exe runs a Chopper command-chaining signature"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: worker_spawns_interpreter
+      description: "Web server worker spawns a command interpreter / shell - parent legitimacy"
+      mapped_to: Q2
+      source: template:parent_child.parent_process_legitimacy
+    - stage: 3
+      label: command_decode
+      description: "Decode the chained enumeration commands and any encoded parameters"
+      mapped_to: Q3
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 4
+      label: delivery_request
+      description: "HTTP request that reached the web shell / exploited the server"
+      mapped_to: Q5
+      source: template:initial_access.delivery_vector
+    - stage: 5
+      label: recon_enumeration
+      description: "Host, network, and account enumeration following web shell access"
+      mapped_to: Q8
+      source: template:discovery_recon.discovery_burst_detection
+    - stage: 6
+      label: lateral_or_exfil
+      description: "Outbound/remote connections for remote discovery or exfiltration"
+      mapped_to: Q16
+      source: attack:T1018.network_indicators
+  dimension_coverage:
+    - dimension: obfuscation_check
+      technique: T1505.003
+      covered_by: Q4
+      source: template:obfuscation.encoded_payload_decode
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1505.003
+      covered_by: Q2
+      source: template:parent_child.parent_process_legitimacy
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1505.003
+      covered_by: Q8
+      source: template:discovery_recon.discovery_burst_detection
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1505.003
+      covered_by: Q12
+      source: template:cue_user_actor.baseline_svc
+      coverage_type: direct
+    - dimension: command_analysis
+      technique: T1018
+      covered_by: Q3
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1033
+      covered_by: Q10
+      source: template:discovery_recon.discovery_user_context
+      coverage_type: direct
+    - dimension: execution_context
+      technique: T1087
+      covered_by: Q9
+      source: template:discovery_recon.discovery_parent_chain
+      coverage_type: direct
+    - dimension: network_indicators
+      technique: T1087
+      covered_by: Q16
+      source: attack:T1018.network_indicators
+      coverage_type: direct
+  mutable_dispositions:
+    - element: WebRootPath
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q5
+      notes: "Custom web directory per hosting environment - kept as context; delivery_vector directs analyst to web server access logs for the originating request rather than hardcoding a path."
+    - element: ParentProcess
+      dimension: parent_process_analysis
+      specific_values: "w3wp.exe (rule); php-cgi.exe, apache.exe variants noted as rationale"
+      disposition: query_injection
+      target_question: Q16
+      notes: "w3wp.exe injected into the network_indicators Image list; parent legitimacy chain covered by Q2."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "bursty enumeration <30s (rationale)"
+      disposition: context
+      target_question: Q8
+      notes: "Threshold expressed as +/-15m correlation window in discovery_burst; sub-30s burst noted in context."
+    - element: CommandLinePattern
+      dimension: command_analysis
+      specific_values: "net user, Get-ADUser, dsquery; native recon binaries"
+      disposition: query_injection
+      target_question: Q8
+      notes: "Native recon binary list carried in discovery_burst selection_recon."
+    - element: UserContext
+      dimension: user_context
+      specific_values: "service accounts / non-admin users (rationale)"
+      disposition: query_injection
+      target_question: Q10
+      notes: "User projected in discovery_user_context; service-identity framing in context."
+    - element: ParentProcessContext
+      dimension: tuning_parameter
+      specific_values: "non-interactive shell / system service (rationale)"
+      disposition: context
+      target_question: Q9
+      notes: "Captured as context in discovery_parent_chain (w3wp.exe / wmiprvse.exe ancestry)."
+  dedup_decisions:
+    - dropped: cue_process_tool.process_chain
+      reason: "parent_process is primary cue and parent_child set active - parent lookup subsumed by parent_child.parent_process_legitimacy (hint acted on)"
+      kept: parent_child.parent_process_legitimacy
+    - dropped: cue_parent_process.mechanism_decode
+      reason: "parent_child.parent_process_legitimacy is the more specific parent lookup (ParentProcessGuid) - same investigation step"
+      kept: parent_child.parent_process_legitimacy
+    - dropped: cue_parent_process.process_chain_followon
+      reason: "cue_parent_process.follow_on / parent_child.sibling_processes overlap - parent_process_legitimacy + discovery_burst already cover sibling enumeration on this host"
+      kept: parent_child.parent_process_legitimacy
+    - dropped: universal.host_user_context
+      reason: "discovery_recon.discovery_user_context is more specific to this discovery-heavy rule and supersedes the generic version per its notes_to_llm"
+      kept: discovery_recon.discovery_user_context
+    - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable"
+      kept: both
+    - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable"
+      kept: both
+  skipped_templates:
+    - template: cue_parent_process.baseline
+      reason: "parent_child + cue_user_actor.baseline_svc cover parent/binary historical frequency; avoids redundant 90d aggregation"
+    - template: cue_parent_process.clustering
+      reason: "cue_host_context activity-around-time coverage and discovery_burst cover concurrent host activity"
+    - template: cue_parent_process.scope
+      reason: "initial_access.campaign_scope (rule-uuid fleet correlation) covers cross-host scope more precisely for an exploitation rule"
+    - template: cue_process_tool.baseline
+      reason: "cue_user_actor.baseline_svc covers binary historical frequency on host/env via parent+binary pivot"
+    - template: cue_host_context.clustering
+      reason: "discovery_recon.discovery_burst_detection covers concurrent host activity with discovery-specific scoping"
+    - template: universal.endpoint_protection_health
+      reason: "rule is not execution/credential-centric in the tamper sense; cue_host_context.precursor surfaces prior tamper alerts on the host, and the webshell pattern does not turn on whether AV was disabled first"
+    - template: organizational_context.change_ticket
+      reason: "webshell command execution under w3wp.exe has no legitimate change-ticket analogue; recon-under-IIS-worker is not a documented admin action"
+    - template: organizational_context.human_recall
+      reason: "alert fires under a service identity (application pool) with no human to recall the action; user-context covered by discovery_user_context"
+    - template: organizational_context.timing_alignment
+      reason: "automated webshell execution timing carries little legitimacy signal; precursor-alert timeline is the more useful temporal context"
+    - template: organizational_context.procedural_consistency
+      reason: "no organizational procedure produces w3wp.exe-spawned enumeration; procedural-consistency framing does not apply"
+    - template: persistence_scope.process_based_persistence
+      reason: "kept question budget on the active webshell chain and discovery; persistence-tool sweep is lower-value for a confirmed webshell-command pattern and would push past 18"
+    - template: persistence_scope.file_based_persistence
+      reason: "file-drop persistence sweep deferred to keep within the 18-question cap; delivery_vector + precursor cover the web directory drop angle as the higher-priority lead"
+  reflection_overrides: []
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - parent_child
+    - discovery_recon
+    - initial_access
+    - obfuscation
+    - cue_user_actor
+    - cue_host_context
+    - cue_process_tool
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 15
+      attack: 2
+      llm_generated: 0
+    phase_distribution:
+      triage: 1
+      analysis: 1
+      context: 15
+    logsource_diversity:
+      process_creation: 13
+      sigma_alert: 2
+      network_connection: 1
+      authentication: 1

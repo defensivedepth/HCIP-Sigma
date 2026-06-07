@@ -1,0 +1,611 @@
+name: Suspicious WmiPrvSE Child Process
+id: 16099359-0050-4aa4-a515-394454018a6c
+description: |
+  Detects the WMI provider host (WmiPrvSE.exe) spawning a child process that is either one of a set of
+  living-off-the-land binaries (certutil, cscript, mshta, msiexec, regsvr32, rundll32, verclsid, wscript)
+  OR cmd.exe whose command line invokes a script host or proxy-execution binary (cscript, mshta, powershell,
+  pwsh, regsvr32, rundll32, wscript) -- excluding benign WerFault, nested WmiPrvSE, and msiexec installer
+  invocations. WmiPrvSE is the host process that executes WMI method calls such as Win32_Process Create, so
+  these children indicate that a local or remote WMI request launched a code-execution utility. Legitimate
+  management tooling and software deployment occasionally drive WMI execution, but operators frequently use the
+  same path to launch downloaders, script hosts, and proxy-execution LOLBins from a parent that hides the true
+  initiator. Determine which child branch fired, decode what the child actually did, trace what issued the WMI
+  call, and confirm whether this parent-child pairing is routine for this host and user.
+type: detection
+detection_id: 8a582fe2-0882-4b89-a82a-da6b2dc32937
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Did WmiPrvSE.exe spawn a child that either is a listed LOLBin or is cmd.exe carrying a script-host or proxy-execution keyword?
+  context: >-
+    Confirm the alert is a true positive by reviewing the exact parent, child Image, and command line. The rule
+    fires on EITHER branch: the child Image ends in one of certutil, cscript, mshta, msiexec, regsvr32, rundll32,
+    verclsid, or wscript; OR the child is cmd.exe and its command line contains cscript, mshta, powershell, pwsh,
+    regsvr32, rundll32, or wscript. Note which branch fired -- the direct-LOLBin branch makes the child binary
+    itself the focus, while the cmd.exe branch makes the keyword inside the command line the thing to decode.
+    Benign WerFault, nested WmiPrvSE, and msiexec /i installer children are filtered out.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to drive WMI-launched execution of script hosts or proxy-execution binaries?
+  context: >-
+    Legitimate software deployment, inventory, and remote management can launch utilities through WMI. Knowing
+    whether this host's role and the acting user routinely produce WMI-spawned execution of these binaries is
+    often the fastest way to separate sanctioned automation from operator activity.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What exactly did the child process do? Decode its full command line.
+  context: >-
+    The child's command line reveals the operation the WMI call launched. Decode any flags, file paths, URLs, or
+    encoded content. For certutil look for -decode/-urlcache fetch behavior; for regsvr32/rundll32 look for the
+    DLL or scriptlet and entrypoint; for mshta/wscript/cscript look for the script or remote resource; for the
+    cmd.exe branch read past the wrapper to the script-host or proxy binary it actually invokes.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:parent_child.parent_process_legitimacy
+  question: Is WmiPrvSE expected to spawn this child, and what issued the WMI call that started it?
+  context: >-
+    WmiPrvSE.exe executes WMI method calls on behalf of a local or remote requester, so it appears as the parent
+    when something runs Win32_Process Create. Tracing the parent's own origin shows whether the chain is routine
+    management tooling or a request from an unexpected source. Because the true initiator is the WMI caller rather
+    than WmiPrvSE itself, correlate against WMI-Activity operational events and any preceding wmic.exe or
+    Invoke-WmiMethod/Invoke-CimMethod activity to identify who issued the call.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- source: template:parent_child.sibling_processes
+  question: What other child processes did this WmiPrvSE instance spawn around the same time?
+  context: >-
+    A single WMI request often launches several utilities in sequence -- a downloader, a script host, then a
+    proxy-execution binary. Examining the other children of the same WmiPrvSE instance reveals the full scope of
+    what this WMI session executed. host.name is included as a fallback because ParentProcessGuid may be
+    unavailable.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: attack:T1047.wmi_activity
+  question: What WMI operational activity occurred on this host around the alert, and was it local or remote?
+  context: >-
+    WMI execution leaves a trail in the WMI-Activity operational channel separate from process creation. Operation
+    events record the namespace, the executing method, and whether the request originated locally or from a remote
+    host. A remote WMI Win32_Process Create immediately before this child points to remote execution rather than a
+    local management task. If WMI-Activity logs are not collected in this environment, treat zero results as a
+    visibility gap rather than evidence the call was local.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: wmi
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - User
+      - Operation
+- source: attack:T1218.010.image_load
+  question: What modules did the proxy-execution child load, and were any loaded from a user-writable or unusual path?
+  context: >-
+    regsvr32.exe and rundll32.exe execute code by loading a DLL or scriptlet; the loaded module is what actually
+    runs. A module loaded from a temp directory, a user profile path, or another non-system location -- or an
+    unsigned module -- is the payload, whereas System32/SysWOW64 loads are typically benign registration. If module
+    load events are not collected in this environment, treat zero results as a visibility gap rather than evidence
+    no module was loaded.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+- source: attack:T1047.network_connection
+  question: Did the spawned child make any outbound network connections, and to where?
+  context: >-
+    Several of these binaries (certutil, mshta, regsvr32, rundll32, the script hosts) can pull a remote payload or
+    establish command-and-control. An outbound connection from the child shortly after it started indicates the WMI
+    call drove a download or remote interaction rather than a purely local action. Compare any destination against
+    known-good update and management endpoints.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run this binary?
+  context: >-
+    Compare the acting user's current activity against their historical behavior. A user who has never launched
+    this binary is more notable than one who runs it routinely. User role and typical toolset should align with
+    WMI-driven execution of script hosts or proxy-execution utilities.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is the WmiPrvSE-to-this-binary launch historically routine on this host or across the environment, or is it a new pairing?
+  context: >-
+    When the alert fires under a service principal, user identity does not attribute the behavior; the meaningful
+    pivot is the launch mechanism -- WmiPrvSE spawning this specific binary. A pairing that already accounts for
+    many prior events is management or deployment automation, while a new or rare WmiPrvSE-to-binary pairing on
+    this host or env-wide is the deviation worth chasing.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the environment around the time of the alert?
+  context: >-
+    Tracking the user's activity across all hosts in the alert window reveals whether this is isolated or part of
+    broader hands-on activity. The same user driving similar WMI-launched execution on multiple hosts widens the
+    scope of what needs review.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did the same WmiPrvSE-to-this-binary launch fire on other hosts in the same window, indicating a coordinated rollout?
+  context: >-
+    Under a service principal, asking what the user did network-wide returns agent-telemetry noise. The meaningful
+    question is whether the same launch mechanism -- WmiPrvSE spawning this binary -- fired on other hosts in the
+    alert window. Multiple hosts in the same window points to pushed or scheduled automation, often remote WMI
+    execution; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:obfuscation.encoded_payload_decode
+  question: Is the child command line encoded or obfuscated, and what does it decode to?
+  context: >-
+    Encoded content hides the operator's actual payload. Common shapes here: certutil -decode/-decodehex with named
+    source and output files, base64 passed to powershell/pwsh through the cmd.exe branch, character concatenation
+    in wscript/cscript scripts, and scriptlet references handed to regsvr32/mshta. Decode iteratively until the
+    content is readable; it typically resolves to a download cradle, an in-memory loader, or a reverse shell.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:lolbin.renamed_binary_check
+  question: Was this binary executed from its expected system path?
+  context: >-
+    These binaries normally live in System32 or SysWOW64. Execution from a user temp directory, profile path, or
+    other non-standard location may indicate the binary was copied or renamed to dodge path-based allowlists.
+    Compare the Image path against the expected location and check OriginalFileName for a mismatch that signals a
+    renamed binary.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- source: template:lolbin.historical_lolbin_baseline
+  question: How often has this host fired this WmiPrvSE-child pattern over the past 90 days, and what command-line shapes are typical?
+  context: >-
+    A WMI-launched LOLBin pattern with no prior history on a host is more notable than one seen regularly under
+    stable management tooling. This query mirrors the rule's full selection structure scoped to this host, so the
+    count reflects the rule's specific firing pattern rather than generic use of these binaries. The command-line
+    projection lets you compare typical invocation shapes against the alerting one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_parent:
+        ParentImage|endswith: \wbem\WmiPrvSE.exe
+      selection_children_1:
+        Image|endswith:
+        - \certutil.exe
+        - \cscript.exe
+        - \mshta.exe
+        - \msiexec.exe
+        - \regsvr32.exe
+        - \rundll32.exe
+        - \verclsid.exe
+        - \wscript.exe
+      selection_children_2:
+        Image|endswith: \cmd.exe
+        CommandLine|contains:
+        - cscript
+        - mshta
+        - powershell
+        - pwsh
+        - regsvr32
+        - rundll32
+        - wscript
+      filter_main_werfault:
+        Image|endswith: \WerFault.exe
+      filter_main_wmiprvse:
+        Image|endswith: \WmiPrvSE.exe
+      filter_main_msiexec:
+        Image|endswith: \msiexec.exe
+        CommandLine|contains: '/i '
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection_parent and 1 of selection_children_* and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - CommandLine
+- source: template:lolbin.technique_class_lateral
+  question: Were any other proxy-execution or download LOLBins used on this host recently?
+  context: >-
+    Operators who use one LOLBin frequently chain several -- a download utility to stage a payload, then a
+    proxy-execution binary to run it. Finding additional LOLBins performing related actions on this host in the same
+    timeframe strengthens the case that the WMI-launched child is part of an operation rather than an isolated event.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_img:
+        Image|endswith:
+          - '\bitsadmin.exe'
+          - '\curl.exe'
+          - '\esentutl.exe'
+          - '\expand.exe'
+          - '\extrac32.exe'
+          - '\makecab.exe'
+          - '\replace.exe'
+          - '\msbuild.exe'
+          - '\cmstp.exe'
+          - '\installutil.exe'
+          - '\forfiles.exe'
+          - '\pcalua.exe'
+          - '\presentationhost.exe'
+          - '\control.exe'
+          - '\infdefaultinstall.exe'
+          - '\msdt.exe'
+          - '\mavinject.exe'
+          - '\wmic.exe'
+          - '\xwizard.exe'
+      condition: selection and selection_img
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Alerts rarely happen in isolation. Earlier detections on the same host -- reconnaissance, credential access,
+    defense tampering -- may reveal the stages that preceded WMI-launched execution and help reconstruct the
+    timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+  - id: T1047
+    name: Windows Management Instrumentation
+    role: primary
+  - id: T1204.002
+    name: 'User Execution: Malicious File'
+    role: secondary
+  - id: T1218.010
+    name: 'System Binary Proxy Execution: Regsvr32'
+    role: secondary
+  attack_chain_coverage:
+  - stage: 1
+    label: wmi_request
+    description: A local or remote WMI request issues Win32_Process Create, executing under WmiPrvSE.exe
+    mapped_to: Q6
+    source: attack:T1047.wmi_activity
+  - stage: 2
+    label: child_spawn
+    description: WmiPrvSE spawns a LOLBin or cmd.exe wrapper as the child process
+    mapped_to: Q1
+    source: template:universal.verify_trigger_match
+  - stage: 3
+    label: command_execution
+    description: The child binary executes its command line (decode, proxy-exec, script host)
+    mapped_to: Q3
+    source: template:cue_process_tool.mechanism_decode
+  - stage: 4
+    label: module_or_network
+    description: Proxy-execution binary loads a module and/or the child initiates outbound network activity
+    mapped_to: Q7
+    source: attack:T1218.010.image_load
+  dimension_coverage:
+  - dimension: time_correlation
+    technique: T1047
+    covered_by: Q6
+    source: attack:T1047.wmi_activity
+    coverage_type: direct
+  - dimension: tuning_parameter
+    technique: T1047
+    covered_by: Q3
+    source: template:cue_process_tool.mechanism_decode
+    coverage_type: direct
+  - dimension: user_context
+    technique: T1047
+    covered_by: Q2
+    source: template:universal.host_user_context
+    coverage_type: direct
+  - dimension: file_path_analysis
+    technique: T1204.002
+    covered_by: Q14
+    source: template:lolbin.renamed_binary_check
+    coverage_type: direct
+  - dimension: command_analysis
+    technique: T1218
+    covered_by: Q13
+    source: template:obfuscation.encoded_payload_decode
+    coverage_type: direct
+  - dimension: parent_process_analysis
+    technique: T1218
+    covered_by: Q4
+    source: template:parent_child.parent_process_legitimacy
+    coverage_type: direct
+  mutable_dispositions:
+  - element: SuspiciousCommandPatterns
+    dimension: tuning_parameter
+    specific_values: 'wmic process call, powershell Invoke-WmiMethod'
+    disposition: context
+    target_question: Q4
+    notes: WMI caller-side patterns named in parent_process_legitimacy context to identify the WMI initiator.
+  - element: WMIQueryScope
+    dimension: tuning_parameter
+    specific_values: '\root\cimv2, \root\subscription'
+    disposition: context
+    target_question: Q6
+    notes: WMI namespaces referenced in wmi_activity context; Operation field projected for namespace/method review.
+  - element: UserContext
+    dimension: user_context
+    specific_values: rationale only
+    disposition: context
+    target_question: Q2
+    notes: Interactive vs system-level execution framing carried in host_user_context.
+  - element: AllowedDLLPaths
+    dimension: tuning_parameter
+    specific_values: 'C:\Windows\System32'
+    disposition: context
+    target_question: Q7
+    notes: Expected-vs-unusual module load path framing in image_load question context.
+  - element: ScriptletExtensions
+    dimension: tuning_parameter
+    specific_values: '.sct, .ocx'
+    disposition: context
+    target_question: Q7
+    notes: Scriptlet/DLL load focus carried in image_load context.
+  - element: CommandLineRegex
+    dimension: command_analysis
+    specific_values: 'URLs, script paths, DLL entrypoints'
+    disposition: context
+    target_question: Q3
+    notes: Argument-decode targets (URLs, scriptlets, entrypoints) named in mechanism_decode context.
+  - element: SuspiciousExtensions
+    dimension: tuning_parameter
+    specific_values: 'exe, scr, lnk, js, vbs, bat, hta, ps1'
+    disposition: context
+    target_question: Q13
+    notes: Encoded/dropped-payload extensions referenced in encoded_payload_decode context.
+  - element: ParentProcessName
+    dimension: parent_process_analysis
+    specific_values: WmiPrvSE.exe (rule-fixed parent)
+    disposition: context
+    target_question: Q4
+    notes: Parent is fixed by the rule; legitimacy framing in parent_process_legitimacy.
+  dedup_decisions:
+  - dropped: cue_process_tool.process_chain
+    reason: parent_process is primary cue and parent-child is in detection — subsumed by parent_child.parent_process_legitimacy
+    kept: parent_child.parent_process_legitimacy
+  - dropped: cue_parent_process.mechanism_decode
+    reason: parent_child technique set active — parent_child.parent_process_legitimacy is more specific for parent legitimacy
+    kept: parent_child.parent_process_legitimacy
+  - dropped: cue_parent_process.baseline
+    reason: parent+binary historical baseline covered by cue_user_actor.baseline_svc; parent+child host frequency adds little over it
+    kept: cue_user_actor.baseline_svc
+  - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc pairing
+    reason: user_actor pair — non-deduplicable
+    kept: both
+  - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc pairing
+    reason: user_actor pair — non-deduplicable
+    kept: both
+  skipped_templates:
+  - template: cue_parent_process.follow_on
+    reason: Sibling-process scope covered by parent_child.sibling_processes (ParentProcessGuid-scoped, more precise than parent-binary scope)
+  - template: cue_parent_process.clustering
+    reason: Overlaps cue_host_context activity context and sibling_processes; dropped to stay within question cap
+  - template: cue_parent_process.scope
+    reason: Cross-host parent-child scope covered by cue_user_actor.clustering_svc (parent+binary, same window)
+  - template: cue_process_tool.baseline
+    reason: Host historical baseline covered by lolbin.historical_lolbin_baseline (reflected, rule-specific pattern) and cue_user_actor.baseline_svc
+  - template: cue_host_context.clustering
+    reason: Same-window host activity covered by parent_child.sibling_processes and cue_user_actor.clustering; dropped to stay within cap
+  - template: universal.evidence_preservation
+    reason: File-on-disk check folded into renamed_binary path question and image_load module question; no distinct downloaded-payload path in detection beyond child-derived %file_paths%
+  - template: universal.endpoint_protection_health
+    reason: cue_host_context.precursor present and rule is execution-launch not credential/tamper-centric — prior-alert context carries any tamper signal per template guidance (b)
+  - template: download_tool.download_success_verification
+    reason: No fixed download destination in detection; download verification subsumed by network_connection question (egress) and image_load (loaded payload)
+  - template: download_tool.payload_analysis
+    reason: No file path fixed by detection; payload hash/sandbox path would re-query child-derived %file_paths% already surfaced via image_load module
+  - template: download_tool.directory_activity
+    reason: No staging directory fixed by detection; directory sweep not anchorable without a rule-specified path
+  - template: initial_access.delivery_vector
+    reason: WMI initiator (not a document/email parent) is the true upstream — covered by parent_process_legitimacy and wmi_activity rather than a delivery-vector lookup
+  - template: initial_access.campaign_scope
+    reason: Same-rule cross-host scope covered by cue_user_actor.clustering_svc and lolbin baseline; rule is not email-delivery-shaped
+  - template: initial_access.application_patch_status
+    reason: No exploited application in the chain — parent is WmiPrvSE (WMI execution), not a patchable document/server app
+  reflection_overrides: []
+  hint_dispositions:
+  - hint: 'logsource ''create_stream_hash'' (recommended by techniques: T1204.002) is not covered and no template family exists — author a custom question with `category: create_stream_hash`'
+    disposition: declined
+    reason: >-
+      create_stream_hash surfaces mark-of-the-web on a downloaded file delivered to a user, but this rule's parent
+      is WmiPrvSE (WMI execution), not a user-facing handler opening an attachment. No file path is fixed by the
+      detection to anchor a Zone.Identifier lookup; the T1204.002 file delivery surface is not what fired this rule.
+      Module-load (Q7) and network_connection (Q8) cover the payload-retrieval surface that is actually in scope.
+  contextual_sets:
+    included: []
+    excluded:
+    - id: ransomware_impact
+      confidence: low
+      reason: 'Match is on the word ransomware in a reference summary, not in the rule. The rule detects WMI-launched execution, not encryption/impact behavior — keyword match is incidental.'
+    - id: network_scope
+      confidence: low
+      reason: 'Triggered by the same ransomware reference keyword. Network scope is addressed by the T1047 network_connection question; a dedicated network_scope set would be incidental to this execution-launch rule.'
+  technique_sets_applied:
+  - universal
+  - parent_child
+  - obfuscation
+  - lolbin
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 14
+      attack: 3
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 14
+    logsource_diversity:
+      process_creation: 13
+      wmi: 1
+      image_load: 1
+      network_connection: 1
+      sigma_alert: 1

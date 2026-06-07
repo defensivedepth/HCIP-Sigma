@@ -1,0 +1,469 @@
+name: Kavremover Dropped Binary LOLBIN Usage
+id: 302ab744-16fe-4180-a1c7-daa25f1856a5
+description: |
+  Detects a command line containing the token ' run run-cmd ' where the parent process is not one of the
+  Kaspersky removal binaries (cleanapi.exe, kavremover.exe). A signed helper binary dropped by Kaspersky Lab
+  Products Remover exposes a "run run-cmd <command>" subcommand that executes arbitrary shell commands under
+  the helper's signed identity, making it a signed-binary proxy for attacker-supplied commands. When the
+  parent is a legitimate Kaspersky removal process this is expected uninstall behavior and is filtered out;
+  when the run-cmd primitive is invoked from any other parent, the run reflects reuse of the signed helper
+  to proxy execution. Investigation should decode the proxied command, establish what launched the helper,
+  and determine whether the run-cmd execution led to payload writes, child process execution, or network egress.
+type: detection
+detection_id: d047726b-c71c-4048-a99b-2e2f50dc107d
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: '2026-06-06'
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line contain the run-cmd proxy token, and is the parent process something other than a Kaspersky removal binary?
+  context: The rule fires on a command line containing ' run run-cmd ' AND a parent process that is not cleanapi.exe or kavremover.exe. Confirm the alert is a true positive by reviewing the exact command line and the parent against those criteria. A Kaspersky removal parent indicates expected uninstall behavior and would have been filtered.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run a Kaspersky removal helper or to proxy commands through a signed third-party utility?
+  context: Legitimate uninstall workflows run the Kaspersky removal helper under a Kaspersky parent, which the rule filters out. Outside that path, knowing whether the user role and host function involve antivirus removal or signed-utility command proxying is often the fastest way to separate routine IT activity from operator abuse of the run-cmd primitive.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What command did the run-cmd primitive actually execute? Decode the full command line after the run-cmd token.
+  context: The run-cmd subcommand takes an arbitrary command string and executes it under the signed helper's identity. Decode everything after ' run run-cmd ' — the proxied executable, its arguments, any quoted shell command, file paths, or URLs. The proxied command is the actual action; the helper is only the launcher.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+      - Image
+      - CurrentDirectory
+- source: template:cue_process_tool.process_chain
+  question: What process spawned this helper, and is that parent chain expected for a signed removal utility?
+  context: The parent reveals how the signed helper was invoked. Legitimate use is driven by a Kaspersky removal process, which the rule excludes. An unexpected parent — a script host, an Office application, a remote-access tool, or an interactive shell — points to the helper being reused as a proxy rather than running as part of a real uninstall.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: attack:T1127.payload_drop
+  question: Did files get written to user-writable paths on this host shortly after the run-cmd execution?
+  context: Signed-utility proxy execution commonly writes a new executable to a user-writable location (the temp profile, AppData, the public profile, or the recycle bin) and then runs it. File writes to those paths in the window after the helper ran can be the dropped payload. Scoping is limited to the alerting host's file activity in the candidate drop directories rather than all file events.
+  range: +30m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_paths:
+        TargetFilename|contains:
+          - '\AppData\Local\Temp\'
+          - '\AppData\Roaming\'
+          - '\Users\Public\'
+          - '$Recycle.Bin'
+      filter_ext:
+        TargetFilename|endswith:
+          - '.exe'
+          - '.dll'
+          - '.scr'
+          - '.com'
+      condition: selection and selection_paths and filter_ext
+    fields:
+      - TargetFilename
+      - Image
+      - User
+- source: attack:T1127.egress
+  question: Did this host make outbound network connections in the window after the run-cmd execution?
+  context: Proxied commands frequently reach out immediately — pulling a second-stage payload or establishing command-and-control. Outbound connections from this host shortly after the helper ran, especially to destinations the host does not normally contact, tie the run-cmd execution to network activity. Filter out connections that did not leave the host.
+  range: +30m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'true'
+      filter_local:
+        DestinationIp|cidr:
+          - '10.0.0.0/8'
+          - '172.16.0.0/12'
+          - '192.168.0.0/16'
+          - '127.0.0.0/8'
+      condition: selection and not filter_local
+    fields:
+      - Image
+      - DestinationIp
+      - DestinationPort
+- source: template:cue_process_tool.follow_on
+  question: What child processes did the helper spawn after the run-cmd execution?
+  context: The processes the helper spawns reveal the proxied command's real impact. The run-cmd primitive routinely launches cmd.exe, powershell.exe, regsvr32.exe, or rundll32.exe to carry out the operator's command. Children scoped to the helper's own process identity show exactly what it ran.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.clustering
+  question: What other tools ran on this host around the same time as the run-cmd execution?
+  context: Signed-binary proxy execution rarely happens in isolation. Activity surrounding the helper run may reveal reconnaissance, credential access, persistence installation, or staging that gives the run-cmd execution broader meaning.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+- source: template:cue_process_tool.baseline
+  question: Has the run-cmd proxy pattern fired on this host before, and how often?
+  context: The run-cmd token from a non-Kaspersky parent is the rule's specific firing pattern. A host that has never produced it is more notable than one where it recurs. Aggregating the rule's command-line pattern over 90 days shows whether this is first-time or recurring activity here.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains: ' run run-cmd '
+      filter_main_legit_parents:
+        ParentImage|endswith:
+          - '\cleanapi.exe'
+          - '\kavremover.exe'
+      condition: selection and not filter_main_legit_parents
+    fields:
+      - User
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired the run-cmd pattern, what parents and users drove it, and does the current alert fit that distribution?
+  context: Even a signed utility can be reused for proxy execution. The query mirrors the rule's selection scoped to this host, so the resulting parent/user distribution reflects how the run-cmd firing pattern has historically run here — not generic binary usage. A new parent process, an unexpected user account, or an unusual command-line shape is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection:
+        CommandLine|contains: ' run run-cmd '
+      filter_main_legit_parents:
+        ParentImage|endswith:
+        - \cleanapi.exe
+        - \kavremover.exe
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired the run-cmd pattern in the past week, and does the cross-host distribution look like consistent automation or one-off activity?
+  context: The query mirrors the rule's selection with no host scope, so the result is a fleet-wide count of the run-cmd firing pattern rather than generic binary usage. Many hosts firing the same pattern points to scripted deployment or vendor automation; one host or a small unrelated set points to manual operator activity. Use the host distribution and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection:
+        CommandLine|contains: ' run run-cmd '
+      filter_main_legit_parents:
+        ParentImage|endswith:
+        - \cleanapi.exe
+        - \kavremover.exe
+      condition: selection and not 1 of filter_main_*
+    fields:
+    - host.name
+- source: template:cue_user_actor.baseline
+  question: Does this user normally invoke the run-cmd proxy pattern across the environment?
+  context: Compare this user's current action against their historical behavior. A user who has never produced the run-cmd token from a non-Kaspersky parent is more notable than one who does so regularly. User role and typical toolset should align with antivirus-removal or signed-utility command proxying.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        CommandLine|contains: ' run run-cmd '
+      filter_main_legit_parents:
+        ParentImage|endswith:
+          - '\cleanapi.exe'
+          - '\kavremover.exe'
+      condition: selection and not filter_main_legit_parents
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is the parent-to-helper launch mechanism behind this run-cmd execution historically routine on this host or environment-wide?
+  context: When the alert fires under a service principal, user identity does not attribute behavior; the meaningful pivot is the launch mechanism — which parent process spawned the helper, and whether that pairing is historically common. A new or rare parent for this helper is the deviation worth chasing; a pairing that already accounts for many prior events reflects vendor or OS automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around the time of the run-cmd execution?
+  context: Tracking the user's activity across all hosts reveals lateral movement or actions spanning multiple endpoints. If the same user triggered similar activity on other hosts, the scope of the operation may be larger than this single alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent-to-helper launch mechanism fire on other hosts in the alert window, indicating a coordinated automation rollout rather than isolated activity?
+  context: Under a service principal, asking what the user did across the network returns agent-telemetry noise because every host runs SYSTEM-owned agents constantly. The meaningful question is whether the same launch mechanism — parent process plus spawned helper — fired on other hosts in the alert window. Multiple hosts in the same window points to scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining activity around the alert reveals what led to the run-cmd execution, what happened after, and whether it is part of a larger sequence. Look for reconnaissance, privilege escalation, or persistence mechanisms.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering, reconnaissance, credential access — may reveal the stages that preceded the run-cmd execution and help reconstruct the full timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1127
+      name: Trusted Developer Utilities Proxy Execution
+      role: primary
+  attack_chain_coverage:
+    - stage: 1
+      label: signed_utility_proxy_invocation
+      description: A trusted/signed utility is executed in a non-developer context and proxies an attacker-supplied command (the run-cmd token from a non-Kaspersky parent).
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: proxied_command_decode
+      description: Decode the arbitrary command the run-cmd primitive executed under the signed identity.
+      mapped_to: Q3
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 3
+      label: suspicious_child_execution
+      description: The utility spawns suspicious children (powershell.exe, cmd.exe, rundll32.exe, regsvr32.exe, wscript.exe).
+      mapped_to: Q7
+      source: template:cue_process_tool.follow_on
+    - stage: 4
+      label: payload_write_from_userwritable_path
+      description: The utility writes and then runs a new PE from user-writable paths.
+      mapped_to: Q5
+      source: attack:T1127.payload_drop
+    - stage: 5
+      label: outbound_network_connection
+      description: The utility or its children immediately make outbound network connections.
+      mapped_to: Q6
+      source: attack:T1127.egress
+  dimension_coverage:
+    - dimension: parent_process_analysis
+      technique: T1127
+      covered_by: Q4
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1127
+      covered_by: Q5
+      source: attack:T1127.payload_drop
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1127
+      covered_by: Q9
+      source: template:cue_process_tool.baseline
+      coverage_type: partial
+  mutable_dispositions:
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "0-30 minutes between utility execution, payload write, and network egress"
+      disposition: query_injection
+      target_question: Q5
+      notes: "+30m range on payload_drop (Q5) and egress (Q6) queries encodes the 0-30m correlation window between run-cmd execution, payload write, and network egress."
+    - element: SuspiciousChildList
+      dimension: tuning_parameter
+      specific_values: "powershell.exe, rundll32.exe, regsvr32.exe, cmd.exe, wscript.exe, mshta.exe"
+      disposition: context
+      target_question: Q7
+      notes: "High-risk child binaries named in follow_on (Q7) context; query is ParentProcessGuid-scoped so it surfaces all children without filtering to the list."
+    - element: RarePathRegex
+      dimension: tuning_parameter
+      specific_values: "%TEMP%, %APPDATA%, public profile, recycle bin"
+      disposition: query_injection
+      target_question: Q5
+      notes: "Injected into payload_drop (Q5) TargetFilename|contains: \\AppData\\Local\\Temp\\, \\AppData\\Roaming\\, \\Users\\Public\\, $Recycle.Bin."
+    - element: AllowedUtilitiesList
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q9
+      notes: "Org-specific allow-list rationale; surfaced via baseline (Q9) and scope (Q11) which let the analyst judge whether the pattern is routine automation."
+    - element: DeveloperHosts
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q2
+      notes: "Known-host expectation handled by host_user_context (Q2) and the fleet scope (Q11)."
+    - element: UnsignedOrInvalidSignatureOnly
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q3
+      notes: "Helper and proxied binaries are Kaspersky-signed; signature filtering is not discriminating here, so mechanism_decode (Q3) focuses on the proxied command rather than signing state. Matches the reference guidance not to filter on signature for this primitive."
+    - element: ParentProcessAllowList
+      dimension: parent_process_analysis
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q4
+      notes: "Orchestrator/parent legitimacy handled by process_chain (Q4) and baseline_deviation (Q10)."
+    - element: NetworkReputationThreshold
+      dimension: tuning_parameter
+      specific_values: "rare/unknown destination heuristic"
+      disposition: context
+      target_question: Q6
+      notes: "egress (Q6) filters out internal RFC1918 destinations so external connections surface; reputation scoring is left to analyst judgment in context."
+  dedup_decisions:
+    - dropped: cue_user_actor.baseline_svc / cue_user_actor.baseline
+      reason: "user_actor pair — non-deduplicable (subject identity vs. launch mechanism); both emitted per AGENTS.md service-principal handling"
+      kept: both
+    - dropped: cue_user_actor.clustering_svc / cue_user_actor.clustering
+      reason: "user_actor pair — non-deduplicable (subject identity vs. launch mechanism); both emitted per AGENTS.md service-principal handling"
+      kept: both
+  skipped_templates:
+    - template: universal.endpoint_protection_health
+      reason: "Recommended (not must_include) generic host-tamper sweep. Dropped to stay at 17 questions while keeping the two attack: questions that satisfy the T1127 file_event and network_connection logsource-coverage hints. Prior-tamper context is partly carried by cue_host_context.precursor (Q17), and this rule's run-cmd primitive is not itself a defense-tampering action."
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "logsource 'image_load' (recommended by techniques: T1127) is not covered — pull in cue_image_load.* or author a custom question with `category: image_load`"
+      disposition: declined
+      reason: >-
+        This rule's selection is the ' run run-cmd ' shell-command proxy
+        primitive, not the cleanapi.exe -n <DLL> arbitrary-DLL-load primitive
+        from the same reference. image_load evidence speaks to the DLL-load
+        variant, which this rule does not fire on; adding image_load coverage
+        of the helper would return load volume without precision for the
+        run-cmd command-proxy behavior under investigation. No compensating
+        attack:T1127.image_load question authored.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 15
+      attack: 2
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 14
+    logsource_diversity:
+      process_creation: 14
+      file_event: 1
+      network_connection: 1
+      sigma_alert: 1

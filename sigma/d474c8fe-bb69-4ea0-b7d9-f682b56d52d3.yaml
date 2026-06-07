@@ -1,0 +1,481 @@
+name: HackTool - Doppelanger LSASS Dumper Execution
+id: b9ded2b3-c67f-4130-a0f3-d652580b5dc6
+description: |
+  Detects execution of the Doppelganger hacktool, an LSASS credential dumper that clones the LSASS process via an undocumented native syscall and writes an XOR-encrypted memory dump to disk while bypassing PPL, VBS, and Credential Guard. The rule fires when a process image named Doppelganger.exe runs, or when a process matches one of two known import-hash fingerprints regardless of filename. Legitimate credential dumping is essentially never expected on production hosts; the realistic benign case is an authorized penetration test or red team engagement, so the investigation centers on confirming the tool ran, identifying which host and account it ran under, and tracing the credential-access chain (LSASS handle access, dump file written to disk, privilege escalation, and any follow-on lateral movement) that this tool performs once executed.
+type: detection
+detection_id: d474c8fe-bb69-4ea0-b7d9-f682b56d52d3
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-06
+questions:
+- source: template:universal.verify_trigger_match
+  question: Did this process match the Doppelganger image name or one of the rule's known import-hash fingerprints?
+  context: >-
+    The rule fires on either of two independent criteria — a process image ending in Doppelganger.exe, or a process whose import hash matches one of two known Doppelganger build fingerprints. Confirm which criterion matched by reviewing the alerting event's Image and Hashes fields. A hash match with a renamed image means the operator renamed the binary, which is itself meaningful; a name-only match with an unknown hash may be a different build or a benign collision on the name.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - Hashes
+- source: template:universal.host_user_context
+  question: Is this host and account expected to run credential-dumping tooling?
+  context: >-
+    Credential dumping is essentially never part of routine operations on production endpoints. Confirm whether the host is a security testing system and whether the account is one a tester or administrator would use for an authorized assessment. A standard user account on a general-purpose workstation running this tool is a strong escalation candidate.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:hacking_tool.authorized_engagement
+  question: Is this Doppelganger execution part of an authorized penetration test or red team engagement?
+  context: >-
+    Offensive credential-access tooling is used in authorized security assessments. Before investing further analysis time, check whether a penetration test or red team exercise is currently scoped to this host or network segment. An authorized engagement with matching tool usage and timing resolves the alert without further work; the absence of any sanctioned engagement makes this a live credential-theft event.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:hacking_tool.tool_capability_used
+  question: How was Doppelganger invoked, and was it run directly or loaded as shellcode by another process?
+  context: >-
+    Doppelganger can run as a standalone executable or be converted to position-independent shellcode and injected into a benign suspended process such as explorer.exe or svchost.exe by its companion loader. Direct execution shows Doppelganger.exe as the Image; a loader-based run hollows a signed host process, so the Image may be a legitimate binary while the import hash still matches. Review the command line and the alerting Image to determine which delivery method was used, since that changes which process to scope downstream queries to.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:credential_access.credential_target_identification
+  question: Was LSASS memory the dump target, and by what method was it accessed?
+  context: >-
+    This tool targets LSASS memory specifically. Rather than reading LSASS directly, it clones the LSASS process via an undocumented native syscall to create an unprotected fork, then captures full memory of the clone — so the access does not look like classic procdump or comsvcs.dll dumping. Determine whether LSASS was successfully accessed and confirm the clone-and-dump method, since the clone approach evades the usual procdump, rundll32 comsvcs.dll, and direct-read indicators and identifies the operator's sophistication.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: attack:T1003.001.access_verification
+  question: Did any process open a full-access handle to lsass.exe on this host around the time of the alert?
+  context: >-
+    LSASS credential dumping requires a process handle to lsass.exe with broad access rights; full-access handle requests carry the mask 0x1F0FFF. Because this tool clones LSASS rather than reading it in place, the handle open may originate from Doppelganger.exe or from a hollowed host process. Review handle-access events to lsass.exe, exclude known AV/EDR processes that legitimately access LSASS, and correlate the source process and access mask with the alerting event. If process_access events are not collected in this environment, treat zero results as a visibility gap rather than evidence nothing accessed LSASS.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_access
+      product: windows
+    detection:
+      selection:
+        TargetImage|endswith: \lsass.exe
+        GrantedAccess|contains:
+          - '0x1F0FFF'
+          - '0x1010'
+          - '0x1410'
+      filter_host:
+        host.name|expand: '%hostname%'
+      condition: selection and filter_host
+    fields:
+      - SourceImage
+      - GrantedAccess
+      - CallTrace
+- source: attack:T1003.001.privileged_token
+  question: Were sensitive privileges such as SeDebugPrivilege assigned to a process on this host around the alert?
+  context: >-
+    To read another process's memory this tool enables SeDebugPrivilege and steals a SYSTEM token from a logon-related process. Assignment of sensitive privileges is recorded as event 4673 in the Windows security log. Review which process and account were granted SeDebugPrivilege or other sensitive privileges near the alert time; an assignment tied to the alerting process or account corroborates the credential-access chain. If security audit events for privilege use are not ingested, treat zero results as a visibility gap rather than evidence no privilege escalation occurred.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: security
+    detection:
+      selection:
+        EventID: 4673
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - SubjectUserName
+      - ProcessName
+      - PrivilegeList
+- source: template:cue_process_tool.process_chain
+  question: What process spawned this tool, and is that parent chain expected for a credential-access binary?
+  context: >-
+    The parent process reveals how the tool was launched. A launch from explorer.exe suggests interactive operator activity; a launch from a script host, a remote-execution service, or an unexpected signed binary suggests automated or remote delivery. Because this tool can also be delivered as shellcode into a hollowed process, the parent of the alerting process is a starting point — walk further up the tree if the immediate parent looks legitimate.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:hacking_tool.tool_specific_artifacts
+  question: Was an encrypted LSASS dump file written to disk by this tool?
+  context: >-
+    This tool writes its captured LSASS memory to disk as an XOR-encrypted file with no MZ header or recognizable minidump signature, so file scanners do not flag it; an example output name is doppelganger.dmp and a known drop location is C:\Windows\Public. Review file-creation events from the alerting process for dump-like artifacts, paying attention to writable staging paths such as C:\Windows\Public, C:\Windows\Temp, and the user TEMP directory. The presence of a written dump confirms credentials were captured and identifies the artifact to collect for scope assessment.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: template:cue_process_tool.follow_on
+  question: What child processes did this tool spawn afterward?
+  context: >-
+    Processes spawned by the tool reveal post-dumping activity. After capturing credentials an operator commonly launches a shell, a decryption or parsing helper, or staging and exfiltration commands. Unexpected children such as cmd.exe, powershell.exe, or archive utilities point to active hands-on-keyboard follow-up rather than a one-off tool run.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:credential_access.credential_exposure_assessment
+  question: Which accounts may be exposed by this LSASS dump, and do any have elevated privileges?
+  context: >-
+    A full LSASS memory capture exposes credential material for every account with an active session or cached secret on the host — interactive users, service accounts, and any administrator who recently logged on. The severity depends on the privilege level of those accounts; domain admin or service-account exposure requires incident escalation and credential rotation, while a single standard-user session may only need monitoring. Cross-reference the accounts with recent logon sessions on this host against directory group memberships.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:credential_access.post_access_lateral_movement
+  question: Were any new logon sessions or remote connections initiated after this event?
+  context: >-
+    Credential theft is typically followed by use of the stolen credentials to reach other systems. New logon events or outbound remote connections — RDP, SMB, WinRM, or remote service execution — shortly after the dump indicate active exploitation of the captured credentials. Review follow-on alerts on this host for lateral-movement indicators in the hours after the alert.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - rule.name
+      - rule.uuid
+      - event.severity_label
+- source: template:cue_user_actor.baseline
+  question: Does this user account have any history of running this tool across the environment?
+  context: >-
+    Compare the alerting account's current action against its historical behavior. An account that has never run this credential dumper is more suspicious than one with a record of authorized testing. Low or zero historical counts indicate first-time use; combine this with knowledge of the account's role. If the alert fired under a service or machine account, user identity attributes little — rely on the launch-mechanism view instead.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is the parent-and-binary launch combination behind this alert historically routine on this host or across the environment?
+  context: >-
+    When the alert fires under a service or machine account, user identity does not attribute the behavior; the meaningful pivot is the launch mechanism — which parent process spawned this binary and whether that pair is historically common. A new or rare parent for this binary is the deviation worth chasing, while a pair already responsible for many prior events points to established automation. Credential dumpers have essentially no legitimate automation footprint, so any recurring pair here deserves direct scrutiny.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user account do across the network around this time?
+  context: >-
+    Tracking the account's activity across all hosts reveals whether the credential access is isolated or part of movement across endpoints. If the same account triggered similar tool execution or suspicious activity on multiple hosts in the alert window, the scope of compromise is larger. Under a service or machine account this view returns broad agent telemetry, so weigh it against the launch-mechanism cross-host view.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did the same parent-and-binary combination fire on other hosts in the same window, indicating a coordinated rollout rather than isolated activity?
+  context: >-
+    Under a service or machine account, asking what the user did network-wide returns agent-telemetry noise because every host runs system-owned agents constantly. The meaningful question is whether the same launch mechanism — parent process plus spawned binary — fired on other hosts in the alert window. Multiple hosts in the same window points to pushed or scheduled deployment of the tool; a single host points to a host-local trigger and likely manual operator activity.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously matched the rule's pattern, what parents and users drove it, and does the current alert fit?
+  context: >-
+    Even when a host has prior hits on this pattern, the parent/user distribution shows how those firings normally occur here. The query mirrors the rule's image-name and import-hash selection scoped to this host, so the result reflects the rule's specific firing pattern rather than generic binary usage. A new parent process, an unexpected account, or a first-ever hit is the anomaly worth chasing — for a dedicated credential dumper, any hit is significant.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+      - Image|endswith: \Doppelganger.exe
+      - Hashes|contains:
+        - IMPHASH=AB94D5217896ADCD765A06B2D52F0AEB
+        - IMPHASH=65F0EA61156EE0C2A35421926F0C7F78
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.scope
+  question: Have other hosts matched the rule's pattern in the past week, and does the distribution look like deployment or one-off activity?
+  context: >-
+    The query mirrors the rule's image-name and import-hash selection with no host scope, giving a fleet-wide count of the rule's firing pattern. Many hosts matching the same pattern points to scripted deployment of the tool across the environment; one host or a small unrelated set points to manual operator activity. Use the host distribution to gauge whether this is contained or part of multi-host operation.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+      - Image|endswith: \Doppelganger.exe
+      - Hashes|contains:
+        - IMPHASH=AB94D5217896ADCD765A06B2D52F0AEB
+        - IMPHASH=65F0EA61156EE0C2A35421926F0C7F78
+      condition: selection
+    fields:
+    - host.name
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1003.001
+      name: LSASS Memory
+      role: primary
+    - id: T1003
+      name: OS Credential Dumping
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: privilege_escalation_token_theft
+      description: "Enable SeDebugPrivilege and steal a SYSTEM token from a logon-related process"
+      mapped_to: Q7
+      source: attack:T1003.001.privileged_token
+    - stage: 2
+      label: lsass_handle_access
+      description: "Open a handle to lsass.exe and clone the process for dumping"
+      mapped_to: Q6
+      source: attack:T1003.001.access_verification
+    - stage: 3
+      label: memory_dump_capture
+      description: "Capture full memory of the LSASS clone and determine the dump method"
+      mapped_to: Q5
+      source: template:credential_access.credential_target_identification
+    - stage: 4
+      label: encrypted_dump_to_disk
+      description: "Write the XOR-encrypted dump artifact to a writable staging path"
+      mapped_to: Q9
+      source: template:hacking_tool.tool_specific_artifacts
+    - stage: 5
+      label: credential_use_lateral_movement
+      description: "Use captured credentials for follow-on logon or lateral movement"
+      mapped_to: Q12
+      source: template:credential_access.post_access_lateral_movement
+  dimension_coverage:
+    - dimension: access_verification
+      technique: T1003.001
+      covered_by: Q6
+      source: attack:T1003.001.access_verification
+      coverage_type: direct
+    - dimension: command_analysis
+      technique: T1003.001
+      covered_by: Q5
+      source: template:credential_access.credential_target_identification
+      coverage_type: partial
+    - dimension: parent_process_analysis
+      technique: T1003.001
+      covered_by: Q8
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1003.001
+      covered_by: Q6
+      source: attack:T1003.001.access_verification
+      coverage_type: indirect
+    - dimension: tuning_parameter
+      technique: T1003.001
+      covered_by: Q9
+      source: template:hacking_tool.tool_specific_artifacts
+      coverage_type: direct
+  mutable_dispositions:
+    - element: AccessMask
+      dimension: access_verification
+      specific_values: "0x1F0FFF (full-access handle to lsass.exe)"
+      disposition: new_question
+      target_question: Q6
+      notes: "Injected 0x1F0FFF plus near-full masks into GrantedAccess|contains on the process_access query targeting lsass.exe"
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "5 minutes between LSASS access and dump file creation"
+      disposition: context
+      target_question: Q6
+      notes: "Access query uses +/-5m and the dump-file query uses +1h; the 5-minute correlation window between access and dump is reflected in the access-window scoping rather than a queryable field"
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "Allowlist legitimate AV/EDR tools accessing lsass.exe"
+      disposition: context
+      target_question: Q6
+      notes: "Q6 context instructs excluding known AV/EDR processes that legitimately access LSASS; Q8 examines the parent chain of the tool itself"
+    - element: DumpFilePath
+      dimension: tuning_parameter
+      specific_values: "%TEMP%, C:\\Windows\\Temp, C:\\Windows\\Public (doppelganger.dmp)"
+      disposition: context
+      target_question: Q9
+      notes: "Exact staging paths and example dump filename injected into Q9 context; file_event query scoped to the tool's process Image via %file_paths%-equivalent Image scoping"
+    - element: CommandLinePattern
+      dimension: command_analysis
+      specific_values: "rundll32, procdump, comsvcs.dll, Invoke-Mimikatz"
+      disposition: context
+      target_question: Q5
+      notes: "These are classic-dumper patterns this tool deliberately avoids by cloning LSASS; Q5 context contrasts the clone method against them. Rule has no commandline_values so no query injection possible"
+  dedup_decisions:
+    - dropped: cue_user_actor.baseline + cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable"
+      kept: both (Q13 user-pivot, Q14 service_principal_substitute)
+    - dropped: cue_user_actor.clustering + cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable"
+      kept: both (Q15 user-pivot, Q16 service_principal_substitute)
+  skipped_templates:
+    - template: cue_process_tool.mechanism_decode
+      reason: "replaced_by: credential_access.credential_target_identification (Q5) — acted on per hint"
+    - template: cue_process_tool.baseline
+      reason: "Generic per-host binary frequency is subsumed by the rule-pattern host baseline (Q17, cue_process_tool.baseline_deviation), which scopes to the rule's image+imphash selection rather than generic binary usage — for a single-purpose dumper the two collapse to the same answer and the deviation form is more precise"
+    - template: cue_process_tool.clustering
+      reason: "Around-the-time tool clustering on this host overlaps cue_host_context.clustering; dropped the process_tool variant to stay within the 18-question cap and because host_context.clustering covers the same +/-15m surrounding-activity question. See note below"
+    - template: cue_host_context.clustering
+      reason: "Dropped to stay within 18-question cap; surrounding-activity coverage is provided by the cross-host launch-mechanism view (Q16) and follow-on children (Q10). Recorded so the drop of a universal-tier cue is auditable"
+    - template: cue_host_context.precursor
+      reason: "Prior-alert timeline on this host is partially carried by post_access_lateral_movement (Q12) which queries sigma alerts on the host; dropped the -6h precursor variant to stay within cap. Credential-access disposition turns more on the dump artifact and account exposure than on preceding alerts"
+    - template: universal.endpoint_protection_health
+      reason: "Doppelganger disables process protection at the kernel level by patching EPROCESS bytes via a vulnerable signed driver, not via the command-line AV/EDR tamper patterns this sweep matches; the notes_to_llm states kernel-level driver tampering will not appear in this query. The handle-access (Q6) and privilege (Q7) questions cover the protection-bypass evidence that is actually observable for this tool"
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "logsource 'registry_set' (recommended by techniques: T1003.001) is not covered — pull in cue_registry_key.* or author a custom question with `category: registry_set`"
+      disposition: declined
+      reason: >-
+        The registry_set analytic in the generic T1003/T1003.001 brief targets SAM/SECURITY hive and cached-credential
+        registry access used by reg-save-style dumping. Doppelganger does not touch the registry — it clones LSASS via
+        NtCreateProcessEx and writes an XOR-encrypted dump to disk, patching kernel EPROCESS bytes (not registry values).
+        A registry_set question would return noise unrelated to this tool's mechanism. The credential-access chain is
+        covered by Q6 (LSASS handle access), Q7 (privilege escalation), Q5 (dump method), and Q9 (on-disk dump artifact).
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - credential_access
+    - hacking_tool
+    - cue_process_tool
+    - cue_user_actor
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 16
+      attack: 2
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 2
+      context: 14
+    logsource_diversity:
+      process_creation: 14
+      process_access: 1
+      security: 1
+      file_event: 1
+      sigma_alert: 1

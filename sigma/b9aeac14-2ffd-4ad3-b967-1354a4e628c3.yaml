@@ -1,0 +1,490 @@
+name: PowerShell Get-Clipboard Cmdlet Via CLI
+id: 79ac0493-e443-49e8-818f-e77acefcfaa1
+description: |
+  Detects the PowerShell Get-Clipboard cmdlet appearing on a process command line, which reads whatever text the
+  interactive user currently has on their clipboard and writes it to the pipeline or stdout. Clipboard contents
+  frequently hold passwords, recovery keys, tokens, and copied sensitive data, so reading them is a lightweight
+  collection step that often follows execution and precedes staging or exfiltration. Legitimate use exists (scripts
+  and developers occasionally read the clipboard), so the investigation should establish how PowerShell was launched,
+  which user and parent drove it, whether the session was interactive, and what happened to the captured data afterward.
+type: detection
+detection_id: b9aeac14-2ffd-4ad3-b967-1354a4e628c3
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: '2026-06-06'
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line contain the Get-Clipboard cmdlet as the rule detects?
+  context: Before investing investigation time, confirm the alert is a true positive by reviewing the exact command
+    line that fired. The rule matches any command line containing the string Get-Clipboard, so verify the cmdlet is
+    actually present and note whether it is a bare interactive read or part of a larger pipeline that stages or sends
+    the captured text elsewhere.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to read the clipboard from PowerShell?
+  context: Legitimate administrative scripting and developer activity can read the clipboard, but most users never
+    invoke Get-Clipboard directly. Knowing whether the user role and host function are consistent with command-line
+    clipboard access is often the fastest path to distinguishing routine operations from collection activity.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What exactly did this PowerShell invocation do beyond reading the clipboard? Decode the full command line.
+  context: The full command line reveals whether Get-Clipboard was a standalone read or one stage of a larger
+    operation. Decode any flags, encoding, file paths, or pipeline that captures the clipboard text and writes it to a
+    file, sends it over the network, or passes it to another command. A bare Get-Clipboard is far less concerning than
+    one piped into Out-File, Invoke-WebRequest, or a base64 conversion.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:powershell.encoded_command_decode
+  question: Was the command encoded or obfuscated? What does it decode to?
+  context: Get-Clipboard is plain text, but it is often embedded inside an -EncodedCommand (-enc) payload or obfuscated
+    with backticks, concatenation, or variable substitution to hide the surrounding collection or exfiltration logic.
+    Base64-encoded commands are the most common form. Decoding reveals the actual script -- where the captured
+    clipboard text is sent, whether it is written to disk, and whether a download cradle or in-memory execution
+    accompanies it.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:powershell.script_block_logging
+  question: Did PowerShell script block logging capture the full Get-Clipboard script content?
+  context: Script block logging records the deobfuscated script content PowerShell actually executed, even when the
+    command line is encoded or obfuscated. This provides ground truth about what ran around the clipboard read,
+    bypassing attacker obfuscation. If PowerShell operational logs are not ingested in this environment, treat zero
+    results as a visibility gap rather than evidence nothing ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+        ScriptBlockText|contains: Get-Clipboard
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- source: template:cue_process_tool.process_chain
+  question: What process spawned this PowerShell session and is that parent chain expected?
+  context: The parent process reveals how PowerShell was invoked. Interactive clipboard reads are normally parented by
+    explorer.exe or a legitimate console host. Parents such as control.exe, mshta.exe, wscript.exe, or an Office
+    application -- especially as a high-integrity child of a UAC bypass chain -- point to a session that gained
+    execution outside normal user interaction before reaching the clipboard.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired the Get-Clipboard pattern, what parents and users normally drive that
+    activity, and does the current alert fit that pattern?
+  context: Even ordinary clipboard reads can be abused. The query mirrors the rule's selection scoped to this host, so
+    the resulting parent and user distribution reflects how the Get-Clipboard firing pattern has historically run
+    here. A new parent process, an unexpected user account, or a non-interactive session is the deviation worth
+    chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains: Get-Clipboard
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: attack:T1115.process_access
+  question: Did any process open a handle to read clipboard-owning windows around the time of this alert?
+  context: Beyond the Get-Clipboard cmdlet, clipboard data is also collected by programs that open handles to the
+    process owning the clipboard contents. Reviewing handle-access events on this host in the alert window can reveal
+    a second collection mechanism running alongside the PowerShell read, or a parent tool that orchestrated both.
+    Cross-reference the source process against the alerting PowerShell session.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_access
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - SourceImage
+      - TargetImage
+      - GrantedAccess
+- source: template:cue_process_tool.follow_on
+  question: What child processes did this PowerShell session spawn afterward?
+  context: The processes spawned after the clipboard read reveal what was done with the captured text. A clipboard
+    read followed by cmd.exe, certutil.exe, curl.exe, or a network-capable utility suggests the collected data was
+    staged or sent onward; a read with no children is more consistent with interactive use.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:data_staging_exfil.data_scope
+  question: Was the captured clipboard text written to a file or staged for later collection on this host?
+  context: Clipboard reads used for collection commonly redirect the captured text to a file (Out-File, Set-Content,
+    redirection) before it is archived or exfiltrated. Reviewing file writes on the host in the alert window shows
+    whether the clipboard contents were persisted to disk and where, which determines the scope of potential data
+    loss.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - TargetFilename
+- source: template:powershell.powershell_security_bypass
+  question: Were PowerShell security controls bypassed or weakened before this clipboard read?
+  context: Operators often disable or bypass PowerShell protections before running collection logic. Common patterns
+    include AMSI bypass (patching amsi.dll in memory), execution policy changes (Set-ExecutionPolicy or -ep bypass),
+    constrained language mode escape, and downgrade to PowerShell v2 (which lacks logging). Finding these precursor
+    events on the host strengthens the case that the clipboard read was part of malicious activity.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- source: template:cue_user_actor.baseline
+  question: Does this user normally read the clipboard from the command line?
+  context: Compare this user's current action against their historical behavior. A user who has never run Get-Clipboard
+    is more suspicious than one who scripts against the clipboard regularly. User role and typical toolset should align
+    with command-line clipboard access.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        CommandLine|contains: Get-Clipboard
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent and the Get-Clipboard pattern historically routine on this host or across the environment,
+    or is the parent unusual for this activity?
+  context: When the alert fires under a service principal, user identity does not attribute behavior. The meaningful
+    pivot is the launch mechanism -- which parent process drove the clipboard read, and whether that parent has
+    produced this pattern before. A new or rare parent for Get-Clipboard is the deviation worth chasing; a parent that
+    already accounts for many prior events is automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        CommandLine|contains: Get-Clipboard
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or collection spanning multiple
+    endpoints. If the same user triggered similar activity on other hosts, the scope of compromise may be larger than
+    a single clipboard read.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did the same parent and Get-Clipboard pattern fire on other hosts in the same window, or is the activity
+    isolated to this host?
+  context: Under a service principal, asking what else the user did across the network returns agent-telemetry noise,
+    since every host runs service-owned processes constantly. The meaningful question is whether the same launch
+    mechanism -- parent process driving a clipboard read -- fired on other hosts in the alert window. Multiple hosts
+    points to scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        CommandLine|contains: Get-Clipboard
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining activity around the clipboard read reveals the immediate
+    context -- what led to this event, what happened after, and whether it is part of a larger sequence. Look for
+    reconnaissance, privilege escalation, persistence, or staging that surrounds the collection step.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_process_tool.scope
+  question: Have other hosts run Get-Clipboard in the past week, and does the cross-host distribution look like
+    consistent automation or one-off activity?
+  context: The query mirrors the rule's selection with no host scope, so the result is a fleet-wide count of the
+    Get-Clipboard firing pattern. Many hosts firing the same pattern points to scripted deployment or vendor
+    automation; one host or a small unrelated set points to manual operator activity. Use the host distribution to
+    calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains: Get-Clipboard
+      condition: selection
+    fields:
+    - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host -- defense tampering, reconnaissance, credential access, or execution
+    -- may reveal the attack stages that preceded the clipboard read and help reconstruct the full timeline. Collection
+    of clipboard data often follows initial execution and access, so prior alerts here are the precursor signal.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1115
+      name: Clipboard Data
+      role: primary
+  attack_chain_coverage:
+    - stage: 1
+      label: clipboard_access
+      description: "Process reads clipboard contents via OS utility (Get-Clipboard cmdlet on the command line)"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: anomalous_context
+      description: "Clipboard access by a non-interactive or abnormal parent process / user, possibly chained with a UAC bypass or other execution chain"
+      mapped_to: Q6
+      source: template:cue_process_tool.process_chain
+    - stage: 3
+      label: staging_or_exfil
+      description: "Captured clipboard text staged to a file or chained with follow-on staging / exfiltration commands"
+      mapped_to: Q10
+      source: template:data_staging_exfil.data_scope
+  dimension_coverage:
+    - dimension: parent_process_analysis
+      technique: T1115
+      covered_by: Q6
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1115
+      covered_by: Q16
+      source: template:cue_host_context.clustering
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1115
+      covered_by: Q7
+      source: template:cue_process_tool.baseline_deviation
+      coverage_type: partial
+    - dimension: user_context
+      technique: T1115
+      covered_by: Q12
+      source: template:cue_user_actor.baseline
+      coverage_type: direct
+  mutable_dispositions:
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only — how far back to look for parent-child and follow-on activity"
+      disposition: context
+      target_question: Q16
+      notes: "Expressed via the +/-15m host clustering window and the +4h follow-on window; no exact threshold is directly queryable"
+    - element: UserContext
+      dimension: user_context
+      specific_values: "rationale only — service vs interactive user filtering"
+      disposition: context
+      target_question: Q12
+      notes: "User-vs-service distinction is the basis for the user baseline question and its non-deduplicable service-principal substitute pair (Q13/Q15)"
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "rationale only — tunable list of expected/benign clipboard accessors"
+      disposition: context
+      target_question: Q6
+      notes: "Parent legitimacy assessed in the process_chain and baseline_deviation questions rather than a hardcoded allowlist"
+  dedup_decisions:
+    - dropped: cue_process_tool.clustering
+      reason: "overlaps cue_host_context.clustering (what else ran on the host around the alert, +/-15m) — host clustering kept"
+      kept: cue_host_context.clustering
+    - dropped: cue_process_tool.baseline
+      reason: "Image-scoped 90d host baseline; baseline_deviation (REFLECTED, filter-correct on the Get-Clipboard pattern) is more specific and the rule has no Image field for Image-scoped aggregation"
+      kept: cue_process_tool.baseline_deviation
+    - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable"
+      kept: both emitted (Q12, Q13)
+    - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable"
+      kept: both emitted (Q14, Q15)
+  skipped_templates:
+    - template: universal.endpoint_protection_health
+      reason: "RECOMMENDED-only generic host-tamper sweep; powershell.powershell_security_bypass (Q11) already surfaces prior AV/EDR and PowerShell-control tamper activity on the host in the -1h window, so the generic sweep adds no coverage for this execution/collection rule"
+    - template: data_staging_exfil.archive_destination
+      reason: "must_include archive-tool template (rar/7z/rclone output destination); Get-Clipboard reads clipboard text to the pipeline and produces no archive file. Staging is covered by Q10 (data_scope, adapted to file writes of the captured text) and onward movement by Q9 (follow_on); a dedicated archive-destination question has no archive to track"
+    - template: data_staging_exfil.encryption_password
+      reason: "must_include archive-encryption template (-p/-hp/--passphrase flags); these flags belong to rar/7z/gpg and cannot apply to the Get-Clipboard cmdlet, which has no archive or password option"
+  hint_dispositions: []
+  # All three brief.hints[] were acted on (declines-only list is therefore empty):
+  #  1. "powershell.encoded_command_decode replaces obfuscation.encoded_payload_decode"
+  #     — acted on: encoded_command_decode is Q4; obfuscation.encoded_payload_decode not emitted.
+  #  2. "CommandLine-only detection — no Image field; use CommandLine pattern matching for scoping"
+  #     — acted on: baseline_deviation (Q7) and scope (Q17) embed CommandLine|contains: Get-Clipboard;
+  #       user_actor baseline (Q12), baseline_svc (Q13) and clustering_svc (Q15) rewritten from
+  #       Image|endswith|expand: '%Image%' to CommandLine|contains: Get-Clipboard.
+  #  3. "logsource 'process_access' (recommended by T1115) is not covered — author a custom question"
+  #     — acted on: Q8 (attack:T1115.process_access) authored with category: process_access.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - powershell
+    - data_staging_exfil
+    - cue_process_tool
+    - cue_user_actor
+    - cue_host_context
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 17
+      attack: 1
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 2
+      context: 14
+    logsource_diversity:
+      process_creation: 14
+      powershell: 1
+      process_access: 1
+      file_event: 1
+      sigma_alert: 1

@@ -1,0 +1,610 @@
+name: HackTool - Windows Credential Editor (WCE) Execution
+id: b837ad8d-8ee1-43c7-a8b3-2e720b06d82c
+description: |
+  Detects execution of Windows Credential Editor (WCE), a post-exploitation
+  credential-extraction tool that reads NT/LM hashes, plaintext passwords, and
+  Kerberos tickets from LSASS memory and can inject hashes or tickets into a
+  logon session for Pass-the-Hash / Pass-the-Ticket reuse. The rule fires when
+  EITHER a process image ends in WCE.exe or WCE64.exe OR a process matches one of
+  the known WCE import-hash (IMPHASH) values, so a renamed binary still trips the
+  hash branch. Legitimate occurrences are limited to sanctioned penetration tests
+  or red-team exercises; outside of those, WCE on an endpoint points to hands-on
+  credential theft, and the investigation should confirm which credential store
+  was reached, which accounts are exposed, and whether stolen credentials were
+  already reused for lateral movement.
+type: detection
+detection_id: 7aa7009a-28b9-4344-8c1f-159489a390df
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: '2026-06-05'
+questions:
+- source: template:universal.verify_trigger_match
+  question: Did this process fire on the WCE image name (WCE.exe / WCE64.exe) or on a known WCE import-hash, and does the event match either branch?
+  context: The rule fires when EITHER the image name ends in WCE.exe / WCE64.exe OR the process matches one of the known WCE IMPHASH values. Note which branch fired before going further. A hash match on a binary whose name is NOT WCE.exe means the operator renamed the tool to evade name-based detection, which raises the priority; a name-only match with a non-matching hash may indicate a different binary reusing the name. Confirm the Image and Hashes fields against the alert before investing further.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - Hashes
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run a credential-dumping tool?
+  context: WCE has no legitimate administrative purpose outside a sanctioned security assessment. If the host is a server or workstation with no assessment scheduled and the user is not a member of an authorized red team, the execution is very likely malicious. Knowing the user role and host function is often the fastest path to disposition.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:hacking_tool.authorized_engagement
+  question: Is this WCE execution part of an authorized penetration test or red team engagement?
+  context: Credential-dumping tools like WCE are used in authorized security assessments. Before investing investigation time, check whether a pentest or red-team exercise is currently active on this host or network segment. An authorized engagement with matching tool usage and timing resolves the alert without further analysis; absence of any sanctioned engagement makes the execution a live credential-theft event.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:hacking_tool.tool_capability_used
+  question: Which WCE capability was invoked — hash listing, hash injection, Kerberos ticket dump, or cleartext password recovery?
+  context: WCE is multi-purpose and the command-line flag reveals which capability ran and therefore the scope of compromise. The "-l"/"-lv" flags list logon-session hashes, "-s" injects a hash into a session for Pass-the-Hash, "-k"/"-K" dump and reuse Kerberos tickets for Pass-the-Ticket, and "-w" recovers cleartext passwords from LSASS (largely broken on modern Windows with WDigest disabled). Hash injection or ticket reuse implies the operator is already moving toward authentication as another identity.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:hacking_tool.tool_specific_artifacts
+  question: Did the WCE process write any output or dump files to disk on this host?
+  context: WCE often writes session listings, dumped hashes, or recovered tickets to files. Hunting file-creation events from the WCE process confirms execution and reveals the scope of what was extracted even if the process has already exited. Output files in user temp directories or the working directory are common; their presence and content indicate which credentials were captured.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in the hour before the alert?
+  context: WCE binary names and hashes are heavily AV-signatured, so an operator running it on an endpoint with active protection usually disables or excludes AV/EDR first. This query surfaces direct attempts to stop AV/EDR services, add broad exclusions, clear logs, or patch AMSI/ETW. Zero rows is a useful "protection looks healthy" signal; populated rows shift the disposition toward operator preparation, so review the parent process and signer of the writer.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+- source: template:credential_access.credential_target_identification
+  question: What credential store did WCE reach — LSASS-resident hashes, cleartext passwords, or Kerberos tickets?
+  context: WCE reads credentials directly from LSASS memory. The capability invoked determines which secrets were exposed — NT/LM hashes (usable for Pass-the-Hash), cleartext passwords recovered via WDigest decryption (mostly ineffective on Windows 8.1+ with WDigest disabled and Credential Guard), or Kerberos tickets (usable for Pass-the-Ticket). Identifying the specific store determines which accounts may be compromised and what remediation is required.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: attack:T1003.001.access_verification
+  question: Did a process open a full-access handle to lsass.exe on this host around the time of the alert, and was it WCE or an allowlisted security tool?
+  context: WCE extracts credentials by opening LSASS process memory, typically with full access (mask 0x1F0FFF) for read/write. Cross-referencing process-access events that target lsass.exe confirms the memory-scraping step and shows whether the source process was WCE, a renamed copy, or a legitimately allowlisted AV/EDR agent. A full-access open of LSASS from a non-trusted source process corroborates active credential theft; allowlist known security tooling before escalating.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_access
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetImage|endswith: '\lsass.exe'
+      condition: selection
+    fields:
+      - SourceImage
+      - GrantedAccess
+      - User
+- source: attack:T1003.001.tuning_parameter
+  question: Were credential dump files written to common staging paths on this host shortly after the alert?
+  context: After scraping LSASS, dump output is frequently written to staging directories such as %TEMP%, C:\Windows\Temp, or C:\Users\Public before exfiltration. Surfacing file-creation events under those paths in the minutes after the alert helps locate the captured credential material and confirm scraping intent. The presence of a dump file under a temp or public path, especially one written by the alerting process, indicates the extracted secrets reached disk.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains:
+          - '\Temp\'
+          - '\Windows\Temp\'
+          - '\Users\Public\'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - User
+- source: template:credential_access.credential_exposure_assessment
+  question: Which accounts may be compromised, and do any have elevated privileges?
+  context: The severity of this credential theft depends on which logon sessions were resident in LSASS when WCE ran. Any account that had logged on to this host — including cached domain admin, service, or helpdesk sessions — may now have its hash, ticket, or password in operator hands. Domain admin or krbtgt exposure requires incident escalation; cross-reference the sessions present on the host with directory group memberships.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:credential_access.post_access_lateral_movement
+  question: Were any new logon sessions or remote connections initiated after this event?
+  context: Credential theft with WCE is typically followed by Pass-the-Hash or Pass-the-Ticket reuse against other systems. Detecting new logon events or outbound remote connections shortly after the dump indicates the stolen credentials are already being exercised. Look specifically for RDP, SMB, WinRM, or remote service creation alerts on this host in the hours after the alert.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - rule.name
+      - rule.uuid
+      - event.severity_label
+- source: template:cue_process_tool.process_chain
+  question: What process spawned WCE, and is that parent chain expected?
+  context: The parent process reveals how WCE was launched. A parent such as explorer.exe or a remote-access shell suggests an interactive operator, while cmd.exe or powershell.exe under an unusual ancestor, or a service / scheduled-task parent, suggests scripted deployment or a foothold. Walk up the tree to see what spawned the parent and what else that parent launched.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: Credential dumping rarely occurs in isolation. Examining process activity in the minutes surrounding the alert reveals the immediate context — reconnaissance, privilege escalation, or staging that preceded the dump, and tool execution that followed it. Aggregating by Image and ParentImage collapses repetitive agent telemetry into single rows while novel parent-child pairs stand out at low counts.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run WCE or other credential-dumping tools?
+  context: Compare this user's current action against their historical behavior. A user who has never run WCE is far more suspicious than one whose role (and prior activity) includes sanctioned security testing. Zero or very low historical counts indicate first-time execution; combine with knowledge of the user's role.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent+binary combination historically routine on this host or across the environment, or is the parent unusual for this binary?
+  context: When the alert fires under a service principal (SYSTEM, LOCAL SERVICE, NETWORK SERVICE, or a computer account), user identity does not attribute the behavior. The meaningful pivot is the launch mechanism — which parent spawned this binary and whether that pair is historically common. A new or rare parent for WCE on this host or env-wide is the deviation worth chasing; a pair that already accounts for many prior events is automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints. If the same user triggered similar activity on other hosts, the scope of compromise may be larger than this single dump. This asks what the user did right now across the network, distinct from their long-term baseline.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent+binary combination fire on other hosts in the same window, indicating a coordinated rollout rather than isolated activity?
+  context: Under a service principal, asking what else the user did across the network returns agent-telemetry noise because every host runs SYSTEM-owned agents constantly. The meaningful question is whether the same launch mechanism — parent process plus spawned binary — fired on other hosts in the alert window. Multiple hosts in the same window points to scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired the WCE pattern, what parents and users drove that activity, and does the current alert fit?
+  context: Even a tool with no legitimate use can have a prior firing history on a host that runs sanctioned assessments. The query mirrors the rule's selection structure scoped to this host, so the resulting parent/user distribution reflects how the rule's specific firing pattern has run here before. A new parent process, an unexpected user account, or an unusual launch shape is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+        Image|endswith:
+        - \WCE.exe
+        - \WCE64.exe
+      selection_hash:
+        Hashes|contains:
+        - IMPHASH=136F0A8572C058A96436C82E541E4C41
+        - IMPHASH=589657C64DDE88533186C39F82FA1F50
+        - IMPHASH=6BFE09EFCB4FFDE061EBDBAFC4DB84CF
+        - IMPHASH=7D490037BF450877E6D0287BDCFF8D2E
+        - IMPHASH=8AB93B061287C79F3088C5BC7E7D97ED
+        - IMPHASH=A53A02B997935FD8EEDCB5F7ABAB9B9F
+        - IMPHASH=BA434A7A729EEC20E136CA4C32D6C740
+        - IMPHASH=BD1D1547DA13C0FCB6C15E86217D5EB8
+        - IMPHASH=E96A73C7BF33A464C510EDE582318BF2
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (1 of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1003.001
+      name: LSASS Memory
+      role: primary
+    - id: T1003
+      name: OS Credential Dumping
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: lsass_access
+      description: "A non-privileged or abnormal process opens a full-access handle (0x1F0FFF) to lsass.exe"
+      mapped_to: Q8
+      source: attack:T1003.001.access_verification
+    - stage: 2
+      label: memory_scrape_and_dump
+      description: "The process scrapes LSASS-resident credentials and writes dump/output to disk"
+      mapped_to: Q9
+      source: attack:T1003.001.tuning_parameter
+    - stage: 3
+      label: credential_store_targeted
+      description: "Which credential store (hashes, cleartext, Kerberos tickets) was reached"
+      mapped_to: Q7
+      source: template:credential_access.credential_target_identification
+    - stage: 4
+      label: stolen_credential_reuse
+      description: "Stolen credentials reused for lateral movement / new logon sessions"
+      mapped_to: Q11
+      source: template:credential_access.post_access_lateral_movement
+  dimension_coverage:
+    - dimension: access_verification
+      technique: T1003.001
+      covered_by: Q8
+      source: attack:T1003.001.access_verification
+      coverage_type: direct
+    - dimension: command_analysis
+      technique: T1003.001
+      covered_by: Q4
+      source: template:hacking_tool.tool_capability_used
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1003.001
+      covered_by: Q12
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1003.001
+      covered_by: Q13
+      source: template:cue_host_context.clustering
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1003.001
+      covered_by: Q9
+      source: attack:T1003.001.tuning_parameter
+      coverage_type: direct
+  mutable_dispositions:
+    - element: AccessMask
+      dimension: access_verification
+      specific_values: "0x1F0FFF"
+      disposition: context
+      target_question: Q8
+      notes: "Full-access mask cited in context; process_access query surfaces GrantedAccess for the analyst to inspect rather than hardcoding a mask that varies by tool."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "~5 minutes between access and dump"
+      disposition: context
+      target_question: Q13
+      notes: "Threshold is not directly queryable; +/-15m clustering window covers the correlation interval."
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "rationale only (allowlist AV/EDR)"
+      disposition: context
+      target_question: Q12
+      notes: "Allowlisting rationale enriches process_chain and access_verification context."
+    - element: DumpFilePath
+      dimension: tuning_parameter
+      specific_values: "%TEMP%, C:\\Windows\\Temp, C:\\Users\\Public"
+      disposition: query_injection
+      target_question: Q9
+      notes: "Injected into file_event TargetFilename|contains selection."
+    - element: CommandLinePattern
+      dimension: command_analysis
+      specific_values: "rundll32, procdump, comsvcs.dll, Invoke-Mimikatz"
+      disposition: context
+      target_question: Q4
+      notes: "Generic dumping-syntax examples are not WCE's own CLI; the WCE-specific flags (-l/-s/-k/-w) drive Q4 instead. Listed as ambient context for the broader T1003.001 dumping family."
+    - element: AccessMask
+      dimension: access_verification
+      specific_values: "0x1F0FFF (T1003)"
+      disposition: context
+      target_question: Q8
+      notes: "Secondary-technique duplicate of the T1003.001 AccessMask element; covered by the same process_access question."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only (T1003)"
+      disposition: context
+      target_question: Q13
+      notes: "Secondary-technique duplicate; covered by host clustering window."
+    - element: ParentProcessFilter
+      dimension: parent_process_analysis
+      specific_values: "rationale only (T1003)"
+      disposition: context
+      target_question: Q12
+      notes: "Secondary-technique duplicate of allowlist rationale; covered by process_chain."
+  dedup_decisions:
+    - dropped: cue_user_actor.baseline + cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable; user-pivot (subject) and parent+binary substitute (mechanism) emitted as both Q14 and Q15"
+      kept: both
+    - dropped: cue_user_actor.clustering + cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable; user-pivot and parent+binary substitute emitted as both Q16 and Q17"
+      kept: both
+  skipped_templates:
+    - template: cue_process_tool.mechanism_decode
+      reason: "replaced_by: credential_access.credential_target_identification (Q7) — more specific for credential-access rule"
+    - template: cue_process_tool.scope
+      reason: "Fleet-pattern REFLECTED scope dropped for the 18-question cap; cross-host distribution of the WCE firing pattern is covered by the user_actor clustering_svc parent+binary pivot (Q17) and the host baseline_deviation (Q18) within the credential-access skeleton."
+    - template: cue_process_tool.baseline
+      reason: "Generic host baseline dropped for the 18-question cap; the host_pattern baseline_deviation (Q18) gives a filter-correct, rule-pattern-scoped historical view that subsumes the generic Image-only count."
+    - template: cue_process_tool.follow_on
+      reason: "Child-process follow-on dropped for the 18-question cap; WCE's post-execution impact is captured by post_access_lateral_movement (Q11, follow-on alert correlation) and the dump-file staging question (Q9)."
+    - template: cue_process_tool.baseline_deviation
+      reason: "kept as Q18 (REFLECTED host_pattern) — listed for completeness, not skipped"
+    - template: cue_host_context.precursor
+      reason: "Prior-alert precursor dropped for the 18-question cap; endpoint_protection_health (Q6) already surfaces the most decision-relevant precursor (tamper-before-credential-access) on this host, and post_access_lateral_movement (Q11) covers the follow-on alert timeline."
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "logsource 'registry_set' (recommended by techniques: T1003.001) is not covered — pull in cue_registry_key.* or author a custom question with category: registry_set"
+      disposition: declined
+      reason: >-
+        WCE extracts credentials from live LSASS memory and from Kerberos
+        ticket caches; it does not perform the SAM/SECURITY/SYSTEM hive
+        registry-export path (reg save) that the registry_set analytic targets.
+        The rule constrains the trigger to WCE image/IMPHASH, whose operational
+        flow (-l/-s/-k/-w) writes credential output to files, not registry.
+        access_verification (Q8, process_access on lsass.exe) and the dump-file
+        staging question (Q9, file_event) cover the WCE-specific evidence path;
+        no compensating attack:T1003.001.registry_set question authored.
+    - hint: "logsource 'security' (recommended by techniques: T1003.001) is not covered and no template family exists — author a custom question with category: security"
+      disposition: declined
+      reason: >-
+        The Security-channel analytic (EID 4663/4656/4673 SeDebugPrivilege /
+        handle requests on lsass.exe) restates the same LSASS-access step that
+        Q8 already captures via Sysmon process_access (EID 10). Q8's
+        SourceImage/GrantedAccess fields answer "who opened lsass.exe with what
+        rights" directly; adding a parallel security-channel question would
+        duplicate that coverage without new investigative angle. Security-event
+        auditing of LSASS handle access is also frequently not enabled, so the
+        process_access pivot is the more reliable source. No separate
+        category: security question authored.
+  contextual_sets:
+    included: []
+    excluded:
+      - id: lateral_movement
+        confidence: medium
+        reason: >-
+          WCE's hash/ticket injection enables lateral movement, but the
+          lateral-movement angle is already carried by credential-access
+          questions: post_access_lateral_movement (Q11, follow-on remote
+          logons) and cue_user_actor.clustering (Q16, user activity across
+          hosts). Adding the lateral_movement technique set would duplicate
+          these without surfacing a new dimension for a rule whose trigger is
+          purely WCE execution, not remote-access tooling.
+  technique_sets_applied:
+    - universal
+    - credential_access
+    - hacking_tool
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 16
+      attack: 2
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 2
+      context: 14
+    logsource_diversity:
+      process_creation: 14
+      file_event: 2
+      process_access: 1
+      sigma_alert: 1

@@ -1,0 +1,609 @@
+name: Schedule Task Creation From Env Variable Or Potentially Suspicious Path Via Schtasks.EXE
+id: 941e968d-83ad-4095-b975-68f5e73b2c55
+description: |
+  Detects schtasks.exe registering a scheduled task whose command or arguments reference a user-writable
+  or environment-variable path (Perflogs, Windows\Temp, AppData\Local, AppData\Roaming, Public, All Users,
+  Default, %AppData%, %Public%). The rule fires when EITHER a direct /create invocation references one of
+  those folders, OR the Task Scheduler service (svchost.exe -k netsvcs -p -s Schedule) is the parent and a
+  task referencing one of those folders is created. Legitimate installers and updaters do stage tasks in
+  these locations, so several vendor-specific installer patterns are filtered out. Malware commonly persists
+  by pointing a recurring task at a dropped payload in AppData/Temp/Public, frequently via a rundll32 loader.
+  Determine which branch fired, decode the task's name, command, and schedule, and confirm whether the task
+  is an approved deployment or an unrecognized persistence mechanism.
+type: detection
+detection_id: 81325ce1-be01-4250-944f-b4789644556f
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: '2026-06-05'
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does this schtasks.exe command line match what this rule detects — a task creation referencing
+    a user-writable or environment-variable path?
+  context: Confirm the alert is a true positive before investing time. The rule fires on EITHER of two branches,
+    so note which one matched. Branch one is a direct ' /create ' whose command line contains one of Perflogs,
+    Users\All Users\, Users\Default\, Users\Public, Windows\Temp, AppData\Local\, AppData\Roaming\, %AppData%,
+    or %Public%. Branch two is a task created under the Task Scheduler service parent (svchost.exe -k netsvcs
+    -p -s Schedule) whose command line references Perflogs, Windows\Temp, Users\Public, or %Public%. The
+    branch that fired tells you whether to focus on the creating process and its parent, or on the path the
+    task points at. Vendor installer patterns (TeamViewer, Avira, K-Lite) are filtered out by the rule.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentCommandLine
+      - Image
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to create scheduled tasks pointing at user-writable folders?
+  context: Legitimate administrative activity and software installers do create scheduled tasks, sometimes in
+    AppData or Temp. Knowing whether this user role and host function normally register persistence this way
+    is often the fastest path to distinguishing a routine install from an unauthorized foothold. A general
+    workstation user manually running schtasks /create against a payload in AppData is atypical.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:parent_child.parent_process_legitimacy
+  question: What process created this scheduled task, and what started that parent?
+  context: The creating process and its origin distinguish a legitimate install chain from an attacker-driven
+    one. If the parent is svchost.exe -k netsvcs -p -s Schedule, the rule's second branch fired and a task is
+    being registered through the scheduler service itself. If the parent is an installer, explorer.exe, or an
+    interactive shell, trace the grandparent — a task creation descended from an Office application, a script
+    host (wscript, cscript, mshta), or a freshly dropped binary points to malicious persistence rather than
+    routine setup.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- source: template:parent_child.sibling_processes
+  question: What other child processes did the same parent spawn?
+  context: If a suspicious parent created this task, it likely spawned other processes in the same burst — a
+    dropper that wrote the payload, a download cradle that fetched it, or reconnaissance tools. Multiple
+    children from the same parent instance around the creation time strongly suggests orchestrated activity
+    rather than a one-off administrative action.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:scheduled_task.task_configuration
+  question: What scheduled task was created — identify the task name (/TN), the command it runs (/TR), and its
+    schedule (/SC)?
+  context: The schtasks command line carries the full persistence configuration. Read the /TN value (a task
+    name masquerading as a vendor updater, sync, or Windows component is a common disguise), the /TR value
+    (the program or script the task launches — note whether it is a rundll32 loader pointing at a DLL, a
+    direct EXE, or a script in AppData/Temp/Public), and the /SC value (ONLOGON and short MINUTE intervals
+    indicate aggressive re-execution). A /RU SYSTEM or highly randomized task name elevates concern. This
+    re-displays the triggering event so you can decode the exact arguments.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:obfuscation.encoded_payload_decode
+  question: Is the task's command line or its payload encoded or obfuscated, and what does it decode to?
+  context: The path referenced by the task often points at a payload that is itself encoded or staged. Decode
+    any base64, hex, environment-variable substitution, or character-concatenation in the /TR target and in
+    the schtasks arguments. A high-entropy or heavily encoded command line embedded in the task hides the real
+    operation — a download cradle, an in-memory loader, or a rundll32 export call against a dropped DLL.
+    Reconstruct the readable command and identify what the task actually executes; iterate decoding for
+    multi-layer encoding.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:scheduled_task.task_trigger_and_timing
+  question: When is the task scheduled to run, and has it already executed?
+  context: The trigger schedule determines when the persistence activates and whether the payload has already
+    run. ONLOGON tasks fire on the next logon; short MINUTE intervals re-execute repeatedly and may have run
+    many times since creation. Scheduled tasks execute as children of the Task Scheduler service (svchost.exe
+    -k netsvcs -p -s Schedule), so processes spawned by that service after the creation time reveal whether
+    the task's payload has launched. Correlating the creation time with the first execution establishes the
+    activation window.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith: '\svchost.exe'
+        ParentCommandLine|contains: 'Schedule'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:scheduled_task.task_still_present
+  question: Is the scheduled task still registered on the system?
+  context: Persistence is only active if the task still exists. Some operators delete a task after it has run
+    to reduce forensic artifacts, while a legitimate updater leaves its task in place. Confirming the task is
+    still present (via schtasks /query /tn <taskname> /v or the Task Scheduler interface on the host)
+    determines whether the mechanism remains active and needs remediation. Use the task name decoded from the
+    creation command to query for it.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: attack:T1053.005.security_event
+  question: Does a task-registration security event on this host corroborate the creation, and what account
+    and task name does it record?
+  context: Process-creation telemetry shows the schtasks.exe invocation, but the authoritative record of a task
+    being registered is the host's scheduled-task audit event, which logs the task name and the account that
+    registered it independently of how the task was created (command line, API, or scheduler service). Matching
+    the registration event to the alerting process confirms the task took effect, and the recorded account
+    shows whether registration ran under the expected user or under SYSTEM. If task-registration auditing is
+    not collected in this environment, treat the absence as a visibility gap rather than evidence the task
+    failed.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      category: security
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID:
+          - 4698
+          - 4702
+      condition: selection
+    fields:
+      - TaskName
+      - SubjectUserName
+- source: attack:T1053.005.registry_task_registration
+  question: Was a Task Scheduler registry key written for a task under a user-writable or env-variable path
+    around the creation time?
+  context: Registered tasks are persisted under the Task Scheduler tree in the registry (the Tasks and TaskCache
+    subkeys), so a task registration produces registry-set activity in addition to the schtasks process event.
+    Watching for writes under those keys catches tasks registered through paths that bypass a visible schtasks
+    command line and confirms the on-disk persistence the alert implies. Pair the registry write timing with
+    the process creation to bound when the task became active.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      category: registry_set
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|contains: '\Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\'
+      condition: selection
+    fields:
+      - TargetObject
+      - Image
+      - Details
+- source: template:cue_user_actor.baseline
+  question: Does this user normally create scheduled tasks or run schtasks.exe?
+  context: Compare this account's current action against its historical behavior. A user who has never created
+    a scheduled task is more suspicious than an administrator or service account that does so routinely. User
+    role and typical toolset should align — task creation from a standard end-user account warrants closer
+    review than the same action from a deployment service account.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent+schtasks.exe combination historically routine on this host or across the environment,
+    or is the parent unusual for task creation?
+  context: When the alert fires under a service principal (SYSTEM, LOCAL SERVICE, NETWORK SERVICE, or a computer
+    account), user identity does not attribute the behavior. The meaningful pivot is the launch mechanism —
+    which parent process spawned schtasks.exe, and whether that pairing is historically common. A new or rare
+    parent for schtasks.exe on this host (or environment-wide) is the deviation worth chasing; a pair that
+    already accounts for thousands of prior events is vendor or OS automation, such as the scheduler service
+    re-registering its own tasks.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the account's activity across all hosts in the alert window reveals whether the task creation
+    is isolated or part of broader hands-on activity — lateral movement, additional persistence, or staging on
+    other endpoints. The same account triggering similar actions on multiple hosts widens the apparent scope of
+    compromise.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent+schtasks.exe combination fire on other hosts in the same window — a coordinated
+    automation rollout, or activity isolated to this host?
+  context: Under a service principal, asking what else the user did across the network returns agent-telemetry
+    noise, since every host runs SYSTEM-owned processes constantly. The meaningful question is whether the same
+    launch mechanism — the parent process spawning schtasks.exe — fired on other hosts in the alert window.
+    Multiple hosts in the same window points to scheduled or pushed automation (a deployment tool or vendor
+    updater); a single host points to a host-local trigger that is more likely targeted.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:persistence_scope.process_based_persistence
+  question: Were other process-based persistence mechanisms installed on this host around the same time?
+  context: Operators rarely rely on a single foothold. Alongside a scheduled task they commonly stack backup
+    mechanisms using different tools — services (sc.exe), registry Run keys (reg.exe), BITS jobs (bitsadmin.exe),
+    WMI subscriptions (wmic.exe), or legacy at.exe jobs. Several persistence installations clustered in the same
+    timeframe indicate intentional stacking rather than an isolated administrative change.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine
+- source: template:lolbin.renamed_binary_check
+  question: Was schtasks.exe executed from its expected System32 path?
+  context: schtasks.exe run from a path outside System32 or SysWOW64 may have been copied or renamed to evade
+    path-based allowlists or detection. A schtasks.exe (or a binary with schtasks.exe as its OriginalFileName)
+    running from a user's temp or AppData directory is more suspicious than one in System32. Compare the Image
+    path against OriginalFileName to spot renaming.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- source: template:lolbin.historical_lolbin_baseline
+  question: How often has this host fired the rule's schtasks task-creation pattern over the past 90 days, and
+    what command-line shapes are typical?
+  context: A task-creation pattern with no prior history on a host is more suspicious than one seen regularly
+    under stable parents. This query mirrors the rule's own selection structure scoped to this host, so the
+    count reflects the rule's specific firing pattern — task creation referencing user-writable or env-variable
+    paths — rather than all schtasks.exe usage. The CommandLine projection lets you compare typical invocation
+    shapes against the alerting one; a single novel shape stands apart from a recurring installer signature.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_1_create:
+        Image|endswith: \schtasks.exe
+        CommandLine|contains|windash: ' /create '
+      selection_1_all_folders:
+        CommandLine|contains:
+        - :\Perflogs
+        - :\Users\All Users\
+        - :\Users\Default\
+        - :\Users\Public
+        - :\Windows\Temp
+        - \AppData\Local\
+        - \AppData\Roaming\
+        - '%AppData%'
+        - '%Public%'
+      selection_2_parent:
+        ParentCommandLine|endswith: \svchost.exe -k netsvcs -p -s Schedule
+      selection_2_some_folders:
+        CommandLine|contains:
+        - :\Perflogs
+        - :\Windows\Temp
+        - \Users\Public
+        - '%Public%'
+      filter_optional_other:
+      - ParentCommandLine|contains: unattended.ini
+      - CommandLine|contains: update_task.xml
+      filter_optional_team_viewer:
+        CommandLine|contains: /Create /TN TVInstallRestore /TR
+      filter_optional_avira_install:
+        CommandLine|contains|all:
+        - '/Create /Xml '
+        - \Temp\.CR.
+        - \Avira_Security_Installation.xml
+      filter_optional_avira_other:
+        CommandLine|contains|all:
+        - /Create /F /TN
+        - '/Xml '
+        - \Temp\
+        - Avira_
+        CommandLine|contains:
+        - .tmp\UpdateFallbackTask.xml
+        - .tmp\WatchdogServiceControlManagerTimeout.xml
+        - .tmp\SystrayAutostart.xml
+        - .tmp\MaintenanceTask.xml
+      filter_optional_klite_codec:
+        CommandLine|contains|all:
+        - \Temp\
+        - '/Create /TN "klcp_update" /XML '
+        - \klcp_update_task.xml
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (( all of selection_1_* or all of selection_2_* ) and not 1 of filter_optional_*) and _pb_scope
+    fields:
+    - CommandLine
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Persistence is usually a stage in a larger sequence, not the first move. Earlier detections on the
+    same host — initial execution, defense tampering, reconnaissance, or download activity — may reveal the
+    stages that preceded task creation and help reconstruct the timeline. A scheduled task created shortly
+    after a dropper or download alert is a stronger signal than one with no preceding activity.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1053.005
+      name: Scheduled Task
+      role: primary
+    - id: T1053
+      name: Scheduled Task/Job
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: task_creation
+      description: "Actor creates or modifies a scheduled task via schtasks.exe referencing a user-writable or env-variable path"
+      mapped_to: Q5
+      source: template:scheduled_task.task_configuration
+    - stage: 2
+      label: task_registration_record
+      description: "Task registration is recorded by the host's scheduled-task audit / registry persistence"
+      mapped_to: Q9
+      source: attack:T1053.005.security_event
+    - stage: 3
+      label: task_execution
+      description: "Scheduled task executes from svchost.exe -k netsvcs -s Schedule at its trigger time"
+      mapped_to: Q7
+      source: template:scheduled_task.task_trigger_and_timing
+  dimension_coverage:
+    - dimension: obfuscation_check
+      technique: T1053.005
+      covered_by: Q6
+      source: template:obfuscation.encoded_payload_decode
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1053.005
+      covered_by: Q7
+      source: template:scheduled_task.task_trigger_and_timing
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1053.005
+      covered_by: Q5
+      source: template:scheduled_task.task_configuration
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1053.005
+      covered_by: Q11
+      source: template:cue_user_actor.baseline
+      coverage_type: direct
+    - dimension: command_analysis
+      technique: T1053
+      covered_by: Q5
+      source: template:scheduled_task.task_configuration
+      coverage_type: direct
+    - dimension: execution_context
+      technique: T1053
+      covered_by: Q16
+      source: template:lolbin.renamed_binary_check
+      coverage_type: direct
+  mutable_dispositions:
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q7
+      notes: "Threshold rationale (group creation + execution in proximity) — folded into task_trigger_and_timing context; not a queryable value."
+    - element: UserContext
+      dimension: user_context
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q11
+      notes: "Non-standard / SYSTEM account scoping rationale — folded into user_actor baseline context and the service-principal substitute pair."
+    - element: TaskNamePattern
+      dimension: tuning_parameter
+      specific_values: "rationale only (/TN obfuscated/random names)"
+      disposition: context
+      target_question: Q5
+      notes: "Task-name masquerade rationale incorporated into task_configuration context (/TN reading guidance); no fixed values to inject."
+    - element: CommandLineEntropyThreshold
+      dimension: obfuscation_check
+      specific_values: "rationale only (entropy threshold)"
+      disposition: context
+      target_question: Q6
+      notes: "Entropy/encoding rationale drives encoded_payload_decode context; threshold is not a directly queryable literal."
+    - element: TaskAuthor
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q9
+      notes: "Registering account surfaced by the security task-registration event (SubjectUserName field)."
+    - element: CommandLineRegex
+      dimension: command_analysis
+      specific_values: "rationale only (suspicious binaries/scripts tied to task)"
+      disposition: context
+      target_question: Q5
+      notes: "Suspicious /TR binary/script analysis folded into task_configuration; no fixed regex literal to inject."
+    - element: ExecutionWindow
+      dimension: tuning_parameter
+      specific_values: "rationale only (lookback to correlate execution after registration)"
+      disposition: context
+      target_question: Q7
+      notes: "Lookback rationale realized as the +4h range on task_trigger_and_timing."
+  dedup_decisions:
+    - dropped: cue_process_tool.process_chain
+      reason: "parent_process is primary cue and parent_child technique set is active — parent_child.parent_process_legitimacy subsumes it (hint acted-on)."
+      kept: parent_child.parent_process_legitimacy
+    - dropped: cue_parent_process.mechanism_decode
+      reason: "parent_child.parent_process_legitimacy (technique set) is more specific for the parent-origin pivot."
+      kept: parent_child.parent_process_legitimacy
+    - dropped: cue_parent_process.follow_on
+      reason: "parent_child.sibling_processes covers same-parent children with ParentProcessGuid precision."
+      kept: parent_child.sibling_processes
+    - dropped: cue_parent_process.clustering
+      reason: "parent_child.sibling_processes plus cue_host_context surrounding activity cover same-parent and same-host context."
+      kept: parent_child.sibling_processes
+    - dropped: cue_parent_process.baseline
+      reason: "cue_user_actor.baseline_svc (parent+binary historical pivot) covers parent-child routineness without a second 90d aggregate."
+      kept: cue_user_actor.baseline_svc
+    - dropped: cue_parent_process.scope
+      reason: "cue_user_actor.clustering_svc (same parent+binary across hosts in window) covers cross-host spread of this launch mechanism."
+      kept: cue_user_actor.clustering_svc
+    - dropped: cue_process_tool.baseline
+      reason: "host-level schtasks history covered by lolbin.historical_lolbin_baseline (rule-pattern-scoped, more specific)."
+      kept: lolbin.historical_lolbin_baseline
+    - dropped: cue_user_actor pair non-dedup
+      reason: "user_actor pair — non-deduplicable: baseline + baseline_svc and clustering + clustering_svc emitted as separate questions per AGENTS.md."
+      kept: cue_user_actor.baseline / baseline_svc / clustering / clustering_svc
+  skipped_templates:
+    - template: cue_process_tool.mechanism_decode
+      reason: "replaced_by: scheduled_task.task_configuration"
+    - template: universal.endpoint_protection_health
+      reason: "Persistence-creation rule, not an execution/credential-access rule; cue_host_context.precursor already surfaces prior tamper/recon alerts on the host, and no disposition turns on whether AV was weakened first. Dropped per template's own RECOMMENDED guidance."
+  reflection_overrides: []
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - scheduled_task
+    - organizational_context
+    - obfuscation
+    - persistence_scope
+    - parent_child
+    - lolbin
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 16
+      attack: 2
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 15
+    logsource_diversity:
+      process_creation: 15
+      security: 1
+      registry_set: 1
+      sigma_alert: 1

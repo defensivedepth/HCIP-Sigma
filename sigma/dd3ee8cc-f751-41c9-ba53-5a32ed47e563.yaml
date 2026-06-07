@@ -1,0 +1,634 @@
+name: Registry Modification of MS-settings Protocol Handler
+id: 03c422f6-b1ff-43cf-834a-f94c9ef2f1cb
+description: |
+  Detects reg.exe or PowerShell writing to the 'ms-settings' protocol handler command key
+  (Software\Classes\ms-settings\shell\open\command). The rule fires when the command line targets
+  that key AND the writer is EITHER reg.exe with an 'add' operation OR powershell.exe/pwsh.exe using
+  New-ItemProperty/Set-ItemProperty (including the 'ni'/'sp' aliases). Auto-elevated binaries such as
+  fodhelper.exe and computerdefaults.exe read this key and execute its default value at high integrity,
+  so writing it stages a UAC bypass that runs an attacker-chosen command without a consent prompt; the
+  same key can also serve as a file-association persistence handler. Investigation should confirm what
+  command was written into the key, what spawned the writer, and what executed at elevated integrity
+  immediately afterward.
+type: detection
+detection_id: dd3ee8cc-f751-41c9-ba53-5a32ed47e563
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-06
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does this event write the ms-settings handler key via either reg.exe add or a PowerShell ItemProperty cmdlet?
+  context: >-
+    Confirm the alert is a true positive before investing time. The rule fires when the command line targets
+    Software\Classes\ms-settings\shell\open\command AND the writer is either reg.exe performing an 'add', or
+    powershell.exe/pwsh.exe using New-ItemProperty, Set-ItemProperty, or their 'ni'/'sp' aliases. Note which
+    branch fired (reg.exe vs PowerShell) and read the exact command line and value being written, since the
+    writer determines where the decoded payload and value name will appear downstream.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to modify protocol-handler registry keys under HKCU Classes?
+  context: >-
+    Legitimate administrative activity can trigger this detection, but direct writes to the ms-settings handler
+    command key are rarely part of normal user or host behavior. Knowing whether this account and endpoint
+    normally perform registry configuration of this kind is often the fastest way to separate a true positive
+    from routine operations.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:registry.registry_key_context
+  question: What exact registry value was written to the ms-settings handler key, and what command does it set to run?
+  context: >-
+    The data written into Software\Classes\ms-settings\shell\open\command is what an auto-elevated binary will
+    execute. The (default) value holds the command to run; a DelegateExecute value set to empty is the trick that
+    forces the shell to use the command key. Pull the structured registry fields linked to this process to read
+    the actual key path and value data rather than parsing them by hand from the command line.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+- source: template:powershell.encoded_command_decode
+  question: If the writer was PowerShell, was the command encoded or obfuscated, and what does it decode to?
+  context: >-
+    PowerShell writes to this key may hide the value being set behind -EncodedCommand (-enc), string concatenation,
+    backtick escaping, or variable substitution. Decoding reveals the actual command staged into the handler key
+    and any surrounding actions (setting DelegateExecute to empty, pointing (default) at a payload in a user-writable
+    path). If the writer was reg.exe, the command is already plain text and this step is a quick read of the value data.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:parent_child.parent_process_legitimacy
+  question: What process spawned this reg.exe or PowerShell writer, and what started that parent?
+  context: >-
+    The launch chain reveals how the registry write was initiated. A user double-clicking a shortcut or an admin
+    script produces a predictable parent; a parent such as a script host, Office application, or a binary running
+    from a user-writable directory points to exploitation or a malicious dropper. Trace the parent's own origin to
+    see whether the chain is legitimate.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- source: template:uac_bypass.bypass_technique_registry_artifacts
+  question: Were related UAC-bypass registry writes (DelegateExecute, other handler keys) made on this host?
+  context: >-
+    The ms-settings handler write is one of a family of registry-based UAC bypasses. The DelegateExecute value
+    set to empty is the companion write that completes the fodhelper/computerdefaults technique, and related keys
+    such as mscfile and Classes\Folder shell\open\command serve other auto-elevated binaries. Finding these
+    companion writes confirms the bypass mechanism and reveals the exact payload staged for elevation.
+  range: -15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - '\reg.exe'
+          - '\powershell.exe'
+          - '\cmd.exe'
+        CommandLine|contains:
+          - 'ms-settings'
+          - 'mscfile'
+          - 'Classes\exefile'
+          - 'Classes\Folder'
+          - 'Environment'
+          - 'Shell\Open\command'
+          - 'DelegateExecute'
+      condition: selection
+    fields:
+      - CommandLine
+      - Image
+- source: template:uac_bypass.elevated_action_after_bypass
+  question: What ran at high or system integrity shortly after the handler key was written?
+  context: >-
+    Writing the ms-settings command key is a means to an end. Once an auto-elevated binary such as fodhelper.exe
+    or computerdefaults.exe is launched, the staged command runs at high integrity. Examining processes that
+    appear at High or System integrity on this host just after the write reveals the actual objective, such as
+    credential dumping, persistence installation, or security-tool tampering.
+  range: +30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        IntegrityLevel:
+          - 'High'
+          - 'System'
+          - 'S-1-16-16384'
+          - 'S-1-16-12288'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - IntegrityLevel
+- source: template:cue_user_actor.baseline
+  question: Does this user normally write protocol-handler or Classes registry keys with reg.exe or PowerShell?
+  context: >-
+    Compare this user's current action against their historical pattern. A user who has never driven this writer
+    binary is more suspicious than one who runs it regularly. User role and typical toolset should align with
+    registry configuration activity.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent and writer-binary combination historically routine on this host or environment, or is the parent unusual for it?
+  context: >-
+    When the alert fires under a service principal, user identity does not attribute behavior; the meaningful
+    pivot is which parent process spawned the writer binary and whether that pair is historically common. A new
+    or rare parent for this binary is the deviation worth chasing, while a pair that already accounts for many
+    prior events points to vendor or operating-system automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around the time of this write?
+  context: >-
+    Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple
+    endpoints. If the same user staged similar registry writes on more than one host, the scope of compromise
+    may be larger than the single alerting host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent and writer-binary combination fire on other hosts in the same window?
+  context: >-
+    Under a service principal, asking what the user did across the network returns agent-telemetry noise because
+    every host runs system-owned agents constantly. The meaningful question is whether the same launch mechanism,
+    the parent process plus the spawned writer binary, fired on other hosts in the alert window. Multiple hosts
+    in the same window point to scheduled or pushed automation, while a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired the rule's pattern, what parents and users drove it, and does this alert fit?
+  context: >-
+    Even common tools can be abused. This query mirrors the rule's selection structure scoped to this host, so the
+    resulting parent and user distribution reflects how the rule's specific firing pattern, not generic reg.exe or
+    PowerShell usage, has historically run here. A new parent process, an unexpected account, or an unusual
+    command-line shape is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_reg_img:
+      - Image|endswith: \reg.exe
+      - OriginalFileName: reg.exe
+      selection_pwsh_img:
+      - Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+      - OriginalFileName:
+        - powershell.exe
+        - pwsh.dll
+      selection_reg_cli:
+        CommandLine|contains: add
+      selection_pwsh_cli:
+        CommandLine|contains:
+        - New-ItemProperty
+        - Set-ItemProperty
+        - 'ni '
+        - 'sp '
+      selection_cli_key:
+        CommandLine|contains: \ms-settings\shell\open\command
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: ((all of selection_reg_* or all of selection_pwsh_*) and selection_cli_key) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: >-
+    Alerts rarely occur in isolation. Examining activity in the minutes around the write shows what led to it and
+    what followed, and whether it is part of a larger sequence. Correlating the registry write with nearby
+    reconnaissance, privilege escalation, or persistence activity establishes the time relationship between the
+    tampering and any elevated execution.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Earlier detections on the same host, such as defense tampering, reconnaissance, or credential access, may
+    reveal the attack stages that preceded the registry write and help reconstruct the timeline. Multiple
+    privilege-escalation or bypass detections in succession strengthen the case for deliberate activity.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired the rule's pattern in the past week, and does the distribution look like automation or one-off activity?
+  context: >-
+    This query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of
+    the rule's firing pattern rather than generic usage of reg.exe or PowerShell. Many hosts firing the same
+    pattern points to scripted deployment or vendor automation; one host or a small unrelated set points to manual
+    operator activity. Use the host distribution and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_reg_img:
+      - Image|endswith: \reg.exe
+      - OriginalFileName: reg.exe
+      selection_pwsh_img:
+      - Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+      - OriginalFileName:
+        - powershell.exe
+        - pwsh.dll
+      selection_reg_cli:
+        CommandLine|contains: add
+      selection_pwsh_cli:
+        CommandLine|contains:
+        - New-ItemProperty
+        - Set-ItemProperty
+        - 'ni '
+        - 'sp '
+      selection_cli_key:
+        CommandLine|contains: \ms-settings\shell\open\command
+      condition: (all of selection_reg_* or all of selection_pwsh_*) and selection_cli_key
+    fields:
+    - host.name
+- source: template:lolbin.renamed_binary_check
+  question: Was the writer binary executed from its expected system path?
+  context: >-
+    reg.exe and powershell.exe run from System32 or SysWOW64 under normal conditions. A copy of either running
+    from a user temp directory or another non-standard path may indicate the binary was relocated or renamed to
+    evade path-based allowlists, which raises the suspicion of the registry write.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- source: template:registry.registry_related_modifications
+  question: Were other registry modifications made on this host in the same session?
+  context: >-
+    An actor who writes one registry key often writes several, for example staging the ms-settings handler for
+    UAC bypass while also setting a Run key for persistence or disabling a security setting. Finding a cluster of
+    registry writes from the same host within a short window reveals the full scope of configuration changes and
+    establishes the time correlation between them.
+  range: +/-30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_reg:
+        Image|endswith:
+          - '\reg.exe'
+          - '\regedit.exe'
+        CommandLine|contains:
+          - ' add '
+          - ' delete '
+          - ' import '
+          - '/s '
+      condition: selection and selection_reg
+    fields:
+      - CommandLine
+- source: template:registry.registry_value_persistence_check
+  question: Does the staged command reference an executable or script that still exists on disk?
+  context: >-
+    The handler write is only effective if the command it stages points at a payload that exists. If the (default)
+    value references an executable in a user-writable path, checking whether that file is present and analyzing its
+    hash determines whether the bypass would actually run code and what that code is. Examine the registry value
+    data to identify the referenced path, then verify it on disk.
+  range: +15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - Hashes
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1548.002
+      name: Bypass User Account Control
+      role: primary
+    - id: T1546.001
+      name: Change Default File Association
+      role: secondary
+    - id: T1112
+      name: Modify Registry
+      role: secondary
+    - id: T1548
+      name: Abuse Elevation Control Mechanism
+      role: secondary
+    - id: T1546
+      name: Event Triggered Execution
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: registry_handler_write
+      description: "Writer (reg.exe add or PowerShell ItemProperty) modifies ms-settings\\shell\\open\\command key"
+      mapped_to: Q3
+      source: template:registry.registry_key_context
+    - stage: 2
+      label: bypass_setup_companion_writes
+      description: "DelegateExecute / companion handler-key writes that complete the auto-elevation trick"
+      mapped_to: Q6
+      source: template:uac_bypass.bypass_technique_registry_artifacts
+    - stage: 3
+      label: elevated_execution
+      description: "Auto-elevated binary reads the key and runs the staged command at high integrity"
+      mapped_to: Q7
+      source: template:uac_bypass.elevated_action_after_bypass
+  dimension_coverage:
+    - dimension: parent_process_analysis
+      technique: T1548.002
+      covered_by: Q5
+      source: template:parent_child.parent_process_legitimacy
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1548.002
+      covered_by: Q13
+      source: template:cue_host_context.clustering
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1548.002
+      covered_by: Q6
+      source: template:uac_bypass.bypass_technique_registry_artifacts
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1546.001
+      covered_by: Q8
+      source: template:cue_user_actor.baseline
+      coverage_type: direct
+  mutable_dispositions:
+    - element: RegistryKeyPathPatterns
+      dimension: tuning_parameter
+      specific_values: "ms-settings\\shell\\open\\command, DelegateExecute, mscfile, Classes\\Folder"
+      disposition: query_injection
+      target_question: Q6
+      notes: "Companion UAC-bypass handler key patterns injected into bypass_technique_registry_artifacts CommandLine|contains"
+    - element: ElevatedProcessNameList
+      dimension: tuning_parameter
+      specific_values: "fodhelper.exe, computerdefaults.exe (auto-elevated readers)"
+      disposition: context
+      target_question: Q7
+      notes: "Named in elevated_action_after_bypass context; query filters on IntegrityLevel High/System, not the binary list"
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "30s correlation between registry tamper and elevation (rationale)"
+      disposition: context
+      target_question: Q13
+      notes: "Time-correlation rationale; clustering window +/-15m surfaces nearby execution"
+    - element: ParentProcessAnomalyThreshold
+      dimension: parent_process_analysis
+      specific_values: "rationale only (non-elevated parent spawning auto-elevated child)"
+      disposition: context
+      target_question: Q5
+      notes: "Parent-child anomaly logic carried in parent_process_legitimacy context"
+    - element: UserContext
+      dimension: user_context
+      specific_values: "rationale only (ignore known admin/installer profiles)"
+      disposition: context
+      target_question: Q8
+      notes: "User baseline scoping carried in user_actor.baseline"
+    - element: SuspiciousHandlerPathRegex
+      dimension: tuning_parameter
+      specific_values: "powershell.exe, rundll32.exe handler paths (rationale)"
+      disposition: context
+      target_question: Q3
+      notes: "Handler-path intent carried in registry_key_context value-data reading"
+  dedup_decisions:
+    - dropped: cue_process_tool.process_chain
+      reason: "parent_child technique set active — parent_process_legitimacy subsumes the process_chain cue"
+      kept: parent_child.parent_process_legitimacy
+    - dropped: uac_bypass.other_escalation_attempts
+      reason: "queries sigma alerts on host (event.module: sigma) — duplicates cue_host_context.precursor's prior-alert sweep"
+      kept: cue_host_context.precursor
+    - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable; both emitted (Q8, Q9)"
+      kept: both
+    - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable; both emitted (Q10, Q11)"
+      kept: both
+  skipped_templates:
+    - template: cue_process_tool.mechanism_decode
+      reason: "replaced_by: registry.registry_key_context (Phase 2 mechanism decode for this registry rule)"
+    - template: cue_process_tool.baseline
+      reason: "generic Image|endswith 90d baseline superseded by reflected baseline_deviation (host pattern, -14d) and scope (fleet pattern)"
+    - template: cue_process_tool.follow_on
+      reason: "post-write child processes captured by elevated_action_after_bypass (+30m High/System) and host clustering"
+    - template: lolbin.historical_lolbin_baseline
+      reason: "rule-pattern host baseline already covered by reflected baseline_deviation; second 90d host-pattern reflection adds no distinct angle"
+    - template: lolbin.technique_class_lateral
+      reason: "objective is a registry write, not download/proxy-exec; other-tools-doing-registry-writes covered by registry_related_modifications"
+    - template: powershell.script_block_logging
+      reason: "writer commands are short single cmdlets (New/Set-ItemProperty); 4104 adds little over the plain command line decoded in encoded_command_decode"
+    - template: powershell.powershell_security_bypass
+      reason: "PowerShell security-bypass precursor sweep is tangential; the rule's pattern is a registry write, and prior tamper alerts are covered by cue_host_context.precursor"
+    - template: universal.endpoint_protection_health
+      reason: "generic host-tamper sweep; prior tamper-as-precursor already covered by cue_host_context.precursor and this rule is not itself execution/credential-centric"
+    - template: persistence_scope.process_based_persistence
+      reason: "other persistence-tool executions overlap registry_related_modifications and elevated_action_after_bypass; slot used for higher-value reflected baselines"
+    - template: persistence_scope.file_based_persistence
+      reason: "Startup/Run file drops are a distinct mechanism; registry_value_persistence_check already pivots to file_event for the staged payload path"
+    - template: organizational_context.change_ticket
+      reason: "kept question count at 18 with the user_actor pairs; change-approval covered by host_user_context legitimacy framing"
+    - template: organizational_context.human_recall
+      reason: "human-recall organizational filler; legitimacy covered by host_user_context"
+    - template: organizational_context.timing_alignment
+      reason: "timing-vs-work-hours organizational filler; not needed alongside host clustering and precursor timeline"
+    - template: organizational_context.procedural_consistency
+      reason: "procedural-norms organizational filler; legitimacy covered by host_user_context"
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "logsource 'image_load' (recommended by techniques: T1548.002) is not covered — pull in cue_image_load.* or author a custom question with category: image_load"
+      disposition: declined
+      reason: >-
+        Rule's detection logic is a process_creation registry write (reg.exe add / PowerShell ItemProperty
+        targeting ms-settings\shell\open\command). The investigation crosses into registry_set (Q3
+        registry_key_context) and file_event (Q18 registry_value_persistence_check) but not image_load —
+        no DLL-load or .NET-hosting step is part of the handler-write pattern. No compensating
+        attack:T1548.002.image_load question authored.
+    - hint: "logsource 'process_access' (recommended by techniques: T1548.002) is not covered and no template family exists — author a custom question with category: process_access"
+      disposition: declined
+      reason: >-
+        process_access (handle/memory access, Sysmon EID 10) describes the cross-process-injection variant of
+        UAC abuse, not the registry-handler-write variant this rule detects. The elevation outcome is covered
+        instead by Q7 (elevated_action_after_bypass) over process_creation at High/System integrity. No
+        process_access question authored.
+    - hint: "logsource 'security' (recommended by techniques: T1548.002,T1546.001) is not covered and no template family exists — author a custom question with category: security"
+      disposition: declined
+      reason: >-
+        The security-channel signal (EID 4672 special-privileges-assigned) is a token/integrity observation
+        already addressed at the process layer by Q7's IntegrityLevel High/System filter over process_creation,
+        which is the visibility this environment reliably has for sigma process alerts. No separate
+        category: security question authored.
+  contextual_sets:
+    included: []
+    excluded:
+      - id: ransomware_impact
+        confidence: low
+        reason: "ransomware appears only in a reference case study, not in the rule's detection logic; the rule fires on a UAC-bypass registry write, so impact-stage questions would be speculative"
+      - id: network_scope
+        confidence: low
+        reason: "keyword match on 'ransomware' in references is incidental; no network indicator in the detection, so network-scope questions do not fit a registry-write rule"
+  technique_sets_applied:
+    - universal
+    - powershell
+    - registry
+    - uac_bypass
+    - parent_child
+    - lolbin
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 18
+      attack: 0
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 2
+      context: 14
+    logsource_diversity:
+      process_creation: 15
+      registry_set: 1
+      sigma_alert: 1
+      file_event: 1

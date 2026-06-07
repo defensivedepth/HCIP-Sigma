@@ -1,0 +1,490 @@
+name: DllUnregisterServer Function Call Via Msiexec.EXE
+id: 23f0144a-f694-4a41-b114-442aa4c661ec
+description: |
+  Detects msiexec.exe invoked with the ` -z ` switch and a `.dll` argument, which calls the
+  target DLL's DllUnregisterServer export — a proxy-execution primitive that runs attacker code
+  through a Microsoft-signed binary, bypassing many path- and signature-based allowlists. The rule
+  fires only when all three conditions hold: the image is msiexec.exe (or a binary with that
+  OriginalFileName), the command line contains ` -z `, and the command line references a `.dll`.
+  Legitimately, msiexec installs and services .msi packages; the DllUnregisterServer switch is
+  rarely used by routine software management. Investigation should confirm the exact DLL path,
+  whether it lives in a user-writable location, what loaded the DLL, what process spawned msiexec,
+  and whether the activity is isolated or part of a wider sequence.
+type: detection
+detection_id: 84f52741-8834-4a8c-a413-2eb2269aa6c8
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line show msiexec.exe running with the ` -z ` switch against a .dll file?
+  context: Confirm the alert is a true positive before investing time. The rule fires only when all
+    three criteria hold together — the image is msiexec.exe (or a binary whose OriginalFileName is
+    msiexec.exe), the command line contains ` -z `, and the command line references a `.dll`. Verify
+    each of these is present in the triggering event and note the full DLL path the switch points at.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to unregister DLLs through msiexec.exe?
+  context: Legitimate software management uses msiexec to install and service .msi packages; calling
+    a DLL's DllUnregisterServer export through the ` -z ` switch is rare in routine administration.
+    Knowing whether the user role and host function involve installer maintenance or developer DLL
+    registration work is often the fastest way to separate a true positive from sanctioned activity.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What is the full DLL path passed to the ` -z ` switch, and where does that DLL live?
+  context: The full command line reveals the specific DLL whose DllUnregisterServer export was called.
+    Decode the path the ` -z ` switch points at — a DLL in System32 or a vendor install directory is
+    far less concerning than one in a user-writable location such as a temp, Downloads, AppData, or
+    Public directory, which is the staging pattern for proxy-executed payloads.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+        CommandLine|contains: '.dll'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: attack:T1218.007.module_load
+  question: Which DLL did msiexec.exe load on this host around the alert, and is it signed and in an expected location?
+  context: The DllUnregisterServer primitive only has effect once msiexec maps the target DLL into its
+    address space, so the module-load event names the actual code that ran. Compare the loaded DLL's
+    path and signature against the path passed on the command line. An unsigned module, or one loaded
+    from a user-writable directory, is the load-bearing artifact for this technique.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+- source: template:cue_process_tool.process_chain
+  question: What process spawned this msiexec.exe instance, and is that parent chain expected?
+  context: The parent process reveals how msiexec was invoked. Interactive installs are typically
+    launched from explorer.exe or a software-management agent. Parents such as mshta.exe, wscript.exe,
+    cscript.exe, powershell.exe, cmd.exe under a user-writable working directory, or an Office
+    application are unusual for a DllUnregisterServer call and point toward scripted or operator-driven
+    proxy execution.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.follow_on
+  question: What child processes did this msiexec.exe instance spawn afterward?
+  context: A DLL loaded through msiexec can spawn follow-on processes as part of its payload. Children
+    such as cmd.exe, powershell.exe, rundll32.exe, or wmic.exe spawned by msiexec are a common
+    post-execution pattern and reveal the actual impact of the loaded code.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: attack:T1218.007.network_retrieval
+  question: Did this msiexec.exe instance make outbound network connections to retrieve a payload?
+  context: msiexec natively supports HTTP/HTTPS and UNC paths and can fetch a remote MSI or DLL in a
+    single step. Outbound connections from msiexec to an external or previously unseen destination
+    around the alert suggest the loaded DLL or an associated package was staged remotely. Compare any
+    destination against known software-distribution and update endpoints.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationHostname
+      - DestinationPort
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation, and correlating the proxy-execution event in time with
+    surrounding activity surfaces what led to it and what followed. Look for reconnaissance, payload
+    staging, privilege escalation, or persistence in the same window — the time relationship between
+    msiexec and other tooling is what distinguishes a one-off install from a multi-stage operation.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host — defense tampering, reconnaissance, credential access,
+    or payload download — may reveal the stages that preceded this proxy-execution event and help
+    reconstruct the timeline that led to it.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run msiexec.exe?
+  context: Compare this user's current action against their historical behavior. A user who has never
+    driven msiexec — let alone a DllUnregisterServer call — is more notable than one who manages
+    installers routinely. The user's role and typical toolset should align with installer servicing.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent-plus-msiexec combination historically routine on this host or across the environment, or is the parent unusual for msiexec?
+  context: When the alert fires under a service principal, user identity does not attribute the
+    behavior; the meaningful pivot is the launch mechanism. Check whether the parent process that
+    spawned msiexec is a pair that already accounts for many prior events — a sign of vendor or OS
+    automation — or a new or rare parent for msiexec, which is the deviation worth chasing.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the environment around this time?
+  context: Tracking the user's activity across all hosts in the alert window reveals lateral movement
+    or coordinated action on multiple endpoints. If the same user drove similar activity elsewhere,
+    the scope of the investigation may be larger than this single host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent-plus-msiexec combination fire on other hosts in the same window?
+  context: Under a service principal, asking what else the user did across the network returns
+    agent-telemetry noise. The meaningful question is whether the same launch mechanism — the parent
+    process spawning msiexec — fired on other hosts in the alert window. Multiple hosts in the same
+    window points to scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:lolbin.renamed_binary_check
+  question: Was msiexec.exe executed from its expected System32 or SysWOW64 path?
+  context: msiexec.exe normally runs from C:\Windows\System32 or C:\Windows\SysWOW64. A copy executed
+    from a user-writable or non-standard path, or a renamed binary whose OriginalFileName is still
+    msiexec.exe, may indicate an attempt to evade path-based allowlists. Compare the Image path against
+    OriginalFileName to confirm the binary's true identity and location.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- source: template:lolbin.technique_class_lateral
+  question: Were any other proxy-execution LOLBins used on this host recently?
+  context: Operators who proxy code through one signed binary often reach for several. If msiexec was
+    used to load a DLL, check whether rundll32, regsvr32, mshta, installutil, cmstp, or similar
+    proxy-execution binaries also ran on this host. Finding multiple proxy-execution LOLBins performing
+    the same kind of action strengthens the case for hands-on activity rather than routine servicing.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_img:
+        Image|endswith:
+          - '\rundll32.exe'
+          - '\regsvr32.exe'
+          - '\mshta.exe'
+          - '\msbuild.exe'
+          - '\cmstp.exe'
+          - '\installutil.exe'
+          - '\forfiles.exe'
+          - '\pcalua.exe'
+          - '\presentationhost.exe'
+          - '\control.exe'
+          - '\infdefaultinstall.exe'
+          - '\msdt.exe'
+          - '\mavinject.exe'
+          - '\wmic.exe'
+          - '\xwizard.exe'
+          - '\ie4uinit.exe'
+      condition: selection and selection_img
+    fields:
+      - Image
+      - CommandLine
+- source: template:lolbin.historical_lolbin_baseline
+  question: How often has this host fired the rule's msiexec DllUnregisterServer pattern over the past 90 days, and what command-line shapes are typical?
+  context: A proxy-execution pattern with no prior history on a host is more notable than one used
+    regularly under stable parents. The query mirrors the rule's selection structure scoped to this
+    host, so the count reflects the rule's specific firing pattern — msiexec with ` -z ` and a `.dll`
+    — not generic msiexec usage. The command-line projection lets you compare typical invocation shapes
+    against the alerting one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_img:
+      - Image|endswith: \msiexec.exe
+      - OriginalFileName: \msiexec.exe
+      selection_flag:
+        CommandLine|contains|windash: ' -z '
+      selection_dll:
+        CommandLine|contains: .dll
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - CommandLine
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1218.007
+      name: Msiexec
+      role: primary
+    - id: T1218
+      name: System Binary Proxy Execution
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: msiexec_invocation_with_suspicious_params
+      description: "msiexec.exe is created with command-line arguments referencing a DLL and the DllUnregisterServer (-z) switch"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: payload_retrieval
+      description: "Network activity to retrieve a remote MSI/DLL payload, where the package is staged off-host"
+      mapped_to: Q7
+      source: attack:T1218.007.network_retrieval
+    - stage: 3
+      label: module_load
+      description: "msiexec loads the target DLL into its address space, executing the DllUnregisterServer export"
+      mapped_to: Q4
+      source: attack:T1218.007.module_load
+  dimension_coverage:
+    - dimension: time_correlation
+      technique: T1218.007
+      covered_by: Q8
+      source: template:cue_host_context.clustering
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1218.007
+      covered_by: Q1
+      source: template:universal.verify_trigger_match
+      coverage_type: direct
+    - dimension: command_analysis
+      technique: T1218
+      covered_by: Q3
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1218
+      covered_by: Q5
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+  mutable_dispositions:
+    - element: SuspiciousCommandlinePatterns
+      dimension: tuning_parameter
+      specific_values: "DLL execution flags (-z), .dll argument; UNC/HTTP(S) paths for remote install"
+      disposition: query_injection
+      target_question: Q3
+      notes: "mechanism_decode selection adds CommandLine|contains '.dll' to scope to DLL invocations; -z/.dll pattern is enforced verbatim in the reflected historical_lolbin_baseline (Q16) and verify_trigger_match (Q1) shows the alerting command"
+    - element: SuspiciousDestinationList
+      dimension: tuning_parameter
+      specific_values: "external domains / IP ranges for msiexec network retrieval"
+      disposition: new_question
+      target_question: Q7
+      notes: "msiexec network_connection question projects DestinationIp/Hostname/Port so the analyst can compare against known distribution endpoints; specific allowlist is environment-coupled, kept as context"
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q8
+      notes: "host clustering uses +/-15m and network_retrieval uses +/-15m to correlate process creation with module load / network activity"
+    - element: LegitimateMSIHashes
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q15
+      notes: "known-good MSI hash list is environment-specific tuning; expected-path / true-identity check (renamed_binary_check) is the queryable proxy"
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "rationale only (e.g., regsvr32 not launched by explorer.exe)"
+      disposition: new_question
+      target_question: Q5
+      notes: "process_chain surfaces the parent; baseline_svc (Q11) profiles whether the parent+msiexec pair is historically routine"
+    - element: SignedBinaryList
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q15
+      notes: "msiexec is the signed binary in scope; renamed_binary_check confirms true identity via OriginalFileName"
+    - element: CommandLineRegex
+      dimension: command_analysis
+      specific_values: "rationale only (URLs, script paths, DLL entrypoints)"
+      disposition: context
+      target_question: Q3
+      notes: "mechanism_decode asks the analyst to decode the DLL path and flags from the full command line"
+    - element: RemoteDomainAllowlist
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q7
+      notes: "enterprise-domain suppression is environment-coupled; network_retrieval question surfaces destinations for analyst comparison"
+  dedup_decisions:
+    - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable; user-pivot and parent+binary substitute degenerate under different conditions"
+      kept: both
+    - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable; user-pivot returns service-principal noise where parent+binary substitute stays precise"
+      kept: both
+  skipped_templates:
+    - template: universal.endpoint_protection_health
+      reason: "recommended (not must_include); no defense_tampering technique set is confirmed for this rule, and this is a proxy-execution/defense-evasion LOLBin rather than a payload-execution or credential-access rule whose disposition turns on prior tamper. cue_host_context.precursor (Q9) already surfaces prior tamper/recon alerts on the host. Dropped to stay within the 18-question cap."
+    - template: cue_process_tool.baseline
+      reason: "host-baseline of generic msiexec usage superseded by the reflected lolbin.historical_lolbin_baseline (Q16), which counts the rule's specific -z/.dll pattern on this host rather than all msiexec executions"
+    - template: cue_process_tool.baseline_deviation
+      reason: "reflected host-pattern parent/user distribution overlaps cue_user_actor.baseline_svc (Q11) and historical_lolbin_baseline (Q16); dropped to stay within cap"
+    - template: cue_process_tool.scope
+      reason: "reflected fleet-pattern cross-host count overlaps cue_user_actor.clustering_svc (Q13), which already answers whether the same parent+msiexec mechanism fired on other hosts; dropped to stay within cap"
+  reflection_overrides: []
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - lolbin
+  generation_stats:
+    total_questions: 16
+    source_counts:
+      template: 14
+      attack: 2
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 13
+    logsource_diversity:
+      process_creation: 13
+      image_load: 1
+      network_connection: 1
+      sigma_alert: 1

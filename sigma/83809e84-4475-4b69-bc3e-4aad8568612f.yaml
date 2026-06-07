@@ -1,0 +1,482 @@
+name: MSExchange Transport Agent Installation
+id: 6018ce4a-c1fc-4140-b286-ca0e536d5f88
+description: |
+  Detects command lines that install a Microsoft Exchange transport agent via the Install-TransportAgent cmdlet.
+  Transport agents are .NET assemblies registered into the Exchange transport pipeline; once installed they fire on
+  SMTP events and gain access to every message flowing through the server, which makes them a durable code-execution
+  and email-interception persistence mechanism that survives reboots and runs inside the Exchange transport service.
+  Legitimate use is limited to administrators deploying signed, vendor-supplied agents (anti-spam, journaling,
+  signature tools); the investigation should determine who ran the cmdlet, which assembly path it registered, whether
+  that assembly is signed and expected, and whether the install was approved.
+type: detection
+detection_id: 83809e84-4475-4b69-bc3e-4aad8568612f
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line contain Install-TransportAgent and match what this rule detects?
+  context: Before investing investigation time, confirm the alert is a true positive by reviewing the exact command line
+    and process details. The rule fires on any command line containing the Install-TransportAgent cmdlet; verify the
+    full invocation, including the agent name and the AssemblyPath argument that points at the DLL being registered.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to install Exchange transport agents?
+  context: Registering a transport agent is an Exchange administrative action that should only happen on Exchange
+    servers, performed by an Exchange administrator or an approved deployment account. A workstation, a non-Exchange
+    server, or a non-administrative user running this cmdlet is a strong deviation from the legitimate baseline.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What did the Install-TransportAgent invocation actually register? Decode the agent name and AssemblyPath.
+  context: The full command line reveals which assembly was registered and where it lives on disk. Decode the
+    -Name, -AssemblyPath, and -TransportAgentFactory arguments. AssemblyPath pointing at a vendor or Exchange
+    install directory with a signed DLL is routine; a path under a user profile, ProgramData, a temp directory, or
+    any world-writable location, or an unsigned/unknown assembly, indicates a malicious agent.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains: Install-TransportAgent
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:cue_process_tool.process_chain
+  question: What process spawned the cmdlet host that ran Install-TransportAgent, and is that parent chain expected?
+  context: The parent process reveals how the cmdlet was invoked. A legitimate install runs from the Exchange
+    Management Shell or a deployment tool with a predictable parent. An unusual parent such as a web server worker
+    process, an Office application, a script host, or a remote-management tool suggests the install followed
+    exploitation or hands-on-keyboard activity rather than planned administration.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously run Install-TransportAgent, what parents and users normally drive it, and
+    does the current alert fit that pattern?
+  context: Even on Exchange servers, transport agent installs are infrequent and tied to specific maintenance.
+    The query mirrors the rule's selection scoped to this host, so the resulting parent/user distribution reflects
+    how this exact install pattern has historically run here. A new parent process, an unexpected account, or an
+    unusual command-line shape is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection:
+        CommandLine|contains: Install-TransportAgent
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: attack:T1505.002.assembly_load
+  question: Did the Exchange transport service load an unusual or unsigned .NET assembly, or log transport-agent errors,
+    around the time of this install?
+  context: A registered transport agent only takes effect when the Exchange transport service loads its assembly; a
+    malicious or malformed agent often produces application-log errors when the transport service initializes or fails
+    to load it. Reviewing transport-service application events near the install time confirms whether the registered
+    assembly was actually brought into the pipeline and whether it is one the environment recognizes.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: application
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Provider_Name
+      - EventID
+      - Message
+- source: attack:T1505.002.image_load
+  question: Was a DLL loaded from the registered AssemblyPath, and is that module signed and expected for Exchange?
+  context: The transport agent is a .NET assembly DLL; once registered, the Exchange transport process loads it.
+    Module-load telemetry shows which DLL was actually mapped and whether it carries a valid signature. An unsigned
+    module, or one loaded from a user-writable or non-standard directory rather than the Exchange or a known vendor
+    install path, indicates the registered agent is not a sanctioned component.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ImageLoaded|endswith: .dll
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+      - Image
+- source: template:cue_process_tool.clustering
+  question: What other administrative tools and cmdlets ran on this host around the time of the install?
+  context: A transport agent install rarely stands alone in an intrusion. Activity in the surrounding window may reveal
+    reconnaissance, web-shell drops, credential access, or additional persistence being staged alongside the agent.
+    The time delta between related actions also helps establish whether this was a single planned change or part of a
+    longer hands-on session.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+- source: template:cue_user_actor.baseline
+  question: Does this user normally install or manage Exchange transport agents?
+  context: Compare this account's current action against its historical behavior. An account that has never registered
+    a transport agent or run Exchange management cmdlets is more suspicious than a dedicated Exchange administrator who
+    does so as part of routine maintenance. The user's role should align with Exchange server administration.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        CommandLine|contains: Install-TransportAgent
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is the parent process that launched this cmdlet host historically routine on this Exchange server, or is the
+    parent unusual for transport-agent management?
+  context: When the alert fires under a service or computer account, user identity does not attribute behavior; the
+    meaningful pivot is the launch mechanism. Which parent process spawned the cmdlet host, and is that parent
+    historically common for transport-agent management on this host. A new or rare parent is the deviation worth
+    chasing; a parent that already accounts for prior installs is established automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains: Install-TransportAgent
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+      - ParentImage
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the environment around the time of the install?
+  context: Tracking the account's activity across all hosts reveals lateral movement or staging on other systems. If
+    the same account triggered Exchange management actions, web-shell drops, or persistence on multiple servers in this
+    window, the scope of the intrusion is larger than a single host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did the same parent and cmdlet-host combination run on other hosts in the same window, indicating a
+    coordinated rollout rather than isolated activity?
+  context: Under a service or computer account, asking what else the user did returns agent-telemetry noise. The
+    meaningful question is whether the same launch mechanism fired on other hosts in the alert window. Multiple
+    Exchange servers running the install in the same window points to a pushed or scheduled change; a single host
+    points to a host-local trigger such as interactive operator activity.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains: Install-TransportAgent
+      condition: selection
+    fields:
+      - host.name
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this install?
+  context: Server-side persistence is often installed after initial access. Earlier detections on the same host such as
+    web-shell activity, exploitation of the mail server, reconnaissance, or credential access may reveal the stages
+    that preceded the agent install and help reconstruct the full timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:organizational_context.change_ticket
+  question: Was there a change ticket, maintenance window, or documented approval for this transport agent install?
+  context: Installing a transport agent is a significant configuration change to mail flow and is normally governed by
+    change control. A corresponding ticket or approved maintenance window suggests authorized activity; absence of one
+    when policy requires it suggests the install was unauthorized and should be escalated.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:organizational_context.human_recall
+  question: Does the Exchange administrator recall installing this transport agent, and can they identify the assembly?
+  context: Direct confirmation from the person behind the account is often the fastest path to legitimacy. If the
+    administrator recalls the install, capture which agent and assembly they deployed and why. If no one recalls it,
+    the credentials may be compromised or the activity may be automated, and the registered assembly should be treated
+    as untrusted until proven otherwise.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:persistence_scope.process_based_persistence
+  question: Were other process-based persistence mechanisms installed on this host around the same time?
+  context: Attackers rarely rely on a single persistence mechanism. After registering a transport agent, they commonly
+    stack backup footholds using different techniques such as scheduled tasks, services, registry Run keys, BITS jobs,
+    or WMI subscriptions. Multiple persistence installs in the same timeframe indicate intentional stacking rather than
+    an isolated administrative change.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine
+- source: template:persistence_scope.file_based_persistence
+  question: Were files dropped to persistence locations such as the Startup folder or Run key paths on this host?
+  context: File-based persistence bypasses command-line detection entirely. Dropping an executable or script into a
+    Startup folder or a path referenced by a registry Run key achieves persistence without invoking schtasks, sc, or
+    reg. File event monitoring captures these drops even when the operator avoids standard persistence tooling, which
+    is relevant when a server foothold is being made resilient.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist_paths:
+        TargetFilename|contains:
+          - '\Start Menu\Programs\Startup\'
+          - '\CurrentVersion\Run'
+          - '\CurrentVersion\RunOnce'
+      condition: selection and selection_persist_paths
+    fields:
+      - TargetFilename
+      - Image
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1505.002
+      name: Transport Agent
+      role: primary
+    - id: T1505
+      name: Server Software Component
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: cmdlet_invocation
+      description: "Adversary runs Install-TransportAgent to register a malicious .NET assembly as an Exchange transport agent"
+      mapped_to: Q3
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 2
+      label: assembly_registration
+      description: "The registered AssemblyPath DLL is loaded into the Exchange transport process / application service"
+      mapped_to: Q6
+      source: attack:T1505.002.assembly_load
+    - stage: 3
+      label: module_load
+      description: "The malicious transport agent DLL is mapped into the transport service for code execution on mail flow"
+      mapped_to: Q7
+      source: attack:T1505.002.image_load
+  dimension_coverage:
+    - dimension: time_correlation
+      technique: T1505.002
+      covered_by: Q8
+      source: template:cue_process_tool.clustering
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1505.002
+      covered_by: Q6
+      source: attack:T1505.002.assembly_load
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1505.002
+      covered_by: Q10
+      source: template:cue_user_actor.baseline
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1505
+      covered_by: Q4
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+  mutable_dispositions:
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q8
+      notes: "Tuning rationale (frequency of Exchange agent updates); reflected as +/-15m clustering window context, not a queryable value"
+    - element: AssemblyPath
+      dimension: tuning_parameter
+      specific_values: "rationale only (DLL paths vary by deployment)"
+      disposition: context
+      target_question: Q3
+      notes: "AssemblyPath argument decoded in mechanism_decode and signature/path checked in assembly_load (Q6) and image_load (Q7); no fixed value to inject"
+    - element: CmdletInvocationThreshold
+      dimension: tuning_parameter
+      specific_values: "rationale only (tunable repeat-use threshold)"
+      disposition: context
+      target_question: Q5
+      notes: "Repeated cmdlet use surfaced by host-scoped baseline_deviation aggregation; threshold is environment-specific, not directly queryable"
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "rationale only (renamed/custom wrapper processes vary)"
+      disposition: context
+      target_question: Q4
+      notes: "Parent process examined in process_chain (Q4) and baseline_deviation (Q5); no fixed parent value to inject"
+  dedup_decisions:
+    - dropped: cue_user_actor.baseline + cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable (user-pivot vs service-principal launch-mechanism pivot)"
+      kept: both
+    - dropped: cue_user_actor.clustering + cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable (user-pivot vs service-principal launch-mechanism pivot)"
+      kept: both
+    - dropped: cue_process_tool.follow_on
+      reason: "Child-process impact for the cmdlet host is low-signal here — the transport agent's effect is the loaded DLL inside the Exchange service, covered by Q6 (assembly_load) and Q7 (image_load), not children of the install command"
+      kept: attack:T1505.002.image_load
+    - dropped: cue_host_context.clustering
+      reason: "Same-host surrounding-activity coverage already provided by Q8 (cue_process_tool.clustering) over the same +/-15m window; cue_host_context.precursor (Q13) covers prior-alert context"
+      kept: template:cue_process_tool.clustering
+  skipped_templates:
+    - template: cue_process_tool.baseline
+      reason: "Historical-frequency baseline overlaps the host-scoped baseline_deviation (Q5), which is the rule-pattern-correct historical view for this CommandLine-only rule; plain Image|endswith baseline does not apply (no Image in detection)"
+    - template: cue_process_tool.scope
+      reason: "Fleet-wide rule-pattern footprint is informational; cross-host coordination is already answered by Q12 (cue_user_actor.clustering_svc), which counts the same Install-TransportAgent pattern across hosts in the alert window"
+    - template: universal.endpoint_protection_health
+      reason: "Persistence rule, not execution/credential-access; cue_host_context.precursor (Q13) already surfaces prior tamper-as-alert activity on the host, so the generic tamper sweep does not earn its slot per its own recommended-drop guidance"
+    - template: organizational_context.timing_alignment
+      reason: "Recommended org question; change_ticket (Q14) and human_recall (Q15) already establish authorization and recall, which are the decisive organizational checks for an Exchange config change"
+    - template: organizational_context.procedural_consistency
+      reason: "Recommended org question; deployment-method consistency is subsumed by change_ticket (Q14) approval check for this server-config action"
+  reflection_overrides: []
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - organizational_context
+    - persistence_scope
+    - cue_process_tool
+    - cue_user_actor
+    - cue_host_context
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 15
+      attack: 2
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 14
+    logsource_diversity:
+      process_creation: 13
+      application: 1
+      image_load: 1
+      sigma_alert: 1
+      file_event: 1

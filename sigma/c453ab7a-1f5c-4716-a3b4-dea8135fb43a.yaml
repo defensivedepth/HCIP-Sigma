@@ -1,0 +1,528 @@
+name: Registry Manipulation via WMI Stdregprov
+id: 4a3945e6-722c-4ceb-a69a-94db654d63e1
+description: |
+  Detects wmic.exe invoked with a command line containing both 'call' and 'stdregprov', which uses the WMI StdRegProv class to read or write the Windows registry instead of reg.exe or regedit.exe. The rule fires when the process image (or OriginalFileName) is wmic.exe AND the command line contains both tokens. StdRegProv can create, enumerate, read, and modify keys and values, so the same pattern covers registry persistence, security-setting tampering, and environmental discovery. Operators choose this path to bypass monitoring focused on traditional registry tools and to retain a working registry interface where reg.exe and regedit are blocked. Investigation should confirm the exact StdRegProv method and target hive/key, attribute the parent and user, and determine whether the change establishes persistence, weakens defenses, or merely queries configuration.
+type: detection
+detection_id: c453ab7a-1f5c-4716-a3b4-dea8135fb43a
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-06
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line show wmic.exe calling the StdRegProv class with both 'call' and 'stdregprov' present?
+  context: Confirm the alert is a true positive by reviewing the full command line and process image against the rule's criteria. The rule fires only when the image (or OriginalFileName) is wmic.exe AND the command line contains both 'call' and 'stdregprov'. Read the StdRegProv method (CreateKey, SetStringValue, SetDWORDValue, DeleteKey, EnumKey, EnumValues, GetStringValue) to tell a write/persistence action apart from a read/discovery one.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- source: template:parent_child.parent_process_legitimacy
+  question: What spawned this wmic.exe process, and what started that parent?
+  context: The parent of wmic.exe is the core attribution signal. A user-driven console (explorer.exe to cmd.exe) or a known management agent is routine; script hosts (wscript.exe, cscript.exe, mshta.exe), Office applications, or wmiprvse.exe driving wmic indicate macro or remote-execution origin. Tracing the parent's own origin shows whether the chain is interactive or automated.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- source: template:parent_child.sibling_processes
+  question: What other child processes did the same parent spawn around this time?
+  context: If the parent that launched wmic.exe is suspicious, it likely launched other processes too. Multiple children from the same parent in a tight window points to scripted orchestration rather than a one-off administrative command. Host scope is included as a fallback because the parent identifier can resolve to NODATA.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:organizational_context.change_ticket
+  question: Was there a change ticket, maintenance window, or documented approval for this registry change?
+  context: Many organizations require change records for registry and configuration changes, especially those affecting persistence or security settings. A corresponding ticket suggests authorized maintenance; absence of one where policy requires it shifts the disposition toward unauthorized activity and can quickly close or escalate the alert.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:organizational_context.timing_alignment
+  question: Does the timing of this activity align with normal work hours and maintenance windows?
+  context: Legitimate registry changes usually occur during business hours or scheduled maintenance. A StdRegProv write at an unusual hour, on a host whose local time makes the activity implausible, or outside any documented window is more suspicious than the same action during a planned change.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:registry.registry_key_context
+  question: Which StdRegProv method and target hive and key were used, and is that location a known persistence or evasion spot?
+  context: The hDefKey code and subkey path reveal intent. HKLM or HKCU Run/RunOnce keys indicate persistence; keys under Windows Defender or Terminal Server policy (for example fDenyTSConnections, scforceoption) indicate security-setting tampering; reads via GetStringValue or EnumValues indicate environmental discovery. Because the write is performed by the WMI provider host rather than wmic itself, a registry_set event keyed to this process may not exist; if it is absent, parse the hDefKey, sSubKeyName, sValueName, and value arguments directly from the alerting command line.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+- source: template:registry.registry_related_modifications
+  question: Were other registry modifications made on this host in the surrounding window?
+  context: Operators who change one key often change several -- setting a Run key for persistence while also disabling a security control. This surfaces nearby registry writes through the traditional tools (reg.exe, regedit.exe) so the analyst can see whether the StdRegProv change was part of a broader cluster of configuration changes pursuing multiple objectives.
+  range: +/-30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_reg:
+        Image|endswith:
+          - '\reg.exe'
+          - '\regedit.exe'
+        CommandLine|contains:
+          - ' add '
+          - ' delete '
+          - ' import '
+          - '/s '
+      condition: selection and selection_reg
+    fields:
+      - CommandLine
+- source: template:discovery_recon.discovery_burst_detection
+  question: Did other reconnaissance commands run on this host around the same time?
+  context: A single discovery action may be troubleshooting, but several reconnaissance commands in rapid succession -- whoami, ipconfig, net user, systeminfo -- is a signature of post-compromise enumeration. StdRegProv reads are themselves a discovery method, so co-occurring native recon binaries strengthen the case that an operator is profiling the host before the next stage.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_recon:
+        Image|endswith:
+          - '\whoami.exe'
+          - '\systeminfo.exe'
+          - '\ipconfig.exe'
+          - '\net.exe'
+          - '\net1.exe'
+          - '\nltest.exe'
+          - '\dsquery.exe'
+          - '\nbtstat.exe'
+          - '\arp.exe'
+          - '\netstat.exe'
+          - '\tasklist.exe'
+          - '\qprocess.exe'
+          - '\query.exe'
+          - '\quser.exe'
+          - '\hostname.exe'
+          - '\nslookup.exe'
+          - '\adfind.exe'
+          - '\csvde.exe'
+          - '\ldifde.exe'
+          - '\dnscmd.exe'
+          - '\cmdkey.exe'
+          - '\setspn.exe'
+      condition: selection and selection_recon
+    fields:
+      - Image
+      - User
+- source: template:discovery_recon.discovery_user_context
+  question: Is this user expected to administer the registry or run WMI management commands?
+  context: Administrators and IT staff legitimately read and write registry settings and use WMI for management. Standard users rarely invoke wmic StdRegProv. The user's role and typical toolset determine whether driving registry changes through WMI is routine or anomalous; a non-admin account using this path is a strong escalation signal.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - User
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run wmic.exe to read or write the registry?
+  context: Compare this user's current action against their historical behavior. A user who has never driven registry changes through WMIC is more suspicious than one who does so regularly as part of their role. User role and typical toolset should align with this activity.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent and wmic.exe combination historically routine on this host or environment-wide, or is the parent unusual for this binary?
+  context: When the alert fires under a service principal (SYSTEM, LOCAL SERVICE, NETWORK SERVICE, or a computer account) user identity does not attribute behavior; the meaningful pivot is the launch mechanism. A parent that already accounts for many prior wmic.exe executions is vendor or OS automation; a new or rare parent for this binary is the deviation worth chasing.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: After identifying the actor, check their activity across all hosts in the window. The same user driving similar activity on multiple endpoints points to lateral movement and a larger scope of compromise. This is distinct from the historical baseline -- it asks what the actor did right now, network-wide.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent and wmic.exe combination fire on other hosts in the same window -- a coordinated automation rollout, or activity isolated to this host?
+  context: Under a service principal, asking what the user did network-wide returns agent-telemetry noise because every host runs SYSTEM-owned agents constantly. The meaningful question is whether the same launch mechanism -- parent process plus wmic.exe -- fired on other hosts in the alert window. Multiple hosts points to scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host -- defense tampering, reconnaissance, or credential access -- may reveal the attack stages that preceded this registry activity and help correlate the WMI registry change with nearby execution within the same timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:lolbin.renamed_binary_check
+  question: Was wmic.exe executed from its expected System32 path?
+  context: wmic.exe normally runs from C:\Windows\System32\wbem\wmic.exe. A copy running from a user-writable or temp directory may indicate the binary was relocated or renamed to evade path-based allowlists. Comparing the Image path against OriginalFileName confirms whether this is the genuine in-place binary or a relocated copy.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- source: template:lolbin.historical_lolbin_baseline
+  question: How often has this host fired the wmic StdRegProv pattern over the past 90 days, and what command-line shapes are typical?
+  context: A WMIC StdRegProv pattern with no prior history on a host is more suspicious than one used regularly under stable parents. The query mirrors the rule's selection scoped to this host, so the count reflects the rule's specific firing pattern rather than generic wmic.exe usage. The command-line projection lets the analyst compare typical invocation shapes -- which hives and keys are normally touched -- against the alerting one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \wmic.exe
+      - OriginalFileName: wmic.exe
+      selection_cli:
+        CommandLine|contains|all:
+        - call
+        - stdregprov
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - CommandLine
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1112
+      name: Modify Registry
+      role: primary
+    - id: T1047
+      name: Windows Management Instrumentation
+      role: secondary
+    - id: T1012
+      name: Query Registry
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: wmi_process_creation
+      description: "wmic.exe is launched, invoking the WMI StdRegProv class (call + stdregprov)"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: registry_action
+      description: "StdRegProv method reads or writes the target hive/key (CreateKey, SetStringValue, EnumValues, etc.)"
+      mapped_to: Q6
+      source: template:registry.registry_key_context
+    - stage: 3
+      label: related_changes
+      description: "Adjacent registry modifications or follow-on actions in the surrounding window"
+      mapped_to: Q7
+      source: template:registry.registry_related_modifications
+  dimension_coverage:
+    - dimension: time_correlation
+      technique: T1047
+      covered_by: Q14
+      source: template:cue_host_context.precursor
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1047
+      covered_by: Q1
+      source: template:universal.verify_trigger_match
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1047
+      covered_by: Q9
+      source: template:discovery_recon.discovery_user_context
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1112
+      covered_by: Q2
+      source: template:parent_child.parent_process_legitimacy
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1112
+      covered_by: Q7
+      source: template:registry.registry_related_modifications
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1112
+      covered_by: Q6
+      source: template:registry.registry_key_context
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1012
+      covered_by: Q2
+      source: template:parent_child.parent_process_legitimacy
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1012
+      covered_by: Q8
+      source: template:discovery_recon.discovery_burst_detection
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1012
+      covered_by: Q1
+      source: template:universal.verify_trigger_match
+      coverage_type: indirect
+  mutable_dispositions:
+    - element: SuspiciousCommandPatterns
+      dimension: tuning_parameter
+      specific_values: "wmic process call, powershell Invoke-WmiMethod, call + stdregprov"
+      disposition: context
+      target_question: Q1
+      notes: "Rule already enforces call + stdregprov via CommandLine|contains|all; verify_trigger_match query is ProcessGuid-scoped so it returns the alerting event by construction. StdRegProv method names surfaced in Q1 context."
+    - element: WMIQueryScope
+      dimension: tuning_parameter
+      specific_values: "\\root\\cimv2, \\root\\subscription"
+      disposition: context
+      target_question: Q6
+      notes: "StdRegProv lives under root\\default; namespace scoping is a detection-tuning knob, not a per-alert pivot. Hive (hDefKey) and key path surfaced in registry_key_context context instead."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q7
+      notes: "Correlation window realized as the +/-30m range on registry_related_modifications and -6h on precursor; no single queryable value."
+    - element: UserContext
+      dimension: user_context
+      specific_values: "interactive vs SYSTEM / low-privileged"
+      disposition: new_question
+      target_question: Q11
+      notes: "Service-principal degeneration handled by the user_actor svc-substitute pair (Q11/Q13); interactive-vs-system judgment in discovery_user_context (Q9)."
+    - element: RemoteDestinationThreshold
+      dimension: tuning_parameter
+      specific_values: "unique remote hosts contacted via WMI in a window"
+      disposition: blocked_query
+      target_question: Q1
+      notes: "Remote-WMI metric; this rule's detection is local StdRegProv registry manipulation with no network component. No compensating network_connection question authored — see hint_dispositions."
+    - element: RegistryKeyPathPatterns
+      dimension: tuning_parameter
+      specific_values: "Run, Services, Security Settings, LSASS"
+      disposition: context
+      target_question: Q6
+      notes: "Persistence/evasion key locations enumerated in registry_key_context context (Run/RunOnce, Defender policy, IFEO)."
+    - element: ParentProcessAllowList
+      dimension: parent_process_analysis
+      specific_values: "regedit.exe, msiexec.exe (legit registry tools)"
+      disposition: context
+      target_question: Q2
+      notes: "For this rule the writer is always wmic.exe, never the allowlisted registry tools; parent legitimacy framed as which process spawned wmic.exe."
+    - element: SignatureCheck
+      dimension: tuning_parameter
+      specific_values: "unsigned exe / abnormal lineage performing registry mod"
+      disposition: new_question
+      target_question: Q15
+      notes: "Realized as renamed_binary_check (Image path vs OriginalFileName) for the wmic.exe LOLBin."
+    - element: TargetRegistryPath
+      dimension: tuning_parameter
+      specific_values: "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion"
+      disposition: context
+      target_question: Q6
+      notes: "Specific hive/key surfaced in registry_key_context; analyst parses sSubKeyName from the command line."
+    - element: ParentProcess
+      dimension: parent_process_analysis
+      specific_values: "cmd.exe, wscript.exe, mshta.exe"
+      disposition: context
+      target_question: Q2
+      notes: "Suspicious-parent set named in parent_process_legitimacy context."
+  dedup_decisions:
+    - dropped: cue_process_tool.process_chain
+      reason: "parent_child technique set active — parent_process_legitimacy is the more specific parent-attribution question and subsumes the cue process_chain"
+      kept: parent_child.parent_process_legitimacy
+    - dropped: discovery_recon.discovery_parent_chain
+      reason: "near-identical ProcessGuid->parent query to parent_child.parent_process_legitimacy, which projects the same parent fields plus child Image/CommandLine"
+      kept: parent_child.parent_process_legitimacy
+    - dropped: universal.host_user_context
+      reason: "discovery_recon.discovery_user_context covers the same user-expectation judgment and is more specific to the discovery/WMI context (per its notes_to_llm); prefer the discovery version"
+      kept: discovery_recon.discovery_user_context
+    - dropped: cue_user_actor pair (baseline + baseline_svc; clustering + clustering_svc)
+      reason: "user_actor pair — non-deduplicable; emitted both user-pivot and service-principal-substitute variants per AGENTS.md"
+      kept: all four (Q10, Q11, Q12, Q13)
+    - dropped: cue_process_tool.clustering
+      reason: "discovery_recon.discovery_burst_detection and cue_user_actor.clustering already cover same-window activity on this host and across the network"
+      kept: discovery_recon.discovery_burst_detection
+    - dropped: cue_process_tool.baseline
+      reason: "lolbin.historical_lolbin_baseline is the rule-pattern-specific 90d host baseline and supersedes the generic binary baseline"
+      kept: lolbin.historical_lolbin_baseline
+    - dropped: cue_process_tool.baseline_deviation
+      reason: "lolbin.historical_lolbin_baseline (reflected, host-scoped) covers the same rule-pattern host history; baseline_deviation would duplicate the host-scoped reflected count"
+      kept: lolbin.historical_lolbin_baseline
+    - dropped: cue_process_tool.follow_on
+      reason: "parent_child.sibling_processes and discovery_burst_detection cover surrounding/spawned activity; a wmic StdRegProv registry write rarely spawns children, so a child-process pivot adds little"
+      kept: parent_child.sibling_processes
+    - dropped: cue_process_tool.scope
+      reason: "lolbin.historical_lolbin_baseline plus the service-principal clustering substitute (cross-host same-window count) cover fleet distribution of the rule pattern"
+      kept: lolbin.historical_lolbin_baseline
+    - dropped: cue_user_actor.baseline (cue-layer)
+      reason: "satisfied by the user_actor template pair already emitted; no separate cue-layer question"
+      kept: cue_user_actor.baseline (template)
+  skipped_templates:
+    - template: cue_process_tool.mechanism_decode
+      reason: "replaced_by: registry.registry_key_context (Phase 2 analysis is the registry-key-context question, which decodes the StdRegProv target)"
+    - template: registry.registry_value_persistence_check
+      reason: "rule writes no file path (has_file_reference: false; StdRegProv sets registry values, not Run-key executable paths captured by the rule); %file_paths% would not resolve. Per its notes_to_llm, skip when no executable path is written."
+    - template: endpoint_protection_health
+      reason: "RECOMMENDED universal sweep; cue_host_context.precursor is present and surfaces prior tamper alerts on this host, and registry_related_modifications surfaces Defender/policy key writes. The rule is registry-manipulation, not payload execution/credential access, so the generic tamper sweep is not the load-bearing precursor question here."
+  hint_dispositions:
+    - hint: "logsource 'network_connection' (recommended by techniques: T1047) is not covered — pull in cue_network_endpoint.* or author a custom question with category: network_connection"
+      disposition: declined
+      reason: >-
+        This rule's detection is local StdRegProv registry manipulation
+        (wmic.exe with call + stdregprov) and carries no remote/network
+        component. T1047's network_connection analytic targets remote WMI
+        execution over DCOM/WinRM (5985/5986); none of this rule's selection
+        clauses imply a remote destination, so a network_connection question
+        would return activity unrelated to what fired the alert. Remote-WMI
+        coverage (RemoteDestinationThreshold mutable element) is recorded as
+        blocked_query in mutable_dispositions.
+    - hint: "logsource 'wmi' (recommended by techniques: T1047) is not covered and no template family exists — author a custom question with category: wmi"
+      disposition: declined
+      reason: >-
+        The rule fires on process_creation (wmic.exe command line), and the
+        StdRegProv method, hive, and key are fully recoverable from the
+        CommandLine surfaced by verify_trigger_match (Q1) and decoded in
+        registry_key_context (Q6). WMI-Activity operational events
+        (5857/5858/5860/5861) would add provider-host detail but no
+        analyst-side decision this rule's process_creation evidence does not
+        already answer for triage; no SO template family exists for category
+        wmi, so a custom query has no normalization path.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - discovery_recon
+    - registry
+    - organizational_context
+    - parent_child
+    - lolbin
+  generation_stats:
+    total_questions: 16
+    source_counts:
+      template: 16
+      attack: 0
+      llm_generated: 0
+    phase_distribution:
+      triage: 1
+      analysis: 1
+      context: 14
+    logsource_diversity:
+      process_creation: 14
+      registry_set: 1
+      sigma_alert: 1

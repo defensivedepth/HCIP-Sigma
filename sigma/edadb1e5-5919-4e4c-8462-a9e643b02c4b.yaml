@@ -1,0 +1,662 @@
+name: Process Memory Dump via RdrLeakDiag.EXE
+id: 659eafe3-137c-4ad4-89c9-65909f85e489
+description: |
+  Detects the Microsoft resource-leak diagnostic tool rdrleakdiag.exe being used to dump
+  process memory. The rule fires when the binary (by Image name or OriginalFileName) runs
+  with a memory-dump flag (/memdmp or fullmemdmp) AND a target/output flag (/p for the
+  target PID and /o for the output directory) all present together. This is a living-off-
+  the-land credential-dumping pattern: an operator targets lsass.exe by PID and writes a
+  full minidump to disk (minidump_<pid>.dmp), which is then parsed offline to recover NTLM
+  hashes, Kerberos tickets, and plaintext credentials. The binary has a narrow legitimate
+  purpose, so the investigation should confirm the target process, locate the dump artifact,
+  and determine whether the credentials in the dumped process are now exposed.
+type: detection
+detection_id: edadb1e5-5919-4e4c-8462-a9e643b02c4b
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-06
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the rdrleakdiag.exe command line carry a dump flag and a target/output flag together?
+  context: >-
+    Confirm the alert is a true positive by reviewing the exact command line. The rule fires
+    only when rdrleakdiag.exe (by Image name or OriginalFileName) runs with a dump flag
+    (/memdmp or fullmemdmp) AND a target/output flag (/p for the PID, /o for the output
+    directory) present in the same invocation. Read the /p value to see which process was
+    targeted and the /o value to see where the dump was written.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run a memory-diagnostic tool against another process?
+  context: >-
+    Legitimate use of rdrleakdiag.exe is narrow — developers or support staff diagnosing a
+    resource leak in a specific application. Knowing whether this user role and host function
+    plausibly involve memory diagnostics is often the fastest way to separate a sanctioned
+    troubleshooting session from credential theft.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:credential_access.credential_target_identification
+  question: Which process was targeted by the dump, and was it lsass.exe?
+  context: >-
+    The /p flag names the PID rdrleakdiag.exe dumped. Resolve that PID to a process — if it is
+    lsass.exe, the dump contains NTLM hashes, Kerberos tickets and keys, and plaintext
+    credentials for every active logon session. Other targets (a line-of-business app being
+    debugged) carry far lower risk. The full command line also shows whether /fullmemdmp was
+    used, which captures the entire address space rather than a partial region.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: attack:T1003.001.access_verification
+  question: Did a handle with full memory-read access open against lsass.exe on this host around the alert?
+  context: >-
+    Dumping process memory requires first opening a handle to the target with read access.
+    A handle granted full access (0x1F0FFF) to lsass.exe from a process that is not a known
+    AV/EDR agent is the access half of the credential-scraping chain. Pair this with the
+    dump-flag command line to confirm rdrleakdiag.exe was the requestor. Zero rows can mean
+    process-access logging is not collected in this environment rather than that no access
+    occurred.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_access
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetImage|endswith: \lsass.exe
+        GrantedAccess|contains:
+          - '0x1F0FFF'
+          - '0x1010'
+          - '0x1410'
+      condition: selection
+    fields:
+      - SourceImage
+      - GrantedAccess
+      - CallTrace
+- source: attack:T1003.001.tuning_parameter
+  question: Where was the memory dump written, and does a minidump artifact exist at that path?
+  context: >-
+    The /o value is the output directory; a successful rdrleakdiag.exe dump creates
+    minidump_<pid>.dmp and results_<pid>.hlk in it. Operators commonly point /o at staging
+    directories such as %TEMP%, C:\Windows\Temp, C:\Users\Public, or C:\ProgramData. Locating
+    the .dmp confirms the dump succeeded and gives the analyst the artifact to scope for
+    exfiltration or deletion.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection_dmp:
+        TargetFilename|contains:
+          - minidump_
+          - results_
+      selection_ext:
+        TargetFilename|endswith:
+          - .dmp
+          - .hlk
+      condition: selection_dmp or selection_ext
+    fields:
+      - TargetFilename
+      - Image
+      - User
+- source: template:cue_process_tool.process_chain
+  question: What process spawned rdrleakdiag.exe, and is that parent chain expected?
+  context: >-
+    The parent process reveals how the tool was launched. A direct interactive launch from
+    explorer.exe or a console differs from a launch under a web/application server, a script
+    host (wscript.exe, cscript.exe, mshta.exe), or a remote-execution service — the latter
+    point to hands-on-keyboard operator activity rather than local troubleshooting.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in the hour before the alert?
+  context: >-
+    Credential dumping is often preceded by attempts to weaken protection so the dump and any
+    follow-on tooling run unhindered. This query surfaces direct attempts to disable AV/EDR
+    services, flip Defender flags, add broad exclusions, clear logs, or patch AMSI/ETW. Zero
+    rows is a useful "protection looks healthy" signal; populated rows shift the disposition
+    toward operator preparation — review the parent process and signing chain to identify the
+    writer.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+- source: template:cue_process_tool.follow_on
+  question: What child processes did rdrleakdiag.exe spawn afterward?
+  context: >-
+    Processes spawned by the tool reveal post-dump activity. A dump is usually followed by
+    staging or exfil steps — archiving utilities (WinRAR, 7z), copy operations, or a parser
+    being run against the .dmp. Unexpected children such as cmd.exe, powershell.exe, or
+    certutil.exe point to an active operator rather than a one-off diagnostic.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:credential_access.post_access_lateral_movement
+  question: Were any new logon sessions or remote connections initiated after this event?
+  context: >-
+    Credential theft is typically followed by lateral movement — stolen credentials are used to
+    reach other systems. Follow-on alerts on this host shortly after the dump that indicate RDP
+    sessions, SMB connections, WinRM usage, remote service execution, or new authentication
+    events suggest the dumped credentials are already being exercised.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - rule.name
+      - rule.uuid
+      - event.severity_label
+- source: template:credential_access.credential_exposure_assessment
+  question: Which accounts may be exposed in the dumped process, and do any have elevated privileges?
+  context: >-
+    The severity of an LSASS dump depends on which sessions were live on the host when memory
+    was captured. Any account with an active logon, cached credential, or service logon on this
+    host should be treated as potentially exposed. Domain admin, service, or other privileged
+    accounts present on the host require incident escalation and credential rotation; a single
+    standard-user session is lower impact.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:cue_process_tool.baseline
+  question: Does this host normally run rdrleakdiag.exe?
+  context: >-
+    A binary that has never run on a host is more suspicious than one that appears regularly.
+    Zero or very low counts over the baseline window indicate first-time or rare execution,
+    which weighs against a routine-diagnostic explanation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host previously ran rdrleakdiag.exe with these dump flags, what parents and users drove it, and does the current alert fit?
+  context: >-
+    Even a legitimate tool can be abused. This query mirrors the rule's full selection (dump
+    flag plus target/output flag) scoped to this host, so the resulting parent and user
+    distribution reflects how this specific dumping pattern has run here historically. A new
+    parent process, an unexpected user account, or an unusual command-line shape is the
+    deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \rdrleakdiag.exe
+      - OriginalFileName: RdrLeakDiag.exe
+      selection_cli_dump:
+        CommandLine|contains|windash:
+        - /memdmp
+        - fullmemdmp
+      selection_cli_output_process:
+        CommandLine|contains|windash:
+        - ' /o '
+        - ' /p '
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run memory-diagnostic tooling like rdrleakdiag.exe?
+  context: >-
+    Compare this user's current action against their historical behavior. A user who has never
+    run rdrleakdiag.exe is more notable than one who runs it routinely as part of a support or
+    development role. User role and typical toolset should align with memory diagnostics.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent and rdrleakdiag.exe combination historically routine on this host or environment-wide?
+  context: >-
+    When the alert fires under a service principal (SYSTEM, LOCAL SERVICE, NETWORK SERVICE, or a
+    computer account), user identity does not attribute behavior — the meaningful pivot is the
+    launch mechanism. A new or rare parent for rdrleakdiag.exe is the deviation worth chasing; a
+    pair that already accounts for many prior events is more likely sanctioned automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: >-
+    Tracking the user's activity across all hosts in the alert window reveals whether the dump is
+    an isolated action or part of broader hands-on activity. The same user driving similar
+    activity on multiple endpoints widens the likely scope of compromise.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent and rdrleakdiag.exe combination fire on other hosts in the same window?
+  context: >-
+    Under a service principal, asking what else the user did network-wide returns agent-telemetry
+    noise. The meaningful question is whether the same launch mechanism — parent process plus the
+    spawned binary — fired on other hosts in the alert window. Multiple hosts point to scheduled
+    or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering,
+    reconnaissance, or initial execution — may reveal the stages that preceded the dump and help
+    reconstruct the timeline. A credential dump sitting at the end of a chain of earlier alerts
+    is a different disposition than one with no precursors.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:cue_process_tool.scope
+  question: Have other hosts run rdrleakdiag.exe with these dump flags in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: >-
+    This query mirrors the rule's full selection with no host scope, so the result is a fleet-wide
+    count of this specific dumping pattern rather than generic use of the binary. Many hosts firing
+    the same pattern suggests scripted deployment; one host or a small unrelated set points to
+    manual operator activity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \rdrleakdiag.exe
+      - OriginalFileName: RdrLeakDiag.exe
+      selection_cli_dump:
+        CommandLine|contains|windash:
+        - /memdmp
+        - fullmemdmp
+      selection_cli_output_process:
+        CommandLine|contains|windash:
+        - ' /o '
+        - ' /p '
+      condition: all of selection_*
+    fields:
+    - host.name
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1003.001
+      name: LSASS Memory
+      role: primary
+    - id: T1003
+      name: OS Credential Dumping
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: handle_open_full_access
+      description: "A process opens a handle with full memory-read access (0x1F0FFF) to lsass.exe"
+      mapped_to: Q4
+      source: attack:T1003.001.access_verification
+    - stage: 2
+      label: memory_dump_invocation
+      description: "rdrleakdiag.exe invokes a full memory dump against the target PID (/memdmp, fullmemdmp, /p, /o)"
+      mapped_to: Q3
+      source: credential_access.credential_target_identification
+    - stage: 3
+      label: dump_file_creation
+      description: "Dump artifact (minidump_<pid>.dmp / results_<pid>.hlk) is written to disk"
+      mapped_to: Q5
+      source: attack:T1003.001.tuning_parameter
+    - stage: 4
+      label: follow_on_use
+      description: "Dump is staged/parsed or stolen credentials drive lateral movement"
+      mapped_to: Q9
+      source: credential_access.post_access_lateral_movement
+  dimension_coverage:
+    - dimension: access_verification
+      technique: T1003.001
+      covered_by: Q4
+      source: attack:T1003.001.access_verification
+      coverage_type: direct
+    - dimension: command_analysis
+      technique: T1003.001
+      covered_by: Q3
+      source: credential_access.credential_target_identification
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1003.001
+      covered_by: Q6
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1003.001
+      covered_by: Q5
+      source: attack:T1003.001.tuning_parameter
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1003.001
+      covered_by: Q5
+      source: attack:T1003.001.tuning_parameter
+      coverage_type: direct
+  mutable_dispositions:
+    - element: AccessMask
+      dimension: access_verification
+      specific_values: "0x1F0FFF (full access); also 0x1010, 0x1410"
+      disposition: new_question
+      target_question: Q4
+      notes: "Injected into process_access GrantedAccess|contains selection for handle-to-lsass detection"
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "5 minutes (access to dump-file creation)"
+      disposition: context
+      target_question: Q5
+      notes: "+/-15m file_event window covers the 5m access-to-dump correlation; threshold stated in context"
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "rationale only (allowlist known AV/EDR)"
+      disposition: new_question
+      target_question: Q6
+      notes: "Parent-chain question surfaces the spawning process so the analyst can judge AV/EDR vs operator launch"
+    - element: DumpFilePath
+      dimension: tuning_parameter
+      specific_values: "%TEMP%, C:\\Windows\\Temp, C:\\Users\\Public, C:\\ProgramData"
+      disposition: query_injection
+      target_question: Q5
+      notes: "minidump_/results_ filename patterns and .dmp/.hlk extensions in file_event selection; staging paths named in context"
+    - element: CommandLinePattern
+      dimension: command_analysis
+      specific_values: "rundll32, procdump, comsvcs.dll, Invoke-Mimikatz (T1003 generic dumping syntax)"
+      disposition: context
+      target_question: Q3
+      notes: "Rule is rdrleakdiag-specific; generic dumping syntaxes are sibling methods, noted as context rather than injected since they would broaden the rule-aligned question"
+  dedup_decisions:
+    - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable (subject-identity vs launch-mechanism pivots; degenerate under different conditions)"
+      kept: both (Q13, Q14)
+    - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable (user-pivot returns agent-telemetry noise under service principals; parent+binary substitute is the clean answer)"
+      kept: both (Q15, Q16)
+    - dropped: cue_process_tool.clustering
+      reason: "host-wide clustering of all binaries +/-15m overlaps cue_host_context coverage; dropped to stay within question cap while keeping the more targeted follow_on and precursor questions"
+      kept: cue_host_context.precursor (Q17)
+    - dropped: cue_host_context.clustering
+      reason: "broad host-activity aggregation overlaps follow_on (post-dump children) and precursor (prior alerts); dropped to stay within cap"
+      kept: cue_process_tool.follow_on (Q8), cue_host_context.precursor (Q17)
+  skipped_templates:
+    - template: cue_process_tool.mechanism_decode
+      reason: "replaced_by: credential_access.credential_target_identification (more specific Phase-2 analysis for the credential-access dimension)"
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "logsource 'registry_set' (recommended by techniques: T1003.001) is not covered — pull in cue_registry_key.* or author a custom question with `category: registry_set`"
+      disposition: declined
+      reason: >-
+        rdrleakdiag.exe dumps process memory directly via OpenProcess + MiniDumpWriteDump and
+        writes a .dmp file; it does not stage credentials through registry modification. The
+        registry_set leg of the T1003.001 analytic targets registry-based credential paths (e.g.,
+        SAM/SECURITY hive saves, DisableRestrictedAdmin) that this specific binary's dumping path
+        does not touch. No compensating attack:T1003.001.registry_set question authored; the
+        access (Q4) and dump-file (Q5) legs are the load-bearing artifacts for rdrleakdiag.
+    - hint: "logsource 'security' (recommended by techniques: T1003.001) is not covered and no template family exists — author a custom question with `category: security`"
+      disposition: declined
+      reason: >-
+        The Security-channel signal for this technique is 4673 (sensitive-privilege use) / 4663
+        (object access) on lsass.exe, which is the same handle-to-lsass access event covered from
+        the Sysmon process_access side by Q4 (attack:T1003.001.access_verification). Authoring a
+        parallel security-channel question would duplicate that access-verification coverage with a
+        log source many environments do not audit; the process_access form is the more reliably
+        collected equivalent.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - credential_access
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 16
+      attack: 2
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 15
+    logsource_diversity:
+      process_creation: 14
+      process_access: 1
+      file_event: 1
+      sigma_alert: 2

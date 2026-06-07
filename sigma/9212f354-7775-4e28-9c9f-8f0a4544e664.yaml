@@ -1,0 +1,584 @@
+name: Active Directory Database Snapshot Via ADExplorer
+id: 85458467-40c2-453e-81dc-b104a8f8a11e
+description: |
+  Detects execution of Sysinternals ADExplorer with a "snapshot" command-line argument, which writes an offline copy of the
+  Active Directory database to a local .dat file. The snapshot is produced by an LDAP query that pulls the entire readable
+  AD object set in one large response, and can be parsed offline to extract users, groups, computers, and trust relationships
+  for attack-path analysis, password spraying lists, or credentials accidentally stored in object attributes. ADExplorer is
+  a signed, legitimately useful administrative viewer, so the investigation should determine whether a known administrator
+  ran the snapshot for a documented purpose or whether the activity is unexpected discovery that may precede lateral movement.
+type: detection
+detection_id: 9212f354-7775-4e28-9c9f-8f0a4544e664
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does this execution match the ADExplorer snapshot pattern this rule detects?
+  context: Confirm the alert is a true positive before investing investigation time. The rule fires only when both conditions
+    hold together — the process is identified as ADExplorer (by Image name, OriginalFileName AdExp, Description "Active Directory
+    Editor", or Product "Sysinternals ADExplorer") AND the command line contains "snapshot". Review the full command line and
+    process metadata to verify both halves are present and that the binary is the genuine Sysinternals tool rather than a
+    renamed look-alike.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+      - Description
+      - Product
+- source: template:universal.host_user_context
+  question: Is this user and host expected to snapshot the Active Directory database?
+  context: Legitimate AD snapshots are usually taken by directory administrators or IT staff for offline review, comparison,
+    or troubleshooting. A standard user, a service account, or a host with no directory-administration role running an AD
+    snapshot is the fastest signal that this is unexpected discovery rather than routine operations.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What exactly did the ADExplorer command request? Decode the full command line.
+  context: The full command line reveals what was snapshotted and where the output was written. Look for the target directory
+    server or domain in the connect arguments, the local path the .dat snapshot was written to, and whether alternate
+    credentials or a non-default port (for example :636 for LDAPS) were specified. The snapshot file is the artifact an
+    operator carries offline for AD enumeration, so its destination path matters for scoping data exposure.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: attack:T1087.002.process_identification
+  question: Is the binary at this path the genuine signed Sysinternals ADExplorer, or a renamed or relocated copy?
+  context: The rule matches on file metadata (OriginalFileName, Description, Product) as well as Image name, so a renamed copy
+    of the real tool still fires while preserving its embedded metadata. Confirm the binary's signature and original filename,
+    and note whether it runs from a standard install or tools location versus a user-writable directory such as a profile,
+    Temp, or Downloads folder. An operator-staged copy in a user-writable path carries more weight than a binary in a managed
+    software location.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - Description
+      - Product
+- source: template:cue_process_tool.process_chain
+  question: What process spawned ADExplorer, and is that parent chain expected?
+  context: The parent process reveals how the tool was launched. An interactive launch from explorer.exe or a known
+    administration console fits routine use. Parents such as script interpreters (wscript.exe, cscript.exe, powershell.exe),
+    remote-execution hosts (wmiprvse.exe, wsmprovhost.exe), or a process injected with alternate credentials point toward
+    automated or operator-driven enumeration.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: attack:T1482.process_access
+  question: Did ADExplorer or a related process access LSASS or perform credential-bearing memory access around this time?
+  context: Snapshotting AD over a SOCKS pivot is sometimes paired with pass-the-hash of a machine-account or other credential
+    so the snapshot runs under borrowed authentication. Cross-process memory access to lsass.exe near the snapshot, especially
+    from the same operator tooling, suggests the snapshot is one stage of a larger credential-access and discovery sequence
+    rather than an isolated administrative action.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_access
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetImage|endswith: '\lsass.exe'
+      condition: selection
+    fields:
+      - SourceImage
+      - GrantedAccess
+      - User
+- source: attack:T1482.security
+  question: Were directory objects or trust relationships accessed in the Security log around the time of the snapshot?
+  context: An AD snapshot issues a broad LDAP query that reads the entire object set, including trust objects, group
+    memberships, and password-policy attributes. Object-access auditing records the principal and the objects touched, which
+    confirms the breadth of what was read and identifies the account whose credentials drove the directory access.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: security
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4662
+      condition: selection
+    fields:
+      - SubjectUserName
+      - ObjectName
+      - AccessMask
+- source: template:discovery_recon.discovery_burst_detection
+  question: Did other reconnaissance or AD-enumeration commands run on this host around the same time?
+  context: A single snapshot may be routine administration, but multiple reconnaissance commands in rapid succession — net
+    group /domain, nltest, dsquery, adfind, or PowerShell AD cmdlets such as Get-ADUser and Get-ADGroupMember — is a signature
+    of post-compromise enumeration. Attackers map accounts, groups, and trusts before selecting their next stage.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_recon:
+        Image|endswith:
+          - '\whoami.exe'
+          - '\systeminfo.exe'
+          - '\ipconfig.exe'
+          - '\net.exe'
+          - '\net1.exe'
+          - '\nltest.exe'
+          - '\dsquery.exe'
+          - '\nbtstat.exe'
+          - '\arp.exe'
+          - '\netstat.exe'
+          - '\tasklist.exe'
+          - '\qprocess.exe'
+          - '\query.exe'
+          - '\quser.exe'
+          - '\hostname.exe'
+          - '\nslookup.exe'
+          - '\adfind.exe'
+          - '\csvde.exe'
+          - '\ldifde.exe'
+          - '\dnscmd.exe'
+          - '\cmdkey.exe'
+          - '\setspn.exe'
+      condition: selection and selection_recon
+    fields:
+      - Image
+      - User
+- source: template:discovery_recon.discovery_parent_chain
+  question: What process spawned the surrounding discovery activity, and is that pattern normal?
+  context: Discovery commands run from a user-launched cmd.exe or a known automation script are routine. The same commands
+    spawned by Office applications, script interpreters, wmiprvse.exe, or wsmprovhost.exe indicate automated or remote
+    post-exploitation enumeration rather than an administrator at a console.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+- source: template:discovery_recon.discovery_user_context
+  question: Is this user expected to run domain-wide directory discovery?
+  context: Directory administrators legitimately enumerate accounts, groups, and trusts. Standard users and most service
+    accounts rarely have a reason to snapshot the entire AD database. The user's role and typical toolset determine whether
+    this reads as routine administration or anomalous discovery from an account that should not be doing it.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - User
+- source: template:cue_process_tool.baseline
+  question: Does this host normally run ADExplorer?
+  context: A directory-management host where ADExplorer runs regularly is far less concerning than a workstation or server
+    that has never executed it. Zero or very low historical counts over the baseline window indicate first-time or rare
+    execution that deserves closer scrutiny.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired this snapshot pattern, what parents and users drove it, and does the current
+    alert fit?
+  context: The query mirrors the rule's selection structure scoped to this host, so the resulting parent and user distribution
+    reflects how this specific snapshot pattern has historically run here — not generic ADExplorer usage. A new parent process,
+    an unexpected user account, or an unusual command-line shape is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \ADExp.exe
+        - \ADExplorer.exe
+        - \ADExplorer64.exe
+        - \ADExplorer64a.exe
+      - OriginalFileName: AdExp
+      - Description: Active Directory Editor
+      - Product: Sysinternals ADExplorer
+      selection_cli:
+        CommandLine|contains: snapshot
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run ADExplorer across the environment?
+  context: Compare this user's current action against their historical behavior. A user who has never run ADExplorer is more
+    suspicious than one who runs it routinely as part of a directory-administration role. The user's role and typical toolset
+    should align with snapshotting the AD database.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent-and-binary combination historically routine here, or is the parent unusual for ADExplorer?
+  context: When the alert fires under a service principal, user identity does not attribute the behavior; the meaningful pivot
+    is the launch mechanism. A parent-and-binary pair that already accounts for many prior events is automation; a new or rare
+    parent for ADExplorer on this host or across the environment is the deviation worth chasing.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or staging on additional endpoints. If the
+    same user triggered AD enumeration or other hands-on activity on multiple hosts, the scope of the operation may be larger
+    than this single snapshot.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent-and-binary combination fire on other hosts in the same window, or is it isolated to this host?
+  context: Under a service principal, network-wide user activity returns agent-telemetry noise. The meaningful question is
+    whether the same launch mechanism — parent process and spawned binary — fired on other hosts in the alert window. Multiple
+    hosts in the same window points to scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired this snapshot pattern in the past week, and does the distribution look like automation or
+    one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of this
+    snapshot pattern rather than generic ADExplorer usage. Many hosts firing the same pattern points to scripted deployment
+    or vendor automation; one host or a small unrelated set points to manual operator activity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \ADExp.exe
+        - \ADExplorer.exe
+        - \ADExplorer64.exe
+        - \ADExplorer64a.exe
+      - OriginalFileName: AdExp
+      - Description: Active Directory Editor
+      - Product: Sysinternals ADExplorer
+      selection_cli:
+        CommandLine|contains: snapshot
+      condition: all of selection_*
+    fields:
+    - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering, credential access, or
+    other reconnaissance — may reveal the attack stages that preceded the snapshot and help reconstruct the full timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+  - id: T1087.002
+    name: Domain Account
+    role: primary
+  - id: T1069.002
+    name: Domain Groups
+    role: secondary
+  - id: T1482
+    name: Domain Trust Discovery
+    role: secondary
+  attack_chain_coverage:
+  - stage: 1
+    label: tool_invocation
+    description: ADExplorer is invoked with a snapshot argument to dump the readable AD object set.
+    mapped_to: Q1
+    source: template:universal.verify_trigger_match
+  - stage: 2
+    label: command_decode
+    description: The snapshot command parameters identify the target directory, output path, and any alternate credentials/port.
+    mapped_to: Q3
+    source: template:cue_process_tool.mechanism_decode
+  - stage: 3
+    label: directory_read
+    description: The snapshot issues a broad LDAP read of accounts, groups, and trust objects (object-access auditing).
+    mapped_to: Q7
+    source: attack:T1482.security
+  - stage: 4
+    label: credential_staging
+    description: Snapshots are sometimes run under borrowed credentials (machine-account pass-the-hash), with LSASS access nearby.
+    mapped_to: Q6
+    source: attack:T1482.process_access
+  - stage: 5
+    label: surrounding_enumeration
+    description: Additional discovery commands cluster around the snapshot as the operator maps the environment.
+    mapped_to: Q8
+    source: template:discovery_recon.discovery_burst_detection
+  dimension_coverage:
+  - dimension: command_analysis
+    technique: T1087.002
+    covered_by: Q3
+    source: template:cue_process_tool.mechanism_decode
+    coverage_type: direct
+  - dimension: process_identification
+    technique: T1087.002
+    covered_by: Q4
+    source: attack:T1087.002.process_identification
+    coverage_type: direct
+  - dimension: time_correlation
+    technique: T1087.002
+    covered_by: Q8
+    source: template:discovery_recon.discovery_burst_detection
+    coverage_type: direct
+  - dimension: tuning_parameter
+    technique: T1087.002
+    covered_by: Q12
+    source: template:cue_process_tool.baseline_deviation
+    coverage_type: direct
+  - dimension: user_context
+    technique: T1087.002
+    covered_by: Q10
+    source: template:discovery_recon.discovery_user_context
+    coverage_type: direct
+  - dimension: execution_context
+    technique: T1087
+    covered_by: Q5
+    source: template:cue_process_tool.process_chain
+    coverage_type: direct
+  - dimension: network_indicators
+    technique: T1087
+    covered_by: Q7
+    source: attack:T1482.security
+    coverage_type: partial
+  - dimension: parent_process_analysis
+    technique: T1087
+    covered_by: Q5
+    source: template:cue_process_tool.process_chain
+    coverage_type: direct
+  mutable_dispositions:
+  - element: CommandLinePattern
+    dimension: command_analysis
+    specific_values: "rationale only — rule already constrains CommandLine|contains snapshot; variants net user /domain, Get-ADUser are alternate detections, not this rule's pattern"
+    disposition: context
+    target_question: Q8
+    notes: Surrounding net/Get-AD* enumeration surfaced via the discovery_burst recon-binary sweep and context prose.
+  - element: TimeWindow
+    dimension: time_correlation
+    specific_values: "5-10 minute bursts of chained discovery"
+    disposition: context
+    target_question: Q8
+    notes: +/-15m clustering window surfaces chained discovery around the snapshot.
+  - element: SourceHost
+    dimension: tuning_parameter
+    specific_values: "rationale only — restrict to non-DC / non-admin endpoints"
+    disposition: context
+    target_question: Q12
+    notes: baseline_deviation contrasts this host's prior firing pattern; non-DC/non-admin framing carried in user_context prose.
+  - element: UserContext
+    dimension: user_context
+    specific_values: "rationale only — non-admin or unexpected user running enumeration"
+    disposition: context
+    target_question: Q10
+    notes: discovery_user_context asks whether the user is expected to run domain-wide discovery.
+  - element: ProcessLineageDepth
+    dimension: tuning_parameter
+    specific_values: "rationale only — how far back the parent-child chain is correlated"
+    disposition: context
+    target_question: Q5
+    notes: process_chain retrieves the parent and notes walking up the tree.
+  - element: ParentImage
+    dimension: tuning_parameter
+    specific_values: "rationale only — expected script hosts / authorized admins"
+    disposition: context
+    target_question: Q5
+    notes: process_chain evaluates whether the parent chain is expected.
+  - element: API_Name
+    dimension: tuning_parameter
+    specific_values: "DSEnumerateDomainTrusts (low-prevalence trust-enumeration API)"
+    disposition: context
+    target_question: Q6
+    notes: Trust-enumeration API surface addressed via process_access/security questions; ADExplorer reaches trusts through LDAP, not the named API, so no query injection.
+  dedup_decisions:
+  - dropped: universal.host_user_context vs discovery_recon.discovery_user_context overlap
+    reason: "kept both — host_user_context framed for the snapshot operation broadly; discovery_user_context framed for domain-wide directory discovery role. Distinct triage angles per discovery_user_context notes (overlap allowed, not forced merge)"
+    kept: both
+  - dropped: cue_user_actor.baseline + cue_user_actor.baseline_svc
+    reason: "user_actor pair — non-deduplicable (subject vs launch-mechanism identity)"
+    kept: both
+  - dropped: cue_user_actor.clustering + cue_user_actor.clustering_svc
+    reason: "user_actor pair — non-deduplicable (subject vs launch-mechanism identity)"
+    kept: both
+  skipped_templates:
+  - template: cue_process_tool.follow_on
+    reason: "ADExplorer snapshot is a terminal data-collection action — it writes a .dat file and does not spawn post-exploitation children, so child-process enumeration adds no signal; surrounding activity is covered by discovery_burst_detection and host-context clustering"
+  - template: cue_process_tool.clustering
+    reason: "host-scoped what-else-ran coverage provided by discovery_recon.discovery_burst_detection (recon-focused, higher signal for a discovery rule); generic host clustering would duplicate it"
+  - template: cue_host_context.clustering
+    reason: "duplicates discovery_recon.discovery_burst_detection host-scoped what-else-ran view; the recon-binary sweep is the higher-signal version for a discovery rule"
+  - template: universal.endpoint_protection_health
+    reason: "rule detects discovery/data-collection, not payload execution or credential access where AV/EDR would be disabled first; tamper-as-precursor signal is carried by cue_host_context.precursor (prior sigma alerts incl. defense tampering)"
+  reflection_overrides: []
+  hint_dispositions:
+  - hint: "logsource 'image_load' (recommended by techniques: T1482) is not covered — pull in cue_image_load.* or author a custom question with `category: image_load`"
+    disposition: declined
+    reason: >-
+      T1482's image_load analytic targets in-process trust-enumeration via
+      DSEnumerateDomainTrusts loaded into a script host (netapi32/ntdsapi DLLs).
+      ADExplorer enumerates trusts over an LDAP wire query, not by loading the
+      domain-trust API into the process, so image_load of trust DLLs is not the
+      artifact this rule's snapshot produces. The directory-read evidence is
+      instead covered by the process_access (LSASS) and security (4662
+      object-access) questions, which capture the credential and object-read
+      surface ADExplorer actually touches.
+  contextual_sets:
+    included: []
+    excluded:
+    - id: ransomware_impact
+      confidence: low
+      reason: "keyword 'ransomware' appears only in reference threat-intel describing groups that have used ADExplorer; the rule detects AD discovery, not encryption/impact behavior — no ransomware_impact question would align with the detection"
+    - id: network_scope
+      confidence: low
+      reason: "same incidental 'ransomware' keyword match; the snapshot is a local process_creation event with no network-connection selection — network_scope questions would not align with what this rule fires on"
+  technique_sets_applied:
+  - universal
+  - discovery_recon
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 15
+      attack: 3
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 15
+    logsource_diversity:
+      process_creation: 15
+      process_access: 1
+      security: 1
+      sigma_alert: 1

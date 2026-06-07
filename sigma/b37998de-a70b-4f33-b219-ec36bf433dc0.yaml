@@ -1,0 +1,514 @@
+name: PUA - PingCastle Execution From Potentially Suspicious Parent
+id: 2943601e-fe5f-47de-a339-02257340d87e
+description: |
+  Detects PingCastle, an Active Directory security-assessment tool, when it is launched from a potentially suspicious parent. The rule fires when the child is PingCastle (by binary name, original filename, product, or a scanner/healthcheck command line) AND the parent command line references a script-style artifact such as a .ps1, .bat, .hta, .js, or .lnk, AND that parent command line EITHER points at a user-writable or temporary location (Temp, AppData, Public, Perflogs) OR resolves under a user profile Favorites or Contacts directory.
+  PingCastle is frequently run legitimately by administrators and consultants to audit domain risk, but it is also used by operators for fast pre-attack reconnaissance because it maps Tier-0 accounts, delegation, ACL paths, and trust relationships from a single low-privilege run. The suspicious-parent constraint is the discriminator: a sanctioned audit is normally launched interactively or from a known automation path, whereas a launch from a script dropped into Temp or a profile folder suggests scripted recon during an intrusion.
+  Investigation should confirm the exact command line and parent against the rule criteria, identify the assessment scope and target directory the operator chose, establish whether the user, host, and tool are authorized for this activity, and look for surrounding stages such as credential access or defense tampering that often accompany hands-on AD enumeration.
+type: detection
+detection_id: b37998de-a70b-4f33-b219-ec36bf433dc0
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the alerting process match PingCastle launched from a suspicious parent, and which parent branch fired?
+  context: >-
+    Confirm the alert is a true positive before investing time. The rule fires when the child is identified as PingCastle
+    (Image ending in PingCastle.exe, OriginalFileName PingCastle.exe, Product Ping Castle, or a --scanner/--healthcheck/--no-enum-limit
+    command line) AND the parent command line references a script artifact (.ps1, .bat, .cmd, .hta, .htm/.html, .js, .lnk, .vbe/.vbs, .wsf)
+    that EITHER lives in a user-writable or temporary path (Temp, AppData Local/Roaming, Users Public, Perflogs, Windows Temp, Temporary Internet)
+    OR resolves under a profile Favorites or Contacts directory. Read ParentCommandLine and note which location branch matched, because a
+    temporary or AppData path versus a Favorites or Contacts path implies different downstream scrutiny of how the script arrived.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentCommandLine
+      - Image
+      - OriginalFileName
+      - CommandLine
+      - Product
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run an Active Directory assessment tool?
+  context: >-
+    Legitimate AD audits are typically run by domain administrators, security engineers, or contracted assessors from a known
+    management host or jump box. PingCastle running under an ordinary user or on a workstation that has no audit role is a
+    stronger signal of unsanctioned reconnaissance. Confirm whether the account role and host function match an authorized
+    assessment activity.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What assessment did PingCastle perform? Decode the scanner, healthcheck, and target arguments.
+  context: >-
+    The command line reveals the operational intent. --healthcheck scores domain risk and writes an HTML and XML report; --scanner
+    runs targeted checks such as nullsession, zerologon, smb, share, localadmin, or laps_bitlocker against hosts; --no-enum-limit
+    removes result caps for a fuller sweep; a --server value names the targeted domain controller. Decode the full argument set to
+    determine what was enumerated and where the report would be written. This host-and-binary scope captures sequential PingCastle
+    invocations that together form one assessment.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:parent_child.parent_process_legitimacy
+  question: Is the parent expected to spawn PingCastle, and what started the parent?
+  context: >-
+    The script-style parent launched from a user-writable or profile path is the core signal for this detection. Trace the
+    parent's own origin to see whether the chain is benign (an administrator double-clicked a known assessment script) or
+    suspicious (a dropped script in Temp or a profile folder spawned the recon tool). The grandparent often distinguishes an
+    interactive run from scripted execution during an intrusion.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- source: template:cue_parent_process.mechanism_decode
+  question: What script or command did the parent run that led to PingCastle?
+  context: >-
+    The parent command line referenced a script artifact in a user-writable or profile location. Retrieve the parent's own
+    process_creation event to see the exact script path and arguments it executed. A script staged in Temp, AppData, or a
+    Favorites or Contacts folder that launches AD reconnaissance is the pattern this rule is built to surface.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+- source: template:parent_child.sibling_processes
+  question: What other child processes did the same parent spawn?
+  context: >-
+    If the script parent launched PingCastle, it may have launched other tools in the same window. Sibling processes reveal
+    whether this is an isolated assessment run or part of a sequence that also includes credential access, lateral movement,
+    or additional discovery utilities.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_parent_process.follow_on
+  question: What other activity did this parent script generate on the host?
+  context: >-
+    Beyond the immediate child, the parent script may have spawned additional processes that continue the operation. Reviewing
+    everything the same parent binary launched on this host helps reconstruct the full scope of activity initiated through this
+    execution chain.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        process.parent.name|expand: '%ParentName%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.baseline
+  question: Does this host normally run PingCastle?
+  context: >-
+    A tool that has never executed on this host is more suspicious than one that runs on a schedule. Zero or very low historical
+    counts indicate a first-time or rare PingCastle execution; a recurring pattern points to a sanctioned, possibly scheduled,
+    audit. Combine the count with knowledge of whether this host has an assessment role.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run Active Directory assessment tooling?
+  context: >-
+    Compare this account's current action against its history. A user who has never run PingCastle or similar AD tooling is more
+    suspicious than one who runs it regularly as part of an assessment role. User role and typical toolset should align with
+    domain-auditing activity.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent-and-PingCastle launch combination historically routine on this host or across the environment?
+  context: >-
+    When the alert fires under a service or machine account, user identity does not attribute the behavior. The meaningful pivot
+    is the launch mechanism: which parent process spawned PingCastle, and whether that pair is historically common. A new or rare
+    parent for this binary is the deviation worth chasing; a pair that already accounts for many prior events is more likely
+    sanctioned automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: >-
+    Tracking the user's activity across all hosts reveals whether the assessment was isolated or part of broader hands-on
+    activity. If the same account triggered similar reconnaissance or follow-on actions on multiple endpoints, the scope of
+    activity is larger than a single run.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent-and-PingCastle launch fire on other hosts in the same window?
+  context: >-
+    Under a service or machine account, asking what else the user did returns agent-telemetry noise. The meaningful question is
+    whether the same launch mechanism fired on other hosts in the alert window. Multiple hosts in the same window points to
+    scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:remote_access_tool.tool_authorization
+  question: Is PingCastle on the organization's approved software list for this host?
+  context: >-
+    Organizations typically sanction AD assessment tooling for specific roles and hosts. PingCastle is a potentially unwanted
+    application: even though it is a legitimate auditing utility, its presence on a host outside an approved assessment context
+    may represent shadow IT or operator-staged reconnaissance. Verify the tool is authorized here regardless of its reputation.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+- source: template:remote_access_tool.connection_destination
+  question: Which directory infrastructure did this PingCastle run connect to?
+  context: >-
+    PingCastle builds its picture through LDAP queries and RPC/SMB calls to a domain controller, so its outbound connections
+    name the directory targets it enumerated. The destinations reveal which domain controllers or trusted domains were scanned
+    and whether the targeting matches an authorized assessment scope. If network data is unavailable for this host, recover the
+    target from the --server value in the decoded command line instead.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationHostname
+      - DestinationPort
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: >-
+    Alerts rarely occur in isolation. Examining activity around the detection reveals what led to the assessment run and what
+    happened after. Look for reconnaissance, credential access, or persistence mechanisms that would place this PingCastle
+    execution within a larger sequence.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Earlier detections on the same host can reveal the stages that preceded this reconnaissance. Credential access, defense
+    tampering, or initial-access alerts before an AD assessment run help reconstruct the timeline and indicate whether this is
+    isolated activity or one step in a multi-stage operation.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in the hour before the alert?
+  context: >-
+    Operators often weaken protection before hands-on activity. This query surfaces direct attempts to disable AV/EDR services,
+    flip Defender flags, add broad exclusions, clear logs, or patch AMSI/ETW. Zero rows is a useful signal that protection looks
+    healthy; populated rows shift the disposition toward operator preparation, so review the parent process and signing chain of
+    the writer.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+  - id: T1595
+    name: Active Scanning
+    role: primary
+  attack_chain_coverage: []
+  dimension_coverage: []
+  mutable_dispositions: []
+  dedup_decisions:
+  - dropped: cue_process_tool.process_chain
+    reason: "parent_process is primary cue and parent_child technique set is active — parent_process_legitimacy and the parent mechanism_decode subsume process_chain"
+    kept: parent_child.parent_process_legitimacy
+  - dropped: cue_parent_process.baseline
+    reason: "overlaps cue_process_tool.baseline (does this host run the tool) and parent_child.parent_process_legitimacy (is the parent-child pair expected); kept the more specific pair"
+    kept: cue_user_actor.baseline_svc
+  - dropped: cue_parent_process.clustering
+    reason: "host-scoped parent activity already covered by cue_parent_process.follow_on (other children of parent) and cue_host_context.clustering (all host activity in window)"
+    kept: cue_parent_process.follow_on
+  - dropped: cue_parent_process.scope
+    reason: "fleet-wide parent+child spread already covered by cue_user_actor.clustering_svc (same parent+binary on other hosts in window) and cue_user_actor.clustering"
+    kept: cue_user_actor.clustering_svc
+  - dropped: remote_access_tool.active_session_context
+    reason: "PingCastle is an AD-assessment tool, not a remote-access session tool; helpdesk-session framing does not fit. Authorization coverage retained via remote_access_tool.tool_authorization reframed to approved-software list"
+    kept: remote_access_tool.tool_authorization
+  - paired: [cue_user_actor.baseline, cue_user_actor.baseline_svc]
+    reason: "user_actor pair — non-deduplicable"
+  - paired: [cue_user_actor.clustering, cue_user_actor.clustering_svc]
+    reason: "user_actor pair — non-deduplicable"
+  skipped_templates: []
+  reflection_overrides: []
+  hint_dispositions:
+  - hint: "Condition uses OR among selection groups: (selection_parent_ext OR selection_parent_path_1 OR selection_parent_path_2). Q1 (verify_trigger_match) and the playbook description must frame this as 'EITHER ... OR ...', not 'X AND Y AND Z'."
+    disposition: acted_on
+    reason: >-
+      Description and the verify_trigger_match question use disjunctive framing ('EITHER a user-writable or temporary path OR
+      a profile Favorites/Contacts directory'); verify_trigger_match context instructs the analyst to note which location branch
+      fired. Recorded here for the audit trail since acted-on hints have no dedicated meta slot.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+  - universal
+  - remote_access_tool
+  - parent_child
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 17
+      attack: 0
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 14
+    logsource_diversity:
+      process_creation: 15
+      network_connection: 1
+      sigma_alert: 1

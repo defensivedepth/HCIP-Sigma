@@ -1,0 +1,512 @@
+name: Suspicious Binary In User Directory Spawned From Office Application
+id: cb6c4cec-088e-4da1-92ed-d6daec78db48
+description: |
+  Detects a Microsoft Office suite application (Word, Excel, PowerPoint, Publisher, Visio, Access, or the
+  Equation Editor) spawning an executable that lives under C:\users\, excluding Teams.exe. The rule fires when
+  the parent Image ends in one of the Office binaries AND the child Image starts with C:\users\ AND ends in
+  .exe AND is not Teams.exe. Office applications open documents that users receive by email, chat, or download;
+  a document with a malicious macro or embedded object can write a payload into a user-writable directory and
+  launch it, which is exactly this parent-child shape. Legitimate add-ins and user-installed tooling occasionally
+  produce the same lineage, so confirm what document opened, what the child executable is and where it came from,
+  whether it carries a mark-of-the-web from a download, and whether this parent-child pairing is routine for this
+  user and host.
+type: detection
+detection_id: aa3a6f94-890e-4e22-b634-ffdfd54792cc
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Did an Office application spawn an executable from a user directory, and which Office app and child binary were involved?
+  context: >-
+    Confirm the alert is a true positive by reviewing the exact parent and child. The rule fires when the parent
+    Image ends in WINWORD.EXE, EXCEL.EXE, POWERPNT.exe, MSPUB.exe, VISIO.exe, MSACCESS.exe, or EQNEDT32.exe AND
+    the child Image starts with C:\users\ AND ends in .exe AND is not Teams.exe. Note which Office application is
+    the parent and the full path of the child executable, since an executable dropped into a user profile path by
+    a document handler is the core signal here.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+- source: template:universal.host_user_context
+  question: Is this user and host expected to launch user-directory executables from an Office application?
+  context: >-
+    Some workflows legitimately drive Office to launch helper executables -- a sanctioned add-in, a line-of-business
+    macro, or a user-installed tool staged under the profile. Knowing whether this host's role and the acting user
+    routinely produce Office-spawned executables from a user directory is often the fastest way to separate
+    sanctioned automation from a malicious document.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:initial_access.delivery_vector
+  question: What document or email attachment caused the Office application to spawn this executable?
+  context: >-
+    Initial access through an Office application typically begins with a document delivered by email, chat, or a
+    download link, carrying a malicious macro or embedded object. Identifying the specific document -- its filename
+    and how it reached the user -- enables blocking at the perimeter and finding other recipients. Read the parent
+    command line for the opened document path, and correlate against mail and web gateway records for the delivery.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+- source: template:parent_child.parent_process_legitimacy
+  question: Is this Office application expected to spawn this child, and what opened the document that started it?
+  context: >-
+    An Office application spawning an executable from a user directory is the core signal for this detection.
+    Tracing the parent's own origin shows whether the chain is legitimate -- a user double-clicked a document that
+    triggered a sanctioned add-in -- or whether the document was opened from a mail handler or download path and
+    its macro launched the child. Read the parent and grandparent command lines for the document path and the
+    application that delivered it.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- source: template:parent_child.sibling_processes
+  question: What other child processes did the same Office application instance spawn around the same time?
+  context: >-
+    A malicious document often launches more than one process -- a dropper, then a script host, then the payload.
+    Examining the other children of the same Office application instance reveals the full scope of what the document
+    executed. host.name is included as a fallback because ParentProcessGuid may be unavailable.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.mechanism_decode
+  question: What exactly did the spawned executable do? Decode its full command line.
+  context: >-
+    The child's command line reveals the operation the document launched. Decode any flags, file paths, URLs, or
+    encoded content. A payload dropped into a user profile path may invoke a script host, a download cradle, or a
+    second-stage loader; read the arguments to identify what it operated on and where it pulled from. This view
+    scopes to executions of this binary on this host in a tight window so multi-step invocations are visible together.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: attack:T1204.002.create_stream_hash
+  question: Does the spawned executable carry a mark-of-the-web indicating it was downloaded from outside the host?
+  context: >-
+    When a file arrives from the internet or another zone, the handler records a Zone.Identifier alternate data
+    stream marking its origin. An executable launched from a user directory that carries a download mark-of-the-web
+    was almost certainly delivered rather than locally produced, which strongly aligns with a document-borne payload.
+    A stream-hash event for this file records the host zone and the URL or share it came from. If alternate-data-stream
+    creation events are not collected in this environment, treat zero results as a visibility gap rather than evidence
+    the file was local.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: create_stream_hash
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - Contents
+- source: template:universal.evidence_preservation
+  question: Is the spawned executable still on disk for analysis?
+  context: >-
+    The executable dropped into the user directory is the payload. Checking whether it still exists on disk enables
+    hash lookups, reputation checks, and sandbox submission. File-creation events for the same path also reveal which
+    process wrote it -- the Office application itself, a script host it spawned, or a separate dropper.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: attack:T1204.002.network_connection
+  question: Did the spawned executable make any outbound network connections, and to where?
+  context: >-
+    A document-delivered payload commonly reaches out immediately to pull a second stage or establish
+    command-and-control. An outbound connection from the child executable shortly after it started indicates the
+    document drove a download or remote interaction rather than a self-contained local action. Compare any
+    destination against known-good update and management endpoints.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+- source: template:initial_access.campaign_scope
+  question: Were other users or hosts hit by the same Office-spawned execution pattern?
+  context: >-
+    Phishing campaigns rarely target a single user. If one document spawned an executable from an Office
+    application, others likely received the same lure. Searching for the same rule firing across other hosts reveals
+    campaign breadth and identifies additional systems that need investigation.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        rule.uuid|expand: '%rule.uuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:initial_access.application_patch_status
+  question: Is the Office application up to date with security patches?
+  context: >-
+    Some initial-access chains exploit known vulnerabilities in Office to achieve code execution rather than relying
+    on macro consent. An unpatched Office installation confirms exploitation was possible and indicates whether other
+    similarly unpatched systems are at risk. Patch status also helps distinguish exploitation of a known CVE from
+    macro-driven execution the user enabled.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run executables from a user directory?
+  context: >-
+    Compare the acting user's current activity against their historical behavior. A user who has never launched an
+    executable from this kind of path is more notable than one who does so routinely. User role and typical toolset
+    should align with running user-directory executables.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this Office-application-to-executable launch historically routine on this host or across the environment, or is it a new pairing?
+  context: >-
+    When the alert fires under a service principal, user identity does not attribute the behavior; the meaningful
+    pivot is the launch mechanism -- this Office application spawning this specific executable. A pairing that
+    already accounts for many prior events is a sanctioned add-in or deployment, while a new or rare
+    Office-to-executable pairing on this host or env-wide is the deviation worth chasing.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the environment around the time of the alert?
+  context: >-
+    Tracking the user's activity across all hosts in the alert window reveals whether this is isolated or part of
+    broader hands-on activity. The same user triggering similar Office-spawned execution on multiple hosts widens
+    the scope of what needs review.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did the same Office-application-to-executable launch fire on other hosts in the same window, indicating a coordinated rollout?
+  context: >-
+    Under a service principal, asking what the user did network-wide returns agent-telemetry noise. The meaningful
+    question is whether the same launch mechanism -- this Office application spawning this executable -- fired on
+    other hosts in the alert window. Multiple hosts in the same window points to a pushed lure or scheduled
+    automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.scope_svc
+  question: Did this same rule fire on other hosts in the past 24 hours, and does the cross-host pattern look like coordinated automation or an isolated detection?
+  context: >-
+    A rule that fires across many hosts on the same day is often tracking a sanctioned add-in or a pushed lure
+    reaching many recipients, while a rule that fires on one host alone is the deviation worth chasing. This view
+    counts how many hosts produced this detection in the window so the cross-host shape is visible at a glance.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        rule.name|expand: '%rule.name%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Alerts rarely happen in isolation. Earlier detections on the same host -- reconnaissance, credential access,
+    defense tampering -- may reveal the stages that preceded the document-driven execution and help reconstruct the
+    timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+  - id: T1204.002
+    name: 'User Execution: Malicious File'
+    role: primary
+  - id: T1204
+    name: User Execution
+    role: secondary
+  attack_chain_coverage:
+  - stage: 1
+    label: file_delivery_open
+    description: User opens a file delivered by email, web, chat, or share; the Office handler processes it.
+    mapped_to: Q3
+    source: template:initial_access.delivery_vector
+  - stage: 2
+    label: payload_dropped
+    description: A file is created in a user-controlled path (Downloads, Temp, Desktop, profile) by the handler or its child.
+    mapped_to: Q8
+    source: template:universal.evidence_preservation
+  - stage: 3
+    label: child_spawn
+    description: The Office parent spawns a new executable from the user directory.
+    mapped_to: Q1
+    source: template:universal.verify_trigger_match
+  - stage: 4
+    label: child_action_egress
+    description: The spawned executable decodes/runs its command line and/or makes outbound network connections.
+    mapped_to: Q9
+    source: attack:T1204.002.network_connection
+  dimension_coverage:
+  - dimension: file_path_analysis
+    technique: T1204.002
+    covered_by: Q8
+    source: template:universal.evidence_preservation
+    coverage_type: direct
+  - dimension: time_correlation
+    technique: T1204.002
+    covered_by: Q5
+    source: template:parent_child.sibling_processes
+    coverage_type: direct
+  - dimension: tuning_parameter
+    technique: T1204.002
+    covered_by: Q6
+    source: template:cue_process_tool.mechanism_decode
+    coverage_type: direct
+  - dimension: user_context
+    technique: T1204
+    covered_by: Q2
+    source: template:universal.host_user_context
+    coverage_type: direct
+  mutable_dispositions:
+  - element: TimeWindow
+    dimension: time_correlation
+    specific_values: '0-5m file write to child spawn'
+    disposition: context
+    target_question: Q5
+    notes: File-write-to-child correlation window framed in sibling_processes (+/-15m) and evidence_preservation; tight window keeps the drop-then-spawn pair visible together.
+  - element: SuspiciousExtensions
+    dimension: tuning_parameter
+    specific_values: 'exe, scr, lnk, pif, cpl, js, vbs, bat, cmd, ps1, hta, iso, docm, xlsm'
+    disposition: context
+    target_question: Q6
+    notes: Rule fixes the child extension to .exe; mechanism_decode context directs decode of the launched payload's arguments. Broader suspicious-extension list is a tuning rationale, not in this rule's selection.
+  - element: UserPaths
+    dimension: file_path_analysis
+    specific_values: 'Downloads, Temp, Desktop, profile AppData staging (C:\users\)'
+    disposition: context
+    target_question: Q8
+    notes: Rule fixes the child path to C:\users\; evidence_preservation and create_stream_hash questions scope to the dropped %file_paths% under the user profile.
+  - element: ParentApps
+    dimension: tuning_parameter
+    specific_values: 'winword, excel, powerpnt, mspub, visio, msaccess, eqnedt32'
+    disposition: context
+    target_question: Q1
+    notes: Parent app list is fixed by the rule selection; named in verify_trigger_match and used to scope parent_process_legitimacy.
+  - element: SignerAllowList
+    dimension: tuning_parameter
+    specific_values: rationale only
+    disposition: context
+    target_question: Q8
+    notes: Trusted-signer suppression is a tuning rationale; evidence_preservation directs hash/reputation review of the dropped executable to apply signer judgment.
+  - element: HighRiskChildren
+    dimension: tuning_parameter
+    specific_values: 'powershell, cmd, wscript, cscript, mshta, rundll32, regsvr32, msiexec, curl, bitsadmin, expand, tar (T1204)'
+    disposition: context
+    target_question: Q6
+    notes: This rule fires on any user-directory .exe child, not a fixed LOLBin list; mechanism_decode directs decode of whatever child fired and any LOLBin it in turn invokes.
+  - element: EgressAllowList
+    dimension: tuning_parameter
+    specific_values: 'corporate update/CDN domains, proxy egress CIDRs (T1204)'
+    disposition: context
+    target_question: Q9
+    notes: Egress-allowlist comparison framed in the network_connection question to suppress benign updater traffic.
+  dedup_decisions:
+  - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc pairing
+    reason: user_actor pair — non-deduplicable
+    kept: both
+  - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc pairing
+    reason: user_actor pair — non-deduplicable
+    kept: both
+  - dropped: cue_parent_process.mechanism_decode
+    reason: parent_child technique set active — parent_child.parent_process_legitimacy is more specific for parent legitimacy
+    kept: parent_child.parent_process_legitimacy
+  skipped_templates:
+  - template: cue_process_tool.process_chain
+    reason: 'Hint: parent_process active — process_chain (ProcessGuid->parent lookup) is subsumed by parent_child.parent_process_legitimacy, which performs the same parent lookup with richer fields.'
+  - template: cue_parent_process.baseline
+    reason: Parent+binary historical baseline covered by cue_user_actor.baseline_svc (process.parent.name + Image), which provides the same parent-child frequency pivot.
+  - template: cue_parent_process.mechanism_decode
+    reason: Parent-decode covered by parent_child.parent_process_legitimacy (same ParentProcessGuid lookup, richer fields including ParentCommandLine).
+  - template: cue_user_actor.follow_on
+    reason: Same-host user follow-on overlaps cue_host_context.precursor (prior alerts) and clustering; dropped to stay within question cap without losing a distinct angle.
+  - template: cue_user_actor.follow_on_svc
+    reason: Service-principal follow-on (repeat binary launches on host) overlaps cue_user_actor.baseline_svc and clustering_svc; dropped to stay within cap.
+  - template: cue_user_actor.scope
+    reason: User-pivot alert scope superseded by cue_user_actor.scope_svc (rule-identity pivot), which is meaningful regardless of which principal fires; only the svc variant kept to stay within cap.
+  - template: cue_process_tool.baseline
+    reason: Host historical baseline of the binary covered by cue_user_actor.baseline (user+binary) and baseline_svc (parent+binary); a host-only baseline adds little over those.
+  - template: cue_host_context.clustering
+    reason: Same-window host activity covered by parent_child.sibling_processes (same-parent children) and cue_user_actor.clustering; dropped to stay within cap.
+  - template: universal.endpoint_protection_health
+    reason: cue_host_context.precursor present and the rule fires on document-driven first-stage execution, not credential access or impact; prior-alert context carries any tamper-as-precursor signal per template guidance (b).
+  reflection_overrides: []
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+  - universal
+  - initial_access
+  - parent_child
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 15
+      attack: 2
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 14
+    logsource_diversity:
+      process_creation: 11
+      create_stream_hash: 1
+      file_event: 1
+      network_connection: 1
+      sigma_alert: 3

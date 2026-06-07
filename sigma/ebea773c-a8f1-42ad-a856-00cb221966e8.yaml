@@ -1,0 +1,585 @@
+name: DLL Sideloading by VMware Xfer Utility
+id: 0d050aef-9835-4c37-98a3-02cc4abbd778
+description: |
+  Detects the signed VMware Xfer utility (VMwareXferlogs.exe) running from any directory
+  other than its standard VMware install path under C:\Program Files\VMware\. The rule fires
+  when a process whose Image ends in \VMwareXferlogs.exe runs AND its path does not start with
+  the VMware install directory. The signed utility imports glib-2.0.dll; when the binary is
+  copied out of its install path, a same-named DLL planted alongside it loads in its place,
+  giving the attacker code execution inside a trusted, signed process. Legitimate firing is
+  rare — confirm the binary's location, the planted DLL, and what loaded into the process,
+  then look for the downloads, decode/decrypt steps, and outbound traffic that typically
+  surround signed-binary proxy execution.
+type: detection
+detection_id: ebea773c-a8f1-42ad-a856-00cb221966e8
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-06
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the alerting process match this rule — VMwareXferlogs.exe running from a path outside C:\Program Files\VMware\?
+  context: Confirm the alert is a true positive before investing time. The rule fires when the Image ends in \VMwareXferlogs.exe AND the full path does not start with C:\Program Files\VMware\. Read the Image path on the alerting event and verify it points somewhere other than the standard VMware install directory; an in-place install path would be a tuning gap, not this pattern.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run VMware utilities from a non-standard directory?
+  context: Legitimate VMware tooling runs from under C:\Program Files\VMware\. A host or user copying VMwareXferlogs.exe into another directory and running it there is the pattern the rule targets. Knowing whether this host runs VMware software at all, and whether this user administers it, is often the fastest way to separate a relocation by an admin from operator-staged proxy execution.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: attack:T1574.001.file_path_analysis
+  question: What directory was VMwareXferlogs.exe launched from, and is that location user-writable or a known staging path?
+  context: The path the binary runs from is the load-bearing artifact for this technique. Signed-binary proxy execution depends on relocating the utility into a directory the operator controls so a planted DLL sits beside it. Directories such as a debug folder under the Windows directory, ProgramData, a user profile, or a temp path are common staging locations and carry more weight than a relocation into another Program Files subfolder.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CurrentDirectory
+      - CommandLine
+- source: template:cue_process_tool.mechanism_decode
+  question: What did VMwareXferlogs.exe do when it ran — decode its full command line and output handling?
+  context: The full command line and current directory reveal the operation. Watch for output redirected to an unusual destination, including UNC paths or admin shares, which is an artifact-hiding pattern seen with this proxy-execution behavior. The query returns every run of the binary on this host within the window so sequential invocations that form one operation are visible together.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: attack:T1574.001.image_load
+  question: Did VMwareXferlogs.exe load glib-2.0.dll or any other DLL from a non-standard directory?
+  context: The sideload itself appears in module-load telemetry — the trusted process loading a same-named library from the relocated directory rather than from its install path. The signed utility imports glib-2.0.dll; a copy of that DLL loading from the same folder the binary was relocated to is the technique executing. If module-load events are not collected in this environment, treat zero results as a visibility gap rather than evidence nothing loaded, and confirm the DLL on disk instead.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+- source: attack:T1574.001.file_path_analysis
+  question: Was glib-2.0.dll or another DLL written into the same directory as the relocated binary?
+  context: Before the sideload runs, the attacker must place the planted DLL next to the relocated executable. File-creation telemetry in the binary's directory shows the staged DLL and any accompanying payload files, including encrypted blobs disguised with innocuous extensions. The presence of glib-2.0.dll outside a VMware install path, especially under a debug or temp directory, is the on-disk form of this technique.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_dll:
+        TargetFilename|contains: '.dll'
+      condition: selection and selection_dll
+    fields:
+      - TargetFilename
+      - Image
+      - User
+- source: attack:T1574.001.tuning_parameter
+  question: Is the DLL loaded by VMwareXferlogs.exe the legitimate signed library, or has it been substituted?
+  context: Substitution detection turns on comparing the loaded DLL against the known-good library — signature status and hash. A legitimate glib-2.0.dll is signed and matches the baseline shipped with VMware; a planted replacement exports the same function names but is unsigned or hash-mismatched. Confirm the signing chain and hash of every DLL that loaded into the process, and treat an unsigned same-named module as the substituted library.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Hashes
+      - Signed
+      - Signature
+- source: template:cue_process_tool.process_chain
+  question: What process spawned VMwareXferlogs.exe, and is that parent chain expected for this utility?
+  context: The parent reveals how the relocated binary was invoked. A scripting host, a command shell run interactively, or an office application launching the utility points to operator-driven execution rather than a VMware service starting its own tooling. Walk up to the parent's own parent if the immediate parent is itself a generic shell.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.follow_on
+  question: What child processes did VMwareXferlogs.exe spawn after it ran?
+  context: Once code runs inside the trusted process, the injected payload commonly spawns or injects into other processes for post-exploitation. Unexpected children such as command shells, script hosts, or download utilities indicate the sideloaded code acted beyond the utility's normal function.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously matched this rule's pattern, what parents and users drove it, and does the current alert fit?
+  context: The query mirrors the rule's selection and filter scoped to this host, so the parent and user distribution reflects how this specific firing pattern has run here historically rather than generic VMware usage. A new parent process or an unexpected account against the established pattern is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection:
+        Image|endswith: \VMwareXferlogs.exe
+      filter:
+        Image|startswith: C:\Program Files\VMware\
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection and not filter) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run VMware utilities or relocate signed binaries like this?
+  context: Compare this user's action against their historical pattern. A user who has never run VMwareXferlogs.exe from a non-standard path is more notable than one who administers VMware tooling regularly. User role and typical toolset should align with running virtualization utilities outside their install directory.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent-plus-binary combination historically routine on this host or environment-wide, or is the parent unusual for this binary?
+  context: When the alert fires under a service principal, user identity does not attribute behavior; the meaningful pivot is the launch mechanism. A new or rare parent for VMwareXferlogs.exe is the deviation worth chasing, while a pair that already accounts for many prior events points to vendor or OS automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or staging on multiple endpoints. If the same user triggered similar relocation or execution activity elsewhere, the scope may be larger than this one host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent-plus-binary combination fire on other hosts in the same window — a coordinated rollout, or isolated to this host?
+  context: Under a service principal, user-scoped network activity returns agent-telemetry noise. The meaningful question is whether the same launch mechanism — parent process plus spawned binary — fired on other hosts in the alert window. Multiple hosts point to pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_process_tool.scope
+  question: Have other hosts matched this rule's pattern in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: The query mirrors the rule's selection and filter with no host scope, giving a fleet-wide count of this firing pattern rather than generic binary usage. Many hosts running VMwareXferlogs.exe from non-standard paths points to scripted deployment or vendor automation; one host or a small unrelated set points to manual operator activity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection:
+        Image|endswith: \VMwareXferlogs.exe
+      filter:
+        Image|startswith: C:\Program Files\VMware\
+      condition: selection and not filter
+    fields:
+    - host.name
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in the hour before the alert?
+  context: This proxy-execution behavior commonly carries in-process steps that blind security tooling — unhooking userland EDR stubs and patching out AMSI and ETW from inside the trusted process. Those in-memory patches will not appear here, but command-line attempts to disable AV/EDR services, add exclusions, or clear logs will. Zero rows is a useful health signal; populated rows shift the disposition toward operator preparation, so review the parent and signing chain of any writer.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — a download or staging step, reconnaissance, or defense tampering — may reveal the stages that preceded the sideload and help reconstruct the timeline of how the binary and its planted DLL arrived.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:persistence_scope.process_based_persistence
+  question: Were other process-based persistence mechanisms installed on this host around the alert?
+  context: Hijacking a signed binary's DLL search path is itself a persistence and execution mechanism, and operators rarely rely on one foothold. Scheduled tasks, services, registry Run-key writes, BITS jobs, or WMI subscriptions installed in the same window indicate intentional stacking rather than isolated administrative action.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1574.001
+      name: DLL Search Order Hijacking
+      role: primary
+    - id: T1574
+      name: Hijack Execution Flow
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: dll_staging
+      description: Planted DLL (and payload files) written into the relocated binary's directory
+      mapped_to: Q6
+      source: attack:T1574.001.file_path_analysis
+    - stage: 2
+      label: proxy_binary_execution
+      description: Signed VMwareXferlogs.exe executed from a non-standard directory
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 3
+      label: dll_sideload
+      description: Trusted process loads the planted same-named DLL from the non-standard directory
+      mapped_to: Q5
+      source: attack:T1574.001.image_load
+    - stage: 4
+      label: post_load_activity
+      description: Sideloaded code spawns or injects into follow-on processes
+      mapped_to: Q9
+      source: template:cue_process_tool.follow_on
+  dimension_coverage:
+    - dimension: time_correlation
+      technique: T1574.001
+      covered_by: Q6
+      source: attack:T1574.001.file_path_analysis
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1574.001
+      covered_by: Q7
+      source: attack:T1574.001.tuning_parameter
+      coverage_type: direct
+    - dimension: file_path_analysis
+      technique: T1574
+      covered_by: Q3
+      source: attack:T1574.001.file_path_analysis
+      coverage_type: direct
+  mutable_dispositions:
+    - element: AllowedDllPaths
+      dimension: tuning_parameter
+      specific_values: 'rationale only (e.g., C:\Windows\System32)'
+      disposition: context
+      target_question: Q5
+      notes: Known-safe DLL directories are a tuning concept; Q5 asks whether the DLL loaded from a non-standard directory, which is the inverse check. No fixed value to inject.
+    - element: ProcessAllowList
+      dimension: tuning_parameter
+      specific_values: rationale only
+      disposition: context
+      target_question: Q2
+      notes: Expected apps loading DLLs from non-standard locations map to the user/host-expectation question; no queryable value.
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: rationale only
+      disposition: context
+      target_question: Q6
+      notes: Correlation interval between DLL write, load, and execution; expressed as the +/-4h file_event range and +/-5m load window rather than a query value.
+    - element: HashBaseline
+      dimension: tuning_parameter
+      specific_values: rationale only
+      disposition: new_question
+      target_question: Q7
+      notes: Baseline-hash substitution check drove the dedicated tuning_parameter question (Q7) projecting Hashes/Signed/Signature on loaded DLLs.
+    - element: ServiceBaseline
+      dimension: tuning_parameter
+      specific_values: rationale only
+      disposition: context
+      target_question: Q10
+      notes: T1574 service-path baseline; this rule is path-relocation not service-path based, so handled as historical-pattern context in the baseline_deviation question.
+  dedup_decisions:
+    - dropped: cue_process_tool.process_chain
+      reason: 'parent cue not active (no parent in detection) — process_chain kept, not subsumed'
+      kept: cue_process_tool.process_chain
+    - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc
+      reason: user_actor pair — non-deduplicable; both emitted (Q11 user-pivot, Q12 service_principal_substitute)
+      kept: both
+    - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc
+      reason: user_actor pair — non-deduplicable; both emitted (Q13 user-pivot, Q14 service_principal_substitute)
+      kept: both
+  skipped_templates:
+    - template: cue_process_tool.baseline
+      reason: superseded by cue_process_tool.baseline_deviation (Q10) which enforces the rule's actual selection+filter pattern rather than generic binary frequency; cue_user_actor.baseline (Q11) covers per-user frequency.
+    - template: cue_process_tool.clustering
+      reason: cue_host_context activity-clustering coverage folded into precursor (Q17) and the persistence sweep (Q18); a generic same-window binary list would duplicate without adding a distinct angle.
+    - template: cue_host_context.clustering
+      reason: same-window host activity is covered by the follow_on (Q9) and persistence (Q18) questions; aggregated Image+ParentImage list would overlap without a distinct investigative angle.
+    - template: organizational_context.change_ticket
+      reason: dropped to stay within 18-question cap; running a signed VMware utility out of its install directory is not a ticketed change pattern, and human_recall plus host_user_context cover authorization.
+    - template: organizational_context.human_recall
+      reason: dropped to stay within 18-question cap; host_user_context (Q2) and the user baseline (Q11) carry the legitimacy question for this relocation behavior.
+    - template: organizational_context.timing_alignment
+      reason: dropped to stay within 18-question cap; timing is addressed by the precursor timeline (Q17) and clustering windows.
+    - template: organizational_context.procedural_consistency
+      reason: dropped to stay within 18-question cap; this rule is not about a change-management tool choice (schtasks/reg) but binary relocation, so procedural-tooling framing adds little.
+    - template: persistence_scope.file_based_persistence
+      reason: dropped to stay within 18-question cap; the file_event DLL-staging question (Q6) already inspects on-disk drops in the binary's directory, the load-bearing file artifact for this technique.
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: >-
+        logsource 'create_stream_hash' (recommended by techniques: T1574.001) is not covered and no template family exists —
+        author a custom question with `category: create_stream_hash`
+      disposition: declined
+      reason: >-
+        create_stream_hash (file-creation hash / alternate-data-stream telemetry) captures the same DLL-staging artifact
+        already inspected by Q6, which queries file_event for the DLL written into the relocated binary's directory, and by
+        Q7, which projects the loaded DLL's Hashes/Signed/Signature to detect substitution against the known-good library.
+        The hash of the planted DLL is reachable through those two questions; a separate create_stream_hash question would
+        re-surface the same dropped-file evidence with no distinct investigative angle for this side-by-side planting case.
+        No compensating create_stream_hash question authored.
+    - hint: >-
+        logsource 'registry_set' (recommended by techniques: T1574.001) is not covered — pull in cue_registry_key.* or author
+        a custom question with `category: registry_set`
+      disposition: declined
+      reason: >-
+        This rule detects DLL search-order hijack by binary relocation — the signed VMwareXferlogs.exe is copied out of
+        C:\Program Files\VMware\ so a same-named DLL planted beside it loads instead. That mechanism leaves no registry
+        artifact; the redirect is purely filesystem-adjacency. registry_set telemetry matters for the registry-redirect
+        and KnownDLLs variants of T1574, not for this side-by-side planting case. Q5/Q7 (image_load) and Q6 (file_event DLL
+        staging) cover the actual artifacts this rule's mechanism produces. No compensating registry_set question authored.
+  contextual_sets:
+    included: []
+    excluded:
+      - id: ransomware_impact
+        confidence: low
+        reason: Keyword match on 'ransomware' comes from the reference's incident attribution, not the rule's behavior. The rule detects a signed-binary relocation/sideload; encryption/impact artifacts are out of scope and would inject incident-specific framing the style guide bans.
+      - id: network_scope
+        confidence: low
+        reason: 'network match is incidental to the same reference. The sideloaded payload''s C2 is downstream; this rule fires on process_creation of the proxy binary. follow_on (Q9) and precursor (Q17) capture post-execution pivots without a speculative network-scope question.'
+  technique_sets_applied:
+    - universal
+    - organizational_context
+    - persistence_scope
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 14
+      attack: 4
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 15
+    logsource_diversity:
+      process_creation: 14
+      image_load: 2
+      file_event: 1
+      sigma_alert: 1

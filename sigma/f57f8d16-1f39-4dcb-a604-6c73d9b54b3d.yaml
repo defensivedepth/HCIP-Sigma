@@ -1,0 +1,555 @@
+name: Sensitive File Access Via Volume Shadow Copy Backup
+id: c07fa2d1-9e37-4bf9-99f2-7eab1411a3fd
+description: |
+  Detects a command line that references a Volume Shadow Copy device path (\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy)
+  together with a sensitive file path — the Active Directory database (NTDS.dit) or the SYSTEM/SECURITY registry hives.
+  Reading these files out of a shadow copy is a common way to obtain credential material (domain password hashes, local
+  account secrets) while sidestepping the locks that protect the live files. Legitimate backup or forensic tooling can
+  touch shadow copies, so the investigation should establish who ran the command, under what parent and account, whether
+  the targeted files were then copied or moved off the host, and whether the same pattern appears elsewhere in the fleet.
+type: detection
+detection_id: f57f8d16-1f39-4dcb-a604-6c73d9b54b3d
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: '2026-06-06'
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line reference a shadow copy device path together with NTDS.dit, SYSTEM, or SECURITY?
+  context: >-
+    Before investing investigation time, confirm the alert is a true positive. The rule fires only when the command line
+    contains both a \\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy path AND one of the sensitive targets (\NTDS.dit, \SYSTEM,
+    or \SECURITY). Read the full command line and confirm both parts are present, and note which sensitive file was targeted —
+    the AD database, the SYSTEM hive, or the SECURITY hive.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to read shadow-copy contents or AD/registry hive files?
+  context: >-
+    Legitimate backup, disaster-recovery, and forensic workflows do read shadow copies and can touch NTDS.dit or registry
+    hives, usually from a backup service account or a domain controller. Reads from an ordinary workstation, an interactive
+    user, or an account with no backup role are far harder to explain and shift the disposition toward credential theft.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What exactly did this command do — which shadow copy index and which target file, and was the file copied to a new path?
+  context: >-
+    Decode the full command. The shadow copy index (HarddiskVolumeShadowCopy1, 2, ...) and the trailing path show which file
+    was read and where it was written. A copy/move to a staging directory (Temp, Public, a user folder) indicates the secret
+    was extracted for offline processing rather than merely listed. The query scopes to commands carrying the shadow-copy
+    device path on this host so it captures the full sequence rather than a single event.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains: \\\\\?\\GLOBALROOT\\Device\\HarddiskVolumeShadowCopy
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+      - Image
+- source: attack:T1490.command_analysis
+  question: Were related shadow-copy creation or AD/registry hive extraction commands run on this host?
+  context: >-
+    Reading a file from a shadow copy is usually one step in a chain — first a shadow copy is created (vssadmin create shadow,
+    wmic shadowcopy call create, diskshadow, ntdsutil ifm), then the hive or database is copied out, and on a domain controller
+    the SYSTEM hive may be exported with reg save to decrypt the AD database. This query surfaces those neighboring commands so
+    the full extraction sequence is visible, including registry-save operations that the alerting command alone does not show.
+  range: +/-30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_cmd:
+        CommandLine|contains:
+          - 'create shadow'
+          - 'shadowcopy'
+          - 'diskshadow'
+          - 'activate instance ntds'
+          - 'create full'
+          - 'reg save hklm\system'
+          - 'reg save hklm\security'
+          - 'reg.exe save hklm\system'
+          - 'save hklm\sam'
+          - 'NTDS.dit'
+      condition: selection and selection_cmd
+    fields:
+      - Image
+      - CommandLine
+      - User
+- source: template:cue_process_tool.process_chain
+  question: What process spawned this command and is that parent chain expected?
+  context: >-
+    The parent process shows how the command was invoked. A backup agent, scheduled task, or management console spawning the
+    command fits routine operations; an interactive shell, a script host (wscript, mshta, powershell), or a remote-execution
+    service (wmiprvse, services.exe from a freshly created service) as parent points to hands-on-keyboard or remote-launched
+    credential access. Note the parent so deviation from the host's normal launch pattern can be judged.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:ransomware_impact.recovery_options_assessment
+  question: What shadow-copy and recovery-related commands were executed on this host?
+  context: >-
+    The same native utilities used to read secrets from a shadow copy (vssadmin, wmic, diskshadow) are also used to create or
+    delete shadow copies and disable recovery. This query surfaces all such commands on the host so the analyst can see whether
+    the shadow copy was freshly created for this extraction and whether recovery was subsequently inhibited. Verify host state
+    manually where possible (vssadmin list shadows, reagentc /info) to confirm which actions succeeded.
+  range: +24h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_recovery:
+        Image|endswith:
+          - '\vssadmin.exe'
+          - '\wmic.exe'
+          - '\bcdedit.exe'
+          - '\wbadmin.exe'
+          - '\reagentc.exe'
+          - '\diskshadow.exe'
+      selection_cmdline:
+        CommandLine|contains:
+          - 'delete shadows'
+          - 'shadowcopy delete'
+          - 'create shadow'
+          - 'recoveryenabled'
+          - 'bootstatuspolicy'
+          - 'delete catalog'
+          - 'delete systemstatebackup'
+          - 'boot.ini'
+          - 'winre.wim'
+          - '/disable'
+      condition: selection and (selection_recovery or selection_cmdline)
+    fields:
+      - Image
+      - CommandLine
+- source: template:ransomware_impact.encryption_or_ransom_indicators
+  question: Did unknown or non-system binaries execute on this host shortly after the shadow-copy access?
+  context: >-
+    After secrets are read from a shadow copy, the next stage is usually offline processing or exfiltration — an unfamiliar
+    binary, an archiver, or a script running from a temp or user-writable path that handles the extracted hive. This query
+    excludes well-known system locations to surface the binaries worth examining for staging, parsing, or transfer of the
+    credential material.
+  range: +30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      filter_known:
+        Image|startswith:
+          - 'C:\Program Files'
+          - 'C:\Windows\System32\svchost'
+          - 'C:\Windows\System32\wbem'
+      condition: selection and not filter_known
+    fields:
+      - Image
+      - CommandLine
+      - CurrentDirectory
+- source: attack:T1490.network_indicators
+  question: Did this host make outbound connections or use file-transfer or admin-share tools in the window after the access?
+  context: >-
+    Extracted hives are valuable only once moved off the host for offline cracking or replication abuse. Look for transfer
+    tooling and remote-copy patterns — copy to a UNC share, robocopy, certutil downloads, curl, bitsadmin, or SMB writes to
+    another host — in the window following the shadow-copy read. Pair this with the question on unknown binaries to determine
+    whether the secret left the host.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_transfer:
+        CommandLine|contains:
+          - 'robocopy'
+          - 'xcopy'
+          - 'copy \\'
+          - '\\\\'
+          - 'certutil'
+          - 'bitsadmin'
+          - 'curl '
+          - 'Invoke-WebRequest'
+          - 'New-PSDrive'
+          - 'net use'
+      condition: selection and selection_transfer
+    fields:
+      - Image
+      - CommandLine
+      - User
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously matched this rule's pattern, what parents and users drove it, and does the current alert fit?
+  context: >-
+    Even legitimate backup or forensic tooling can read shadow copies. This query mirrors the rule's selection scoped to this
+    host, so the parent/user distribution reflects how this specific shadow-copy-plus-sensitive-file pattern has historically
+    run here. A new parent process, an unexpected account, or a first-ever occurrence is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_1:
+        CommandLine|contains: \\\\\?\\GLOBALROOT\\Device\\HarddiskVolumeShadowCopy
+      selection_2:
+        CommandLine|contains:
+        - \\NTDS.dit
+        - \\SYSTEM
+        - \\SECURITY
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_user_actor.baseline
+  question: Does this user normally read shadow copies or AD/registry hive files?
+  context: >-
+    Compare this account's current action against its history. An account that has never read shadow-copy contents or hive
+    files is more suspicious than a backup or DC-administration account that does so routinely. The account's role should align
+    with shadow-copy access; an ordinary user account performing it is the anomaly worth chasing.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_1:
+        CommandLine|contains: \\\\\?\\GLOBALROOT\\Device\\HarddiskVolumeShadowCopy
+      selection_2:
+        CommandLine|contains:
+        - \\NTDS.dit
+        - \\SYSTEM
+        - \\SECURITY
+      selection_user:
+        User|expand: '%User%'
+      condition: all of selection_*
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is the parent-plus-binary that drove this shadow-copy access historically routine on this host or environment-wide?
+  context: >-
+    When the alert fires under a service principal (SYSTEM, LOCAL/NETWORK SERVICE, or a computer account), the account name
+    does not attribute behavior. The meaningful pivot is the launch mechanism — which parent process spawned the binary that
+    issued the command. A new or rare parent-and-binary pair is the deviation; a pair already responsible for many prior events
+    is backup or management automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: >-
+    Tracking the account's activity across all hosts shows whether the shadow-copy access is isolated or part of a wider
+    operation. The same account reading hives on, or authenticating to, several hosts in a short window suggests credential
+    access feeding lateral movement.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did the same parent-plus-binary fire on other hosts in this window — a coordinated rollout, or isolated to this host?
+  context: >-
+    Under a service principal, asking what the account did network-wide returns agent-telemetry noise, since every host runs
+    SYSTEM-owned agents constantly. The meaningful question is whether the same launch mechanism — parent process plus spawned
+    binary — fired on other hosts in the alert window. Several hosts in the same window point to pushed or scheduled automation;
+    a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: >-
+    Alerts rarely occur in isolation. Aggregating activity around the alert reveals the immediate context — what preceded the
+    shadow-copy access and what followed it. Look for reconnaissance, privilege escalation, service creation, or staging that
+    places the access in a larger sequence. Novel parent-child pairs stand out at low counts against the host's routine noise.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Earlier detections on the same host — defense tampering, reconnaissance, privilege escalation, or remote-execution
+    activity — may reveal the stages that preceded the shadow-copy access and help reconstruct how the operator gained the
+    access needed to read protected files.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:network_scope.actor_authentication_trail
+  question: Where has this user authenticated recently?
+  context: >-
+    Authentication events show which systems the account reached before and after the shadow-copy access. Reading AD or
+    registry hives is frequently a precursor to lateral movement using the recovered hashes, so an account authenticating to
+    many systems in a short period — especially with network or RDP logons after the access — is a signal the operation is
+    spreading.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      service: security
+    detection:
+      selection:
+        EventID:
+          - 4624
+          - 4625
+        TargetUserName|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - IpAddress
+      - EventID
+      - LogonType
+- source: template:cue_process_tool.scope
+  question: Have other hosts matched this rule's pattern in the past week, and does the distribution look like automation or one-off activity?
+  context: >-
+    This query mirrors the rule's selection with no host scope, giving a fleet-wide count of the shadow-copy-plus-sensitive-file
+    pattern rather than generic binary usage. Many hosts matching the same pattern points to scripted backup tooling or a
+    widespread operation; a single host or a small unrelated set points to manual operator activity. Use the host distribution
+    to calibrate scope.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_1:
+        CommandLine|contains: \\\\\?\\GLOBALROOT\\Device\\HarddiskVolumeShadowCopy
+      selection_2:
+        CommandLine|contains:
+        - \\NTDS.dit
+        - \\SYSTEM
+        - \\SECURITY
+      condition: all of selection_*
+    fields:
+    - host.name
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1490
+      name: Inhibit System Recovery
+      role: primary
+  attack_chain_coverage:
+    - stage: 1
+      label: shadow_copy_present
+      description: A shadow copy is created or already exists to expose locked sensitive files
+      mapped_to: Q4
+      source: attack:T1490.command_analysis
+    - stage: 2
+      label: sensitive_file_read
+      description: The protected file (NTDS.dit / SYSTEM / SECURITY) is read out of the shadow copy device path
+      mapped_to: Q3
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 3
+      label: extraction_or_exfil
+      description: The extracted hive/database is staged, parsed offline, or copied off the host
+      mapped_to: Q8
+      source: attack:T1490.network_indicators
+  dimension_coverage:
+    - dimension: command_analysis
+      technique: T1490
+      covered_by: Q3
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: direct
+    - dimension: network_indicators
+      technique: T1490
+      covered_by: Q8
+      source: attack:T1490.network_indicators
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1490
+      covered_by: Q14
+      source: template:cue_host_context.clustering
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1490
+      covered_by: Q5
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+  mutable_dispositions:
+    - element: CommandLinePattern
+      dimension: command_analysis
+      specific_values: "/all, /quiet, -delete, create shadow, reg save, NTDS.dit, diskshadow"
+      disposition: query_injection
+      target_question: Q4
+      notes: "Shadow-create and hive-extraction command variants injected into the attack:T1490.command_analysis selection_cmd CommandLine|contains list"
+    - element: ParentProcessContext
+      dimension: tuning_parameter
+      specific_values: "rationale only (e.g., powershell -> diskshadow)"
+      disposition: context
+      target_question: Q5
+      notes: "Parent-child chain reasoning carried in process_chain and baseline_deviation context; ParentImage projected in both queries"
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q14
+      notes: "Rapid-sequence framing carried via +/-15m clustering and +24h/+30m forward windows; threshold not directly queryable"
+  dedup_decisions:
+    - dropped: cue_user_actor.baseline (user-pivot)
+      reason: "user_actor pair — non-deduplicable; emitted alongside service_principal_substitute baseline_svc"
+      kept: cue_user_actor.baseline_svc
+    - dropped: cue_user_actor.clustering (user-pivot)
+      reason: "user_actor pair — non-deduplicable; emitted alongside service_principal_substitute clustering_svc"
+      kept: cue_user_actor.clustering_svc
+    - dropped: cue_process_tool.baseline
+      reason: "generic Image|endswith baseline of cmd.exe is too noisy per cmd.exe hint; rule-pattern-scoped baseline_deviation (REFLECTED) supersedes it for first-time/rare detection"
+      kept: cue_process_tool.baseline_deviation
+    - dropped: ransomware_impact.destruction_scope_on_host
+      reason: "destructive-binary sweep on host overlaps recovery_options_assessment (recovery cmds) and cue_host_context.clustering (all host activity); both kept, this adds no distinct coverage for a credential-access-via-VSS rule"
+      kept: template:ransomware_impact.recovery_options_assessment
+    - dropped: ransomware_impact.network_wide_impact
+      reason: "same-rule alert correlation across hosts is covered by the rule-pattern fleet count in cue_process_tool.scope (REFLECTED) plus cross-host launch-mechanism check in clustering_svc"
+      kept: template:cue_process_tool.scope
+    - dropped: network_scope.same_action_other_hosts
+      reason: "Image|endswith cross-host query is the cmd.exe Image-scoping pattern the hint warns against; rule-pattern fleet count in cue_process_tool.scope is the precise replacement"
+      kept: template:cue_process_tool.scope
+    - dropped: network_scope.actor_activity_network_wide
+      reason: "duplicates cue_user_actor.clustering (User|expand network-wide, aggregated by host+Image); single user-network-wide question retained"
+      kept: template:cue_user_actor.clustering
+  skipped_templates:
+    - template: cue_process_tool.follow_on
+      reason: "ParentImage|endswith %Image% (cmd.exe) child query is the noisy Image-scoping pattern the cmd.exe hint warns against; post-access stages covered by attack:T1490.network_indicators and ransomware_impact.encryption_or_ransom_indicators"
+    - template: cue_process_tool.clustering
+      reason: "host-wide tool clustering duplicates cue_host_context.clustering (same +/-15m host-scoped aggregation); host_context version retained"
+    - template: universal.endpoint_protection_health
+      reason: "recommended generic tamper sweep; prior-tamper-as-precursor is already surfaced by cue_host_context.precursor and the rule is credential-access (reading hives), not payload execution that an operator would typically precede by disabling AV"
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "logsource 'registry_set' (recommended by techniques: T1490) is not covered — pull in cue_registry_key.* or author a custom question with `category: registry_set`"
+      disposition: declined
+      reason: >-
+        The rule fires on a process command line that reads registry-hive FILES (\SYSTEM, \SECURITY) and the AD database out
+        of a shadow-copy device path — a file-read/copy action recorded in process_creation, not a live registry value
+        modification recorded by registry_set (EventCode 13/14). registry_set telemetry would not contain the shadow-copy
+        device path or the hive file path this rule keys on, so it cannot answer the question of what was read. The
+        registry-hive extraction angle is instead covered in process_creation by Q4 (attack:T1490.command_analysis), which
+        searches for the paired `reg save hklm\system` / `reg save hklm\security` / `save hklm\sam` exports that accompany
+        offline hive decryption. No compensating registry_set question authored.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - ransomware_impact
+    - network_scope
+    - cue_process_tool
+    - cue_user_actor
+    - cue_host_context
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 15
+      attack: 2
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 14
+    logsource_diversity:
+      process_creation: 15
+      windows_security: 1
+      sigma_alert: 1

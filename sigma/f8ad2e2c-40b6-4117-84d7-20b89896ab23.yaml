@@ -1,0 +1,524 @@
+name: Suspicious Scan Loop Network
+id: 2858f78e-114d-46f9-8e7f-becfddd7a119
+description: |
+  Detects a command line that combines a loop construct ("for " or "foreach ") with a network resolution or reachability
+  utility (nslookup or ping) in the same invocation. This is the classic shape of a scripted network sweep -- iterating over
+  a host list or address range and resolving or pinging each entry to map reachable systems for lateral movement. Legitimate
+  scripts and IT troubleshooting use the same construct, so the investigation should determine the breadth of the iteration,
+  who and what launched it, whether it fits this host's history, and whether enumeration of additional systems or follow-on
+  tooling accompanied it.
+type: detection
+detection_id: f8ad2e2c-40b6-4117-84d7-20b89896ab23
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: '2026-06-06'
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line combine a loop construct with nslookup or ping, as this rule detects?
+  context: Confirm the alert is a true positive by reviewing the exact command line. The rule fires only when a single command
+    line contains both a loop keyword ("for " or "foreach ") AND a resolution/reachability utility (nslookup or ping) -- the
+    signature of an iterated sweep rather than a one-off lookup. Verify both elements are present and read the iteration set
+    to see what range or host list is being walked.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:cue_process_tool.mechanism_decode
+  question: What does the looped command actually iterate over, and what does it do to each target?
+  context: The full command line reveals the scope and intent of the sweep. Decode the iteration set -- a numeric range (for
+    /L 1,1,254), a file of hostnames, or piped command output -- and the per-iteration action. ping with output redirected
+    to a file is reconnaissance staging; nslookup resolving an internal name list is DNS-based enumeration. Note any output
+    redirection, additional flags, or chained commands in the DO/process block.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_loop:
+        CommandLine|contains:
+          - 'for '
+          - 'foreach '
+      selection_tools:
+        CommandLine|contains:
+          - nslookup
+          - ping
+      condition: selection_host and selection_loop and selection_tools
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:discovery_recon.discovery_parent_chain
+  question: What process spawned this looped scan command, and is that parent chain normal?
+  context: Legitimate discovery loops are typically run from cmd.exe or powershell.exe spawned by explorer.exe (an interactive
+    operator) or from a known automation/orchestration process. A scan loop spawned by an Office application, a script
+    interpreter such as wscript.exe or mshta.exe, or a remote-execution host like wmiprvse.exe or wsmprovhost.exe points to
+    automated post-exploitation enumeration rather than manual troubleshooting.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+- source: template:discovery_recon.discovery_user_context
+  question: Is this user expected to run scripted network enumeration?
+  context: Network administrators and IT staff legitimately script ping/nslookup sweeps for inventory and connectivity
+    troubleshooting. Standard users and service accounts rarely iterate over an address range or host list. The user's role
+    and typical toolset determine whether the looped enumeration is routine or anomalous.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - User
+- source: template:discovery_recon.discovery_burst_detection
+  question: Did other reconnaissance commands run on this host around the same time?
+  context: A single scan loop may be troubleshooting, but multiple distinct reconnaissance binaries in rapid succession --
+    nslookup, net, nltest, arp, nbtstat, hostname -- is a signature of post-compromise enumeration. Three or more different
+    recon tools within roughly fifteen minutes typically indicates automated discovery. The mutable burst window (often under
+    thirty seconds for scripted runs) is what separates a tight automated sweep from intermittent manual checks.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_recon:
+        Image|endswith:
+          - '\whoami.exe'
+          - '\systeminfo.exe'
+          - '\ipconfig.exe'
+          - '\net.exe'
+          - '\net1.exe'
+          - '\nltest.exe'
+          - '\dsquery.exe'
+          - '\nbtstat.exe'
+          - '\arp.exe'
+          - '\netstat.exe'
+          - '\tasklist.exe'
+          - '\qprocess.exe'
+          - '\query.exe'
+          - '\quser.exe'
+          - '\hostname.exe'
+          - '\nslookup.exe'
+          - '\adfind.exe'
+          - '\csvde.exe'
+          - '\ldifde.exe'
+          - '\dnscmd.exe'
+          - '\cmdkey.exe'
+          - '\setspn.exe'
+      condition: selection and selection_recon
+    fields:
+      - Image
+      - User
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host previously fired this looped-scan pattern, what parents and users drove it, and does the current
+    alert fit?
+  context: Even routine troubleshooting scripts recur. The query mirrors the rule's selection structure scoped to this host,
+    so the resulting parent/user distribution reflects how this specific firing pattern -- not generic shell usage -- has
+    historically run here. A new parent process, an unexpected user account, or an unusual command-line shape relative to the
+    historical baseline is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_loop:
+        CommandLine|contains:
+        - 'for '
+        - 'foreach '
+      selection_tools:
+        CommandLine|contains:
+        - nslookup
+        - ping
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.follow_on
+  question: What did the parent of this scan loop spawn afterward?
+  context: The processes launched after a network sweep reveal its purpose. A reconnaissance loop followed by lateral-movement
+    tooling, credential access, or remote execution against the systems just enumerated indicates the discovery fed an active
+    operation. The parent that launched the loop is the pivot for what ran next on this host.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.clustering
+  question: What other tools ran on this host around the same time?
+  context: Reconnaissance rarely happens in isolation. Activity surrounding the scan loop may reveal privilege escalation,
+    persistence installation, credential access, or data staging that provides broader context. Scan the surrounding process
+    activity for tools that would advance an operation past the discovery stage.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run scripted network enumeration like this?
+  context: Compare this user's current activity against their historical behavior. A user who has never run an iterated
+    ping/nslookup sweep is more suspicious than one who does so regularly as part of an inventory or monitoring routine. User
+    role and typical toolset should align with the detected behavior.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_user:
+        User|expand: '%User%'
+      selection_loop:
+        CommandLine|contains:
+          - 'for '
+          - 'foreach '
+      selection_tools:
+        CommandLine|contains:
+          - nslookup
+          - ping
+      condition: selection_user and selection_loop and selection_tools
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is the parent process that launched this scan loop historically routine on this host or environment-wide?
+  context: When the alert fires under a service principal (SYSTEM, LOCAL SERVICE, NETWORK SERVICE, or a computer account),
+    the user identity does not attribute the behavior. The meaningful pivot is the launch mechanism -- which parent process
+    spawned the looped sweep, and whether that parent is historically common. A new or rare parent is the deviation worth
+    chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_parent:
+        process.parent.name|expand: '%ParentName%'
+      selection_loop:
+        CommandLine|contains:
+          - 'for '
+          - 'foreach '
+      selection_tools:
+        CommandLine|contains:
+          - nslookup
+          - ping
+      condition: selection_parent and selection_loop and selection_tools
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or coordinated activity on multiple
+    endpoints. If the same user triggered similar enumeration or follow-on activity on other hosts in the same window, the
+    scope of the operation may be larger than this single alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent and looped-scan pattern fire on other hosts in the same window?
+  context: Under a service principal, asking what the user did network-wide returns agent-telemetry noise. The meaningful
+    question is whether the same launch mechanism -- the parent process plus the looped ping/nslookup pattern -- fired on
+    other hosts in the alert window. Multiple hosts in the same window points to scheduled or pushed automation; a single
+    host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_parent:
+        process.parent.name|expand: '%ParentName%'
+      selection_loop:
+        CommandLine|contains:
+          - 'for '
+          - 'foreach '
+      selection_tools:
+        CommandLine|contains:
+          - nslookup
+          - ping
+      condition: selection_parent and selection_loop and selection_tools
+    fields:
+      - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining activity around the alert reveals what led to this event, what
+    happened after, and whether it is part of a larger sequence. Look for reconnaissance, privilege escalation, or
+    persistence mechanisms in the surrounding process activity.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host -- defense tampering, initial access, credential access -- may reveal the
+    attack stages that preceded this enumeration and help reconstruct the timeline. Reconnaissance commonly follows initial
+    access and precedes lateral movement, so the order of alerts tells the story.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired this looped-scan pattern in the past week, and does the cross-host distribution look like
+    automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of this
+    firing pattern rather than generic shell usage. Many hosts firing the same pattern points to scripted deployment or
+    vendor automation; one host or a small unrelated set points to manual operator activity. Use the host distribution to
+    calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_loop:
+        CommandLine|contains:
+        - 'for '
+        - 'foreach '
+      selection_tools:
+        CommandLine|contains:
+        - nslookup
+        - ping
+      condition: all of selection_*
+    fields:
+    - host.name
+- source: attack:T1018.network_connection
+  question: Did this host generate a burst of DNS lookups or ICMP/outbound connections to many distinct internal addresses
+    around the alert time?
+  context: A loop wrapping nslookup or ping produces network-layer evidence even when command-line capture is incomplete --
+    a rapid series of DNS queries from one host, or outbound reachability probes to many distinct internal addresses in a
+    short window. A fan-out to a contiguous address range or a large host list confirms an active sweep and reveals which
+    systems were enumerated. If DNS and connection telemetry are not collected for this host, treat sparse results as a
+    visibility gap rather than evidence the sweep was narrow.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: dns
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - QueryName
+- source: llm_generated
+  question: What is the scope of the iteration -- a contiguous address range, a discrete host list, or piped command output?
+  context: The breadth and source of the iteration set distinguish a narrow connectivity check from a broad sweep. A
+    contiguous range (for /L over 1..254) or a large discrete host list indicates intent to map many systems; piped output
+    from net view or a hostfile indicates the operator already had a target list. Read the iteration set and any output
+    redirection to gauge how many systems were touched and whether results were staged to a file for later use.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1059
+      name: Command and Scripting Interpreter
+      role: primary
+    - id: T1018
+      name: Remote System Discovery
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: interpreter_invocation
+      description: "A scripting/command interpreter executes a loop construct (for/foreach) carrying enumeration utilities"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: command_decode
+      description: "Decode the loop's iteration set and per-iteration action (range, host list, piped output, redirection)"
+      mapped_to: Q2
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 3
+      label: enumeration_execution
+      description: "Execution of network enumeration utilities (nslookup, ping) in short succession against many targets"
+      mapped_to: Q16
+      source: attack:T1018.network_connection
+    - stage: 4
+      label: chained_followon
+      description: "Enumeration chained with lateral movement or secondary tooling against the systems discovered"
+      mapped_to: Q7
+      source: template:cue_process_tool.follow_on
+  dimension_coverage:
+    - dimension: command_analysis
+      technique: T1059
+      covered_by: Q2
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1059
+      covered_by: Q3
+      source: template:discovery_recon.discovery_parent_chain
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1059
+      covered_by: Q5
+      source: template:discovery_recon.discovery_burst_detection
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1059
+      covered_by: Q5
+      source: template:discovery_recon.discovery_burst_detection
+      coverage_type: partial
+    - dimension: user_context
+      technique: T1059
+      covered_by: Q4
+      source: template:discovery_recon.discovery_user_context
+      coverage_type: direct
+  mutable_dispositions:
+    - element: CommandLinePattern
+      dimension: command_analysis
+      specific_values: "for , foreach , nslookup, ping (rule selection values)"
+      disposition: query_injection
+      target_question: Q2
+      notes: "Rule's for/foreach + nslookup/ping selection injected into mechanism_decode CommandLine|contains scope"
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "bursty execution <30s for scripted runs"
+      disposition: context
+      target_question: Q5
+      notes: "Threshold is not directly queryable; burst window described in discovery_burst_detection context"
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "rationale only (no specific parent values in rule)"
+      disposition: context
+      target_question: Q3
+      notes: "Suspicious-parent rationale carried in discovery_parent_chain context (Office, script hosts, wmiprvse/wsmprovhost)"
+    - element: ParentProcess
+      dimension: parent_process_analysis
+      specific_values: "rationale only (e.g., Word.exe spawning enumeration)"
+      disposition: context
+      target_question: Q3
+      notes: "T1018 parent-ancestry rationale folded into discovery_parent_chain context"
+  dedup_decisions:
+    - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable; emitted both (Q9 user-pivot, Q10 parent+binary substitute). CommandLine-only rule so substitute scopes on process.parent.name plus the rule's CommandLine pattern, not a bare Image."
+      kept: both
+    - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable; emitted both (Q11 user-pivot, Q12 parent+pattern substitute)."
+      kept: both
+    - dropped: cue_process_tool.process_chain
+      reason: "discovery_recon.discovery_parent_chain (technique set, more specific to discovery context) covers the parent-chain dimension; the generic cue version would duplicate it"
+      kept: discovery_recon.discovery_parent_chain
+    - dropped: universal.host_user_context
+      reason: "discovery_recon.discovery_user_context overlaps and is more specific to discovery context (per its notes_to_llm); kept the discovery version to avoid a near-identical user-role question"
+      kept: discovery_recon.discovery_user_context
+  skipped_templates:
+    - template: cue_process_tool.baseline
+      reason: "Template scopes on Image|endswith|expand %Image% but this is a CommandLine-only rule with no Image/binary; cue_process_tool.baseline_deviation (REFLECTED, host-scoped on the rule's actual CommandLine pattern) covers host-historical baseline correctly"
+    - template: universal.endpoint_protection_health
+      reason: "RECOMMENDED, not must_include; this is a discovery-tactic rule (network enumeration), not a payload-execution or credential-access rule where the disposition turns on whether protection was disabled first. cue_host_context.precursor (Q14) already surfaces any prior tamper alerts on the host. Dropped to keep the set focused and within the 18-question cap."
+  reflection_overrides: []
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded:
+      - id: lateral_movement
+        confidence: medium
+        reason: "Rule fires on the discovery shape (loop + ping/nslookup); it detects enumeration, not the lateral movement itself. Lateral-movement follow-on is already covered behaviorally by the follow_on question (Q7) and cross-host clustering (Q11/Q12) without pulling in lateral_movement-specific templates (remote-service/SMB/admin-share questions) that the rule's detection logic does not touch."
+  technique_sets_applied:
+    - universal
+    - discovery_recon
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 15
+      attack: 1
+      llm_generated: 1
+    phase_distribution:
+      triage: 1
+      analysis: 1
+      context: 15
+    logsource_diversity:
+      process_creation: 15
+      dns: 1
+      sigma_alert: 1

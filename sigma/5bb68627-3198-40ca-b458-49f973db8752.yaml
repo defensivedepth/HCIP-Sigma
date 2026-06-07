@@ -1,0 +1,621 @@
+name: Rundll32 Execution Without Parameters
+id: 7a04d2e2-44de-42cb-b8bb-6ea60ce35f72
+description: |
+  Detects a rundll32 process whose command line is just the binary name with no
+  arguments, which is abnormal because rundll32 is designed to load and run an
+  exported function from a DLL named on its command line. A bare rundll32 launch
+  is the host-process signature of a remote service-execution lateral movement
+  pattern: a service spawns a parameterless rundll32 that loads an injected DLL
+  over a named pipe and runs under SYSTEM. Legitimate parameterless rundll32 is
+  rare and usually a stray manual invocation, so the investigation should confirm
+  the command line carried no DLL or export, identify the parent service and the
+  binary that created it, determine how the host was reached over SMB, and trace
+  what the host process did once it was running.
+type: detection
+detection_id: 5bb68627-3198-40ca-b458-49f973db8752
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Did rundll32 run with no command-line arguments, just the bare binary
+    name, matching what this rule detects?
+  context: Before investing investigation time, confirm the alert is a true positive.
+    The rule fires when a process command line is exactly rundll32 or rundll32.exe
+    with nothing after it. Read the exact command line and verify no DLL path and no
+    exported function name follow the binary. Normal rundll32 always names a DLL and
+    an export; a bare invocation does no useful work on its own and is the host-process
+    signature this rule targets.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this host and user expected to launch a parameterless rundll32, and
+    is this host a normal target for remote administration?
+  context: Legitimate parameterless rundll32 is uncommon and usually a one-off manual
+    typo. Knowing whether this endpoint is routinely administered remotely and whether
+    the acting account performs remote service operations is often the fastest path
+    to separating a stray invocation from a service-spawned host process. A server
+    that is a frequent administrative target is a different finding than a workstation
+    that has never been reached this way.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: attack:T1569.002.host_process_lineage
+  question: What process spawned the parameterless rundll32, and does that parent
+    look like a legitimately installed service or a transient dropped binary?
+  context: A bare rundll32 used as an injection host is typically spawned by a service,
+    and that service binary is frequently a randomly named executable dropped into
+    C:\Windows just before launch rather than a known signed program. Read the parent
+    image and where it lives. A parent under C:\Windows with a random eight-character
+    name, or services.exe spawning rundll32 directly, points to a temporary service
+    created for execution rather than normal operation.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.mechanism_decode
+  question: Under which user context did the parameterless rundll32 run, and what is
+    the integrity level and full image path?
+  context: The host-process pattern this rule targets runs rundll32 under SYSTEM from
+    the SysWOW64 path to host an injected DLL connected over a named pipe. Confirm the
+    account and the exact image path of the launched process. A SYSTEM-context
+    parameterless rundll32 from SysWOW64 with no DLL on its command line is consistent
+    with a service-hosted injection target rather than any normal use of the binary.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - User
+      - CommandLine
+      - IntegrityLevel
+- source: attack:T1569.002.service_creation
+  question: Was a service registry key created or modified on this host shortly before
+    the rundll32 launch, pointing at a non-standard service binary?
+  context: Remote service execution registers a temporary service whose ImagePath
+    points at the binary that will spawn the host process, leaving a write under the
+    Services key. Look for service-key creation or ImagePath changes referencing a
+    binary in C:\Windows with a random name in the minutes before the launch. A new
+    service key tied to an unfamiliar executable correlates the registry side of the
+    service install with the process the rule fired on.
+  range: -10m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|contains: '\Services\'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+      - User
+- source: attack:T1021.002.remote_smb_access
+  question: Was there a network logon to this host over the admin shares immediately
+    before the launch, and what account and source did it use?
+  context: This host-process pattern is reached by remote service execution over SMB
+    admin shares such as ADMIN$, C$, and IPC$, which produces a network logon
+    (type 3) just before the service runs. Look for logon events on this host in the
+    minutes before the rundll32 launch and identify the account and originating
+    address. A network logon from an unexpected source account within the correlation
+    window ties the lateral access to the local execution.
+  range: -10m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: security
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID:
+          - 4624
+          - 4648
+        LogonType: 3
+      condition: selection
+    fields:
+      - TargetUserName
+      - IpAddress
+      - LogonType
+      - AuthenticationPackageName
+- source: template:lateral_movement.source_host_identification
+  question: What host initiated the inbound SMB connection to this endpoint, and is
+    it an expected administrative source?
+  context: Remote service execution requires a source and a destination. Inbound
+    connections to SMB and RPC ports just before the launch reveal whether the access
+    came from a known admin jump box or an unexpected internal host. Attackers who
+    have compromised one host use it as a pivot to spawn service-hosted execution on
+    others, so the source address is a key scoping field.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        DestinationPort:
+          - 445
+          - 135
+      condition: selection
+    fields:
+      - SourceIp
+      - DestinationPort
+- source: template:cue_process_tool.follow_on
+  question: What child processes did the parameterless rundll32 spawn after it
+    started?
+  context: A bare rundll32 used as an injection host frequently goes on to spawn
+    interactive or post-exploitation processes such as cmd.exe, powershell.exe, or
+    runonce.exe once the injected code runs and impersonates SYSTEM. Children of this
+    process reveal what the hosted code actually did. Spawned command interpreters or
+    transfer utilities under a parameterless rundll32 point to hands-on execution
+    rather than a harmless stray launch.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - User
+- source: attack:T1570.lateral_tool_transfer
+  question: Was an executable written into C:\Windows or another system directory on
+    this host shortly before the launch?
+  context: The service binary that spawns the host process is typically transferred
+    onto the target over the admin share and written into C:\Windows with a random
+    name just before the service runs. Look for executable file writes into system
+    directories in the minutes preceding the launch. A freshly written, randomly
+    named binary in C:\Windows correlates the lateral file transfer with the local
+    service execution and identifies the staged artifact.
+  range: -30m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith: '.exe'
+      filter_path:
+        TargetFilename|contains: '\Windows\'
+      condition: selection and filter_path
+    fields:
+      - TargetFilename
+      - Image
+      - User
+- source: attack:T1570.obfuscation_check
+  question: Does the staged service binary or host-process artifact have a random or
+    non-descriptive name, and is it signed by a recognized publisher?
+  context: Transferred tooling for this pattern uses randomized, non-descriptive
+    binary names in C:\Windows to evade name-based allowlists, and the binaries are
+    usually unsigned or self-signed rather than carrying a recognized publisher.
+    Review the name and signature of the parent service binary. A short random
+    filename with no valid signature, dropped into a system directory, is the
+    obfuscation marker that distinguishes staged tooling from a legitimate installer.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Signed
+      - Signature
+      - SignatureStatus
+- source: template:cue_user_actor.baseline
+  question: Does this user account normally run rundll32 across the environment, and
+    has it ever launched it with no parameters?
+  context: Compare the acting account against its own history. Most accounts that run
+    rundll32 always do so with a DLL and an export named on the command line. An
+    account with no prior parameterless rundll32 launches, or one that does not
+    normally run rundll32 at all, is more notable than a routine administrative
+    account. The user role and typical toolset should align with remote service
+    operations.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        CommandLine|contains:
+          - rundll32.exe
+          - rundll32
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent-and-rundll32 launch pattern historically routine on this
+    host or across the environment, or is the parent unusual for it?
+  context: When the alert fires under a service principal, user identity does not
+    attribute the behavior; the meaningful pivot is which parent process spawned the
+    parameterless rundll32 and whether that pairing is historically common. A new or
+    rare parent for this launch pattern on this host or environment-wide is the
+    deviation worth chasing, while a parent that already accounts for many prior
+    events is more likely automation or a deployment tool.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        CommandLine|contains:
+          - rundll32.exe
+          - rundll32
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the acting account's activity across all hosts reveals whether the
+    parameterless rundll32 launch was a single event or part of activity spanning
+    multiple endpoints. If the same account drove similar service-hosted execution on
+    other hosts in the window, the scope is broader than one machine and points to
+    active lateral movement.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent-and-rundll32 launch pattern fire on other hosts in
+    the same window, indicating a coordinated rollout rather than isolated activity?
+  context: Under a service principal, asking what else the user did across the network
+    returns agent-telemetry noise, since every host runs system-owned agents
+    constantly. The meaningful question is whether the same launch mechanism, a parent
+    process spawning a parameterless rundll32, fired on other hosts in the alert
+    window. Multiple hosts in the same window points to a scripted lateral rollout; a
+    single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        CommandLine|contains:
+          - rundll32.exe
+          - rundll32
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining the activity surrounding the
+    parameterless rundll32 launch reveals what staged it and what followed, including
+    the service install, reconnaissance, or follow-on execution under the impersonated
+    context. Novel parent-child pairs at low counts are what to scan for against the
+    high-count noise of routine system processes.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host, such as remote-access reconnaissance,
+    credential access, or service tampering, may reveal the attack stages that
+    preceded the service-hosted execution and help reconstruct the full timeline.
+    Lateral service execution is often one step in a sequence, so prior alerts give
+    the context for how the host was reached.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired the rule's rundll32 pattern, what
+    parents and users normally drive it, and does the current alert fit?
+  context: Even legitimate stray invocations can match a bare rundll32. This query
+    mirrors the rule's selection structure scoped to this host, so the resulting
+    parent and user distribution reflects how this specific firing pattern has
+    historically run here, not generic rundll32 usage. A new parent process, an
+    unexpected account, or a first-ever occurrence is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine:
+        - rundll32.exe
+        - rundll32
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired the rule's rundll32 pattern in the past week, and
+    does the cross-host distribution look like consistent automation or one-off
+    activity?
+  context: This query mirrors the rule's selection structure with no host scope, so
+    the result is a fleet-wide count of the bare-rundll32 firing pattern rather than
+    generic process activity. A small unrelated set of hosts firing the same pattern
+    in a short window points to operator-driven lateral movement; a steady spread
+    across many hosts may indicate a benign management tool that invokes rundll32 this
+    way. Use the host distribution to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine:
+        - rundll32.exe
+        - rundll32
+      condition: selection
+    fields:
+    - host.name
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1569.002
+      name: Service Execution
+      role: primary
+    - id: T1021.002
+      name: SMB/Windows Admin Shares
+      role: secondary
+    - id: T1570
+      name: Lateral Tool Transfer
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: remote_smb_access
+      description: "Remote network logon over SMB admin shares (ADMIN$/C$/IPC$) reaches the target host"
+      mapped_to: Q6
+      source: attack:T1021.002.remote_smb_access
+    - stage: 2
+      label: service_creation
+      description: "A temporary service is registered whose ImagePath points at a dropped binary in C:\\Windows"
+      mapped_to: Q5
+      source: attack:T1569.002.service_creation
+    - stage: 3
+      label: host_process_spawn
+      description: "The service binary spawns a parameterless SysWOW64\\rundll32.exe under SYSTEM, the act the rule detects"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 4
+      label: injection_and_followon
+      description: "The host process loads an injected DLL over a named pipe and spawns follow-on processes under the impersonated context"
+      mapped_to: Q8
+      source: template:cue_process_tool.follow_on
+    - stage: 5
+      label: lateral_tool_transfer
+      description: "The service binary is transferred onto the target over the admin share and written into a system directory before the launch"
+      mapped_to: Q9
+      source: attack:T1570.lateral_tool_transfer
+  dimension_coverage:
+    - dimension: time_correlation
+      technique: T1021.002
+      covered_by: Q6
+      source: attack:T1021.002.remote_smb_access
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1569.002
+      covered_by: Q5
+      source: attack:T1569.002.service_creation
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1021.002
+      covered_by: Q11
+      source: template:cue_user_actor.baseline
+      coverage_type: direct
+    - dimension: command_analysis
+      technique: T1021
+      covered_by: Q4
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: direct
+    - dimension: obfuscation_check
+      technique: T1570
+      covered_by: Q10
+      source: attack:T1570.obfuscation_check
+      coverage_type: direct
+  mutable_dispositions:
+    - element: ShareName
+      dimension: tuning_parameter
+      specific_values: "C$, ADMIN$, IPC$"
+      disposition: context
+      target_question: Q6
+      notes: "Admin-share names named in Q6 context; process_creation/security logon events do not expose a per-event share field, so the values inform the prose rather than a selection. The network-port proxy (445/135) is enforced in Q7."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "5-10 minutes between remote access and remote execution"
+      disposition: query_injection
+      target_question: Q6
+      notes: "Realized as the -10m range on Q6 (remote_smb_access) and Q5 (service_creation), correlating logon and service install to the launch within the analytic's window."
+    - element: ProcessList
+      dimension: tuning_parameter
+      specific_values: "cmd.exe, powershell.exe, runonce.exe, certutil.exe"
+      disposition: context
+      target_question: Q8
+      notes: "Named in Q8 (follow_on) context as the expected post-injection children; the follow_on query is ParentProcessGuid-scoped to this exact host process, so it already returns only that process's children without needing an Image|contains filter that would exclude unanticipated payloads."
+    - element: DestinationPort
+      dimension: tuning_parameter
+      specific_values: "445, 135"
+      disposition: query_injection
+      target_question: Q7
+      notes: "SMB/RPC ports injected into the source_host_identification network_connection selection per the PsExec lateral-movement port set."
+    - element: ServiceBinaryAllowlist
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q3
+      notes: "Tuning rationale for known service binaries; no concrete values in the analytic. Realized as the parent-binary judgment in Q3 (host_process_lineage), which asks whether the spawning service binary is an installed program or a transient dropped executable."
+    - element: ParentProcessCorrelationWindow
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q5
+      notes: "Correlation-window rationale; realized as the -10m range tying service-key creation to the launch."
+    - element: RemoteExecutionHosts
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q7
+      notes: "Approved remote source rationale; realized as the source-host judgment in source_host_identification (is the inbound SMB source an expected admin jump box)."
+    - element: UserContext
+      dimension: user_context
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q11
+      notes: "Expected-remote-admin rationale; realized as the user baseline judgment over the rundll32 pattern."
+    - element: FilePathWhitelist
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q9
+      notes: "Legitimate-software-directory rationale; realized inversely as the C:\\Windows system-directory write filter in lateral_tool_transfer, which surfaces staged binaries in the path a legitimate updater would not target."
+  dedup_decisions:
+    - dropped: cue_user_actor.baseline + cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable; both emitted (subject-pivot and launch-mechanism-pivot). Image-pivot adapted to the CommandLine rundll32 pattern per the CommandLine-only hint."
+      kept: both
+    - dropped: cue_user_actor.clustering + cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable; both emitted (subject-pivot and launch-mechanism-pivot)."
+      kept: both
+    - dropped: cue_process_tool.process_chain
+      reason: "parent-lineage coverage authored as attack:T1569.002.host_process_lineage (Q3) which carries the same ParentProcessGuid lookup plus the service-binary judgment specific to this pattern — process_chain would duplicate the query."
+      kept: attack:T1569.002.host_process_lineage
+    - dropped: cue_process_tool.baseline
+      reason: "generic Image|endswith host baseline subsumed by the REFLECTED host-pattern question (baseline_deviation, Q17) which scopes to the rule's actual rundll32 CommandLine firing pattern rather than all rundll32 usage."
+      kept: cue_process_tool.baseline_deviation
+    - dropped: cue_process_tool.clustering
+      reason: "Image-only host aggregation subsumed by cue_host_context.clustering (Q15), which projects Image+ParentImage and surfaces novel parent-child pairs."
+      kept: cue_host_context.clustering
+  skipped_templates:
+    - template: lateral_movement.authentication_method
+      reason: "must_include; the network-logon account, source, and logon type are already surfaced by attack:T1021.002.remote_smb_access (Q6), which queries 4624/4648 type-3 logons directly. Authentication_method's ProcessGuid query would re-display the alert user without adding the logon-type detail the security query already provides."
+    - template: lateral_movement.target_activity_after_access
+      reason: "must_include; post-access activity on the target host is covered by cue_process_tool.follow_on (Q8, children of the host process) and cue_host_context.clustering (Q15). target_activity_after_access is a broad host-wide +30m aggregation that duplicates the clustering view. Trimmed to stay within the 14-18 target."
+    - template: lateral_movement.lateral_movement_scope
+      reason: "must_include; the scope of the acting account across hosts is covered by cue_user_actor.clustering (Q13) and the service-principal substitute (Q14). lateral_movement_scope filters on psexec.exe/mstsc.exe Image names that do not appear in this rule's pattern (the lateral tool here is a dropped random binary, not a named PsExec executable), so its Image list would not match this chain. Trimmed to stay within the 14-18 target."
+    - template: network_scope.same_action_other_hosts
+      reason: "recommended; fleet-wide same-pattern scope is covered by the REFLECTED cue_process_tool.scope (Q18), which mirrors the rule's exact CommandLine selection. same_action_other_hosts pivots on Image|endswith %Image% (rundll32, ubiquitous) and would return generic rundll32 usage rather than the rule's bare-invocation pattern."
+    - template: network_scope.actor_activity_network_wide
+      reason: "recommended; duplicates cue_user_actor.clustering (Q13) — identical User|expand network-wide aggregation projecting host.name+Image."
+    - template: network_scope.actor_authentication_trail
+      reason: "recommended; the user's authentication trail is covered by attack:T1021.002.remote_smb_access (Q6) for the alerting host's inbound logon. A network-wide 4624/4625 sweep would duplicate the security-log pivot already in the playbook. Trimmed to stay within the 14-18 target."
+    - template: universal.endpoint_protection_health
+      reason: "recommended; dropped because cue_host_context.precursor (Q16) already surfaces prior tamper/recon alerts on the host, and this rule fires on the execution mechanism (service-hosted rundll32) rather than on a hands-on-keyboard payload where pre-emptive AV/EDR disabling is the pivotal question. Trimmed to stay within the 14-18 target."
+  reflection_overrides: []
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - lateral_movement
+    - cue_process_tool
+    - cue_user_actor
+    - cue_host_context
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 13
+      attack: 5
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 15
+    logsource_diversity:
+      process_creation: 13
+      registry_set: 1
+      security: 1
+      network_connection: 1
+      file_event: 1
+      sigma_alert: 1

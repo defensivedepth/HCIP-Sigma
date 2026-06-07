@@ -1,0 +1,463 @@
+name: Deny Service Access Using Security Descriptor Tampering Via Sc.EXE
+id: a0d4e4b3-b2d8-4e6e-9d4f-352774717683
+description: |
+  Detects sc.exe sdset commands that write a Deny ACE (D;) targeting critical trustees (Interactive Users, Service logon, Built-in Administrators, Local System, or Everyone) into a service security descriptor. The rule fires only when the sc.exe binary, the sdset + D; tokens, and a critical-trustee token all appear together in the command line. Denying List-Children/Query rights to these principals makes a service unenumerable by services.exe, Get-Service, WMI, and sc query while it keeps running and autostarting across reboots, so this is most often used to hide a persistence service. Legitimate use is rare; investigation should confirm which service was modified, what binary it runs, whether a change was authorized, and whether the modification accompanied service creation or other persistence activity.
+type: detection
+detection_id: 99cf1e02-00fb-4c0d-8375-563f978dfd37
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the sc.exe command line contain an sdset operation that writes a Deny ACE against a critical trustee?
+  context: Confirm the alert is a true positive before investing investigation time. The rule fires when the command line includes sdset together with a Deny ACE token (D;) and at least one critical-trustee alias (IU, SU, BA, SY, or WD). Read the full command line and confirm the SDDL string applies a Deny ACE to one of those principals rather than a benign permission change.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to modify service security descriptors with sc.exe sdset?
+  context: Editing a service DACL to deny enumeration rights is not routine administration. Knowing whether the account and host function normally perform service configuration changes is often the fastest way to separate an authorized maintenance action from operator activity.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:organizational_context.change_ticket
+  question: Was there a change ticket, maintenance window, or documented approval for this service security descriptor change?
+  context: Service descriptor modifications that deny enumeration to administrators are high-impact and would normally be documented. A corresponding ticket suggests authorized hardening or troubleshooting; absence of one when policy requires it shifts the disposition toward unauthorized activity.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:service_persistence.service_configuration
+  question: What service was the descriptor change applied to, and what binary does that service execute?
+  context: The sc.exe command line names the target service, but the service install event carries the structured binary path, start type, and account. Attackers hide services that run a malicious binary, often placed in world-writable directories or masquerading as a legitimate service. Identify the service named in the sdset command line, then review its configured binary path and account.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: system
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 7045
+      condition: selection
+    fields:
+      - ServiceName
+      - ImagePath
+      - StartType
+      - AccountName
+- source: template:service_persistence.service_current_status
+  question: Is the targeted service currently running, and what account is it using?
+  context: A service whose DACL was modified to deny enumeration keeps running and autostarting even though Get-Service, WMI, and sc query return nothing for it. Because normal tools cannot list it, the analyst must check the candidate service name directly on the host. A service running as LocalSystem has full system privileges; the running account indicates the access level the persistence holds.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: attack:T1543.003.registry_persistence
+  question: Were the registry keys under the service control set modified around the time of this command?
+  context: Service configuration and DACL changes are reflected under HKLM\System\CurrentControlSet\Services. Registry events for the modified service — Start, ImagePath, ObjectName, or the Security subkey holding the descriptor — corroborate the command-line activity and reveal whether the service was newly created or an existing one was altered, even if the structured service-install event is not captured.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|contains: '\System\CurrentControlSet\Services\'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+- source: attack:T1543.003.service_install_security
+  question: Did a service install event fire on this host for the targeted service in the surrounding window?
+  context: Windows records service installation in the Security log independently of command-line tooling. Pairing the sc.exe sdset activity with a service install event confirms whether the descriptor was tampered immediately after the service was created — a strong signal of deliberate hiding — versus modification of a long-standing service. The install record also surfaces the binary path and account configured for the service.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: security
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4697
+      condition: selection
+    fields:
+      - ServiceName
+      - ServiceFileName
+      - ServiceAccount
+      - SubjectUserName
+- source: template:cue_process_tool.process_chain
+  question: What process spawned sc.exe, and is that parent chain expected for service administration?
+  context: The parent process reveals how sc.exe was invoked. Legitimate service changes are usually driven by interactive admin sessions, management consoles, or deployment tooling. An unusual parent — a script host, Office application, or a process running from a user-writable path — points to scripted or operator-driven invocation rather than routine administration.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:lolbin.renamed_binary_check
+  question: Was sc.exe executed from its expected System32 or SysWOW64 path?
+  context: sc.exe run from a non-standard path may indicate the binary was copied or renamed to evade path-based allowlists. A sc.exe invoked from a user temp or profile directory is more suspicious than one in System32. Compare the Image path and OriginalFileName from the alerting event.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- source: template:lolbin.historical_lolbin_baseline
+  question: How often has this host fired the sc.exe sdset Deny-ACE pattern over the past 90 days, and what command-line shapes are typical?
+  context: A service-descriptor Deny-ACE pattern with no prior history on a host is more suspicious than one seen regularly under stable administration. The query mirrors the rule's selection structure scoped to this host, so the count reflects the rule's specific firing pattern rather than generic sc.exe usage. The CommandLine projection lets the analyst compare typical invocation shapes against the alerting one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_sc:
+      - Image|endswith: \sc.exe
+      - OriginalFileName: sc.exe
+      selection_sdset:
+        CommandLine|contains|all:
+        - sdset
+        - D;
+      selection_trustee:
+        CommandLine|contains:
+        - ;IU
+        - ;SU
+        - ;BA
+        - ;SY
+        - ;WD
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - CommandLine
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run sc.exe to modify service configurations?
+  context: Compare the account's current action against its historical behavior. A user who has never run sc.exe for service management is more suspicious than one who does so as part of their role. The result should align with the user's expected administrative duties.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent-plus-sc.exe launch combination historically routine on this host or across the environment, or is the parent unusual?
+  context: When the alert fires under a service principal, user identity does not attribute behavior; the meaningful pivot is which parent process spawned sc.exe and whether that pair is historically common. A new or rare parent for sc.exe is the deviation worth chasing; a pair that already accounts for many prior events is automation or OS-driven activity.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the environment around the time of the alert?
+  context: Tracking the account's activity across all hosts reveals lateral movement or coordinated changes on multiple endpoints. If the same user drove similar service-tampering or persistence activity elsewhere, the scope of the operation is larger than this one host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent-plus-sc.exe combination fire on other hosts in the same window, indicating a coordinated rollout rather than isolated activity?
+  context: Under a service principal, asking what else the user did returns agent-telemetry noise because every host runs SYSTEM-owned agents constantly. The meaningful question is whether the same launch mechanism — parent process plus sc.exe — fired on other hosts in the alert window. Multiple hosts point to scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining the surrounding process activity reveals what led to this event and what followed, and whether the service-hiding action is part of a larger sequence. Look for reconnaissance, service creation, privilege escalation, or additional persistence mechanisms.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host — defense tampering, reconnaissance, credential access, or service creation — may reveal the attack stages that preceded the descriptor change and help reconstruct the timeline. Service hiding usually follows the installation of the service it conceals.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:persistence_scope.process_based_persistence
+  question: Were other process-based persistence mechanisms installed on this host around the same time?
+  context: Attackers rarely rely on a single persistence mechanism. After hiding a service, they commonly install backup footholds using different techniques — scheduled tasks, registry Run keys, BITS jobs, or WMI subscriptions. Multiple persistence installations in the same timeframe indicate intentional stacking rather than isolated administration.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1543.003
+      name: Windows Service
+      role: primary
+    - id: T1543
+      name: Create or Modify System Process
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: descriptor_tampering_command
+      description: "Operator runs sc.exe sdset writing a Deny ACE against critical trustees to hide a service"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: target_service_identification
+      description: "Identify the service modified and the binary it executes"
+      mapped_to: Q4
+      source: template:service_persistence.service_configuration
+    - stage: 3
+      label: service_runtime_state
+      description: "Determine whether the hidden service is running and under what account"
+      mapped_to: Q5
+      source: template:service_persistence.service_current_status
+    - stage: 4
+      label: registry_service_modification
+      description: "Registry changes under CurrentControlSet\\Services corroborating service create/modify"
+      mapped_to: Q6
+      source: attack:T1543.003.registry_persistence
+    - stage: 5
+      label: service_install_record
+      description: "Service install event confirming creation timing relative to the descriptor change"
+      mapped_to: Q7
+      source: attack:T1543.003.service_install_security
+  dimension_coverage:
+    - dimension: tuning_parameter
+      technique: T1543.003
+      covered_by: Q4
+      source: template:service_persistence.service_configuration
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1543
+      covered_by: Q8
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+  mutable_dispositions:
+    - element: ServiceNamePattern
+      dimension: tuning_parameter
+      specific_values: "rationale only (regex for uncommon service names)"
+      disposition: context
+      target_question: Q4
+      notes: "Service name is read from the structured service-install event and the sdset command line; no fixed value to inject."
+    - element: ImagePathFilter
+      dimension: tuning_parameter
+      specific_values: "C:\\Users\\, C:\\Temp\\"
+      disposition: context
+      target_question: Q4
+      notes: "World-writable image paths called out in context as the persistence-payload signal; service-creation logsource returns ImagePath for review."
+    - element: DriverExtensionList
+      dimension: tuning_parameter
+      specific_values: ".sys driver loads"
+      disposition: context
+      target_question: Q4
+      notes: "Driver-install variant noted; this rule fires on sdset descriptor tampering, not driver load, so no .sys query injected."
+    - element: StartupTypeChangeWindow
+      dimension: tuning_parameter
+      specific_values: "rationale only (temporal correlation window)"
+      disposition: new_question
+      target_question: Q6
+      notes: "Registry Start-key correlation realized as the CurrentControlSet\\Services registry question with +/-15m window."
+    - element: UnsignedBinaryAlert
+      dimension: tuning_parameter
+      specific_values: "rationale only (unsigned service binary)"
+      disposition: context
+      target_question: Q4
+      notes: "Binary path surfaced for signing review; no signing field queryable from process_creation here."
+    - element: ParentProcessFilter
+      dimension: parent_process_analysis
+      specific_values: "rationale only (non-admin processes launching service tools)"
+      disposition: context
+      target_question: Q8
+      notes: "Parent-chain question evaluates whether the spawning process is expected for service administration."
+    - element: RegistryPathList
+      dimension: tuning_parameter
+      specific_values: "HKLM\\System\\CurrentControlSet\\Services"
+      disposition: query_injection
+      target_question: Q6
+      notes: "Injected into the registry_set question TargetObject|contains selection."
+  dedup_decisions:
+    - dropped: cue_user_actor.baseline + cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable (subject vs. launch-mechanism identity); emitted both per AGENTS.md"
+      kept: both
+    - dropped: cue_user_actor.clustering + cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable (subject vs. launch-mechanism identity); emitted both per AGENTS.md"
+      kept: both
+    - dropped: cue_process_tool.baseline_deviation
+      reason: "REFLECTED host_pattern query is the same rule-pattern host scope as lolbin.historical_lolbin_baseline; the latter is kept (must_include) and covers the same host-history question"
+      kept: lolbin.historical_lolbin_baseline
+    - dropped: cue_process_tool.scope
+      reason: "fleet-wide rule-pattern count overlaps host-history baseline already kept; cross-host coordination is covered by cue_user_actor.clustering_svc"
+      kept: lolbin.historical_lolbin_baseline
+    - dropped: cue_process_tool.baseline
+      reason: "generic sc.exe host baseline subsumed by the rule-pattern-scoped lolbin.historical_lolbin_baseline"
+      kept: lolbin.historical_lolbin_baseline
+    - dropped: cue_process_tool.follow_on
+      reason: "sc.exe sdset does not spawn child payloads; child-process question adds no investigative value for descriptor tampering"
+      kept: none
+    - dropped: cue_process_tool.clustering
+      reason: "host-wide tool clustering overlaps cue_host_context.clustering which is kept"
+      kept: cue_host_context.clustering
+    - dropped: lolbin.technique_class_lateral
+      reason: "objective is service hiding via descriptor tampering, not download/proxy-exec; cross-LOLBin-same-objective question is not applicable to sdset, and persistence_scope.process_based_persistence already covers other persistence tooling on the host"
+      kept: persistence_scope.process_based_persistence
+    - dropped: persistence_scope.file_based_persistence
+      reason: "dropped to respect 18-question cap; service-DACL hiding is registry/service-config based, not file-drop based, so file Startup/Run-path persistence is the least relevant persistence facet here"
+      kept: none
+    - dropped: universal.endpoint_protection_health
+      reason: "cue_host_context.precursor is present and the rule is persistence/defense-evasion-centric rather than execution/credential-access; prior-alert context carries the tamper-precursor signal, and the generic tamper sweep would not add specificity for this sdset rule"
+      kept: cue_host_context.precursor
+  skipped_templates:
+    - template: cue_process_tool.mechanism_decode
+      reason: "replaced_by: service_persistence.service_configuration"
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - service_persistence
+    - organizational_context
+    - persistence_scope
+    - lolbin
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 15
+      attack: 2
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 14
+    logsource_diversity:
+      process_creation: 13
+      system_service: 1
+      security: 1
+      registry_set: 1
+      sigma_alert: 1

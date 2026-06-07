@@ -1,0 +1,667 @@
+name: HackTool - UACMe Akagi Execution
+id: 57939c61-7f0a-4b33-8c53-6d1350de1a6b
+description: |
+  Detects execution of UACMe (the Akagi launcher binary), an aggregator of Windows UAC-bypass proof-of-concept methods that
+  abuse auto-elevation in trusted system binaries to obtain a high-integrity process without a consent prompt. The rule fires
+  when an event matches EITHER the tool's embedded PE metadata (Product, Company, Description, OriginalFileName), OR an Image
+  name ending in Akagi.exe or Akagi64.exe, OR one of the known UACMe import-hash values — any one branch is sufficient.
+  Legitimate appearances are essentially limited to authorized penetration tests or red-team exercises; outside that context,
+  UACMe execution indicates a deliberate privilege-escalation attempt, so the investigation centers on which bypass method
+  was used, what registry or auto-elevated-binary mechanism it set up, and what action ran at high integrity afterward.
+type: detection
+detection_id: d38d2fa4-98e6-4a24-aff1-410b0c9ad177
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: '2026-06-06'
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does this event match UACMe via its PE metadata, an Akagi.exe / Akagi64.exe image name, or a known UACMe import hash?
+  context: >-
+    The rule fires when at least one of three independent branches matches — the tool's PE metadata (Product UACMe, one of
+    its decoy Company / Description strings, or OriginalFileName Akagi.exe/Akagi64.exe), an Image ending in Akagi.exe or
+    Akagi64.exe, or a listed IMPHASH value. Confirm which branch fired by reviewing the returned Image, OriginalFileName,
+    Company, Description, Product, and Hashes. A metadata or hash match on a binary that was renamed away from Akagi tells a
+    different story than a plain image-name match, and the branch that fired guides which downstream evidence carries weight.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - Company
+      - Description
+      - Hashes
+      - Product
+- source: template:hacking_tool.authorized_engagement
+  question: Is this UACMe execution part of an authorized penetration test or red team engagement?
+  context: >-
+    UACMe is an offensive UAC-bypass toolkit used in authorized security assessments. Check whether a pentest or red team
+    exercise is active on this host or network segment for this timeframe. An authorized engagement with matching tool usage
+    and timing resolves the alert without further analysis; absence of one moves the disposition toward a deliberate
+    escalation attempt.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run a UAC-bypass tool?
+  context: >-
+    UACMe forces elevation by abusing auto-elevated system binaries, an action that has no routine administrative equivalent.
+    Knowing whether the user role and host function could plausibly involve offensive-security tooling is often the fastest
+    path to separating an authorized test from an intrusion. A standard user workstation running UACMe is far less explainable
+    than a dedicated assessment host.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:hacking_tool.tool_capability_used
+  question: Which UACMe method number and target command were invoked?
+  context: >-
+    UACMe is a multi-method launcher invoked as Akagi.exe <method-number> [target-binary-or-cmd]; the method number selects
+    which bypass is attempted (for example FodHelper, sdclt, computerdefaults, or a COM-elevation handler) and the target is
+    the command that runs elevated. Read the command line of the triggering event to identify the method number and target —
+    method 33 launching cmd.exe differs in scope from a method that runs PowerShell with an encoded payload.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:hacking_tool.tool_specific_artifacts
+  question: What files did the UACMe process write to this host?
+  context: >-
+    Even after the launcher exits, file-creation events from its process reveal staged payloads, dropped helper binaries, or
+    extracted method components. Pair these with the method number to understand what the bypass placed on disk and where, so
+    cleanup and scope can be assessed independently of whether the original process is still running.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in the hour before the alert?
+  context: >-
+    Operators commonly weaken AV/EDR before running an escalation tool so the resulting high-integrity payload is not blocked.
+    The query surfaces direct attempts to disable protection services, flip Defender flags, add broad exclusions, clear logs,
+    or patch AMSI/ETW. Zero rows is a useful "protection looks healthy" signal — kernel-level driver tampering and in-memory
+    patches will not appear here. Populated rows shift the disposition toward operator preparation; review the parent process
+    and signing chain to identify the writer.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+- source: template:uac_bypass.bypass_technique_registry_artifacts
+  question: Were registry modifications made through command-line tools to set up this UAC bypass?
+  context: >-
+    Many UACMe methods write an attacker command to a per-user registry key that an auto-elevated process reads and executes.
+    Common targets include HKCU\Software\Classes\ms-settings\Shell\Open\command, mscfile\shell\open\command, exefile and
+    Folder shell-open keys, and HKCU\Environment. Finding the write through reg.exe, powershell.exe, or cmd.exe confirms the
+    bypass mechanism and reveals the exact payload staged for elevated execution.
+  range: -15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - '\reg.exe'
+          - '\powershell.exe'
+          - '\cmd.exe'
+        CommandLine|contains:
+          - 'ms-settings'
+          - 'mscfile'
+          - 'Classes\exefile'
+          - 'Classes\Folder'
+          - 'Environment'
+          - 'Shell\Open\command'
+          - 'DelegateExecute'
+      condition: selection
+    fields:
+      - CommandLine
+      - Image
+- source: attack:T1548.002.registry_set
+  question: Were the UAC-bypass registry keys themselves modified on this host around the alert?
+  context: >-
+    Registry-trigger UACMe methods leave a registry-set artifact independent of which process wrote it — a value under the
+    per-user shell-open command keys pointing at a non-default binary. Reviewing registry-set events on these keys catches
+    bypasses staged through APIs that do not pass the command through a visible reg.exe/cmd.exe/powershell.exe command line,
+    and confirms the value that the auto-elevated front-end would have executed.
+  range: +/-30m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|contains:
+          - '\ms-settings\Shell\Open\command'
+          - '\mscfile\shell\open\command'
+          - '\Classes\exefile\shell\open\command'
+          - '\Classes\Folder\shell\open\command'
+          - '\Environment\windir'
+          - '\DelegateExecute'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+- source: template:uac_bypass.elevated_action_after_bypass
+  question: What action was performed with elevated privileges after the UAC bypass?
+  context: >-
+    UAC bypass is a means to an end — elevation enables actions that require high integrity such as installing persistence,
+    dumping credentials, tampering with security tools, or accessing protected resources. Examining processes spawned at High
+    or System integrity shortly after the bypass reveals the operator's objective and the true scope of the incident.
+  range: +30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        IntegrityLevel:
+          - 'High'
+          - 'System'
+          - 'S-1-16-16384'
+          - 'S-1-16-12288'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - IntegrityLevel
+- source: attack:T1548.002.tuning_parameter
+  question: Did a known auto-elevated system binary spawn an unexpected child process on this host around the alert?
+  context: >-
+    UAC bypasses work by making an auto-elevated front-end run an attacker-chosen command, so the on-host signature is an
+    auto-elevated binary spawning something it normally never launches — for example fodhelper.exe, computerdefaults.exe,
+    sdclt.exe, eventvwr.exe, slui.exe, or wusa.exe launching cmd.exe or powershell.exe. Reviewing children of these binaries
+    in the alert window distinguishes a successful bypass from a launcher that was blocked before elevation.
+  range: +/-30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith:
+          - '\fodhelper.exe'
+          - '\computerdefaults.exe'
+          - '\sdclt.exe'
+          - '\eventvwr.exe'
+          - '\slui.exe'
+          - '\wusa.exe'
+          - '\sysprep.exe'
+          - '\cmstp.exe'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+      - IntegrityLevel
+- source: template:uac_bypass.other_escalation_attempts
+  question: Were other privilege escalation techniques attempted on this host?
+  context: >-
+    Operators who attempt one UAC bypass often try multiple methods until one succeeds, especially when the OS version or
+    configuration blocks certain techniques. Other privilege-escalation or UAC-bypass detections on this host, from the same
+    user or process, confirm deliberate escalation activity rather than a single false positive.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - rule.name
+      - rule.uuid
+      - event.severity_label
+- source: template:cue_process_tool.process_chain
+  question: What process spawned UACMe and is that parent chain expected?
+  context: >-
+    The parent process shows how the tool was launched. An interactive shell, a remote-execution service, or an Office or
+    script-host parent each imply a different delivery path; a parent that is itself recently dropped or unsigned suggests the
+    tool arrived as part of a larger intrusion. Walk up from the parent to see what spawned it and what else it spawned.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run UACMe or comparable offensive tooling?
+  context: >-
+    Compare this user's current action against their historical behavior. A user who has never run UACMe across the fleet is
+    more suspicious than one who does so regularly as part of a known assessment role. Zero or very low counts indicate
+    first-time use; combine the result with what the user's role is expected to involve.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent-plus-UACMe launch combination historically routine on this host or across the environment?
+  context: >-
+    When the alert fires under a service principal, user identity does not attribute the behavior, so the meaningful pivot is
+    the launch mechanism — which parent process spawned the tool, and whether that pairing is historically common. A new or
+    rare parent for this binary is the deviation worth chasing; a pairing that already accounts for many prior events points
+    to vendor or OS automation rather than an operator.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: >-
+    Tracking the user's activity across all hosts reveals lateral movement or escalation attempts spanning multiple
+    endpoints. If the same user triggered comparable activity on several hosts in this window, the scope of the operation is
+    larger than a single bypass.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent-plus-UACMe combination fire on other hosts in the same window?
+  context: >-
+    Under a service principal, asking what the user did network-wide returns agent-telemetry noise, since every host runs
+    service-owned processes constantly. The meaningful question is whether the same launch mechanism — the parent process and
+    the spawned tool — appeared on other hosts in the alert window. Multiple hosts point to scheduled or pushed automation; a
+    single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_process_tool.clustering
+  question: What other tools ran on this host in the minutes around the alert?
+  context: >-
+    Escalation tools rarely run alone. Activity immediately surrounding UACMe may reveal preceding reconnaissance or
+    credential-staging and following persistence or tampering, correlating tightly in time with the bypass. A tight cluster
+    of distinct tools in this window provides the broader context for the investigation.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering, reconnaissance, or credential
+    access — may reveal the stages that preceded this escalation attempt and help reconstruct the full timeline leading up to
+    the bypass.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1548.002
+      name: Bypass User Account Control
+      role: primary
+    - id: T1548
+      name: Abuse Elevation Control Mechanism
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: bypass_setup
+      description: "Registry change to a UAC-related auto-elevation key (per-user shell-open command / Environment) stages the attacker command."
+      mapped_to: Q7
+      source: template:uac_bypass.bypass_technique_registry_artifacts
+    - stage: 2
+      label: registry_artifact
+      description: "Registry-set artifact on the UAC keys, independent of the writing process."
+      mapped_to: Q8
+      source: attack:T1548.002.registry_set
+    - stage: 3
+      label: auto_elevated_invocation
+      description: "Auto-elevated binary (fodhelper/sdclt/computerdefaults/etc.) spawns the attacker-chosen child without a consent prompt."
+      mapped_to: Q10
+      source: attack:T1548.002.tuning_parameter
+    - stage: 4
+      label: elevated_action
+      description: "Action performed at High/System integrity after the bypass succeeds."
+      mapped_to: Q9
+      source: template:uac_bypass.elevated_action_after_bypass
+  dimension_coverage:
+    - dimension: parent_process_analysis
+      technique: T1548.002
+      covered_by: Q12
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1548.002
+      covered_by: Q17
+      source: template:cue_process_tool.clustering
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1548.002
+      covered_by: Q10
+      source: attack:T1548.002.tuning_parameter
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1548
+      covered_by: Q13
+      source: template:cue_user_actor.baseline
+      coverage_type: direct
+  mutable_dispositions:
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only (e.g., 30s correlation window)"
+      disposition: context
+      target_question: Q17
+      notes: "Tuning rationale, no queryable value; clustering uses +/-15m and the registry/auto-elevated questions use +/-30m to bracket the bypass-to-elevation window."
+    - element: ElevatedProcessNameList
+      dimension: tuning_parameter
+      specific_values: "sdclt.exe, eventvwr.exe, computerdefaults.exe, fodhelper.exe, slui.exe, wusa.exe, sysprep.exe, cmstp.exe"
+      disposition: query_injection
+      target_question: Q10
+      notes: "Auto-elevated binary list injected into ParentImage|endswith selection of the new tuning_parameter question."
+    - element: ParentProcessAnomalyThreshold
+      dimension: parent_process_analysis
+      specific_values: "rationale only (non-elevated process spawning auto-elevated one)"
+      disposition: context
+      target_question: Q12
+      notes: "Parent-child anomaly logic is not directly queryable; process_chain question surfaces the parent for analyst judgment, and the parent+binary baseline establishes whether the pairing is rare."
+    - element: ElevatedProcessPath
+      dimension: tuning_parameter
+      specific_values: "rationale only (paths for unsigned/unexpected elevated binaries)"
+      disposition: context
+      target_question: Q9
+      notes: "T1548 secondary; elevated_action_after_bypass returns Image+IntegrityLevel for High/System processes so the analyst can judge path/signing."
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q12
+      notes: "T1548 secondary; same coverage as ParentProcessAnomalyThreshold."
+  dedup_decisions:
+    - dropped: cue_process_tool.mechanism_decode
+      reason: "Phase-2 mechanism decode is more specifically served by hacking_tool.tool_capability_used (Q4), which directs the analyst to the UACMe method number and target command. UACMe is a single-shot launcher, so host+binary scoping would return the same row."
+      kept: hacking_tool.tool_capability_used
+    - dropped: cue_process_tool.baseline
+      reason: "Historical frequency baselining is covered by the user-pivot baseline (Q13) and the parent+binary substitute baseline (Q14)."
+      kept: cue_user_actor.baseline
+    - dropped: cue_process_tool.baseline_deviation
+      reason: "REFLECTED host-pattern deviation overlaps the parent+binary substitute baseline (Q14) which already scopes the rule's binary to host/env and surfaces parent+host concentration; rule has no CommandLine so the reflected block adds no parameter precision."
+      kept: cue_user_actor.baseline_svc
+    - dropped: cue_process_tool.follow_on
+      reason: "Post-execution child processes are covered by elevated_action_after_bypass (Q9, High/System children) and the auto-elevated-binary children question (Q10)."
+      kept: uac_bypass.elevated_action_after_bypass
+    - dropped: cue_process_tool.scope
+      reason: "REFLECTED fleet-pattern cross-host count overlaps the parent+binary cross-host substitute clustering (Q16) and the host-scoped other-escalation alert sweep (Q11); kept the universal endpoint_protection_health slot instead to retain tamper-precursor coverage for this escalation rule."
+      kept: cue_user_actor.clustering_svc
+    - dropped: cue_host_context.clustering
+      reason: "Host-context activity is covered by cue_process_tool.clustering (Q17, +/-15m tool cluster) and cue_host_context.precursor (Q18, prior alerts); both surface the surrounding-activity picture without a third near-identical host aggregation."
+      kept: cue_process_tool.clustering
+    - dropped: cue_user_actor.baseline + cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable"
+      kept: both (Q13 user-pivot, Q14 parent+binary substitute)
+    - dropped: cue_user_actor.clustering + cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable"
+      kept: both (Q15 user-pivot, Q16 parent+binary substitute)
+  skipped_templates: []
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "logsource 'image_load' (recommended by techniques: T1548.002) is not covered — pull in cue_image_load.* or author a custom question with `category: image_load`"
+      disposition: declined
+      reason: >-
+        This rule detects UACMe by PE metadata, image name, and import hash on the launcher itself, not by DLL-hijack
+        side-loading. The image_load analytic for T1548.002 targets DLL-hijack bypass variants (CRYPTBASE/NetFXPerf), which
+        the Akagi launcher signature does not constrain to; the COM/registry bypass paths this tool predominantly uses leave
+        no distinctive image_load on the launcher. Q10 (auto-elevated binary child processes) covers the elevation outcome
+        via process_creation evidence sufficient for triage. No compensating attack:T1548.002.image_load question authored.
+    - hint: "logsource 'process_access' (recommended by techniques: T1548.002) is not covered and no template family exists — author a custom question with `category: process_access`"
+      disposition: declined
+      reason: >-
+        process_access (Sysmon EID 10) is the analytic's signal for token-impersonation / COM-elevation handle access, a
+        small subset of UACMe methods. The rule fires on launcher identity, not on a specific handle-open behavior, so a
+        process_access question would not be scoped by anything the rule actually matched and would return broad cross-fleet
+        handle noise. Elevation outcome is covered at process_creation granularity by Q9 (High/System action) and Q10
+        (auto-elevated parent). No compensating attack:T1548.002.process_access question authored.
+    - hint: "logsource 'security' (recommended by techniques: T1548.002) is not covered and no template family exists — author a custom question with `category: security`"
+      disposition: declined
+      reason: >-
+        The security-log analytic relies on EID 4672 (special privileges assigned) to flag elevated-token grants. That
+        signal is the same elevation outcome already captured by Q9 via process_creation IntegrityLevel (High/System), which
+        is the integrity dimension exposed in this environment's sigma process_creation telemetry; a separate security-channel
+        question would duplicate the elevated-action determination without adding precision tied to this rule's match. No
+        compensating attack:T1548.002.security question authored.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - hacking_tool
+    - uac_bypass
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 16
+      attack: 2
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 15
+    logsource_diversity:
+      process_creation: 14
+      file_event: 1
+      registry_set: 1
+      sigma_alert: 2

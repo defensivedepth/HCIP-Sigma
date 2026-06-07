@@ -1,0 +1,440 @@
+name: Suspicious Process Parents
+id: 22cd9546-1772-4a84-9d31-4e9ed6f01054
+description: |
+  Detects child processes spawned by parent binaries that should normally have no children, or only a single
+  known child. The rule fires on two branches: a parent ending in minesweeper.exe, winver.exe, or bitsadmin.exe
+  spawning any child at all, OR a parent ending in csrss.exe, certutil.exe, eventvwr.exe, calc.exe, or notepad.exe
+  spawning a child that is not on the known-good list (WerFault.exe, wermgr.exe, conhost.exe, mmc.exe,
+  win32calc.exe, notepad.exe). An anomalous child under one of these parents is a common signature of process
+  injection and spawn-to masquerading, where an implant injects into a legitimate-looking process and then launches
+  follow-on tooling under it. Investigation should confirm which parent branch fired, establish whether the parent
+  is genuinely that binary or an injected host, and determine what the spawned child did.
+type: detection
+detection_id: cbec226f-63d9-4eca-9f52-dfb6652f24df
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: '2026-06-06'
+questions:
+- source: template:universal.verify_trigger_match
+  question: Which parent branch fired, and is the parent-child pairing genuinely anomalous?
+  context: Confirm the alert against the rule's two branches. The first branch fires when the parent ends in
+    minesweeper.exe, winver.exe, or bitsadmin.exe and spawns any child — these binaries normally have no children.
+    The second fires when the parent ends in csrss.exe, certutil.exe, eventvwr.exe, calc.exe, or notepad.exe and
+    the child is not WerFault.exe, wermgr.exe, conhost.exe, mmc.exe, win32calc.exe, or notepad.exe. Note which
+    parent and child are present, because the branch determines which downstream questions carry weight.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run the spawned child under this parent?
+  context: Some parent-child pairs are routine in specific roles — for example bitsadmin used by software
+    distribution, or eventvwr launched from an admin console. Knowing whether the user role and host function
+    explain the spawn is often the fastest way to separate routine administration from injection.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:masquerading.true_identity
+  question: Is the parent process genuinely the binary its name suggests, based on its metadata and hash?
+  context: A parent ending in csrss.exe, certutil.exe, calc.exe, or similar may be the real signed system binary
+    that was injected into, or an unrelated binary renamed to impersonate it. Compare the parent's Image path
+    against its OriginalFileName, and check the signing status and hash. A Microsoft-signed binary from its
+    canonical system directory points to injection of a legitimate process; an unsigned or relocated binary points
+    to a renamed impostor.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - Hashes
+- source: template:masquerading.binary_origin
+  question: How did the parent binary arrive on the host, and is it running from its expected directory?
+  context: Signed system binaries like csrss.exe, certutil.exe, and eventvwr.exe normally live in canonical system
+    directories. A copy of one of these names in a user-writable location (Desktop, Downloads, Temp, AppData) is a
+    location anomaly consistent with masquerading. Tracing the file creation event by basename over a long window
+    reveals whether the parent was dropped, copied, or installed, and which process wrote it.
+  range: -30d
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains|expand: '%file_name%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: attack:T1036.execution_context
+  question: What is the full command line of the spawned child, and what does it do?
+  context: The anomalous child under one of these parents is the operational payload of a spawn-to injection.
+    Decode its arguments, any encoded content, file paths, and URLs to identify what it does — reconnaissance,
+    credential access, download, or lateral movement. The child's purpose, not the parent's name, is what
+    determines severity.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - CurrentDirectory
+- source: template:cue_parent_process.mechanism_decode
+  question: What is the parent process doing, and what command line did it run with?
+  context: The parent's own command line and execution context show how the suspect process was started and
+    whether it was driven interactively, by a service, or by another process. For an injected legitimate binary,
+    the parent's command line is often the normal launch arguments while the anomalous behavior is the unexpected
+    child; for a renamed impostor, the command line itself may reveal the operation.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+- source: attack:T1036.time_correlation
+  question: How much time elapsed between the parent's start and the spawning of this child?
+  context: For genuine spawn-to injection, the child frequently appears well after the parent started, once the
+    implant has established itself in the injected process. A parent that has been running for an extended period
+    and then suddenly spawns an anomalous child fits injection better than a fresh launch-and-spawn sequence.
+    Compare the parent's process start time with the child's creation time on this host.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%ParentImage%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+- source: template:cue_parent_process.follow_on
+  question: What other child processes did this parent spawn on the host?
+  context: An injected or abused parent is often used to launch several tools in sequence — reconnaissance,
+    credential access, then movement. Listing every child of this parent binary on the host reveals the full scope
+    of activity initiated through it, beyond the single child that triggered the alert.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%ParentImage%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:masquerading.renamed_binary_activity
+  question: What did the spawned child do after execution, and does the same child appear under this parent on other hosts?
+  context: The point of spawning a payload under a benign-looking parent is to operate while blending in. Examining
+    the child's own child processes, file writes, and network connections reveals its objective. The same
+    parent-child pairing appearing across multiple hosts points to deliberate distribution or automation rather
+    than an isolated event.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_parent_process.baseline
+  question: Has this parent binary ever spawned this child on this host before?
+  context: Some parent-child pairings are routine for a host's role while others are unprecedented. A pairing with
+    zero or very low historical count is a novel spawning relationship and weighs toward injection or masquerading;
+    a pairing already seen thousands of times is more likely OS or vendor automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%ParentImage%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run activity that produces this parent-child pairing?
+  context: Compare the user's current activity against their history. A user who has never been associated with this
+    parent spawning this child is more notable than one who does so as part of a routine role. User role and typical
+    toolset should align with the pairing.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent-child pairing historically routine on this host or across the environment, or is the parent unusual for this child?
+  context: When the alert fires under a service principal, user identity does not attribute behavior. The meaningful
+    pivot is the launch mechanism — which parent spawned this child and whether that pair is historically common. A
+    new or rare parent for this child is the deviation worth chasing; a pair that already accounts for thousands of
+    prior events is OS or vendor automation. Host concentration in the result helps identify a scheduled-task
+    signature.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith|expand: '%ParentImage%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts in the alert window reveals lateral movement or activity
+    spanning multiple endpoints. The same user driving similar activity on several hosts widens the likely scope of
+    compromise.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent-child pairing fire on other hosts in the same window?
+  context: Under a service principal, network-wide user activity returns agent-telemetry noise because every host
+    runs SYSTEM-owned agents constantly. The meaningful question is whether the same launch mechanism — this parent
+    spawning this child — appeared on other hosts in the alert window. Multiple hosts in the same window points to
+    scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith|expand: '%ParentImage%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining process activity around the alert window reveals what led to
+    this event and what followed. Aggregating by parent and child collapses repetitive agent telemetry into
+    high-count rows while novel parent-child pairs stand out at low counts.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host — defense tampering, reconnaissance, or credential access — may
+    reveal the stages that preceded this event and help reconstruct the timeline. A spawn-to injection is often
+    preceded by an initial-access or execution alert.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1036
+      name: Masquerading
+      role: primary
+  attack_chain_coverage:
+    - stage: 1
+      label: parent_masquerade
+      description: A legitimate-looking parent (renamed impostor or injected signed binary) is established on the host
+      mapped_to: Q3
+      source: template:masquerading.true_identity
+    - stage: 2
+      label: delivery
+      description: The masquerading parent binary is dropped, copied, or installed on the host
+      mapped_to: Q4
+      source: template:masquerading.binary_origin
+    - stage: 3
+      label: anomalous_spawn
+      description: The parent spawns a child inconsistent with its known usage (any child for branch A, non-allowlisted child for branch B)
+      mapped_to: Q5
+      source: attack:T1036.execution_context
+    - stage: 4
+      label: payload_execution
+      description: The spawned child performs the operational objective and may appear across hosts
+      mapped_to: Q9
+      source: template:masquerading.renamed_binary_activity
+  dimension_coverage:
+    - dimension: execution_context
+      technique: T1036
+      covered_by: Q5
+      source: attack:T1036.execution_context
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1036
+      covered_by: Q7
+      source: attack:T1036.time_correlation
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1036
+      covered_by: Q3
+      source: template:masquerading.true_identity
+      coverage_type: direct
+  mutable_dispositions:
+    - element: OriginalFilenameMismatch
+      dimension: tuning_parameter
+      specific_values: "rationale only — compare Image basename against PE OriginalFilename"
+      disposition: context
+      target_question: Q3
+      notes: "true_identity is KEEP_EXACT and already projects OriginalFileName + Image + Hashes; question/context direct the analyst to compare the parent's name against its OriginalFilename for impostor vs injected-signed."
+    - element: KnownSystemUtilityPaths
+      dimension: tuning_parameter
+      specific_values: "rationale only — expected install directories for signed system binaries"
+      disposition: context
+      target_question: Q4
+      notes: "binary_origin context calls out canonical system directories vs user-writable locations as the location-anomaly discriminator for csrss/certutil/eventvwr/calc."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only — correlation window between parent start and child spawn"
+      disposition: new_question
+      target_question: Q7
+      notes: "Generated attack:T1036.time_correlation question to compare parent start time against child creation time; injected parents typically spawn long after their own start."
+  dedup_decisions:
+    - dropped: cue_process_tool.process_chain
+      reason: "parent_process is the primary cue and the rule's detection field is ParentImage — the parent chain is already covered by cue_parent_process.mechanism_decode (Q6); hint 1 directs this drop"
+      kept: template:cue_parent_process.mechanism_decode
+    - dropped: cue_process_tool.mechanism_decode
+      reason: "no commandline_values on the rule and the alerting subject is a parent-child relationship, not a single tool invocation; child decode covered by attack:T1036.execution_context (Q5), parent decode by cue_parent_process.mechanism_decode (Q6)"
+      kept: attack:T1036.execution_context
+    - dropped: cue_parent_process.clustering
+      reason: "near-identical to cue_parent_process.follow_on (Q8) — both list host-scoped process activity for the same parent; follow_on's +4h window is the more useful framing for scoping spawned tooling"
+      kept: template:cue_parent_process.follow_on
+    - dropped: cue_parent_process.scope
+      reason: "cross-host parent-child distribution is covered by masquerading.renamed_binary_activity (Q9) and cue_user_actor.clustering_svc (Q14), both of which pivot on the same parent+child pair across hosts"
+      kept: template:cue_user_actor.clustering_svc
+    - dropped: cue_process_tool.baseline
+      reason: "host-level binary baseline is subsumed by cue_parent_process.baseline (Q10), which scopes to the parent-child pair — the discriminating unit for this rule — rather than the child binary alone"
+      kept: template:cue_parent_process.baseline
+    - dropped: pair cue_user_actor.baseline / cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable; both emitted (Q11 user-pivot, Q12 parent+child substitute) because the firing identity cannot be predicted at generation time"
+      kept: both
+    - dropped: pair cue_user_actor.clustering / cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable; both emitted (Q13 user-pivot, Q14 parent+child substitute)"
+      kept: both
+  skipped_templates:
+    - template: universal.endpoint_protection_health
+      reason: "RECOMMENDED-only generic host-tamper sweep; this is a masquerading/process-injection rule, not an execution or credential-access rule whose disposition turns on whether protection was disabled first. Prior-alert tamper context is carried by cue_host_context.precursor (Q16). Dropped to stay within the 16-question budget."
+  reflection_overrides: []
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - masquerading
+    - cue_parent_process
+    - cue_user_actor
+    - cue_host_context
+  generation_stats:
+    total_questions: 16
+    source_counts:
+      template: 14
+      attack: 2
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 2
+      context: 12
+    logsource_diversity:
+      process_creation: 14
+      file_event: 1
+      sigma_alert: 1

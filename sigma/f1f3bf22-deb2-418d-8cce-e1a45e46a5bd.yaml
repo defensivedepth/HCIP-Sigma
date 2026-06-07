@@ -1,0 +1,521 @@
+name: MMC20 Lateral Movement
+id: 380e243e-b677-409f-b20b-48cfdc7d3be9
+description: |
+  Detects mmc.exe spawned by svchost.exe with the "-Embedding" command line, the signature of remote
+  code execution through the MMC20.Application DCOM object. An administrator on a remote host can
+  activate this COM object over RPC (TCP 135) and call ExecuteShellCommand to run arbitrary commands;
+  the DCOM service on the target launches mmc.exe with "-Embedding", which then spawns the attacker's
+  payload (cmd.exe, powershell.exe, rundll32.exe, and similar). Legitimate MMC snap-in use does not
+  produce an svchost-parented, "-Embedding" mmc.exe with command-interpreter children, so investigation
+  should establish the source host of the remote activation, the account that invoked it, and what
+  mmc.exe spawned afterward.
+type: detection
+detection_id: f1f3bf22-deb2-418d-8cce-e1a45e46a5bd
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: '2026-06-06'
+questions:
+- source: template:universal.verify_trigger_match
+  question: Was mmc.exe launched by svchost.exe with the -Embedding flag on this host?
+  context: Confirm the alert is a true positive by reviewing the triggering event. The rule fires only
+    when all three conditions hold together — parent ends in svchost.exe, the image ends in mmc.exe, and
+    the command line contains -Embedding. That combination is the DCOM-activated MMC instance, distinct
+    from an interactively launched console.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this host expected to receive remote MMC/DCOM activations, and is the acting account an expected administrator?
+  context: DCOM activation is a privileged operation, so this fires under an account with local admin
+    rights on the target. A server administered through MMC snap-ins by known operators is different from
+    a workstation that has no reason to be a remote management target. Compare the host role and the
+    account against expected administrative use.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: attack:T1021.003.code_execution
+  question: What child processes did this mmc.exe instance spawn?
+  context: The mmc.exe launch itself is only the activation step. DCOM-based execution delivers its payload
+    through mmc.exe's children — command interpreters and script hosts such as cmd.exe, powershell.exe, or
+    rundll32.exe. An mmc.exe that spawns a command interpreter is the execution stage of the technique;
+    mmc.exe with no children may be an incomplete or failed activation.
+  range: +30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What exactly did this mmc.exe invocation do beyond the -Embedding activation?
+  context: Decode the full command line of the alerting mmc.exe and of any process it spawned. The
+    -Embedding flag marks COM/DCOM activation; the payload is whatever the activating caller passed to
+    ExecuteShellCommand. Look for encoded PowerShell, hidden window flags, and download or staging
+    arguments in the child command lines.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:parent_child.parent_process_legitimacy
+  question: Is svchost.exe expected to spawn mmc.exe here, and what svchost service instance launched it?
+  context: The parent-child relationship is the core signal. mmc.exe parented to svchost.exe (rather than
+    explorer.exe or another interactive process) indicates the console was instantiated by a service —
+    the DCOM/COM activation path — not opened by a user. Identify which svchost service group launched it
+    and whether that is expected on this host.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- source: template:parent_child.sibling_processes
+  question: What other processes did the same svchost.exe parent spawn around this time?
+  context: The svchost service instance that launched mmc.exe may have launched other DCOM-activated
+    processes in the same window. Sibling processes from the same parent reveal whether this is a single
+    activation or part of a sequence of remotely instantiated tools on the host.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: attack:T1021.003.process_identification
+  question: What modules did this mmc.exe instance load, and do they indicate scripting or COM-automation engines?
+  context: DCOM execution through MMC20.Application loads the COM automation substrate, and payloads
+    frequently pull in scripting engines (jscript.dll, vbscript.dll), the .NET runtime (clr.dll), or
+    wmi providers. Module loads that point to script or automation engines corroborate hands-on execution
+    rather than a benign console launch. Other binaries are abused the same way over DCOM (for example
+    excel.exe and wmiprvse.exe); the loaded-module pattern is the cross-binary discriminator.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith: \mmc.exe
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+- source: template:lateral_movement.source_host_identification
+  question: What host initiated the remote connection to this system, and is it an expected administrative source?
+  context: DCOM activation reaches the target over RPC on TCP 135 plus an ephemeral high port. Inbound
+    connections on the lateral-movement ports just before the mmc.exe launch identify the source host —
+    a known admin jump box versus an unexpected workstation distinguishes sanctioned management from an
+    attacker pivoting between endpoints.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        DestinationPort:
+          - 135
+          - 445
+          - 5985
+          - 5986
+          - 3389
+      condition: selection
+    fields:
+      - SourceIp
+      - DestinationPort
+- source: template:lateral_movement.authentication_method
+  question: How did the acting account authenticate to this host -- valid credentials, pass-the-hash, or a Kerberos ticket?
+  context: DCOM activation requires a successful logon to the target, typically a network logon (type 3).
+    The authentication method shows how access was obtained — NTLM network logons with no preceding
+    interactive logon suggest credential reuse or pass-the-hash, while a Kerberos ticket points to a
+    domain credential. Correlate the logon events with the alert time.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - User
+      - CommandLine
+- source: template:lateral_movement.target_activity_after_access
+  question: What processes ran on this host in the period after the mmc.exe activation?
+  context: Lateral movement is a means to an end. After remote execution lands, an operator typically
+    runs reconnaissance, credential access, or tool-staging commands. Process activity in the window
+    following the activation reveals the objective on this host.
+  range: +30m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - User
+      - Image
+- source: template:lateral_movement.lateral_movement_scope
+  question: Has this account used lateral-movement tooling to reach other hosts in the environment?
+  context: Operators rarely stop at one target. If the same account is running remote-execution and
+    lateral-movement tools across multiple systems, the scope of compromise is wider than this host.
+    A spread of destinations from one account in a short window indicates active movement.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      selection_lateral:
+        Image|endswith:
+          - '\psexec.exe'
+          - '\psexec64.exe'
+          - '\mstsc.exe'
+          - '\ssh.exe'
+          - '\plink.exe'
+          - '\wmic.exe'
+      condition: selection and selection_lateral
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.baseline
+  question: Does this account normally run mmc.exe or administer hosts through MMC?
+  context: Compare the acting account against its historical behavior. An account that routinely manages
+    systems through MMC consoles is different from one that has never launched mmc.exe. Zero or very low
+    historical counts across the environment indicate first-time or rare use that aligns the account with
+    the detected activity poorly.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is the svchost.exe-to-mmc.exe launch pattern historically routine on this host or environment-wide?
+  context: When the alert fires under a service principal, account identity does not attribute behavior;
+    the launch mechanism does. Check how often svchost.exe has spawned mmc.exe historically. A pairing
+    that already accounts for many prior events points to existing management automation, while a new or
+    rare svchost-to-mmc launch is the deviation worth chasing.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this account do across the network around the time of the alert?
+  context: After identifying the acting account, check its activity across all hosts in the alert window.
+    If the same account triggered similar remote-execution activity on multiple endpoints, the operation
+    spans more than this host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did the svchost.exe-to-mmc.exe launch pattern fire on other hosts in the same window?
+  context: Under a service principal, network-wide account activity returns telemetry noise. The
+    meaningful question is whether the same launch mechanism — svchost.exe spawning mmc.exe — appeared on
+    other hosts in the alert window. Several hosts in the same window points to a coordinated push across
+    targets; a single host points to a host-local activation.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Aggregating process activity around the alert time surfaces
+    the immediate context — what preceded the activation and what followed it. Novel parent-child pairs
+    at low counts stand out against routine high-count telemetry.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host — reconnaissance, credential access, defense tampering —
+    may reveal the stages that preceded the remote execution and help reconstruct the timeline. The
+    sequence of alerts often tells the story of how access was gained before this activation.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1021.003
+      name: Distributed Component Object Model
+      role: primary
+    - id: T1021
+      name: Remote Services
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: remote_dcom_activation
+      description: "Remote DCOM invocation by a privileged account over RPC (TCP 135) + ephemeral port"
+      mapped_to: Q8
+      source: template:lateral_movement.source_host_identification
+    - stage: 2
+      label: privileged_authentication
+      description: "Successful logon to the target as the activating admin account"
+      mapped_to: Q9
+      source: template:lateral_movement.authentication_method
+    - stage: 3
+      label: abnormal_process_instantiation
+      description: "DCOM service spawns mmc.exe with -Embedding on the target (the alerting event)"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 4
+      label: code_execution
+      description: "mmc.exe spawns the payload (cmd/powershell/rundll32) — the execution objective"
+      mapped_to: Q3
+      source: attack:T1021.003.code_execution
+  dimension_coverage:
+    - dimension: process_identification
+      technique: T1021.003
+      covered_by: Q7
+      source: attack:T1021.003.process_identification
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1021.003
+      covered_by: Q8
+      source: template:lateral_movement.source_host_identification
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1021.003
+      covered_by: Q8
+      source: template:lateral_movement.source_host_identification
+      coverage_type: partial
+    - dimension: user_context
+      technique: T1021.003
+      covered_by: Q12
+      source: template:cue_user_actor.baseline
+      coverage_type: direct
+    - dimension: command_analysis
+      technique: T1021
+      covered_by: Q4
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: direct
+  mutable_dispositions:
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only (e.g., 300s correlation window)"
+      disposition: context
+      target_question: Q8
+      notes: "No specific queryable value; correlation-window rationale carried in source-host and
+        post-access question time ranges (+/-15m, +30m)."
+    - element: UserContext
+      dimension: user_context
+      specific_values: "rationale only — rare/first-time DCOM invocations by an account"
+      disposition: context
+      target_question: Q12
+      notes: "Drives the user-actor baseline (Q12) and its service-principal substitute (Q13)."
+    - element: ProcessName
+      dimension: process_identification
+      specific_values: "excel.exe, wmiprvse.exe (DCOM-abusable binaries); mmc child interpreters cmd.exe/powershell.exe/rundll32.exe"
+      disposition: query_injection
+      target_question: Q3
+      notes: "mmc.exe child interpreters surfaced via ParentProcessGuid scope in Q3; cross-binary
+        excel.exe/wmiprvse.exe pattern noted in Q7 context and corroborated via image_load module pattern."
+    - element: RemoteHostList
+      dimension: tuning_parameter
+      specific_values: "rationale only — known set of systems expected to send/receive DCOM"
+      disposition: context
+      target_question: Q8
+      notes: "Source-host identification (Q8) and the expected-admin-source framing in Q2 carry the
+        allowlist rationale; no fixed host list is queryable at generation time."
+    - element: LogonUser
+      dimension: tuning_parameter
+      specific_values: "rationale only — service/privileged accounts for higher fidelity (T1021)"
+      disposition: context
+      target_question: Q9
+      notes: "Authentication-method question (Q9) and user baselines carry the privileged-account
+        rationale."
+  dedup_decisions:
+    - dropped: cue_process_tool.process_chain
+      reason: "parent_process is primary cue — parent_child.parent_process_legitimacy (Q5) subsumes the parent-chain question per hint"
+      kept: template:parent_child.parent_process_legitimacy
+    - dropped: cue_parent_process.mechanism_decode
+      reason: "parent_child technique set active — parent_process_legitimacy (Q5) is the more specific parent-origin question"
+      kept: template:parent_child.parent_process_legitimacy
+    - dropped: cue_parent_process.follow_on
+      reason: "follow-on children of mmc.exe are the load-bearing payload — covered by attack:T1021.003.code_execution (Q3) scoped to the mmc ProcessGuid rather than the svchost parent-binary"
+      kept: attack:T1021.003.code_execution
+    - dropped: cue_user_actor.baseline pair / clustering pair
+      reason: "user_actor pair — non-deduplicable; both user-pivot and service_principal_substitute variants emitted (Q12+Q13, Q14+Q15)"
+      kept: both variants
+  skipped_templates:
+    - template: cue_parent_process.baseline
+      reason: "parent_child.parent_process_legitimacy + cue_user_actor.baseline_svc (svchost->mmc launch frequency) already cover parent-child baseline; avoids a third near-identical aggregation"
+    - template: cue_parent_process.clustering
+      reason: "cue_host_context.clustering (Q16) covers around-the-time host activity; parent-scoped clustering would duplicate sibling_processes (Q6)"
+    - template: cue_parent_process.scope
+      reason: "cue_user_actor.clustering_svc (Q15) already searches the svchost->mmc launch pattern across hosts"
+    - template: cue_process_tool.baseline
+      reason: "host-level mmc.exe frequency duplicates the user-actor and launch-mechanism baselines (Q12, Q13); the launch-mechanism baseline is the higher-signal cut for a service-spawned binary"
+    - template: universal.endpoint_protection_health
+      reason: "defense_tampering is not confirmed for this rule, but prior-alert precursor (Q17) already surfaces host-level tamper activity; this lateral-movement/execution rule's disposition turns on source host and payload children, not on whether AV was disabled first on the target"
+    - template: network_scope.same_action_other_hosts
+      reason: "cross-host mmc.exe spread is covered by cue_user_actor.clustering_svc (Q15) on the svchost->mmc launch pattern, which is more specific than Image-only matching"
+    - template: network_scope.actor_activity_network_wide
+      reason: "duplicates cue_user_actor.clustering (Q14) — same User-scoped network-wide activity query"
+    - template: network_scope.actor_authentication_trail
+      reason: "lateral_movement.authentication_method (Q9) covers the auth dimension; a separate 4624/4625 security-log question would overlap and the security logsource is acted-on via Q9's auth framing"
+    - template: remote_access_tool.tool_authorization
+      reason: "remote_access_tool set confirmed on a spurious 'title contains atera' match; the rule title is 'MMC20 Lateral Movement' with no RMM tool. mmc.exe is not a remote-access product, so approved-software-list framing does not apply"
+    - template: remote_access_tool.active_session_context
+      reason: "spurious remote_access_tool match (see tool_authorization); no helpdesk-session framing fits a DCOM mmc.exe activation"
+    - template: remote_access_tool.connection_destination
+      reason: "spurious remote_access_tool match; mmc.exe does not establish RMM relay connections — DCOM inbound source is covered by lateral_movement.source_host_identification (Q8)"
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "logsource 'security' (recommended by techniques: T1021.003) is not covered and no template family exists — author a custom question with category: security"
+      disposition: declined
+      reason: >-
+        No standalone category:security question authored because the DCOM-logon evidence (4624/4648)
+        is already the subject of lateral_movement.authentication_method (Q9), which directs the analyst
+        to the network-logon trail DCOM activation produces, while lateral_movement.source_host_identification
+        (Q8) identifies the activating source over the RPC ports. A separate 4624/4648 security-log query
+        would restate Q9's intent without adding a distinct investigation step for this single-event
+        process_creation rule.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - lateral_movement
+    - parent_child
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 15
+      attack: 2
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 14
+    logsource_diversity:
+      process_creation: 14
+      image_load: 1
+      network_connection: 1
+      sigma_alert: 1

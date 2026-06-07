@@ -1,0 +1,646 @@
+name: Potential Credential Dumping Via WER
+id: 9668d11a-b316-4228-b4f5-51dd7b275f46
+description: |
+  Detects WerFault.exe running under a SYSTEM/service account (ParentUser or User containing AUTHORI/AUTORI) with a
+  command line that carries all of the ' -u -p ', ' -ip ', and ' -s ' switches, while the parent is NOT lsass.exe. This
+  pattern matches the LSASS Shtinkering technique, which coerces Windows Error Reporting into dumping LSASS memory so the
+  attacker's own process never opens a handle to lsass.exe. Legitimate Windows Error Reporting can produce similar command
+  lines, so verify the faulting process referenced by the -p PID and confirm whether a credential-bearing dump was produced
+  and what followed it.
+type: detection
+detection_id: 9a4ccd1a-3526-4d99-b980-9f9c5d3a6ff3
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does this WerFault.exe invocation carry the -u -p, -ip, and -s switches under a SYSTEM/service account with a non-LSASS parent?
+  context: Confirm the alert is a true positive before investing time. Check that the Image or OriginalFileName is WerFault.exe,
+    that ParentUser or User contains AUTHORI/AUTORI, that the command line holds all of ' -u -p ', ' -ip ', and ' -s ', and
+    that the parent is not lsass.exe. Note the PID after -p — that is the process WER is reporting on, and it should resolve
+    to lsass.exe for the Shtinkering pattern.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+      - User
+      - ParentUser
+- source: template:universal.host_user_context
+  question: Is this host and account expected to generate Windows Error Reporting dumps for system processes?
+  context: Routine WER activity runs under SYSTEM and reports on faulting applications, so the account context alone is not
+    decisive. Knowing whether this host normally produces error-report dumps and whether any operator or automation is
+    expected to be driving WER here is often the fastest way to separate a real WER fault from a coerced LSASS dump.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in the hour before the alert?
+  context: Tampering often precedes credential access — an operator who routes around EDR by abusing WER may also have weakened
+    protection first. The query surfaces direct attempts to disable AV/EDR services, flip Defender flags, add broad exclusions,
+    clear logs, or patch AMSI/ETW. Zero rows is a useful "protection looks healthy" signal; populated rows shift the disposition
+    toward operator preparation, so review the parent process and signing chain to identify the writer.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+- source: template:credential_access.credential_target_identification
+  question: Was LSASS memory the dump target, and by what method?
+  context: This rule fires on the Windows Error Reporting dump path rather than the classic dumping tools, so the alerting
+    command line will not show procdump, comsvcs.dll MiniDump, rundll32, or Invoke-Mimikatz. Confirm the -p PID resolves to
+    lsass.exe and treat WerFault as the dumping primitive itself — the calling process never opens an LSASS handle, which is
+    what makes this path evade tooling hooked on conventional dump APIs.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: attack:T1003.001.access_verification
+  question: Did any process open a full-access handle to lsass.exe on this host around the alert?
+  context: Credential dumping requires opening lsass.exe with broad rights, classically the full-access mask 0x1F0FFF. WER
+    Shtinkering is designed to avoid this from the attacker's own process, so a matching handle from WerFault.exe or another
+    non-security process corroborates an active dump, while its absence is consistent with the coerced-WER path where no
+    attacker handle is created. Allowlist known AV/EDR tools that legitimately access LSASS.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_access
+      product: windows
+    detection:
+      selection:
+        TargetImage|endswith: '\lsass.exe'
+        GrantedAccess: '0x1F0FFF'
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - SourceImage
+      - GrantedAccess
+      - User
+- source: attack:T1003.001.tuning_parameter
+  question: Was a memory dump file written to a staging directory on this host shortly after the alert?
+  context: The end product of the WER dump path is a memory dump file landing where the operator can retrieve it — commonly
+    %TEMP%, C:\Windows\Temp, C:\ProgramData, or another world-writable staging directory. A new .dmp or large file appearing
+    on this host within minutes of the alert is strong corroboration that LSASS memory was captured; its absence weakens the
+    dump hypothesis.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains:
+          - '\Temp\'
+          - '\ProgramData\'
+          - '\Users\Public\'
+          - '\Windows\Temp\'
+      filter:
+        TargetFilename|endswith: '.dmp'
+      condition: selection and filter
+    fields:
+      - TargetFilename
+      - Image
+      - User
+- source: template:cue_process_tool.process_chain
+  question: What process spawned this WerFault.exe instance, and is that parent chain expected for error reporting?
+  context: Legitimate WER is launched by the service-control path (svchost/services). A parent that is a shell, scripting host,
+    or other operator-controlled process indicates the report was synthesized rather than triggered by a genuine fault. The
+    rule already excludes lsass.exe as the parent, so the real launcher is what attributes intent — allowlist known
+    legitimate tools and treat an unexpected parent as the deviation to chase.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:credential_access.credential_exposure_assessment
+  question: Which accounts had active sessions on this host, and do any have elevated privileges?
+  context: An LSASS dump exposes the credentials and secrets of every account with an active session or cached logon on this
+    host at dump time. Enumerate who was logged on and cross-reference against directory group memberships. Domain admin,
+    enterprise admin, or service-account exposure requires incident escalation; a single standard-user session may only need
+    monitoring and a password reset.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:credential_access.post_access_lateral_movement
+  question: Were any new logon sessions or remote connections initiated on this host after the alert?
+  context: Credential theft is typically followed by lateral movement using the stolen secrets. Look for follow-on alerts
+    indicating RDP, SMB, WinRM, PsExec, or fresh authentication events shortly after the dump. Their presence indicates the
+    captured credentials are already being exercised; escalate accordingly.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - rule.name
+      - rule.uuid
+      - event.severity_label
+- source: template:cue_user_actor.baseline
+  question: Does this user account normally run WerFault.exe with these reporting switches?
+  context: Compare the alerting account's current action against its historical behavior. WER reporting under a service
+    principal is routine in aggregate, but a specific account that has never produced this exact reporting pattern is more
+    suspicious than one that does so regularly. Combine with knowledge of the account's role.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent+WerFault.exe combination historically routine on this host or across the environment, or is the parent unusual for WerFault.exe?
+  context: When the alert fires under a service principal, user identity does not attribute behavior — the meaningful pivot
+    is the launch mechanism. Which parent process spawned WerFault.exe, and is that pair historically common here. A new or
+    rare parent for WerFault.exe is the deviation worth chasing; a pair that already accounts for thousands of prior events
+    is OS or vendor automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user account do across the network around this time?
+  context: Tracking the account's activity across all hosts reveals lateral movement or multi-endpoint operations. If the
+    same account triggered similar activity on multiple hosts in the alert window, the scope of compromise may be larger
+    than this single dump.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent+WerFault.exe combination fire on other hosts in the same window — a coordinated rollout, or isolated to this host?
+  context: Under a service principal, asking what else the user did across the network returns agent-telemetry noise, since
+    every host runs SYSTEM-owned agents constantly. The meaningful question is whether the same launch mechanism — parent
+    process plus WerFault.exe — fired on other hosts in the alert window. Multiple hosts points to scheduled or pushed
+    automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired the rule's pattern, what parents and users normally drive it, and does the current alert fit?
+  context: Even routine error reporting can be abused. The query mirrors the rule's selection structure scoped to this host,
+    so the resulting parent/user distribution reflects how this specific firing pattern has historically run here — not
+    generic WerFault.exe usage. A new parent process, an unexpected account, or an unusual command-line shape is the anomaly
+    worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_img:
+      - Image|endswith: \Werfault.exe
+      - OriginalFileName: WerFault.exe
+      selection_cli:
+        ParentUser|contains:
+        - AUTHORI
+        - AUTORI
+        User|contains:
+        - AUTHORI
+        - AUTORI
+        CommandLine|contains|all:
+        - ' -u -p '
+        - ' -ip '
+        - ' -s '
+      filter_lsass:
+        ParentImage: C:\Windows\System32\lsass.exe
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_* and not 1 of filter_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.follow_on
+  question: What child processes did this WerFault.exe instance spawn afterward?
+  context: A genuine WER fault report does little beyond writing its dump and exiting. Child processes spawned by this
+    WerFault.exe — a shell, a copy/exfil utility, an archiver — would indicate the dump is being staged or moved and point
+    to hands-on-keyboard activity following the credential capture.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired the rule's pattern in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of this
+    firing pattern — not generic WerFault.exe usage. Many hosts firing the same pattern points to a benign software or
+    vendor behavior that trips this rule; one host or a small unrelated set points to targeted operator activity. Use the
+    host distribution to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_img:
+      - Image|endswith: \Werfault.exe
+      - OriginalFileName: WerFault.exe
+      selection_cli:
+        ParentUser|contains:
+        - AUTHORI
+        - AUTORI
+        User|contains:
+        - AUTHORI
+        - AUTORI
+        CommandLine|contains|all:
+        - ' -u -p '
+        - ' -ip '
+        - ' -s '
+      filter_lsass:
+        ParentImage: C:\Windows\System32\lsass.exe
+      condition: all of selection_* and not 1 of filter_*
+    fields:
+    - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining process activity around the dump reveals what led to it and what
+    followed — reconnaissance, privilege escalation, or staging that provides broader context. Novel parent-child pairs at
+    low counts are what to scan for; repetitive agent telemetry collapses into high-count rows.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host — defense tampering, reconnaissance, or initial access — may reveal the attack
+    stages that preceded the credential dump and help reconstruct the timeline. Credential access is rarely the first
+    action; what came before it tells the story.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1003.001
+      name: LSASS Memory
+      role: primary
+    - id: T1003
+      name: OS Credential Dumping
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: lsass_access
+      description: "A non-privileged or abnormal process opens a full-access handle (0x1F0FFF) to lsass.exe"
+      mapped_to: Q5
+      source: attack:T1003.001.access_verification
+    - stage: 2
+      label: memory_dump
+      description: "WerFault is coerced into dumping LSASS memory to a file"
+      mapped_to: Q6
+      source: attack:T1003.001.tuning_parameter
+    - stage: 3
+      label: post_dump_movement
+      description: "Captured credentials are used for lateral movement or follow-on activity"
+      mapped_to: Q9
+      source: template:credential_access.post_access_lateral_movement
+  dimension_coverage:
+    - dimension: access_verification
+      technique: T1003.001
+      covered_by: Q5
+      source: attack:T1003.001.access_verification
+      coverage_type: direct
+    - dimension: command_analysis
+      technique: T1003.001
+      covered_by: Q4
+      source: template:credential_access.credential_target_identification
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1003.001
+      covered_by: Q7
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1003.001
+      covered_by: Q17
+      source: template:cue_host_context.clustering
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1003.001
+      covered_by: Q6
+      source: attack:T1003.001.tuning_parameter
+      coverage_type: direct
+  mutable_dispositions:
+    - element: AccessMask
+      dimension: access_verification
+      specific_values: "0x1F0FFF"
+      disposition: query_injection
+      target_question: Q5
+      notes: "Injected as GrantedAccess: '0x1F0FFF' into the process_access query for the LSASS full-access handle."
+    - element: DumpFilePath
+      dimension: tuning_parameter
+      specific_values: "%TEMP%, C:\\Windows\\Temp, C:\\ProgramData, C:\\Users\\Public"
+      disposition: query_injection
+      target_question: Q6
+      notes: "Injected as TargetFilename|contains staging-dir list plus .dmp filter into the file_event query."
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "rationale only (allowlist AV/EDR)"
+      disposition: context
+      target_question: Q7
+      notes: "Allowlisting guidance placed in process_chain context; rule already excludes lsass.exe parent."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "~5 minutes between access and dump"
+      disposition: context
+      target_question: Q5
+      notes: "Threshold not directly queryable; reflected in the +/-5m and +4h ranges and corroboration framing."
+    - element: CommandLinePattern
+      dimension: command_analysis
+      specific_values: "rundll32, procdump, comsvcs.dll, Invoke-Mimikatz"
+      disposition: context
+      target_question: Q4
+      notes: "Used as contrast in credential_target_identification context — this rule fires on the WER path, not these tools."
+    - element: AccessMask
+      dimension: access_verification
+      specific_values: "0x1F0FFF (T1003 secondary)"
+      disposition: query_injection
+      target_question: Q5
+      notes: "Same handle-mask coverage as T1003.001 element; single process_access question serves both techniques."
+    - element: ParentProcessFilter
+      dimension: parent_process_analysis
+      specific_values: "rationale only (allowlist security tools, T1003 secondary)"
+      disposition: context
+      target_question: Q7
+      notes: "Same parent-allowlist coverage as T1003.001 element."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only (T1003 secondary)"
+      disposition: context
+      target_question: Q5
+      notes: "Same time-correlation coverage as T1003.001 element."
+  dedup_decisions:
+    - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable (user-pivot vs. parent+binary launch-mechanism pivot)"
+      kept: both
+    - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable (user-pivot degenerates under service principal; parent+binary substitute is the clean answer)"
+      kept: both
+    - dropped: cue_process_tool.clustering
+      reason: "near-identical to cue_host_context.clustering (Q17) — same host-scoped +/-15m around-the-alert sweep; host_context version aggregates Image+ParentImage and is richer. Dropped to stay under the 18-question cap."
+      kept: cue_host_context.clustering
+    - dropped: cue_process_tool.baseline
+      reason: "generic werfault.exe frequency is uninformative — WerFault.exe runs constantly; the rule-pattern baseline_deviation (Q14) gives the precise rule-pattern frequency instead. Dropped to stay under the 18-question cap."
+      kept: cue_process_tool.baseline_deviation
+  skipped_templates:
+    - template: cue_process_tool.mechanism_decode
+      reason: "replaced_by: credential_access.credential_target_identification (Q4)"
+  hint_dispositions:
+    - hint: "logsource 'registry_set' (recommended by techniques: T1003.001) is not covered — pull in cue_registry_key.* or author a custom question with `category: registry_set`"
+      disposition: declined
+      reason: >-
+        This rule fires on the WER/WerFault dump path, whose artifact is a memory dump file, not a registry write. The
+        registry_set channel for T1003.001 covers SilentProcessExit-style dump triggers (HKLM\SOFTWARE\Microsoft\Windows
+        NT\CurrentVersion\SilentProcessExit), an adjacent dumping mechanism the rule does not detect. The dump-file artifact
+        is covered by Q6 (attack:T1003.001.tuning_parameter, file_event). No compensating registry_set question authored.
+    - hint: "logsource 'security' (recommended by techniques: T1003.001) is not covered and no template family exists — author a custom question with `category: security`"
+      disposition: declined
+      reason: >-
+        The security-channel analytics (4663/4656/4673 sensitive handle/privilege access to lsass.exe) measure the same
+        full-access-handle-to-LSASS signal already covered by Q5 (attack:T1003.001.access_verification) via the process_access
+        channel and its 0x1F0FFF GrantedAccess filter. Authoring a duplicate security-channel question would surface the same
+        handle-open event through a parallel log source without adding investigative distinction.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - credential_access
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 16
+      attack: 2
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 2
+      context: 14
+    logsource_diversity:
+      process_creation: 14
+      process_access: 1
+      file_event: 1
+      sigma_alert: 2

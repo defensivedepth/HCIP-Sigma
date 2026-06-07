@@ -1,0 +1,551 @@
+name: Active Directory Structure Export Via Csvde.EXE
+id: a7f497e8-0682-4588-a824-1a4ea615c464
+description: |
+  Detects execution of csvde.exe with an output flag (-f) and without an import flag (-i), which exports
+  Active Directory objects and attributes to a CSV file. csvde.exe is a legitimate domain administration
+  utility, so the activity is routine when run by directory administrators or scheduled reporting jobs; it
+  is also a common post-compromise discovery step because it dumps the full directory structure to a single
+  file without requiring domain-admin rights in many environments. Determine who ran the export, what the
+  LDAP filter and target attributes were, where the output file went, and whether the export was accompanied
+  by other reconnaissance or staging activity on the host.
+type: detection
+detection_id: e5d36acd-acb4-4c6f-a13f-9eb203d50099
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: '2026-06-06'
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line match what this rule detects -- csvde.exe with an output flag and no import flag?
+  context: >-
+    Confirm the alert is a true positive before investing investigation time. The rule fires when csvde.exe
+    (by image name or original filename) runs with a "-f" output flag and without a "-i" import flag, meaning
+    the invocation exports directory data rather than loading it. Review the exact command line and process
+    details against that criteria.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- source: template:discovery_recon.discovery_user_context
+  question: Is this user expected to export the Active Directory structure?
+  context: >-
+    Directory administrators and IT staff legitimately export AD objects for reporting, audits, or migration
+    planning. Standard users and service accounts rarely need to run csvde.exe at all. The user's role and
+    typical behavior baseline determine whether this export is routine or anomalous.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What exactly did this csvde.exe export do? Decode the LDAP filter, attribute list, and output file from the command line.
+  context: >-
+    The full command line reveals the scope of the export. Decode the "-r" LDAP filter (which object classes
+    were targeted -- users, computers, the whole directory), the "-l" attribute list (which fields were
+    pulled, e.g. samAccountName, mail, lastLogon, description), the "-f" output filename, and any "-s" server
+    or "-d" base-DN scoping. A narrow query for a specific OU reads differently than a full-directory dump.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:discovery_recon.discovery_parent_chain
+  question: What process spawned csvde.exe, and is this a normal pattern?
+  context: >-
+    Legitimate exports are typically launched from an interactive cmd.exe or PowerShell session spawned by
+    explorer.exe, or from a known scheduled-reporting script. Discovery commands spawned by unusual parents --
+    Office applications, script interpreters like wscript.exe or mshta.exe, wmiprvse.exe (WMI remote
+    execution), wsmprovhost.exe (WinRM), or a remote-execution utility -- point to automated post-exploitation
+    enumeration rather than admin work.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+- source: attack:T1087.002.process_identification
+  question: Is the alerting binary the genuine Microsoft csvde.exe, or a renamed copy matched by its original filename?
+  context: >-
+    The rule matches both the image name "\csvde.exe" and the embedded OriginalFileName "csvde.exe", so a
+    renamed binary still fires. Compare the on-disk path against the expected system location, and check the
+    signature and original filename: a file named something else but carrying the csvde.exe original filename,
+    or an unsigned copy outside the system directory, indicates the utility was relocated or repackaged to
+    evade name-based controls.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - Hashes
+- source: template:data_staging_exfil.data_scope
+  question: What directory data did the export target, and what output file was written?
+  context: >-
+    The command-line arguments reveal what was collected -- a specific OU and a short attribute list (a
+    scoped admin report) versus the full directory with broad attributes (bulk enumeration). The "-f" output
+    file is the artifact that holds the exported data; its name and path determine the severity of potential
+    data loss and where to look for the dropped CSV.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - TargetFilename
+- source: template:data_staging_exfil.archive_destination
+  question: Where was the exported CSV moved or sent after creation?
+  context: >-
+    Directory exports are often staged locally and then moved to a staging location or sent over the network.
+    Checking file events for the output file being copied, renamed, or compressed, and network connections
+    from the same host, reveals whether the CSV left the endpoint -- uploaded to cloud storage, copied to
+    removable media, or sent to an external server.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: template:discovery_recon.discovery_burst_detection
+  question: Did other reconnaissance commands run on this host around the same time?
+  context: >-
+    A single export may be legitimate troubleshooting, but multiple reconnaissance commands in rapid
+    succession -- whoami, net, nltest, ldifde, dsquery, nslookup -- is a signature pattern of post-compromise
+    enumeration. Attackers run these to map the environment before moving to the next stage. Three or more
+    different recon binaries within fifteen minutes typically indicates automated reconnaissance.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_recon:
+        Image|endswith:
+          - '\whoami.exe'
+          - '\systeminfo.exe'
+          - '\ipconfig.exe'
+          - '\net.exe'
+          - '\net1.exe'
+          - '\nltest.exe'
+          - '\dsquery.exe'
+          - '\nbtstat.exe'
+          - '\arp.exe'
+          - '\netstat.exe'
+          - '\tasklist.exe'
+          - '\qprocess.exe'
+          - '\query.exe'
+          - '\quser.exe'
+          - '\hostname.exe'
+          - '\nslookup.exe'
+          - '\adfind.exe'
+          - '\ldifde.exe'
+          - '\dnscmd.exe'
+          - '\cmdkey.exe'
+          - '\setspn.exe'
+      condition: selection and selection_recon
+    fields:
+      - Image
+      - User
+- source: template:cue_process_tool.follow_on
+  question: What child processes did csvde.exe spawn afterward?
+  context: >-
+    A directory export tool has no legitimate reason to spawn child processes. Children such as cmd.exe,
+    powershell.exe, or a compression or transfer utility appearing under csvde.exe would indicate the export
+    was part of a larger scripted operation that staged or moved the collected data.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.baseline
+  question: Does this host normally run csvde.exe?
+  context: >-
+    A binary that has never been seen on a host is more suspicious than one that runs regularly. csvde.exe
+    on a workstation or a non-administrative server is unexpected; on a directory-management host it may be
+    routine. Zero or very low historical counts indicate first-time or rare execution.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired this export pattern, what parents and users normally drive it, and does the current alert fit?
+  context: >-
+    Even routine tools get abused. The query mirrors the rule's selection scoped to this host, so the parent
+    and user distribution reflects how this specific export pattern -- not generic csvde.exe usage -- has run
+    here before. A new parent process, an unexpected user account, or an unusual command-line shape is the
+    deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \csvde.exe
+      - OriginalFileName: csvde.exe
+      selection_remote:
+        CommandLine|contains: ' -f'
+      filter_import:
+        CommandLine|contains: ' -i'
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_* and not 1 of filter_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run csvde.exe?
+  context: >-
+    Compare this user's current action against their historical behavior. A user who has never exported
+    directory data is more suspicious than one who does so regularly as part of their role. The user's job
+    function and typical toolset should align with running a domain-enumeration utility.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent+binary combination historically routine on this host or across the environment, or is the parent unusual for csvde.exe?
+  context: >-
+    When the alert fires under a service principal, user identity does not attribute the behavior. The
+    meaningful pivot is the launch mechanism -- which parent process spawned csvde.exe, and whether that
+    pair is historically common. A new or rare parent for this binary is the deviation worth chasing; a pair
+    that already accounts for thousands of prior events is vendor or OS automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: >-
+    Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple
+    endpoints. If the same user triggered similar enumeration on several hosts, the scope of the operation
+    may be larger than a single export.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent+binary combination fire on other hosts in the same window -- a coordinated rollout, or isolated to this host?
+  context: >-
+    Under a service principal, asking what else the user did across the network returns agent-telemetry noise,
+    since every host runs SYSTEM-owned agents constantly. The meaningful question is whether the same launch
+    mechanism -- the parent process spawning csvde.exe -- fired on other hosts in the alert window. Multiple
+    hosts in the same window points to scheduled or pushed automation; a single host points to a host-local
+    trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: >-
+    Alerts rarely occur in isolation. Examining surrounding activity reveals what led to the export and what
+    happened after, and whether it is part of a larger sequence. Look for credential access, privilege
+    escalation, lateral-movement tooling, or data-staging utilities around the export.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired this export pattern in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: >-
+    The query mirrors the rule's selection with no host scope, so the result is a fleet-wide count of this
+    export pattern rather than generic csvde.exe usage. Many hosts firing the same pattern points to scripted
+    deployment or scheduled reporting; one host or a small unrelated set points to manual operator activity.
+    Use the host distribution and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \csvde.exe
+      - OriginalFileName: csvde.exe
+      selection_remote:
+        CommandLine|contains: ' -f'
+      filter_import:
+        CommandLine|contains: ' -i'
+      condition: all of selection_* and not 1 of filter_*
+    fields:
+    - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Alerts rarely happen in isolation. Earlier detections on the same host -- defense tampering,
+    reconnaissance, credential access -- may reveal the attack stages that preceded the export and help
+    reconstruct the full timeline. Reconnaissance followed by exploitation, or credential access followed by
+    enumeration, tells the attack story.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1087.002
+      name: Domain Account
+      role: primary
+    - id: T1087
+      name: Account Discovery
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: enumeration_command_execution
+      description: "Adversary runs csvde.exe with an output flag to export domain account/object data"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: command_decode
+      description: "Decode the LDAP filter, attribute list, and output file to determine export scope"
+      mapped_to: Q3
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 3
+      label: output_staging
+      description: "Exported CSV is written and may be moved, compressed, or exfiltrated"
+      mapped_to: Q7
+      source: template:data_staging_exfil.archive_destination
+  dimension_coverage:
+    - dimension: command_analysis
+      technique: T1087.002
+      covered_by: Q3
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: direct
+    - dimension: process_identification
+      technique: T1087.002
+      covered_by: Q5
+      source: attack:T1087.002.process_identification
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1087.002
+      covered_by: Q8
+      source: template:discovery_recon.discovery_burst_detection
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1087.002
+      covered_by: Q11
+      source: template:cue_process_tool.baseline_deviation
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1087.002
+      covered_by: Q2
+      source: template:discovery_recon.discovery_user_context
+      coverage_type: direct
+    - dimension: execution_context
+      technique: T1087
+      covered_by: Q9
+      source: template:cue_process_tool.follow_on
+      coverage_type: direct
+    - dimension: network_indicators
+      technique: T1087
+      covered_by: Q7
+      source: template:data_staging_exfil.archive_destination
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1087
+      covered_by: Q4
+      source: template:discovery_recon.discovery_parent_chain
+      coverage_type: direct
+  mutable_dispositions:
+    - element: CommandLinePattern
+      dimension: command_analysis
+      specific_values: "net user /domain, Get-ADUser, Get-ADGroupMember, dsquery (enumeration command variants)"
+      disposition: query_injection
+      target_question: Q8
+      notes: "discovery_burst_detection Image|endswith list enumerates AD/recon binaries (net, nltest, dsquery, ldifde, adfind, setspn); triggering binary csvde.exe removed from list to surface OTHER recon"
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only (burst-of-enumeration tuning)"
+      disposition: context
+      target_question: Q8
+      notes: "Burst framing (3+ recon binaries in 15m = automated) carried in discovery_burst_detection context"
+    - element: SourceHost
+      dimension: tuning_parameter
+      specific_values: "rationale only (restrict to non-DC / non-admin hosts)"
+      disposition: context
+      target_question: Q10
+      notes: "Host-baseline and fleet-scope questions surface whether csvde.exe is expected on the alerting host; non-DC/non-admin context carried in prose"
+    - element: UserContext
+      dimension: user_context
+      specific_values: "rationale only (restrict to non-admin / unexpected users)"
+      disposition: context
+      target_question: Q2
+      notes: "discovery_user_context asks whether the user is expected to export AD"
+  dedup_decisions:
+    - dropped: cue_process_tool.process_chain
+      reason: "discovery_recon.discovery_parent_chain (technique set) is more specific to discovery enumeration and covers the same parent-chain question"
+      kept: discovery_recon.discovery_parent_chain
+    - dropped: cue_process_tool.clustering
+      reason: "host-level around-time activity covered by cue_host_context.clustering; recon-specific around-time activity covered by discovery_recon.discovery_burst_detection — both more useful than a generic Image-only clustering"
+      kept: cue_host_context.clustering
+    - dropped: universal.host_user_context
+      reason: "discovery_recon.discovery_user_context supersedes it per its notes_to_llm (more specific to discovery context); kept the discovery version"
+      kept: discovery_recon.discovery_user_context
+    - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable"
+      kept: both emitted (Q12 user-pivot, Q13 parent+binary substitute)
+    - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable"
+      kept: both emitted (Q14 user-pivot, Q15 parent+binary substitute)
+  skipped_templates:
+    - template: data_staging_exfil.encryption_password
+      reason: "csvde.exe writes a plaintext CSV via -f and has no encryption or password-protection flags; the question (-p/-hp/--passphrase archive encryption) has no applicable construct for this rule"
+    - template: universal.endpoint_protection_health
+      reason: "Recommended-not-required generic tamper sweep. This is a discovery/AD-enumeration rule, not an execution/credential-access rule; disposition does not turn on whether AV/EDR was disabled first. Prior-alert tamper context is already surfaced by cue_host_context.precursor (Q18)"
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - discovery_recon
+    - data_staging_exfil
+    - cue_process_tool
+    - cue_user_actor
+    - cue_host_context
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 17
+      attack: 1
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 15
+    logsource_diversity:
+      process_creation: 15
+      file_event: 2
+      sigma_alert: 1

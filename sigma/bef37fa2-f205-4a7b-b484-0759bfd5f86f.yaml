@@ -1,0 +1,534 @@
+name: PUA - Advanced IP Scanner Execution
+id: 9cd02c2e-f38f-4162-a41d-914936f1c799
+description: |
+  Detects execution of Advanced IP Scanner, a portable network discovery tool. The rule fires when EITHER the process identity matches advanced_ip_scanner (Image, OriginalFileName, or Description) OR the command line contains both /portable and /lng. Advanced IP Scanner has legitimate administrative uses for inventory and troubleshooting, but it is also a common reconnaissance tool dropped before lateral movement and impact. The investigation should determine whether the scan was authorized administrative activity or operator-driven enumeration of the local network and reachable shares.
+type: detection
+detection_id: bef37fa2-f205-4a7b-b484-0759bfd5f86f
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-06
+questions:
+- source: template:universal.verify_trigger_match
+  question: Did the alerting process match Advanced IP Scanner by binary identity, or by the /portable and /lng command-line flags?
+  context: >-
+    The rule fires when EITHER the process identity matches advanced_ip_scanner (Image, OriginalFileName, or Description)
+    OR the command line carries both /portable and /lng. Confirm which branch fired and review the exact command line and
+    process details. The branch matters downstream — an identity match confirms the named tool ran, while a flags-only match
+    can indicate a renamed or repackaged copy whose origin and signing chain deserve extra scrutiny.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+      - Description
+- source: template:discovery_recon.discovery_user_context
+  question: Is this user expected to run network discovery tooling on this host?
+  context: >-
+    Network administrators and IT staff legitimately run scanners for inventory and troubleshooting. Standard users rarely
+    need to sweep the local network. The user's role and typical behavior baseline determine whether this scan is routine
+    or anomalous, and whether the host function (admin workstation vs. ordinary endpoint) fits the activity.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - User
+- source: template:remote_access_tool.tool_authorization
+  question: Is Advanced IP Scanner on the organization's approved software list for this host?
+  context: >-
+    Many organizations restrict which network-scanning and discovery tools are sanctioned and on which hosts they may run.
+    A portable scanner that runs without installation leaves little inventory footprint and is frequently used as a drop-in
+    reconnaissance tool. An unapproved scanner — regardless of its legitimacy as a product — may represent shadow IT or
+    operator-staged enumeration.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+- source: template:cue_process_tool.mechanism_decode
+  question: What did this Advanced IP Scanner invocation actually do? Decode the full command line and the /portable and /lng flags.
+  context: >-
+    The full command line reveals the scope and intent of the scan. The /portable flag indicates the no-install portable
+    build, and /lng selects the language file. Look for any range, target, or output-path arguments that show what network
+    was swept and where results were written. This scopes to all executions of the binary on this host within the window,
+    which together may form a single scanning session.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:discovery_recon.discovery_parent_chain
+  question: What process spawned Advanced IP Scanner, and is that parent chain normal?
+  context: >-
+    Legitimate scanner use is typically launched interactively from explorer.exe or a command prompt, or from a known
+    automation script. Launch from Office applications, script interpreters (wscript.exe, cscript.exe, mshta.exe),
+    wmiprvse.exe (WMI remote execution), or wsmprovhost.exe (WinRM remote execution) points to automated post-exploitation
+    rather than an administrator at the keyboard.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+- source: attack:T1046.network_scan_fanout
+  question: Did this host make a burst of outbound connections to many distinct internal addresses around the scan?
+  context: >-
+    A network scan manifests as sequential connection attempts to many unique destination addresses within a short window.
+    A high count of distinct destinations in a few minutes is the signature of a sweep; a handful of connections is closer
+    to ordinary activity. Tuning note — what counts as a scan depends on the scan-rate threshold (unique destinations per
+    time window) and on which binaries are sanctioned scanners in this environment.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+- source: attack:T1135.smb_share_enum
+  question: Did the scan fan out to SMB ports 445 or 139 across multiple internal hosts?
+  context: >-
+    Network share discovery shows up as a burst of outbound SMB/RPC connections (445/139) to many hosts in a short window,
+    often followed by IPC$ or srvsvc share enumeration. Many distinct SMB destinations over the correlation window points
+    to share-mapping reconnaissance rather than a single intended file access. Tuning note — a burst-host threshold (for
+    example five or more unique SMB destinations within the window) separates scanning from routine file access.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        DestinationPort:
+          - 445
+          - 139
+      condition: selection
+    fields:
+      - DestinationIp
+      - Image
+- source: template:discovery_recon.discovery_burst_detection
+  question: Did other reconnaissance commands run on this host around the same time?
+  context: >-
+    A single discovery action may be legitimate troubleshooting, but several reconnaissance commands in rapid succession —
+    net view, nltest, nslookup, arp, netstat — is a signature of post-compromise enumeration. Three or more distinct recon
+    binaries within fifteen minutes typically indicates an automated discovery stage rather than an administrator spot-check.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_recon:
+        Image|endswith:
+          - '\whoami.exe'
+          - '\systeminfo.exe'
+          - '\ipconfig.exe'
+          - '\net.exe'
+          - '\net1.exe'
+          - '\nltest.exe'
+          - '\dsquery.exe'
+          - '\nbtstat.exe'
+          - '\arp.exe'
+          - '\netstat.exe'
+          - '\tasklist.exe'
+          - '\qprocess.exe'
+          - '\query.exe'
+          - '\quser.exe'
+          - '\hostname.exe'
+          - '\nslookup.exe'
+          - '\adfind.exe'
+          - '\csvde.exe'
+          - '\ldifde.exe'
+          - '\dnscmd.exe'
+          - '\cmdkey.exe'
+          - '\setspn.exe'
+      condition: selection and selection_recon
+    fields:
+      - Image
+      - User
+- source: template:cue_process_tool.follow_on
+  question: What child processes did the scanner spawn afterward?
+  context: >-
+    The processes spawned by a scanning tool reveal what followed the reconnaissance. A standalone scan spawns little or
+    nothing; unexpected children such as cmd.exe, powershell.exe, or file-copy and remote-execution helpers point to the
+    scan feeding directly into a next attack stage.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.baseline
+  question: Does this host normally run Advanced IP Scanner?
+  context: >-
+    A scanner that has never been seen on a host is more suspicious than one that runs regularly. Zero or very low historical
+    counts over the baseline window indicate first-time or rare execution, which raises the priority of the other questions.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired this rule's pattern, what parents and users normally drive it, and does the current alert fit?
+  context: >-
+    Even a sanctioned scanner can be abused. The query mirrors the rule's selection structure scoped to this host, so the
+    resulting parent and user distribution reflects how this specific firing pattern has historically run here. A new parent
+    process, an unexpected user account, or an unusual command-line shape is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|contains: \advanced_ip_scanner
+      - OriginalFileName|contains: advanced_ip_scanner
+      - Description|contains: Advanced IP Scanner
+      selection_cli:
+        CommandLine|contains|all:
+        - /portable
+        - /lng
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (1 of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired this rule's pattern in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: >-
+    The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of this firing
+    pattern rather than generic use of the binary. Many hosts firing the same pattern points to scripted deployment or
+    sanctioned IT inventory automation; one host or a small unrelated set points to manual operator activity. Use the host
+    distribution to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|contains: \advanced_ip_scanner
+      - OriginalFileName|contains: advanced_ip_scanner
+      - Description|contains: Advanced IP Scanner
+      selection_cli:
+        CommandLine|contains|all:
+        - /portable
+        - /lng
+      condition: 1 of selection_*
+    fields:
+    - host.name
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run network scanning tools?
+  context: >-
+    Compare this user's current action against their historical behavior. A user who has never run a scanner is more
+    suspicious than one who does so regularly as part of an IT role. The user's role and typical toolset should align with
+    network discovery activity.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent and binary combination historically routine on this host or environment-wide, or is the parent unusual for this scanner?
+  context: >-
+    When the alert fires under a service principal, user identity does not attribute behavior. The meaningful pivot is the
+    launch mechanism — which parent process spawned the scanner, and whether that pair is historically common. A new or rare
+    parent for this binary is the deviation worth chasing; a pair that already accounts for thousands of prior events is
+    vendor or OS automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: >-
+    Tracking the user's activity across all hosts reveals lateral movement or activity across multiple endpoints. If the
+    same user triggered similar activity on multiple hosts, the scope of the operation may be larger than the single alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent and binary combination fire on other hosts in the same window — is this a coordinated rollout or isolated to this host?
+  context: >-
+    Under a service principal, asking what else the user did returns agent-telemetry noise, since every host runs
+    SYSTEM-owned agents constantly. The meaningful question is whether the same launch mechanism — parent process plus
+    spawned binary — fired on other hosts in the alert window. Multiple hosts in the same window points to scheduled or
+    pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering, credential access, or other
+    reconnaissance — may reveal the attack stages that preceded the scan and help reconstruct the full timeline. Reconnaissance
+    sitting between initial access and lateral movement is a common ordering.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1046
+      name: Network Service Discovery
+      role: primary
+    - id: T1135
+      name: Network Share Discovery
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: scanner_execution
+      description: "Discovery tool launched to enumerate the network"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: network_sweep
+      description: "Process performs sequential outbound connections to many destinations (port/service probing)"
+      mapped_to: Q6
+      source: attack:T1046.network_scan_fanout
+    - stage: 3
+      label: share_enumeration
+      description: "SMB/RPC fan-out (445/139) to many hosts for network share discovery"
+      mapped_to: Q7
+      source: attack:T1135.smb_share_enum
+    - stage: 4
+      label: follow_on
+      description: "Optional follow-on execution feeding the discovery into the next attack stage"
+      mapped_to: Q9
+      source: template:cue_process_tool.follow_on
+  dimension_coverage:
+    - dimension: time_correlation
+      technique: T1046
+      covered_by: Q6
+      source: attack:T1046.network_scan_fanout
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1046
+      covered_by: Q6
+      source: attack:T1046.network_scan_fanout
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1046
+      covered_by: Q2
+      source: template:discovery_recon.discovery_user_context
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1135
+      covered_by: Q7
+      source: attack:T1135.smb_share_enum
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1135
+      covered_by: Q7
+      source: attack:T1135.smb_share_enum
+      coverage_type: direct
+  mutable_dispositions:
+    - element: ScanRateThreshold
+      dimension: tuning_parameter
+      specific_values: "unique destination IPs/ports per time window (rationale only)"
+      disposition: context
+      target_question: Q6
+      notes: "Threshold not directly queryable; described in Q6 context as the calibration that separates a sweep from ordinary activity."
+    - element: KnownScannerExeList
+      dimension: tuning_parameter
+      specific_values: "Nmap, Nessus, sanctioned scanners (rationale only)"
+      disposition: context
+      target_question: Q6
+      notes: "Sanctioned-scanner list described in Q6 context and addressed operationally by Q3 tool_authorization."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "~60s (T1046), ~10m (T1135)"
+      disposition: context
+      target_question: Q6
+      notes: "Correlation window expressed as the +/-15m query range and as 'within the window' phrasing in Q6/Q7 context."
+    - element: BurstHostThreshold
+      dimension: tuning_parameter
+      specific_values: ">=5 unique SMB destination hosts within TimeWindow"
+      disposition: context
+      target_question: Q7
+      notes: "Burst-host threshold stated with example value (five or more) in Q7 context; the query surfaces the distinct-destination count for the analyst to compare."
+    - element: AllowedDiscoveryAccounts
+      dimension: tuning_parameter
+      specific_values: "service/admin accounts running inventory scripts (rationale only)"
+      disposition: context
+      target_question: Q2
+      notes: "Account-allowlist rationale folded into Q2 (user role) and Q14 (user baseline)."
+    - element: PipeNameAllowList
+      dimension: tuning_parameter
+      specific_values: "\\PIPE\\spoolss and management-agent pipes (rationale only)"
+      disposition: context
+      target_question: Q7
+      notes: "Pipe allowlist is a tuning exclusion without queryable values for this process_creation-anchored rule; noted as share-enumeration context in Q7."
+  dedup_decisions:
+    - dropped: cue_process_tool.process_chain
+      reason: "discovery_recon technique set active — its discovery_parent_chain is the more specific parent-context question for a discovery rule; within-phase technique set wins over cue"
+      kept: discovery_recon.discovery_parent_chain
+    - dropped: cue_process_tool.clustering
+      reason: "around-the-time tool clustering on this host is covered by discovery_burst_detection (recon binaries) and cue_user_actor.clustering (user network-wide); avoids a third near-identical host-window aggregation"
+      kept: discovery_recon.discovery_burst_detection
+    - dropped: cue_host_context.clustering
+      reason: "host-window Image+ParentImage aggregation duplicates discovery_burst_detection and the user clustering questions; dropped to stay within the 18-question cap"
+      kept: discovery_recon.discovery_burst_detection
+    - dropped: universal.host_user_context
+      reason: "discovery_recon.discovery_user_context is the more specific user-role question per its notes_to_llm; merged into Q2"
+      kept: discovery_recon.discovery_user_context
+    - dropped: remote_access_tool.active_session_context
+      reason: "Advanced IP Scanner is a network discovery tool, not an interactive remote-access/RMM product — there is no support-session model to correlate against; authorization angle retained via Q3 tool_authorization"
+      kept: remote_access_tool.tool_authorization
+    - dropped: remote_access_tool.connection_destination
+      reason: "the RAT relay-endpoint framing does not fit a scanner; its network_connection angle is repurposed as the scan-fanout question Q6 (many internal destinations) rather than a single external relay"
+      kept: attack:T1046.network_scan_fanout
+    - dropped: cue_user_actor.baseline
+      reason: "user_actor pair — non-deduplicable"
+      kept: cue_user_actor.baseline_svc
+    - dropped: cue_user_actor.clustering
+      reason: "user_actor pair — non-deduplicable"
+      kept: cue_user_actor.clustering_svc
+  skipped_templates: []
+  reflection_overrides: []
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded:
+      - id: ransomware_impact
+        confidence: medium
+        reason: "Match is on references describing ransomware groups that happen to use this scanner — the rule detects a discovery tool, not impact behavior. No encryption/shadow-copy/inhibit-recovery question fits the detection logic; precursor (Q17) surfaces any prior impact-stage alerts."
+      - id: network_scope
+        confidence: medium
+        reason: "Keyword match on 'ransomware' in references is incidental to the network-scope set; the actual network fan-out coverage is provided directly by attack:T1046.network_scan_fanout (Q6) and attack:T1135.smb_share_enum (Q7) tied to the rule's discovery techniques."
+  technique_sets_applied:
+    - universal
+    - discovery_recon
+    - remote_access_tool
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 15
+      attack: 2
+      llm_generated: 0
+    phase_distribution:
+      triage: 1
+      analysis: 1
+      context: 15
+    logsource_diversity:
+      process_creation: 14
+      network_connection: 2
+      sigma_alert: 1

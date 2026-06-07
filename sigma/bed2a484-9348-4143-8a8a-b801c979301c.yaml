@@ -1,0 +1,591 @@
+name: Webshell Detection With Command Line Keywords
+id: 51555593-948d-48fd-9689-83feb57bb3fc
+description: |
+  Detects a web server process (w3wp.exe, php-cgi.exe, nginx.exe, httpd.exe, caddy.exe, or a Tomcat/Java host) spawning a child process that runs reconnaissance or execution commands commonly issued through a web shell. The rule fires when EITHER a recognized web server parent is present OR a Tomcat/Java parent with web server characteristics is present, AND EITHER one of several suspicious child patterns runs: net user/use/group, ping -n, wmic /node, an encoded or hidden PowerShell command, a download cradle, a discovery binary (whoami, ipconfig, net, dsquery, systeminfo, and similar), or directory-traversal command syntax. A web server process launching command interpreters or discovery utilities is a hallmark of web shell command execution; legitimate web applications rarely shell out to these tools. Determine what command ran, whether the parent web server was actually compromised, and whether the activity is isolated reconnaissance or the start of hands-on enumeration and lateral movement.
+type: detection
+detection_id: bed2a484-9348-4143-8a8a-b801c979301c
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-06
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does this event match the rule - a web server parent spawning a suspicious discovery or execution command?
+  context: >-
+    Confirm the alert before investing time. The rule fires when EITHER a recognized web server binary (w3wp.exe, php-cgi.exe,
+    nginx.exe, httpd.exe, caddy.exe) OR a Tomcat/Java host is the parent, AND EITHER the child runs one of the suspicious
+    patterns - net user/use/group, ping -n, wmic /node, encoded or hidden PowerShell, a WebClient download cradle, a discovery
+    binary, or cd-traversal syntax. Note which web server branch and which child branch fired; the branch that matched
+    determines which downstream questions carry the most weight.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - OriginalFileName
+      - CommandLine
+- source: template:parent_child.parent_process_legitimacy
+  question: Is this web server process expected to spawn this child, and what started the web server itself?
+  context: >-
+    The web server-to-child relationship is the core signal. A web application that shells out to a command interpreter or
+    discovery utility is the behavior a web shell produces. Trace the parent web server process back to its own origin to
+    confirm it is a normal service start rather than a process that was itself launched through an unusual chain.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- source: template:initial_access.delivery_vector
+  question: What web request or web shell file triggered this execution?
+  context: >-
+    Command execution under a web server process usually originates from a web request handled by a deployed web shell. Check
+    web server access logs for the request that lines up with the alert timestamp - the URL, method, source address, and any
+    suspicious file under the web root. Identifying the request enables blocking at the perimeter and locating the dropped
+    web shell on disk.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+- source: template:powershell.encoded_command_decode
+  question: Was the command encoded or obfuscated, and what does it decode to?
+  context: >-
+    The rule matches -enc, -EncodedCommand, hidden-window flags, and WebClient download cradles - all common ways a web shell
+    hides what it runs. Base64-encoded PowerShell is the most frequent form. Decoding reveals the actual payload, such as a
+    download cradle, reverse shell, or in-memory .NET loader. For web shell parameter values, decode the suspicious request
+    content the rule fired on.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:parent_child.sibling_processes
+  question: What other child processes did this same web server parent spawn?
+  context: >-
+    A web shell typically issues a series of commands through the same web server process. Examining the other children of
+    this exact parent instance reveals the full scope of activity - chained reconnaissance, file operations, or lateral
+    movement tools launched from the same foothold rather than a single isolated command.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_parent_process.baseline
+  question: Has this web server parent historically spawned this child binary on this host?
+  context: >-
+    Some web application stacks legitimately invoke helper processes, but a web server spawning a command interpreter or
+    discovery utility is rarely routine. A zero or very low historical count for this specific parent-and-child pairing
+    points to a novel spawning relationship introduced by a web shell rather than normal application behavior. Tune for the
+    specific web root and hosting environment - custom directories and third-party server binaries shift what counts as normal.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:discovery_recon.discovery_burst_detection
+  question: Did other reconnaissance commands run on this host around the same time?
+  context: >-
+    A single discovery command may be troubleshooting, but several in rapid succession - whoami, ipconfig, net user, nltest,
+    systeminfo - is the signature of post-compromise enumeration through a web shell. Three or more distinct recon binaries
+    within a short window typically indicates automated reconnaissance run after the initial foothold. The triggering binary
+    is excluded so this surfaces additional discovery activity.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_recon:
+        Image|endswith:
+          - '\whoami.exe'
+          - '\systeminfo.exe'
+          - '\ipconfig.exe'
+          - '\net.exe'
+          - '\net1.exe'
+          - '\nltest.exe'
+          - '\dsquery.exe'
+          - '\nbtstat.exe'
+          - '\arp.exe'
+          - '\netstat.exe'
+          - '\tasklist.exe'
+          - '\qprocess.exe'
+          - '\query.exe'
+          - '\quser.exe'
+          - '\hostname.exe'
+          - '\nslookup.exe'
+          - '\tracert.exe'
+          - '\pathping.exe'
+      condition: selection and selection_recon
+    fields:
+      - Image
+      - User
+- source: template:discovery_recon.discovery_user_context
+  question: Is the account that ran this command expected to perform administrative discovery on this host?
+  context: >-
+    Network administrators and IT staff legitimately run discovery commands for troubleshooting, but a web server worker
+    process normally executes under a low-privilege service account that has no reason to enumerate users, groups, or remote
+    systems. An enumeration command running under a web server service account is a strong sign the activity came through a
+    web shell rather than an interactive admin.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - User
+- source: attack:T1018.network_indicators
+  question: Did the host the alert fired on initiate outbound or internal connections consistent with remote system enumeration or lateral movement?
+  context: >-
+    Web shell reconnaissance commonly chains into reaching out to other systems - pinging or resolving internal hosts,
+    enumerating shares, or connecting to discovered targets. Outbound or internal connections from the alerting host around
+    the time of the discovery commands help distinguish local fact-gathering from active movement toward other systems. A
+    burst of new internal destinations alongside the enumeration commands raises the priority.
+  range: +/-30m
+  query: |
+    aggregation: true
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'true'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Image
+- source: template:cue_user_actor.baseline
+  question: Does this account normally run this binary anywhere in the environment?
+  context: >-
+    Compare the account against its own history. An account that has never run this discovery or interpreter binary across
+    any host is more suspicious than one that does so routinely. The account role and its typical toolset should align with
+    what fired.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this web server parent and child binary combination historically routine on this host or across the environment?
+  context: >-
+    When the alert fires under a service principal, user identity does not attribute behavior; the meaningful pivot is the
+    launch mechanism. Check whether this web server parent spawning this binary is historically common. A new or rare parent
+    for this binary is the deviation worth chasing, while a pair that already accounts for thousands of prior events is
+    application or OS automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this account do across the network around this time?
+  context: >-
+    Tracking the account's activity across all hosts reveals whether the reconnaissance is confined to this server or spread
+    across multiple endpoints. The same account driving similar activity on several hosts widens the scope of compromise.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same web server parent and child binary combination fire on other hosts in the same window?
+  context: >-
+    Under a service principal, asking what else the account did across the network returns agent-telemetry noise. The
+    meaningful question is whether the same launch mechanism - web server parent spawning this binary - fired on other hosts
+    in the alert window. Multiple hosts in the same window points to a coordinated push against several web servers; a single
+    host points to a server-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: >-
+    Alerts rarely occur in isolation. Examining activity around the alert reveals what led to this event and what followed -
+    additional reconnaissance, file drops, privilege escalation, or persistence. Aggregating by process and parent collapses
+    routine telemetry into high-count rows while novel parent-child pairs stand out at low counts.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Earlier detections on the same host - exploitation attempts against the web application, file writes to the web root, or
+    prior reconnaissance - may reveal the stages that preceded this command execution and help reconstruct how the web shell
+    was planted. The alert timeline tells the attack story.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:initial_access.campaign_scope
+  question: Were other web servers targeted by the same activity?
+  context: >-
+    Exploitation of internet-facing web applications rarely targets a single server. Correlating the same rule across all
+    hosts reveals how many web servers show the same web shell command execution pattern and identifies additional
+    compromised systems that need investigation.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        rule.uuid|expand: '%rule.uuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: attack:T1505.003.auth_activity
+  question: Were there authentication or logon events on this host consistent with the web shell account being used for access?
+  context: >-
+    Web shell command execution under a server service account, and any lateral movement it drives, leaves authentication
+    traces. Logon and explicit-credential events on this host around the alert window help establish which account context
+    the commands ran under and whether the same account authenticated to other systems. If authentication logs are not
+    ingested in this environment, treat zero results as a visibility gap rather than evidence nothing occurred.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: authentication
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - User
+      - LogonType
+      - SourceNetworkAddress
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1505.003
+      name: Web Shell
+      role: primary
+    - id: T1018
+      name: Remote System Discovery
+      role: secondary
+    - id: T1033
+      name: System Owner/User Discovery
+      role: secondary
+    - id: T1087
+      name: Account Discovery
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: web_request_delivery
+      description: "Inbound web request handled by a deployed web shell on the web server"
+      mapped_to: Q3
+      source: template:initial_access.delivery_vector
+    - stage: 2
+      label: server_spawns_child
+      description: "Web server process (w3wp.exe, php-cgi.exe, java.exe, etc.) spawns a command interpreter or discovery utility"
+      mapped_to: Q2
+      source: template:parent_child.parent_process_legitimacy
+    - stage: 3
+      label: command_execution
+      description: "Spawned child runs reconnaissance or execution commands (decode encoded/hidden PowerShell and download cradles)"
+      mapped_to: Q4
+      source: template:powershell.encoded_command_decode
+    - stage: 4
+      label: enumeration_burst
+      description: "Chained discovery commands (net, ping, wmic, whoami, dsquery) run through the web shell"
+      mapped_to: Q7
+      source: template:discovery_recon.discovery_burst_detection
+  dimension_coverage:
+    - dimension: obfuscation_check
+      technique: T1505.003
+      covered_by: Q4
+      source: template:powershell.encoded_command_decode
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1505.003
+      covered_by: Q2
+      source: template:parent_child.parent_process_legitimacy
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1505.003
+      covered_by: Q7
+      source: template:discovery_recon.discovery_burst_detection
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1505.003
+      covered_by: Q6
+      source: template:cue_parent_process.baseline
+      coverage_type: direct
+    - dimension: command_analysis
+      technique: T1018
+      covered_by: Q7
+      source: template:discovery_recon.discovery_burst_detection
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1033
+      covered_by: Q8
+      source: template:discovery_recon.discovery_user_context
+      coverage_type: direct
+    - dimension: execution_context
+      technique: T1087
+      covered_by: Q2
+      source: template:parent_child.parent_process_legitimacy
+      coverage_type: direct
+    - dimension: network_indicators
+      technique: T1087
+      covered_by: Q9
+      source: attack:T1018.network_indicators
+      coverage_type: direct
+  mutable_dispositions:
+    - element: WebRootPath
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q6
+      notes: "Custom web root / hosting environment noted as a tuning factor in the parent-child baseline context"
+    - element: ParentProcess
+      dimension: parent_process_analysis
+      specific_values: "w3wp.exe, php-cgi.exe, nginx.exe, httpd.exe, caddy.exe, java.exe, javaw.exe, ws_tomcatservice.exe"
+      disposition: context
+      target_question: Q2
+      notes: "Web server parent binaries from the rule selection carried in Q2/Q6; parent scoped via %ParentName% expand"
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only (bursty enumeration <30s)"
+      disposition: query_injection
+      target_question: Q7
+      notes: "Tight +/-15m window on the discovery-burst query approximates bursty enumeration grouping"
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "rationale only (custom/renamed server wrappers)"
+      disposition: context
+      target_question: Q11
+      notes: "Service-principal parent+binary baseline covers renamed/custom server wrappers"
+    - element: CommandLinePattern
+      dimension: command_analysis
+      specific_values: "net user/use/group, ping -n, dsquery, whoami, Get-ADUser style enumeration"
+      disposition: query_injection
+      target_question: Q7
+      notes: "Recon binary list in the discovery-burst selection enforces the command pattern"
+    - element: ParentProcessContext
+      dimension: tuning_parameter
+      specific_values: "rationale only (non-interactive shell / service)"
+      disposition: context
+      target_question: Q8
+      notes: "Web server service-account context noted in discovery_user_context"
+    - element: UserContext
+      dimension: user_context
+      specific_values: "rationale only (service accounts / unexpected users)"
+      disposition: context
+      target_question: Q8
+      notes: "Low-privilege web server service account framed as the discriminator"
+  dedup_decisions:
+    - dropped: cue_process_tool.process_chain
+      reason: "parent_process is primary cue and parent_child technique set active — parent-chain coverage subsumes it (brief hint)"
+      kept: template:parent_child.parent_process_legitimacy
+    - dropped: discovery_recon.discovery_parent_chain
+      reason: "duplicates parent-origin coverage already provided by parent_child.parent_process_legitimacy (same ProcessGuid->ParentImage/ParentCommandLine pivot)"
+      kept: template:parent_child.parent_process_legitimacy
+    - dropped: cue_parent_process.follow_on
+      reason: "duplicates sibling-process coverage; parent_child.sibling_processes scopes to the exact parent instance via ParentProcessGuid"
+      kept: template:parent_child.sibling_processes
+    - dropped: cue_parent_process.clustering
+      reason: "duplicates host-context clustering already provided by cue_host_context.clustering for around-the-alert activity"
+      kept: template:cue_host_context.clustering
+    - dropped: cue_parent_process.mechanism_decode
+      reason: "parent-origin and decode coverage handled by parent_process_legitimacy plus powershell.encoded_command_decode; separate ParentProcessGuid lookup redundant"
+      kept: template:parent_child.parent_process_legitimacy
+    - dropped: cue_process_tool.baseline
+      reason: "host-level binary baseline subsumed by parent-and-child baseline (cue_parent_process.baseline) which is more specific to the web-server spawn"
+      kept: template:cue_parent_process.baseline
+    - dropped: universal.host_user_context
+      reason: "discovery_recon.discovery_user_context is more specific to discovery-command context — brief note directs preferring it over universal.host_user_context"
+      kept: template:discovery_recon.discovery_user_context
+    - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable"
+      kept: both emitted (Q10, Q11)
+    - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable"
+      kept: both emitted (Q12, Q13)
+  skipped_templates:
+    - template: obfuscation.encoded_payload_decode
+      reason: "replaced_by: powershell.encoded_command_decode — rule's encoded branch is PowerShell -enc/-EncodedCommand, so the powershell decode is more specific"
+    - template: scheduled_task.task_configuration
+      reason: "scheduled_task confirmed only because schtasks.exe appears in the rule's discovery binary list; the rule fires on discovery via a web shell, not on task creation, so the task-config family is not applicable"
+    - template: scheduled_task.task_trigger_and_timing
+      reason: "scheduled_task not a genuine fit — see task_configuration skip reason"
+    - template: scheduled_task.task_still_present
+      reason: "scheduled_task not a genuine fit — see task_configuration skip reason"
+    - template: defense_tampering.what_was_disabled
+      reason: "defense_tampering confirmed only because wevtutil.exe appears in the discovery binary list; the rule detects log-enumeration as recon, not log-clearing tampering, so the tamper family is not applicable"
+    - template: defense_tampering.protection_status
+      reason: "defense_tampering not a genuine fit — see what_was_disabled skip reason"
+    - template: defense_tampering.activity_after_tampering
+      reason: "defense_tampering not a genuine fit — see what_was_disabled skip reason"
+    - template: defense_tampering.other_tampering_activity
+      reason: "defense_tampering not a genuine fit — see what_was_disabled skip reason"
+    - template: universal.endpoint_protection_health
+      reason: "recommended-only generic tamper sweep; this rule is discovery/web-shell-centric, not a payload-execution or credential-access rule whose disposition turns on prior tamper. cue_host_context.precursor already carries prior-alert tamper context"
+    - template: powershell.script_block_logging
+      reason: "rule fires on short single-cmdlet discovery and encoded PowerShell already decoded in powershell.encoded_command_decode; script-block layer adds little for these short commands and the slot is used for network/auth coverage of the discovery techniques"
+    - template: powershell.powershell_security_bypass
+      reason: "rule's PowerShell branch is encoded/hidden discovery, not a bypass primitive; bypass-precursor sweep less relevant than the discovery and network coverage prioritized within the 18-question cap"
+    - template: scheduled_task / defense_tampering / discovery / initial_access remaining recommended templates
+      reason: "trimmed to stay within the 18-question cap; coverage of discovery, parent-chain, scope, and decode dimensions is complete with the selected set"
+    - template: persistence_scope.process_based_persistence
+      reason: "persistence-tool sweep not central to a discovery-via-web-shell alert; persistence enumeration deferred to keep within the cap while covering the discovery and initial-access dimensions"
+    - template: persistence_scope.file_based_persistence
+      reason: "file-event persistence-drop sweep deferred for cap; web shell file drop is approached via the delivery-vector question instead"
+    - template: organizational_context.*
+      reason: "organizational change-ticket/recall/timing questions are less load-bearing for a low-privilege web server service account executing recon; trimmed for cap in favor of technical discovery and network coverage"
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "defense_tampering.what_was_disabled replaces cue_process_tool.mechanism_decode"
+      disposition: declined
+      reason: >-
+        defense_tampering is confirmed only because wevtutil.exe appears in the rule's discovery binary list. The rule fires
+        on a web server spawning recon/exec commands, not on log clearing or AV disabling; the tamper family does not fit.
+        Phase 2 decode is covered by powershell.encoded_command_decode (Q4), which matches the rule's actual encoded/hidden
+        PowerShell branch.
+    - hint: "scheduled_task.task_configuration replaces cue_process_tool.mechanism_decode"
+      disposition: declined
+      reason: >-
+        scheduled_task is confirmed only because schtasks.exe is one entry in the discovery binary list. The rule does not
+        fire on task creation, so task_configuration is not the right Phase 2 decode. powershell.encoded_command_decode (Q4)
+        is the applicable mechanism_decode for the rule's encoded-command branch.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - parent_child
+    - powershell
+    - discovery_recon
+    - initial_access
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 15
+      attack: 2
+      llm_generated: 0
+    phase_distribution:
+      triage: 1
+      analysis: 1
+      context: 15
+    logsource_diversity:
+      process_creation: 13
+      network_connection: 1
+      authentication: 1
+      sigma_alert: 2

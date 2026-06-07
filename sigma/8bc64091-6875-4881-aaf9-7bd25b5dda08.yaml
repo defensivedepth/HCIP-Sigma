@@ -1,0 +1,472 @@
+name: Suspicious Process Patterns NTDS.DIT Exfil
+id: 5b4028d2-128e-4f6b-abb5-530e99876ca7
+description: |
+  Detects process activity associated with extracting the Active Directory database (NTDS.dit), which holds every domain account's password hash. The rule fires when ANY one of several patterns appears: execution of NTDS dumping tools (NTDSDump.exe, NTDSDumpEx.exe, NTDSgrab.ps1), command lines that combine ntds.dit with system.hiv, ntdsutil snapshot phrases (ac i ntds / activate instance ntds with create full), a copy of \windows\ntds\ntds.dit, a powershell invocation referencing ntds.dit, or any process referencing ntds.dit that runs from or under a staging directory (apache, tomcat, AppData, Temp, Public, PerfLogs). Legitimate matches come from sanctioned domain controller backups, disaster-recovery snapshots, or AD migration tooling; malicious matches are credential-dumping that typically precedes offline hash cracking and domain-wide lateral movement. The investigation should confirm which branch fired, decode the exact operation, identify the user and host context, and determine whether the resulting database file was staged or moved off the system.
+type: detection
+detection_id: 8bc64091-6875-4881-aaf9-7bd25b5dda08
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the process match one of the NTDS.dit extraction patterns this rule detects?
+  context: This rule fires when EITHER a known NTDS dumping tool ran (NTDSDump.exe, NTDSDumpEx.exe, NTDSgrab.ps1), OR a command line combined ntds.dit with system.hiv, OR ntdsutil snapshot phrasing appeared (ac i ntds / activate instance ntds together with create full), OR \windows\ntds\ntds.dit was copied, OR a powershell command referenced ntds.dit, OR any process referencing ntds.dit ran from or under a staging directory. Confirm the exact command line and note which branch fired — a tool-name match is high-confidence on its own, while the staging-directory branch depends on where the binary lives, so its location is the load-bearing detail for that fire.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to read or back up the Active Directory database?
+  context: NTDS.dit handling is restricted to domain controllers and the accounts that administer them. A domain controller running sanctioned backup or migration tooling under a known service or admin account is routine; the same pattern on a workstation, member server, or under an unexpected account is not. Establishing whether the host is a domain controller and whether the user role includes AD backup duties is often the fastest path to a disposition.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:credential_access.credential_target_identification
+  question: Was NTDS.dit accessed, copied, or exported, and by what method?
+  context: NTDS.dit is the credential store for the entire domain. Decode the full command line to identify the extraction method — direct tool (NTDSDump/NTDSDumpEx with system.hiv), ntdsutil snapshot (ac i ntds / create full), a raw copy of \windows\ntds\ntds.dit from a shadow volume, or a powershell wrapper. The method indicates whether the system hive was also captured (both are required to decrypt hashes offline) and how far the operation progressed.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:parent_child.parent_process_legitimacy
+  question: What process started this one, and is that origin consistent with sanctioned AD backup?
+  context: One branch of this rule keys on the binary or its parent running from a staging directory (apache, tomcat, AppData, Temp, Public, PerfLogs). A web-server parent such as apache or tomcat spawning an NTDS-referencing process points to exploitation of an internet-facing service rather than administrative work. Tracing the parent's own origin distinguishes a legitimate backup job launched by a scheduler or admin shell from a process spawned through a compromised service.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- source: template:parent_child.sibling_processes
+  question: What other processes did the same parent spawn around this time?
+  context: If a compromised service or operator shell launched the NTDS extraction, it likely launched other tools in the same window — registry hive exports (reg save system / security), shadow copy creation, archive utilities to compress the database, or transfer tools to move it off-host. Siblings from the same parent reveal whether this was an isolated action or one step in a staged credential-theft sequence.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_parent_process.mechanism_decode
+  question: What is the parent process's own command line and what launched it?
+  context: Retrieving the parent's process_creation event shows how the extraction was initiated. A scheduler, a remote-administration service, or an interactive admin shell suggests sanctioned activity; a web application worker, a script interpreter, or an unexpected one-off process suggests the parent was the foothold. The parent's command line and grandparent often reveal the entry vector.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+- source: template:cue_artifact.mechanism_decode
+  question: Where was the NTDS.dit copy or output written, and does that file still exist?
+  context: Extraction methods write the database (and often the system hive) to an operator-chosen path — staging directories such as Public, Temp, or AppData are common. Identify the destination path from the command line, then confirm whether the file is still on disk. A present file enables hash review of what was exposed; an absent one suggests it was already moved or deleted after exfiltration.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: template:cue_artifact.artifact_verification
+  question: If an NTDS dumping tool ran, what is its file hash and does threat intel flag it?
+  context: When the fire is a named tool (NTDSDump.exe, NTDSDumpEx.exe, NTDSgrab.ps1), confirm it is the real utility and not a renamed or trojanized binary by computing its hash and checking reputation. A known offensive-tooling hash confirms intent; an unrecognized hash for a credential-dumping filename warrants deeper inspection of the binary itself.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Hashes
+- source: attack:T1003.003.time_correlation
+  question: Was a volume shadow copy created or vssadmin/diskshadow run on this host shortly before the alert?
+  context: Copying \windows\ntds\ntds.dit from a live domain controller requires a shadow copy, because the file is locked while AD is running. A vssadmin create shadow, diskshadow script, or ntdsutil snapshot in the minutes before this alert ties the database access to a deliberate extraction sequence. Process telemetry only shows the launching commands; if a separate alert or file-creation event recorded the shadow volume, correlate its timestamp to this event to confirm the chain.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_shadow:
+        CommandLine|contains:
+          - 'vssadmin'
+          - 'diskshadow'
+          - 'create shadow'
+          - 'HarddiskVolumeShadowCopy'
+          - 'activate instance ntds'
+          - 'ac i ntds'
+      condition: selection_host and selection_shadow
+    fields:
+      - Image
+      - CommandLine
+      - User
+- source: template:cue_process_tool.baseline
+  question: Has this extraction tool or command pattern run on this host before?
+  context: Sanctioned NTDS backups on a domain controller tend to recur on a schedule under the same account, so a long history of identical activity argues for routine operations. Zero or first-time appearance of the dumping tool or the ntdsutil snapshot pattern on this host points to novel, hands-on activity that deserves escalation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run AD database extraction or backup tooling?
+  context: Compare this user's current action against their historical behavior across the environment. An account that routinely runs domain controller backups is a weaker signal than one that has never touched NTDS tooling. A standard user, a developer, or a service account with no AD-administration role performing this action is a strong deviation worth chasing.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent and binary combination historically routine on this host or across the environment?
+  context: When the alert fires under SYSTEM or a service account, user identity does not attribute the behavior — the meaningful pivot is the launch mechanism. Check whether this parent process spawning this binary is already common (a backup product or scheduled job that accounts for many prior events) or new and rare. A parent that has never spawned this binary before is the deviation worth chasing.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the environment around this time?
+  context: After credential theft, an operator often pivots quickly using the same identity. Tracking this user's activity across all hosts in the surrounding window reveals whether the NTDS extraction was a single action or part of broader hands-on movement — reconnaissance, additional credential access, or access to other systems.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent and binary combination fire on other hosts in the same window?
+  context: Under a service principal, pivoting on user identity returns agent-telemetry noise because every host runs the same system-owned processes. The meaningful question is whether the same launch mechanism — this parent spawning this binary — appeared on other hosts in the alert window. Multiple hosts point to scheduled or pushed automation; a single host points to a host-local trigger such as an interactive operator.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:credential_access.post_access_lateral_movement
+  question: Did any follow-on detections fire on this host after the extraction?
+  context: NTDS.dit yields every domain account's hash, which enables immediate lateral movement and persistence. Follow-on alerts on this host — remote service execution, suspicious authentication, archive or transfer activity, or further credential access — indicate the stolen database is being acted on rather than sitting idle. The alert timeline after this event often shows the next stage.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - rule.name
+      - rule.uuid
+      - event.severity_label
+- source: template:credential_access.credential_exposure_assessment
+  question: Which domain accounts are exposed, and which of them hold elevated privileges?
+  context: A successful NTDS.dit extraction exposes every account in the domain, so the practical severity question is which of those accounts are privileged. Domain Admins, Enterprise Admins, the krbtgt account, and broadly entitled service accounts force domain-wide remediation — krbtgt exposure in particular enables forged Kerberos tickets. Cross-reference the affected domain against directory group memberships to scope credential resets.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: NTDS extraction is rarely the first step. Earlier detections on the same host — exploitation of an internet-facing service, defense tampering, reconnaissance, or shadow copy creation — may reveal how the operator reached domain controller access and help reconstruct the timeline leading to this event.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+  - id: T1003.003
+    name: NTDS
+    role: primary
+  - id: T1003
+    name: OS Credential Dumping
+    role: secondary
+  attack_chain_coverage:
+  - stage: 1
+    label: shadow_copy_or_snapshot
+    description: Actor creates a volume shadow copy or ntdsutil snapshot to unlock the live NTDS.dit
+    mapped_to: Q9
+    source: attack:T1003.003.time_correlation
+  - stage: 2
+    label: ntds_access_copy
+    description: Actor copies, dumps, or exports NTDS.dit (and typically the SYSTEM hive)
+    mapped_to: Q3
+    source: template:credential_access.credential_target_identification
+  - stage: 3
+    label: staging_and_followon
+    description: Database file is staged to disk then used for offline cracking and lateral movement
+    mapped_to: Q15
+    source: template:credential_access.post_access_lateral_movement
+  dimension_coverage:
+  - dimension: parent_process_analysis
+    technique: T1003.003
+    covered_by: Q4
+    source: template:parent_child.parent_process_legitimacy
+    coverage_type: direct
+  - dimension: time_correlation
+    technique: T1003.003
+    covered_by: Q9
+    source: attack:T1003.003.time_correlation
+    coverage_type: direct
+  - dimension: tuning_parameter
+    technique: T1003.003
+    covered_by: Q3
+    source: template:credential_access.credential_target_identification
+    coverage_type: direct
+  - dimension: user_context
+    technique: T1003.003
+    covered_by: Q2
+    source: template:universal.host_user_context
+    coverage_type: direct
+  - dimension: access_verification
+    technique: T1003
+    covered_by: Q9
+    source: attack:T1003.003.time_correlation
+    coverage_type: partial
+  mutable_dispositions:
+  - element: TargetFilePath
+    dimension: tuning_parameter
+    specific_values: '%SystemRoot%\NTDS\ntds.dit, \windows\ntds\ntds.dit'
+    disposition: query_injection
+    target_question: Q9
+    notes: ntds path / snapshot phrases injected into the time_correlation CommandLine|contains sweep; ntds.dit copy path is also a detection field of the rule itself surfaced in Q1/Q3.
+  - element: ParentProcessName
+    dimension: parent_process_analysis
+    specific_values: 'staging-dir parents: apache, tomcat (rule set1_selection_image_folder)'
+    disposition: context
+    target_question: Q4
+    notes: Parent-from-staging-directory branch framed in parent_process_legitimacy context; web-server parent called out as exploitation indicator.
+  - element: TimeWindow
+    dimension: time_correlation
+    specific_values: '~5 min window between shadow copy creation and NTDS access'
+    disposition: context
+    target_question: Q9
+    notes: Temporal correlation framed in context; -1h range covers the shadow-copy-precedes-access pattern.
+  - element: UserContext
+    dimension: user_context
+    specific_values: rationale only
+    disposition: context
+    target_question: Q2
+    notes: Privileged-user / service-account expectation framed in host_user_context and user_actor baseline.
+  - element: AccessMask
+    dimension: access_verification
+    specific_values: '0x1F0FFF (full access)'
+    disposition: context
+    target_question: Q9
+    notes: >-
+      AccessMask is a process_access (Sysmon EID 10) field; this rule is
+      process_creation only and produces no GrantedAccess events, so the mask
+      cannot be queried here. Access to the locked database file is instead
+      evidenced by the shadow-copy/snapshot precursor in Q9.
+  dedup_decisions:
+  - dropped: cue_process_tool.process_chain
+    reason: parent_process is primary cue — its parent-origin coverage subsumes process_chain (brief hint)
+    kept: parent_child.parent_process_legitimacy
+  - dropped: cue_parent_process.follow_on
+    reason: parent_child.sibling_processes covers same-parent children with ParentProcessGuid precision
+    kept: parent_child.sibling_processes
+  - dropped: cue_parent_process.baseline
+    reason: cue_user_actor.baseline_svc covers parent+binary historical frequency more precisely
+    kept: cue_user_actor.baseline_svc
+  - dropped: cue_parent_process.clustering
+    reason: cue_host_context.clustering-style around-the-alert context already covered by sibling_processes and user clustering
+    kept: parent_child.sibling_processes
+  - dropped: cue_parent_process.scope
+    reason: cross-host parent+binary spread covered by cue_user_actor.clustering_svc
+    kept: cue_user_actor.clustering_svc
+  - dropped: cue_artifact.baseline
+    reason: file-on-disk and history covered by cue_artifact.mechanism_decode (presence) and cue_process_tool.baseline (tool history)
+    kept: cue_artifact.mechanism_decode
+  - dropped: cue_user_actor.baseline + cue_user_actor.baseline_svc kept as pair
+    reason: user_actor pair — non-deduplicable
+    kept: both
+  - dropped: cue_user_actor.clustering + cue_user_actor.clustering_svc kept as pair
+    reason: user_actor pair — non-deduplicable
+    kept: both
+  skipped_templates:
+  - template: cue_process_tool.mechanism_decode
+    reason: 'replaced_by: credential_access.credential_target_identification (brief hint and template field)'
+  - template: cue_host_context.clustering
+    reason: around-the-alert host activity covered by sibling_processes and user clustering; precursor retained for prior-alert timeline
+  - template: universal.evidence_preservation
+    reason: file-on-disk check folded into cue_artifact.mechanism_decode which already pivots on %file_paths% for the NTDS/output file
+  - template: universal.endpoint_protection_health
+    reason: >-
+      cue_host_context.precursor is present and surfaces prior tamper alerts on
+      the host in the lead-up window; this rule's disposition turns on AD
+      database access (host identity and method), not on whether AV/EDR was
+      weakened first, so the generic tamper sweep does not earn a slot under the
+      18-question target.
+  reflection_overrides: []
+  hint_dispositions:
+  - hint: 'cue_artifact: derived: \bcopy\s in CommandLine'
+    disposition: acted-on
+    reason: cue_artifact.mechanism_decode and cue_artifact.artifact_verification both authored — copied NTDS.dit/output file presence and tool hash.
+  - hint: credential_access.credential_target_identification replaces cue_process_tool.mechanism_decode
+    disposition: acted-on
+    reason: cue_process_tool.mechanism_decode skipped; credential_target_identification authored as Phase 2.
+  - hint: parent_process is primary — drop cue_process_tool:process_chain
+    disposition: acted-on
+    reason: cue_process_tool.process_chain dropped; see dedup_decisions.
+  - hint: File paths derived from CommandLine — use %file_paths% placeholder
+    disposition: acted-on
+    reason: cue_artifact.mechanism_decode and artifact_verification use TargetFilename|endswith|expand %file_paths%.
+  - hint: 'Condition uses OR among selection groups; Q1 and description must frame as EITHER ... OR ...'
+    disposition: acted-on
+    reason: Q1 and description use disjunctive EITHER/OR framing per condition_topology.prose; Q1 context directs the analyst to note which branch fired.
+  contextual_sets:
+    included: []
+    excluded:
+    - id: data_staging_exfil
+      confidence: medium
+      reason: >-
+        Rule detects the credential-access step (NTDS.dit access/copy), not a
+        staging/exfil transfer. The 'exfiltration' keyword in the title/refs is
+        incidental to the dump itself; cue_artifact.mechanism_decode already
+        covers the on-disk staged file, and post_access_lateral_movement covers
+        downstream movement. No archive/transfer-specific detection in the rule
+        to anchor a data_staging_exfil question.
+  technique_sets_applied:
+  - universal
+  - credential_access
+  - parent_child
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 16
+      attack: 1
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 14
+    logsource_diversity:
+      process_creation: 13
+      file_event: 2
+      sigma_alert: 2

@@ -1,0 +1,634 @@
+name: Suspicious Usage Of Active Directory Diagnostic Tool (ntdsutil.exe)
+id: 9dd6bf30-02e4-404f-8d10-e3822108f3b1
+description: |
+  Detects execution of ntdsutil.exe with command-line patterns used to expose the Active Directory
+  database (ntds.dit) for offline reading. The rule fires when the binary is ntdsutil.exe (by Image or
+  OriginalFileName) AND its command line either contains both "snapshot" and "mount " (mounting a Volume
+  Shadow Copy of the AD volume) or contains "ac", " i", and " ntds" together (activating the ntds instance
+  before snapshot work). Legitimate context is a domain administrator restoring or inspecting AD snapshots;
+  the malicious context is an operator mounting a snapshot of the live AD volume so the ntds.dit credential
+  store can be read offline without touching the running AD DS service, typically followed by exposing the
+  mount via a directory-server tool and extracting hashes. Determine whether the activity was authorized,
+  which AD database files or shadow copies were touched, and whether credential use or lateral movement
+  followed.
+type: detection
+detection_id: a58353df-af43-4753-bad0-cd83ef35eef5
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line match the ntdsutil snapshot/mount or activate-instance pattern this rule detects?
+  context: Confirm the alert is a true positive before investing time. The rule fires when the binary is
+    ntdsutil.exe AND the command line either combines "snapshot" with "mount " or combines "ac", " i", and
+    " ntds". Read the exact command line and the OriginalFileName, and note which branch fired and what snapshot
+    GUID or instance was referenced, since that determines whether a shadow copy of the AD volume was actually
+    mounted.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run AD database snapshot or instance-activation operations?
+  context: ntdsutil snapshot and instance-activation operations are normally run by a domain administrator on a
+    domain controller, and require an elevated context. The same activity on a non-DC, or by an account that is
+    not a recognized AD administrator or backup operator, is far more likely to be operator activity than routine
+    maintenance. Knowing whether the user role and host function are consistent with AD database management is
+    often the fastest way to separate authorized work from credential theft.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:credential_access.credential_target_identification
+  question: Was NTDS.dit accessed, and was a shadow copy of the AD volume mounted to read it offline?
+  context: ntdsutil snapshot/mount exposes the volume containing ntds.dit and its log files as a read-only copy,
+    which is the credential store for the entire domain. Read the full command line to confirm whether a snapshot
+    was created, listed, or mounted, and which GUID or index was referenced. A mount of the AD volume is the step
+    that makes every domain credential readable offline without stopping the live AD DS service, so confirming it
+    determines that the whole domain's account hashes may be exposed.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: attack:T1003.003.file_event
+  question: Were ntds.dit, its log files, or a mounted shadow-copy path written or copied on this host around the alert?
+  context: A snapshot/mount of the AD volume exposes ntds.dit so it can be read or copied off the live database.
+    File-creation events touching the NTDS directory, ntds.dit, the EDB log files, or a freshly mounted
+    shadow-copy path show whether the database was actually read out rather than just enumerated. Volume Shadow
+    Copy creation immediately before these accesses is the temporal pairing that distinguishes a credential dump
+    from a benign snapshot listing. If file events are not collected on domain controllers in this environment,
+    treat zero results as a visibility gap rather than evidence nothing was copied.
+  range: +/-30m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_paths:
+        TargetFilename|contains:
+          - '\NTDS\'
+          - 'ntds.dit'
+          - '\HarddiskVolumeShadowCopy'
+      condition: selection_host and selection_paths
+    fields:
+      - TargetFilename
+      - Image
+      - User
+- source: template:cue_process_tool.process_chain
+  question: What process spawned ntdsutil.exe, and is that parent chain expected?
+  context: The parent reveals how ntdsutil was invoked. Interactive administration from explorer.exe or a console
+    launched by an administrator is consistent with manual maintenance; a parent such as a scripting host, a
+    remote-execution service, a batch file, or an unexpected automation chain points to scripted or remote
+    operator activity. Walk up from the parent to see what launched it and what else it spawned in the same
+    session.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.follow_on
+  question: What child processes did ntdsutil.exe spawn afterward, and was a directory-server or copy tool launched?
+  context: Mounting a snapshot only exposes the data; reading it out requires a follow-on step. Watch for
+    dsamain.exe exposing the mounted snapshot as a read-only LDAP server, or copy/archive tools moving ntds.dit
+    or the mounted volume off the host. Children such as cmd.exe, powershell.exe, or robocopy.exe spawned by
+    ntdsutil after a mount indicate the operator proceeded from exposure to extraction.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:credential_access.credential_exposure_assessment
+  question: Which domain accounts may be exposed, and do any have elevated privileges?
+  context: A mounted snapshot of ntds.dit exposes the password hashes of every account in the domain, including
+    Domain Admins, Enterprise Admins, the krbtgt account, and service accounts. Exposure of krbtgt enables Golden
+    Ticket forgery, so this activity should be treated as a potential full-domain credential compromise until
+    scoped. Cross-reference the account that ran the tool and the domain's privileged group memberships to decide
+    escalation and whether a krbtgt reset is warranted.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:credential_access.post_access_lateral_movement
+  question: Were any new logon sessions or remote connections initiated on this host after the snapshot activity?
+  context: Extraction of domain hashes is typically followed by use of those credentials to move laterally. Look
+    on this host for follow-on detections indicating RDP, SMB, WinRM, or remote-execution activity, or new
+    authentication events, in the hours after the snapshot/mount. Because offline cracking or pass-the-hash from a
+    full ntds.dit dump can begin quickly with privileged accounts, treat new remote activity shortly after as
+    active exploitation of the exposed credentials.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - rule.name
+      - rule.uuid
+      - event.severity_label
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in the hour before the alert?
+  context: Credential extraction from a domain controller is a hands-on-keyboard action an operator may precede by
+    weakening protection. The query surfaces direct attempts to disable AV/EDR services, flip Defender flags, add
+    broad exclusions, clear logs, or patch AMSI/ETW on this host. Zero rows is a useful "protection looks healthy"
+    signal — kernel-level driver tampering and in-memory patches will not appear here. Populated rows shift the
+    disposition toward operator preparation; review the parent process and signing chain to identify the writer.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired this ntdsutil snapshot pattern, what parents and users drove it, and does the current alert fit?
+  context: Even legitimate AD maintenance uses ntdsutil. The query mirrors the rule's selection structure scoped
+    to this host, so the resulting parent/user distribution reflects how this specific snapshot/activate pattern
+    has historically run here — not generic ntdsutil usage. A new parent process, an unexpected user account, or
+    an unusual command-line shape is the deviation worth chasing; a recurring administrative or backup pattern
+    points to routine work.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \ntdsutil.exe
+      - OriginalFileName: ntdsutil.exe
+      selection_cli:
+      - CommandLine|contains|all:
+        - snapshot
+        - 'mount '
+      - CommandLine|contains|all:
+        - ac
+        - ' i'
+        - ' ntds'
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run ntdsutil or other AD database management commands?
+  context: Compare this user's current action against their historical behavior. An account that has never run
+    ntdsutil is more notable than a directory-services administrator or backup operator who runs it as part of
+    their role. User role and typical toolset should align with managing the AD database; an unexpected account
+    performing snapshot operations is a strong reason to treat the alert as credential access rather than
+    maintenance.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent-plus-binary launch mechanism historically routine on this host or across the environment, or is the parent unusual for ntdsutil?
+  context: When the alert fires under a service principal such as SYSTEM, user identity does not attribute the
+    behavior; the meaningful pivot is which parent process spawned ntdsutil and whether that pair is historically
+    common. A new or rare parent for this binary on this host (or environment-wide) is the deviation worth
+    chasing, whereas a pair that already accounts for many prior events is backup or OS-driven automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the environment around the time of the alert?
+  context: Tracking the user's activity across all hosts reveals whether the snapshot operation was an isolated
+    administrative action or one step in broader activity. If the same user triggered reconnaissance, credential
+    access, or remote execution on other domain controllers or member servers in this window, the scope is larger
+    than a single host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent-plus-binary combination fire on other hosts in the same window — a coordinated rollout, or activity isolated to this host?
+  context: Under a service principal, asking what the user did across the network returns agent-telemetry noise
+    because every host runs SYSTEM-owned processes constantly. The meaningful question is whether the same launch
+    mechanism — parent process plus ntdsutil — fired on other hosts in the alert window. Multiple hosts point to
+    scheduled or pushed automation such as a backup job; a single host points to a host-local, likely
+    hands-on-keyboard trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Aggregating process activity around the snapshot operation reveals
+    what led to it and what followed — reconnaissance, privilege escalation, directory-server exposure, or staging
+    of the extracted database. Novel parent-child pairs standing out at low counts against high-count routine
+    noise are what to scan for.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host — reconnaissance, defense tampering, or other credential access —
+    may reveal the attack stages that preceded the snapshot operation and help reconstruct the timeline. An
+    ntds.dit exposure that follows initial access and privilege escalation on the same domain controller reads
+    very differently from one that stands alone.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired this ntdsutil snapshot pattern in the past week, and does the distribution look like automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count
+    of this snapshot/activate pattern rather than generic ntdsutil usage. Many hosts firing the same pattern points
+    to a scripted backup or maintenance process; one host or a small unrelated set points to manual operator
+    activity. Use the host distribution and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \ntdsutil.exe
+      - OriginalFileName: ntdsutil.exe
+      selection_cli:
+      - CommandLine|contains|all:
+        - snapshot
+        - 'mount '
+      - CommandLine|contains|all:
+        - ac
+        - ' i'
+        - ' ntds'
+      condition: all of selection_*
+    fields:
+    - host.name
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1003.003
+      name: NTDS
+      role: primary
+    - id: T1003
+      name: OS Credential Dumping
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: instance_activation_snapshot
+      description: "Operator activates the ntds instance and creates/mounts a Volume Shadow Copy snapshot of the AD volume via ntdsutil.exe"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: ntds_exposure
+      description: "Mounted snapshot exposes ntds.dit and its logs as a readable copy of the live AD database"
+      mapped_to: Q3
+      source: template:credential_access.credential_target_identification
+    - stage: 3
+      label: database_readout
+      description: "ntds.dit / log files or the mounted shadow-copy path are read or copied off the host (and/or exposed via a directory-server tool)"
+      mapped_to: Q4
+      source: attack:T1003.003.file_event
+    - stage: 4
+      label: credential_use
+      description: "Extracted domain credentials are used for lateral movement / authentication"
+      mapped_to: Q8
+      source: template:credential_access.post_access_lateral_movement
+  dimension_coverage:
+    - dimension: parent_process_analysis
+      technique: T1003.003
+      covered_by: Q5
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1003.003
+      covered_by: Q4
+      source: attack:T1003.003.file_event
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1003.003
+      covered_by: Q4
+      source: attack:T1003.003.file_event
+      coverage_type: indirect
+    - dimension: user_context
+      technique: T1003.003
+      covered_by: Q2
+      source: template:universal.host_user_context
+      coverage_type: direct
+    - dimension: access_verification
+      technique: T1003
+      covered_by: Q3
+      source: template:credential_access.credential_target_identification
+      coverage_type: indirect
+    - dimension: parent_process_analysis
+      technique: T1003
+      covered_by: Q5
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1003
+      covered_by: Q15
+      source: template:cue_host_context.clustering
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1003
+      covered_by: Q10
+      source: template:cue_process_tool.baseline_deviation
+      coverage_type: indirect
+  mutable_dispositions:
+    - element: TargetFilePath
+      dimension: tuning_parameter
+      specific_values: "%SystemRoot%\\NTDS\\ntds.dit, custom DC storage paths, mounted shadow-copy paths"
+      disposition: query_injection
+      target_question: Q4
+      notes: "Injected the NTDS directory, ntds.dit, and HarddiskVolumeShadowCopy path patterns into the file_event TargetFilename|contains selection."
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "rationale only (suppress backup-related parents)"
+      disposition: context
+      target_question: Q5
+      notes: "Tuning rationale to allowlist backup parents; process_chain establishes whether the launching process is a backup/admin context. No fixed values to inject."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "~5 min window between shadow copy creation and NTDS access"
+      disposition: context
+      target_question: Q4
+      notes: "Correlation-window rationale; expressed as the +/-30m file_event window pairing shadow-copy creation with ntds.dit access, with the tight 5-min pairing called out in context."
+    - element: UserContext
+      dimension: user_context
+      specific_values: "rationale only (expected privileged user/service account)"
+      disposition: context
+      target_question: Q2
+      notes: "Privileged-user tuning rationale; host_user_context and cue_user_actor.baseline scope expected AD-admin/backup-operator behavior. No fixed values to inject."
+    - element: AccessMask
+      dimension: access_verification
+      specific_values: "0x1F0FFF (full access)"
+      disposition: context
+      target_question: Q3
+      notes: "From T1003 (secondary) LSASS/SAM analytic; this rule is process_creation on ntdsutil with no process_access GrantedAccess field available, so the access-rights angle is expressed as context in credential_target_identification (confirming the mount/read of ntds.dit) rather than a GrantedAccess selection."
+    - element: ParentProcessFilter
+      dimension: parent_process_analysis
+      specific_values: "rationale only (allowlist known security/system tools)"
+      disposition: context
+      target_question: Q5
+      notes: "T1003 secondary tuning rationale to allowlist trusted parents; covered by process_chain. No fixed values."
+  dedup_decisions:
+    - dropped: cue_process_tool.mechanism_decode
+      reason: "replaced_by credential_access.credential_target_identification (more specific; identifies the credential store / ntds.dit target)"
+      kept: credential_access.credential_target_identification
+    - dropped: cue_process_tool.baseline
+      reason: "generic Image-baseline of ntdsutil is weaker than the rule-pattern-scoped reflected baseline_deviation, which mirrors the snapshot/activate selection on this host"
+      kept: cue_process_tool.baseline_deviation
+    - dropped: cue_process_tool.clustering
+      reason: "host-wide concurrent-tool aggregation duplicates cue_host_context.clustering, which uses the same host-scoped +/-15m Image aggregation"
+      kept: cue_host_context.clustering
+    - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable; both emitted (subject identity vs. launch-mechanism identity)"
+      kept: both
+    - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable; both emitted (user network-wide activity vs. parent+binary cross-host rollout)"
+      kept: both
+  skipped_templates:
+    - template: cue_process_tool.mechanism_decode
+      reason: "replaced_by: credential_access.credential_target_identification"
+    - template: cue_process_tool.baseline
+      reason: "superseded by the reflected cue_process_tool.baseline_deviation (rule-pattern-scoped host baseline); recorded under dedup_decisions."
+    - template: cue_process_tool.clustering
+      reason: "duplicates cue_host_context.clustering (same host-scoped +/-15m aggregation); recorded under dedup_decisions."
+  reflection_overrides: []
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - credential_access
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 16
+      attack: 1
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 14
+    logsource_diversity:
+      process_creation: 14
+      file_event: 1
+      sigma_alert: 2

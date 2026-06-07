@@ -1,0 +1,589 @@
+name: PUA - Process Hacker Execution
+id: 07cbf7c3-3e11-46fb-828c-13116f21aab0
+description: |
+  Detects execution of Process Hacker (now rebranded System Informer) by binary metadata — Image name/path, OriginalFileName, Description, Product, or a known file hash. Process Hacker is a kernel-driver-backed process and service viewer that legitimate administrators and developers use, but is also routinely staged by operators to close handles held by security products, stop kernel-mode AV/EDR driver services, and impersonate the token of a SYSTEM-context process. Because the rule matches on tool identity rather than any specific argument, the investigation centers on whether this user, host, and parent chain are expected to run a low-level process-manipulation tool, what the tool did once running, and whether protection-tampering, persistence, or follow-on execution accompanied it.
+type: detection
+detection_id: 811e0002-b13b-4a15-9d00-a613fce66e42
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the alerting process match Process Hacker by name, metadata, or hash?
+  context: Before investing investigation time, confirm the alert is a true positive. The rule fires when the Image path, OriginalFileName, Description, Product, or file hash identifies the binary as Process Hacker (or a renamed copy of it). Review the event's Image, OriginalFileName, Description, Product, and Hashes against the rule criteria — a renamed copy still matches on metadata or hash even when the filename is changed.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - Description
+      - Hashes
+      - Product
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run a low-level process and service manipulation tool?
+  context: Legitimate administrative and development activity can trigger this detection — Process Hacker is a dual-use tool. Knowing whether the user role (IT support, developer, sysadmin) and host function are consistent with running a kernel-driver-backed process viewer is often the fastest path to distinguishing routine use from operator activity.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:remote_access_tool.tool_authorization
+  question: Is Process Hacker on the organization's approved software list for this host?
+  context: Organizations typically maintain a list of sanctioned administrative and diagnostic tools. Process Hacker is unsigned in its free distribution and is commonly shipped alongside attacker tooling rather than installed through normal channels, so its presence on a host where it is not approved may represent shadow IT or operator-staged tooling regardless of the tool's general reputation.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+- source: template:cue_process_tool.mechanism_decode
+  question: From where was Process Hacker run, and is the binary signed and located in an expected install path?
+  context: The full execution context reveals how the tool was staged. Note the directory it ran from — a path under a user profile, Temp, or a download folder rather than a Program Files install location suggests it was dropped for a single operation. The free build is unsigned, so an unsigned binary alone is not conclusive, but combined with an unusual path and an unusual parent it points to operator staging rather than a managed install.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CurrentDirectory
+      - Hashes
+- source: template:cue_process_tool.process_chain
+  question: What process spawned Process Hacker, and is that parent chain expected?
+  context: The parent process reveals how the tool was invoked. Interactive administrative use typically has explorer.exe or a console shell in the chain. A parent such as a script interpreter, an Office application, a download cradle, or a service process spawning Process Hacker points to scripted or exploitation-driven launch rather than a human opening the tool.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.follow_on
+  question: What child processes did Process Hacker spawn afterward?
+  context: Process Hacker's "Run as this user…" action lets an operator inherit another process's token — most notably a SYSTEM-context process — and spawn arbitrary executables with it. Children such as cmd.exe, powershell.exe, or other tooling launched from Process Hacker indicate it was used as a launch vehicle rather than just for viewing process state.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - User
+- source: template:cue_process_tool.baseline
+  question: Does this host normally run Process Hacker?
+  context: A process that has never been seen on a host is more notable than one that runs regularly. Zero or very low historical counts over the past 90 days indicate first-time or rare execution, which raises the priority of the parent-chain and follow-on questions; a steady history suggests an installed administrative or development tool.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously matched this rule's pattern, what parents and users normally drove it, and does the current alert fit?
+  context: The query mirrors the rule's selection structure scoped to this host, so the resulting parent and user distribution reflects how Process Hacker has historically run here, not generic binary usage. A new parent process, an unexpected user account, or a first-ever appearance is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+      - Image|contains: \ProcessHacker_
+      - Image|endswith: \ProcessHacker.exe
+      - OriginalFileName:
+        - ProcessHacker.exe
+        - Process Hacker
+      - Description: Process Hacker
+      - Product: Process Hacker
+      - Hashes|contains:
+        - MD5=68F9B52895F4D34E74112F3129B3B00D
+        - MD5=B365AF317AE730A67C936F21432B9C71
+        - SHA1=A0BDFAC3CE1880B32FF9B696458327CE352E3B1D
+        - SHA1=C5E2018BF7C0F314FED4FD7FE7E69FA2E648359E
+        - SHA256=D4A0FE56316A2C45B9BA9AC1005363309A3EDC7ACF9E4DF64D326A0FF273E80F
+        - SHA256=BD2C2CF0631D881ED382817AFCCE2B093F4E412FFB170A719E2762F250ABFEA4
+        - IMPHASH=3695333C60DEDECDCAFF1590409AA462
+        - IMPHASH=04DE0AD9C37EB7BD52043D2ECAC958DF
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run Process Hacker?
+  context: Compare this user's current action against their historical behavior across all hosts. A user who has never run a low-level process-manipulation tool is more notable than one who does so as part of a documented IT or development role. User role and typical toolset should align with running this kind of tool.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent and Process Hacker combination historically routine on this host or environment-wide, or is the parent unusual for this binary?
+  context: When the alert fires under a service principal, user identity does not attribute behavior. The meaningful pivot is the launch mechanism — which parent process spawned Process Hacker, and whether that pair is historically common. A new or rare parent for this binary is the deviation worth chasing; a pair that already accounts for many prior events is vendor or OS automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints. If the same user ran similar tooling on several hosts in this window, the scope of the activity may be larger than the single alerting host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent and Process Hacker combination fire on other hosts in the same window — coordinated automation, or isolated to this host?
+  context: Under a service principal, asking what else the user did across the network returns agent-telemetry noise, since every host runs SYSTEM-owned agents constantly. The meaningful question is whether the same launch mechanism — parent process plus spawned binary — fired on other hosts in the alert window. Multiple hosts points to scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in the hour before the alert?
+  context: Process Hacker's most-abused primitives are closing handles held by security products and stopping their services, so tamper-as-precursor is a live question for this alert. This query surfaces command-line attempts to disable AV/EDR services, flip Defender flags, add broad exclusions, clear logs, or patch AMSI/ETW. Zero rows is a useful "protection looks healthy via command line" signal — Process Hacker's own handle-close and driver-service stop actions are GUI-driven and will not appear here. Populated rows shift the disposition toward operator preparation; review the parent process and signing chain to identify the writer.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+- source: attack:T1543.service_creation
+  question: Was a new or modified Windows service created on this host around the time of the alert?
+  context: Process Hacker can create, edit, and stop services — including kernel driver services — directly from its UI, and installing its own driver service is how it gains kernel-level access. A service installation recorded in the security log near the alert time, especially one pointing at an unusual binary path or a driver, indicates the tool was used for service-backed persistence or driver loading rather than read-only inspection. If service install auditing is not collected in this environment, treat zero results as a visibility gap rather than evidence nothing happened.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: security
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4697
+      condition: selection
+    fields:
+      - ServiceName
+      - ServiceFileName
+      - ServiceType
+      - SubjectUserName
+- source: attack:T1543.registry_autostart
+  question: Were autostart service or driver registry keys created or modified on this host around the alert?
+  context: Process Hacker's kernel access depends on a driver service registered under the services hive (for example a KProcessHacker entry under HKLM\SYSTEM\CurrentControlSet\Services). Writes to service or autostart registry paths near the alert time can reveal the driver-service install or other persistence stacking that accompanies hands-on use of the tool. If registry change events are not collected in this environment, treat zero results as a visibility gap.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_paths:
+        TargetObject|contains:
+          - '\CurrentControlSet\Services\'
+          - '\CurrentVersion\Run'
+          - '\CurrentVersion\RunOnce'
+      condition: selection and selection_paths
+    fields:
+      - TargetObject
+      - Details
+      - Image
+- source: template:cue_process_tool.scope
+  question: Have other hosts matched this rule's pattern in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of where Process Hacker matched this pattern, not generic usage of the binary name. Many hosts matching points to scripted or vendor deployment of the tool; one host or a small unrelated set points to manual operator activity. Use the host distribution to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+      - Image|contains: \ProcessHacker_
+      - Image|endswith: \ProcessHacker.exe
+      - OriginalFileName:
+        - ProcessHacker.exe
+        - Process Hacker
+      - Description: Process Hacker
+      - Product: Process Hacker
+      - Hashes|contains:
+        - MD5=68F9B52895F4D34E74112F3129B3B00D
+        - MD5=B365AF317AE730A67C936F21432B9C71
+        - SHA1=A0BDFAC3CE1880B32FF9B696458327CE352E3B1D
+        - SHA1=C5E2018BF7C0F314FED4FD7FE7E69FA2E648359E
+        - SHA256=D4A0FE56316A2C45B9BA9AC1005363309A3EDC7ACF9E4DF64D326A0FF273E80F
+        - SHA256=BD2C2CF0631D881ED382817AFCCE2B093F4E412FFB170A719E2762F250ABFEA4
+        - IMPHASH=3695333C60DEDECDCAFF1590409AA462
+        - IMPHASH=04DE0AD9C37EB7BD52043D2ECAC958DF
+      condition: selection
+    fields:
+    - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering, reconnaissance, or credential access — may reveal the attack stages that preceded staging a process-manipulation tool and help reconstruct the timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1543
+      name: Create or Modify System Process
+      role: primary
+    - id: T1564
+      name: Hide Artifacts
+      role: secondary
+    - id: T1622
+      name: Debugger Evasion
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: tool_identity_confirmation
+      description: "Confirm the alerting binary is Process Hacker by name, metadata, or hash"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: tool_operation
+      description: "Determine how the tool was staged and run (path, signing, parent)"
+      mapped_to: Q4
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 3
+      label: service_driver_creation
+      description: "Service / driver service creation or modification (T1543 core behavior — Process Hacker driver service install)"
+      mapped_to: Q14
+      source: attack:T1543.service_creation
+    - stage: 4
+      label: autostart_registry
+      description: "Registry autostart / services-hive modification used for persistence and driver loading (T1543/T1564)"
+      mapped_to: Q15
+      source: attack:T1543.registry_autostart
+  dimension_coverage:
+    - dimension: parent_process_analysis
+      technique: T1543
+      covered_by: Q5
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1543
+      covered_by: Q8
+      source: template:cue_process_tool.baseline_deviation
+      coverage_type: indirect
+    - dimension: tuning_parameter
+      technique: T1564
+      covered_by: Q15
+      source: attack:T1543.registry_autostart
+      coverage_type: indirect
+    - dimension: tuning_parameter
+      technique: T1622
+      covered_by: Q7
+      source: template:cue_process_tool.baseline
+      coverage_type: indirect
+    - dimension: file_path_analysis
+      technique: T1622
+      covered_by: Q4
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: direct
+  mutable_dispositions:
+    - element: ApiCallFrequencyThreshold
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q7
+      notes: "T1622 API-flood threshold is a rule-tuning parameter with no concrete value; the rule fires on binary identity, not API-call frequency. Historical-baseline framing carries the tuning rationale."
+    - element: ProcessAllowList
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q3
+      notes: "Legitimate-debugger/dev-tool allowlist maps to the approved-software-list question for this PUA tool."
+    - element: FileExtensions
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q4
+      notes: "T1564 sensitive-file-extension tuning has no fixed value; not applicable to a process-identity rule. Staging-path analysis covers the file-location angle."
+    - element: ADSDetection
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q4
+      notes: "Alternate-Data-Stream toggle is a tuning flag, not a value; no ADS in this rule's logic."
+    - element: ServiceNamePattern
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q14
+      notes: "Unusual-service-name regex is a tuning rationale; the service-creation question surfaces ServiceName/ServiceFileName for the analyst to judge."
+    - element: ParentProcessFilter
+      dimension: parent_process_analysis
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q5
+      notes: "Non-administrative-parent-starting-service-tools rationale covered by the parent-chain question."
+    - element: RegistryPathList
+      dimension: tuning_parameter
+      specific_values: "HKLM\\System\\CurrentControlSet\\Services"
+      disposition: query_injection
+      target_question: Q15
+      notes: "Services-hive autostart path injected into the registry_set custom question's TargetObject|contains list."
+  dedup_decisions:
+    - dropped: discovery_recon.discovery_user_context
+      reason: "Overlaps universal.host_user_context per template notes; kept host_user_context (better fit for a tool-identity PUA rule than 'administrative discovery commands' framing)"
+      kept: universal.host_user_context
+    - dropped: cue_user_actor.baseline + cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable; both emitted (Q9 user-pivot, Q10 parent+binary substitute)"
+      kept: both
+    - dropped: cue_user_actor.clustering + cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable; both emitted (Q11 user-pivot, Q12 parent+binary substitute)"
+      kept: both
+  skipped_templates:
+    - template: discovery_recon.discovery_burst_detection
+      reason: "Rule fires on a single PUA tool identity, not a recon binary; no recon-burst signal to surface and the technique set's discovery dimension is incidental to T1622 discovery-tactic tagging."
+    - template: discovery_recon.discovery_parent_chain
+      reason: "Generic discovery parent-chain duplicates cue_process_tool.process_chain (Q5) which already pivots ProcessGuid→parent for the actual alerting binary."
+    - template: cue_process_tool.clustering
+      reason: "Host-wide tool clustering overlaps cue_host_context.precursor (Q16, prior-alert timeline) and cue_user_actor.clustering (Q11); dropped to stay within the 18-question cap."
+    - template: cue_host_context.clustering
+      reason: "Aggregated host activity overlaps cue_user_actor.clustering (Q11) and the prior-alert precursor (Q16); dropped to stay within cap."
+    - template: organizational_context.change_ticket
+      reason: "Template notes say skip change-ticket for pua/hktl/apt prefixes — change tickets are irrelevant for a PUA tool detection."
+    - template: organizational_context.human_recall
+      reason: "Organizational confirmation already covered by tool_authorization (Q3) and the host_user_context judgment (Q2); dropped to keep count within cap."
+    - template: organizational_context.timing_alignment
+      reason: "Timing-window judgment less load-bearing than tamper/persistence coverage for a defense-evasion tool; dropped to stay within cap."
+    - template: organizational_context.procedural_consistency
+      reason: "Standard-procedure framing targets schtasks/net/reg command-line changes, not a GUI process-manipulation tool; not a fit."
+    - template: remote_access_tool.active_session_context
+      reason: "Helpdesk-session framing is for RMM/tunneling tools; Process Hacker is not a remote-access session tool, so support-ticket correlation does not apply."
+    - template: remote_access_tool.connection_destination
+      reason: "Process Hacker is not a network-relay tool; outbound-endpoint analysis does not apply and the rule has no network indicator."
+    - template: persistence_scope.process_based_persistence
+      reason: "Service/driver persistence for this tool is better captured by the security-log service-creation question (Q14) and registry_set autostart question (Q15); the generic schtasks/sc/reg sweep adds little for a driver-backed tool."
+    - template: persistence_scope.file_based_persistence
+      reason: "No file_event indicator in this rule; Startup-folder/Run-key drops covered for the registry angle by Q15. Dropped to stay within cap."
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - remote_access_tool
+    - discovery_recon
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 15
+      attack: 2
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 14
+    logsource_diversity:
+      process_creation: 13
+      security: 1
+      registry_set: 1
+      sigma_alert: 1

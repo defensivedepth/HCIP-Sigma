@@ -1,0 +1,687 @@
+name: HackTool - PCHunter Execution
+id: c016d0cd-b81d-4f72-a63e-6e82c5315d86
+description: |
+  Detects execution of PCHunter (also branded XueTr), a kernel-level anti-rootkit and process/driver inspection utility. The rule fires when at least one of three independent conditions matches: the image name ends in PCHunter64.exe or PCHunter32.exe, the PE metadata carries the OriginalFileName PCHunter.exe or the Epoolsoft description, or one of the known file hashes is present. PCHunter is dual-use: legitimate responders use it to triage rootkit infections, while operators weaponize the same kernel primitives to enumerate and remove security-product callbacks, SSDT entries, and minifilters before disabling endpoint protection. Determine who launched it, whether the binary is genuinely PCHunter or a renamed copy, what kernel and process structures it touched, and whether defense tampering or other reconnaissance surrounded the event.
+type: detection
+detection_id: fca949cc-79ca-446e-8064-01aa7e52ece5
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-06
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does this process match what this rule detects as PCHunter execution?
+  context: >-
+    Confirm the alert is a true positive before investing investigation time. The rule fires on any one of three branches,
+    so note which one matched: the image name ends in PCHunter64.exe or PCHunter32.exe, the PE metadata carries the
+    OriginalFileName PCHunter.exe or the Epoolsoft Windows Information View Tools description, or one of the known file
+    hashes is present. The branch that fired determines how much weight to put on the binary-identity questions downstream.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - Description
+      - Hashes
+- source: template:hacking_tool.authorized_engagement
+  question: Is this PCHunter execution part of an authorized penetration test, red team engagement, or sanctioned IR triage?
+  context: >-
+    PCHunter is a legitimate rootkit-hunting and kernel-inspection tool that incident responders and researchers run during
+    triage. Before deeper analysis, check whether an authorized engagement or IR effort is active on this host or segment.
+    A sanctioned activity with matching timing resolves the alert without further work.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:discovery_recon.discovery_user_context
+  question: Is this user and host expected to run a kernel-inspection tool like PCHunter?
+  context: >-
+    Responders and a small set of administrators legitimately run anti-rootkit utilities; standard users and most servers
+    have no routine need for kernel-level process and driver inspection. The user's role and the host's function determine
+    whether this execution is routine maintenance or anomalous.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - User
+- source: template:hacking_tool.tool_capability_used
+  question: What did PCHunter inspect or manipulate, and how was it launched?
+  context: >-
+    PCHunter is multi-purpose: it can enumerate processes, kernel modules, and services, but it can also remove
+    CreateProcess and registry-callback notify routines, restore or strip SSDT and inline hooks, and delete minifilter
+    and disk filter drivers. The command-line arguments, any companion configuration, and the launch context reveal whether
+    the run was passive inspection or active tampering with security instrumentation.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:cue_process_tool.mechanism_decode
+  question: What were all PCHunter invocations on this host around the alert, and what did each command do?
+  context: >-
+    The triggering event shows one invocation; PCHunter operations are often driven through several sequential runs or a
+    wrapping script. Reviewing every execution of the binary on this host in the surrounding window reveals the full
+    operation, including whether the driver was loaded and which kernel or process structures were targeted.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: attack:T1007.process_identification
+  question: Is this binary genuinely PCHunter, or a renamed or repacked copy carrying its metadata or hashes?
+  context: >-
+    The rule fires on three independent signals, and they do not always agree. A binary whose PE metadata or hash matches
+    PCHunter but whose on-disk name is something innocuous indicates an operator renamed the tool to blend in; a file named
+    PCHunter that lacks the expected metadata and hashes may be a decoy or a tampered build. Compare image name, OriginalFileName,
+    description, and hashes against each other to establish true identity.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - Description
+      - Hashes
+- source: attack:T1057.process_access
+  question: What processes did PCHunter open handles into, and were any of them security products?
+  context: >-
+    PCHunter's process-inspection and termination primitives work by opening handles into other processes. Cross-process
+    access targeting AV/EDR agents, LSASS, or other protected processes signals an attempt to enumerate or kill security
+    tooling rather than benign triage. Process-access events from the PCHunter image on this host expose those targets even
+    when the original process has exited.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_access
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        SourceImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - TargetImage
+      - GrantedAccess
+      - SourceImage
+- source: attack:T1012.registry_query
+  question: Were registry keys for services, callbacks, or execution hijacks modified on this host around the alert?
+  context: >-
+    Beyond reading the registry for environment discovery, PCHunter can edit service entries, Image File Execution Options,
+    and startup items, and its driver registers under a service key. Registry modifications to service, callback, or IFEO
+    keys in the same window indicate the tool moved from inspection to persistence or defense evasion.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_target:
+        TargetObject|contains:
+          - '\Services\'
+          - '\Image File Execution Options\'
+          - '\CurrentVersion\Run'
+          - '\Control\Session Manager'
+      condition: selection_host and selection_target
+    fields:
+      - TargetObject
+      - Details
+      - Image
+- source: template:discovery_recon.discovery_parent_chain
+  question: What process spawned PCHunter, and is that parent chain expected?
+  context: >-
+    Legitimate triage runs PCHunter from an interactive shell launched by explorer.exe or from a known management tool.
+    Launch from a script interpreter (wscript.exe, mshta.exe), Office application, wmiprvse.exe, or wsmprovhost.exe points
+    to automated or remote post-exploitation rather than a hands-on responder.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+- source: template:discovery_recon.discovery_burst_detection
+  question: Did other reconnaissance commands run on this host around the same time?
+  context: >-
+    A single discovery action may be benign, but multiple native enumeration commands in rapid succession -- whoami,
+    systeminfo, tasklist, net, nltest -- is a signature of post-compromise enumeration. PCHunter running alongside a burst
+    of native recon binaries strengthens the case that an operator is surveying the host before the next stage.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_recon:
+        Image|endswith:
+          - '\whoami.exe'
+          - '\systeminfo.exe'
+          - '\ipconfig.exe'
+          - '\net.exe'
+          - '\net1.exe'
+          - '\nltest.exe'
+          - '\dsquery.exe'
+          - '\nbtstat.exe'
+          - '\arp.exe'
+          - '\netstat.exe'
+          - '\tasklist.exe'
+          - '\qprocess.exe'
+          - '\query.exe'
+          - '\quser.exe'
+          - '\hostname.exe'
+          - '\nslookup.exe'
+          - '\adfind.exe'
+          - '\csvde.exe'
+          - '\ldifde.exe'
+          - '\dnscmd.exe'
+          - '\cmdkey.exe'
+          - '\setspn.exe'
+      condition: selection and selection_recon
+    fields:
+      - Image
+      - User
+- source: template:hacking_tool.tool_specific_artifacts
+  question: What files did the PCHunter process create on this host?
+  context: >-
+    Kernel-inspection tools leave artifacts: examination reports, exported dumps, the unpacked driver written to disk
+    before loading, and configuration or key files dropped alongside the binary. File-creation events from the PCHunter
+    image confirm execution scope and reveal staged output even after the process exits.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in the hour before the alert?
+  context: >-
+    PCHunter's core abuse is disabling security instrumentation, so prior user-mode tamper activity is a strong precursor
+    signal. This sweep surfaces attempts to stop or reconfigure AV/EDR services, flip Defender flags, add exclusions, clear
+    logs, or patch AMSI/ETW. Zero rows is a useful health signal, but kernel-level driver tampering and in-memory patches
+    that PCHunter itself performs will not appear here; populated rows shift the disposition toward operator preparation.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run PCHunter or similar kernel-inspection tools?
+  context: >-
+    Compare this user's current action against their historical behavior across the environment. A user who has never run
+    PCHunter is more suspicious than a responder or administrator who runs it routinely. The user's role and typical toolset
+    should align with kernel-level inspection.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent-and-binary combination historically routine on this host or environment-wide, or is the parent unusual for PCHunter?
+  context: >-
+    When the alert fires under a service principal, user identity does not attribute behavior; the meaningful pivot is the
+    launch mechanism. A new or rare parent process for PCHunter on this host or environment-wide is the deviation worth
+    chasing, while a parent that already accounts for thousands of prior events is vendor or management automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: >-
+    Tracking the user's activity across all hosts reveals whether the kernel-inspection activity is isolated or part of
+    movement across multiple endpoints. The same user driving similar activity on several hosts widens the potential scope
+    of compromise.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did the same parent-and-binary combination fire on other hosts in this window, indicating a coordinated rollout?
+  context: >-
+    Under a service principal, asking what the user did network-wide returns agent-telemetry noise. The meaningful question
+    is whether the same launch mechanism -- parent process plus PCHunter -- fired on other hosts in the alert window.
+    Multiple hosts point to scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host previously fired this rule's pattern, what parents and users drove it, and does the current alert fit?
+  context: >-
+    Even legitimate tools can be abused. The query mirrors the rule's selection structure scoped to this host, so the
+    resulting parent and user distribution reflects how the rule's specific firing pattern has historically run here. A new
+    parent process, an unexpected user account, or an unusual launch shape is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_image:
+        Image|endswith:
+        - \PCHunter64.exe
+        - \PCHunter32.exe
+      selection_pe:
+      - OriginalFileName: PCHunter.exe
+      - Description: Epoolsoft Windows Information View Tools
+      selection_hashes:
+        Hashes|contains:
+        - SHA1=5F1CBC3D99558307BC1250D084FA968521482025
+        - MD5=987B65CD9B9F4E9A1AFD8F8B48CF64A7
+        - SHA256=2B214BDDAAB130C274DE6204AF6DBA5AEEC7433DA99AA950022FA306421A6D32
+        - IMPHASH=444D210CEA1FF8112F256A4997EED7FF
+        - SHA1=3FB89787CB97D902780DA080545584D97FB1C2EB
+        - MD5=228DD0C2E6287547E26FFBD973A40F14
+        - SHA256=55F041BF4E78E9BFA6D4EE68BE40E496CE3A1353E1CA4306598589E19802522C
+        - IMPHASH=0479F44DF47CFA2EF1CCC4416A538663
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (1 of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired this rule's pattern in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: >-
+    The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of the rule's
+    firing pattern. Many hosts firing the same pattern points to scripted deployment or sanctioned tool rollout; one host
+    or a small unrelated set points to manual operator activity. Use the host distribution to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_image:
+        Image|endswith:
+        - \PCHunter64.exe
+        - \PCHunter32.exe
+      selection_pe:
+      - OriginalFileName: PCHunter.exe
+      - Description: Epoolsoft Windows Information View Tools
+      selection_hashes:
+        Hashes|contains:
+        - SHA1=5F1CBC3D99558307BC1250D084FA968521482025
+        - MD5=987B65CD9B9F4E9A1AFD8F8B48CF64A7
+        - SHA256=2B214BDDAAB130C274DE6204AF6DBA5AEEC7433DA99AA950022FA306421A6D32
+        - IMPHASH=444D210CEA1FF8112F256A4997EED7FF
+        - SHA1=3FB89787CB97D902780DA080545584D97FB1C2EB
+        - MD5=228DD0C2E6287547E26FFBD973A40F14
+        - SHA256=55F041BF4E78E9BFA6D4EE68BE40E496CE3A1353E1CA4306598589E19802522C
+        - IMPHASH=0479F44DF47CFA2EF1CCC4416A538663
+      condition: 1 of selection_*
+    fields:
+    - host.name
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1057
+      name: Process Discovery
+      role: primary
+    - id: T1007
+      name: System Service Discovery
+      role: secondary
+    - id: T1012
+      name: Query Registry
+      role: secondary
+    - id: T1082
+      name: System Information Discovery
+      role: secondary
+    - id: T1083
+      name: File and Directory Discovery
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: tool_identity
+      description: "Confirm the binary is genuinely PCHunter (name/PE/hash) rather than a renamed or repacked copy"
+      mapped_to: Q6
+      source: attack:T1007.process_identification
+    - stage: 2
+      label: capability_invoked
+      description: "Determine which kernel/process/service inspection or manipulation capability was used"
+      mapped_to: Q4
+      source: template:hacking_tool.tool_capability_used
+    - stage: 3
+      label: process_enumeration_access
+      description: "Identify which processes PCHunter opened handles into (process discovery / EDR targeting)"
+      mapped_to: Q7
+      source: attack:T1057.process_access
+    - stage: 4
+      label: registry_and_service_query
+      description: "Surface registry/service/IFEO modifications that follow inspection"
+      mapped_to: Q8
+      source: attack:T1012.registry_query
+    - stage: 5
+      label: surrounding_recon
+      description: "Detect co-occurring native discovery commands (system/file/service info)"
+      mapped_to: Q10
+      source: template:discovery_recon.discovery_burst_detection
+  dimension_coverage:
+    - dimension: parent_process_analysis
+      technique: T1057
+      covered_by: Q9
+      source: template:discovery_recon.discovery_parent_chain
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1082
+      covered_by: Q10
+      source: template:discovery_recon.discovery_burst_detection
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1012
+      covered_by: Q8
+      source: attack:T1012.registry_query
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1082
+      covered_by: Q3
+      source: template:discovery_recon.discovery_user_context
+      coverage_type: direct
+    - dimension: command_analysis
+      technique: T1057
+      covered_by: Q4
+      source: template:hacking_tool.tool_capability_used
+      coverage_type: direct
+    - dimension: process_identification
+      technique: T1007
+      covered_by: Q6
+      source: attack:T1007.process_identification
+      coverage_type: direct
+  mutable_dispositions:
+    - element: ProcessName
+      dimension: process_identification
+      specific_values: "PCHunter64.exe, PCHunter32.exe, OriginalFileName PCHunter.exe, Epoolsoft description, known hashes"
+      disposition: query_injection
+      target_question: Q6
+      notes: "Identity verification compares image/OriginalFileName/Description/Hashes from the alerting event"
+    - element: TargetRegistryPath
+      dimension: tuning_parameter
+      specific_values: "\\Services\\, \\Image File Execution Options\\, \\CurrentVersion\\Run, \\Control\\Session Manager"
+      disposition: query_injection
+      target_question: Q8
+      notes: "Injected into registry_set TargetObject|contains for service/IFEO/run/session-manager keys"
+    - element: CommandLineMatch / CommandLineRegex / CommandLinePattern
+      dimension: command_analysis
+      specific_values: "rationale only — rule has no CommandLine selection; PCHunter is GUI/driver-driven"
+      disposition: context
+      target_question: Q4
+      notes: "Capability question reads the alerting CommandLine for any args; no fixed values to inject"
+    - element: ParentProcessName / ParentProcess
+      dimension: parent_process_analysis
+      specific_values: "rationale only — suspicious parents (wscript, mshta, wmiprvse, Office)"
+      disposition: context
+      target_question: Q9
+      notes: "Suspicious-parent guidance kept in discovery_parent_chain context"
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only — burst of discovery within minutes"
+      disposition: context
+      target_question: Q10
+      notes: "Burst framing captured in discovery_burst_detection; threshold not directly queryable"
+    - element: UserContext
+      dimension: user_context
+      specific_values: "rationale only — unusual user/service accounts"
+      disposition: context
+      target_question: Q3
+      notes: "User-context scoping captured in discovery_user_context and user baseline"
+  dedup_decisions:
+    - dropped: cue_process_tool.process_chain
+      reason: "discovery_recon.discovery_parent_chain (must_include) covers the parent-of-tool angle more specifically for a discovery tool"
+      kept: discovery_recon.discovery_parent_chain
+    - dropped: universal.host_user_context
+      reason: "discovery_recon.discovery_user_context is more specific to discovery context and the template's own notes_to_llm directs preferring it; merged to avoid duplicate ProcessGuid->User question"
+      kept: discovery_recon.discovery_user_context
+    - dropped: cue_user_actor pair (baseline + baseline_svc), (clustering + clustering_svc)
+      reason: "user_actor pair — non-deduplicable; both variants emitted as Q13/Q14 and Q15/Q16"
+      kept: cue_user_actor.baseline + cue_user_actor.baseline_svc + cue_user_actor.clustering + cue_user_actor.clustering_svc
+    - dropped: cue_process_tool.baseline
+      reason: "redundant with cue_process_tool.baseline_deviation (host-scoped historical pattern) and cue_user_actor.baseline; dropped to stay within 18-question cap"
+      kept: cue_process_tool.baseline_deviation
+    - dropped: cue_process_tool.follow_on
+      reason: "PCHunter rarely spawns children (GUI/driver tool); child-process angle adds little and dropped to stay within cap"
+      kept: none
+    - dropped: cue_process_tool.clustering
+      reason: "redundant with cue_host_context surrounding-activity intent and discovery_burst_detection; dropped to stay within cap"
+      kept: discovery_recon.discovery_burst_detection
+    - dropped: cue_host_context.clustering
+      reason: "surrounding-host-activity intent already carried by discovery_burst_detection and endpoint_protection_health; dropped to stay within cap"
+      kept: discovery_recon.discovery_burst_detection
+    - dropped: cue_host_context.precursor
+      reason: "prior-alert-on-host precursor signal overlaps endpoint_protection_health tamper sweep for this defense-evasion tool; dropped to stay within cap"
+      kept: universal.endpoint_protection_health
+  skipped_templates: []
+  reflection_overrides: []
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - discovery_recon
+    - hacking_tool
+    - cue_process_tool
+    - cue_user_actor
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 15
+      attack: 3
+      llm_generated: 0
+    phase_distribution:
+      triage: 1
+      analysis: 1
+      context: 16
+    logsource_diversity:
+      process_creation: 15
+      process_access: 1
+      registry_set: 1
+      file_event: 1

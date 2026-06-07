@@ -1,0 +1,559 @@
+name: WmiPrvSE Spawned A Process
+id: ac62c5d3-9f09-442f-a85a-7a29c9587beb
+description: |
+  Detects a process whose parent is WmiPrvSE.exe, the WMI provider host that executes
+  work requested through Windows Management Instrumentation. The rule fires when the
+  parent image ends in WmiPrvSE.exe and none of the tuning filters apply (system logon
+  IDs, AUTHORITY/AUTORITY service accounts, WmiPrvSE/WerFault children, or null logon ID).
+  WMI is a common transport for remote command execution and lateral movement, so an
+  unexpected child of WmiPrvSE.exe — especially a command interpreter, script host, or
+  administrative binary — may represent code executed over WMI from a remote caller.
+  Determine what the child process did, whether the execution correlates with a remote
+  network logon, and whether the activity matches sanctioned management tooling.
+type: detection
+detection_id: d21374ff-f574-44a7-9998-4a8c8bf33d7d
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-06
+questions:
+- source: template:universal.verify_trigger_match
+  question: Is the parent process of the alerting child WmiPrvSE.exe, and which child binary did it spawn?
+  context: Confirm the alert is a true positive by reviewing the triggering event. The rule
+    fires when the parent image ends in WmiPrvSE.exe and the event is not excluded by the
+    service-account, system-logon-ID, or WmiPrvSE/WerFault child filters. Note the child
+    Image and its command line — the rule places no constraint on what the child is, so the
+    identity of the spawned binary drives the rest of the investigation.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+- source: template:universal.host_user_context
+  question: Is this user and host expected to execute processes through WMI?
+  context: Legitimate remote management, software deployment, and monitoring tooling routinely
+    drive WMI execution. Knowing whether the user role and host function are consistent with
+    WMI-launched activity is often the fastest way to separate sanctioned administration from
+    remote code execution by an external caller.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What exactly did the WMI-spawned child process do? Decode its command-line arguments.
+  context: The full command line of the child reveals the operation carried out over WMI.
+    Decode any flags, encoded content, file paths, or URLs, and watch for execution patterns
+    associated with WMI abuse such as wmic process call create or Invoke-WmiMethod. The query
+    returns every process_creation on this host in the surrounding window so sequential
+    invocations that form a single logical operation are visible together.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith: \WmiPrvSE.exe
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - CurrentDirectory
+      - User
+- source: template:cue_parent_process.mechanism_decode
+  question: What invoked WmiPrvSE.exe to perform this work, and is that request local or remote?
+  context: WmiPrvSE.exe is started on demand by the WMI service to run requested work. Its own
+    process event and surrounding activity indicate how the WMI request arrived. A remote
+    request typically pairs with a network logon and an inbound connection on the WMI ports,
+    while a purely local request originates from a process on the same host.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+- source: attack:T1047.network_correlation
+  question: Did an inbound connection on the WMI ports reach this host within minutes of the spawned process?
+  context: Remote WMI execution arrives over DCOM/RPC — TCP 135 followed by a high dynamic
+    port, or 5985/5986 when carried over WinRM. An inbound connection on these ports closely
+    preceding the spawned process indicates the command was driven by a remote caller rather
+    than a local one, and the source address identifies the originating host. Absence of a
+    matching connection points toward local WMI use.
+  range: +/-10m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'false'
+        DestinationPort:
+          - 135
+          - 5985
+          - 5986
+      condition: selection
+    fields:
+      - SourceIp
+      - DestinationPort
+      - Image
+      - User
+- source: attack:T1047.wmi_provider_activity
+  question: What WMI activity was recorded on this host around the time of the spawned process?
+  context: WMI operational events record method execution and event-subscription changes,
+    including the namespace and the operation performed. Abuse commonly targets the cimv2 and
+    subscription namespaces. Correlating these records with the spawned process shows which
+    WMI operation produced the execution and whether a persistent event subscription was
+    created. If WMI operational logs are not ingested in this environment, treat zero results
+    as a visibility gap rather than evidence nothing occurred.
+  range: +/-10m
+  query: |
+    aggregation: false
+    logsource:
+      category: wmi
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - User
+      - EventID
+      - Operation
+      - Namespace
+- source: template:cue_parent_process.follow_on
+  question: What other child processes did WmiPrvSE.exe spawn on this host in the hours around the alert?
+  context: A remote caller using WMI often runs several commands in sequence — reconnaissance,
+    credential access, then further execution — each surfacing as a separate child of
+    WmiPrvSE.exe. Listing the other children of the WMI provider host reveals the full scope
+    of activity driven through this transport.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith: \WmiPrvSE.exe
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - User
+- source: template:cue_parent_process.clustering
+  question: What file and network activity is associated with the spawned process around the same time?
+  context: Beyond its command line, the child process may have written files or opened network
+    connections that reveal downloaded payloads or command-and-control traffic. Activity from
+    the same process within a tight window helps establish what the WMI-launched execution
+    actually accomplished.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith: \WmiPrvSE.exe
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_parent_process.baseline
+  question: Does WmiPrvSE.exe normally spawn this child binary on this host?
+  context: Some children of WmiPrvSE.exe are routine — management agents, inventory collectors,
+    and monitoring helpers run regularly through WMI. A child binary that has never or rarely
+    been spawned by WmiPrvSE.exe on this host is the deviation worth chasing. The historical
+    count of this specific parent-child pairing separates routine automation from a novel
+    execution.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith: \WmiPrvSE.exe
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run this binary across the environment?
+  context: Compare this user's current action against their historical pattern. A user who has
+    never run this binary is more notable than one who runs it routinely, and the user role
+    should align with WMI-driven execution. This pivot attributes behavior to the subject when
+    the alert fires under a named interactive account.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is the WmiPrvSE.exe-to-child pairing historically routine on this host or across the environment, or is this binary an unusual child for the WMI provider host?
+  context: When the alert fires under a service principal, user identity does not attribute
+    behavior. The meaningful pivot is the launch mechanism — whether WmiPrvSE.exe spawning this
+    specific binary is historically common. A new or rare child for the WMI provider host is
+    the deviation worth chasing, while a pairing that already accounts for thousands of prior
+    events is vendor or operating-system automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \WmiPrvSE.exe
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity
+    spanning multiple endpoints. If the same user drove similar execution on several hosts in
+    a short window, the scope of the activity is larger than a single endpoint. This pivot is
+    meaningful when the alert fires under a named interactive account.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same WmiPrvSE.exe-to-child pairing fire on other hosts in the same window — a coordinated rollout, or activity isolated to this host?
+  context: Under a service principal, asking what else the user did across the network returns
+    agent-telemetry noise, because every host runs system-owned processes constantly. The
+    meaningful question is whether the same launch mechanism — WmiPrvSE.exe spawning this
+    binary — fired on other hosts in the alert window. Multiple hosts point to scheduled or
+    pushed automation, or to a remote caller fanning out across the environment; a single host
+    points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \WmiPrvSE.exe
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining activity around the alert reveals what
+    led to this event and what followed, and whether it is part of a larger sequence. Aggregating
+    by image and parent collapses repetitive agent telemetry while novel parent-child pairs
+    stand out at low counts.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host — defense tampering, reconnaissance, or credential
+    access — may reveal the stages that preceded this event and help reconstruct the timeline.
+    A remote-execution event is more concerning when prior alerts show network logon or
+    credential activity leading up to it.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in the hour before the alert?
+  context: Tampering typically precedes payload execution. The query surfaces direct attempts
+    to disable AV/EDR services, flip Defender flags, add broad exclusions, clear logs, or patch
+    AMSI/ETW. Zero rows is a useful protection-looks-healthy signal — kernel-level driver
+    tampering and in-memory patches will not appear here. Populated rows shift the disposition
+    toward operator preparation; review the parent process and signing chain to identify the
+    writer.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1047
+      name: Windows Management Instrumentation
+      role: primary
+  attack_chain_coverage:
+    - stage: 1
+      label: wmi_process_creation
+      description: WmiPrvSE.exe spawns a child process to perform requested WMI work
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: command_execution
+      description: The spawned child executes the requested local or remote command
+      mapped_to: Q3
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 3
+      label: network_connection_if_remote
+      description: A remote WMI request arrives over DCOM/RPC or WinRM as an inbound connection
+      mapped_to: Q5
+      source: attack:T1047.network_correlation
+    - stage: 4
+      label: wmi_provider_events
+      description: WMI operational events record the method execution / subscription that drove the spawn
+      mapped_to: Q6
+      source: attack:T1047.wmi_provider_activity
+  dimension_coverage:
+    - dimension: time_correlation
+      technique: T1047
+      covered_by: Q5
+      source: attack:T1047.network_correlation
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1047
+      covered_by: Q3
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1047
+      covered_by: Q2
+      source: template:universal.host_user_context
+      coverage_type: direct
+  mutable_dispositions:
+    - element: WMIQueryScope
+      dimension: tuning_parameter
+      specific_values: "\\root\\cimv2, \\root\\subscription"
+      disposition: query_injection
+      target_question: Q6
+      notes: Namespace surfaced via the wmi-provider-activity query Namespace field and named in context; cimv2/subscription called out as the abuse-relevant namespaces.
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q5
+      notes: Correlation window between the spawn and the inbound WMI connection set to +/-10m on the network-correlation question.
+    - element: UserContext
+      dimension: user_context
+      specific_values: "interactive vs SYSTEM / low-privileged"
+      disposition: context
+      target_question: Q2
+      notes: Interactive-vs-service-principal distinction drives the host_user_context framing and the cue_user_actor user-pivot/substitute pair.
+    - element: RemoteDestinationThreshold
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q13
+      notes: Cross-host fan-out of the same launch mechanism in the alert window is surfaced by the clustering_svc question; a numeric unique-host threshold is not directly queryable.
+    - element: SuspiciousCommandPatterns
+      dimension: tuning_parameter
+      specific_values: "wmic process call, powershell Invoke-WmiMethod"
+      disposition: context
+      target_question: Q3
+      notes: WMI-abuse command patterns named in the mechanism_decode context; the rule places no CommandLine constraint on the child, so the decode question reads the full command line rather than pre-filtering on these patterns.
+  dedup_decisions:
+    - dropped: cue_process_tool.process_chain
+      reason: "parent_process is primary cue and ParentImage is the detection field — the upward pivot is covered by cue_parent_process.mechanism_decode; hint directs this drop"
+      kept: template:cue_parent_process.mechanism_decode
+    - dropped: cue_process_tool.baseline
+      reason: "child Image is unconstrained by the rule; host-binary baseline is subsumed by cue_parent_process.baseline which baselines the parent-child pairing that actually defines the alert"
+      kept: template:cue_parent_process.baseline
+    - dropped: cue_parent_process.scope
+      reason: "cross-host distribution of the WmiPrvSE-to-child pairing is already covered by cue_user_actor.clustering_svc (same parent+binary, env-wide); avoids a near-identical aggregation"
+      kept: template:cue_user_actor.clustering_svc
+    - dropped: user_actor_pair
+      reason: "user_actor pair — non-deduplicable; cue_user_actor.baseline + baseline_svc and clustering + clustering_svc emitted as four distinct questions"
+      kept: template:cue_user_actor.baseline_svc
+  skipped_templates: []
+  reflection_overrides: []
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+  generation_stats:
+    total_questions: 16
+    source_counts:
+      template: 14
+      attack: 2
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 2
+      context: 12
+    logsource_diversity:
+      process_creation: 13
+      network_connection: 1
+      wmi: 1
+      sigma_alert: 1

@@ -1,0 +1,525 @@
+name: Suspicious AgentExecutor PowerShell Execution
+id: 62475e78-9c96-477e-a5df-6088138d4aa2
+description: |
+  Detects AgentExecutor.exe (the Intune Management Extension helper) running with the
+  '-powershell' or '-remediationScript' switch while NOT being launched by the Intune agent
+  and NOT pointed at the in-box WindowsPowerShell v1.0 path. AgentExecutor is a
+  Microsoft-signed binary that will run an arbitrary script, or any executable named
+  powershell.exe found in the folder named by its 6th positional argument, with
+  ExecutionPolicy Bypass and under user context. Legitimately it is driven only by the
+  Intune Management Extension service; outside that path it is a living-off-the-land proxy
+  for unsigned script or EXE execution. Investigation should confirm what the spawned
+  PowerShell or EXE actually did, what launched AgentExecutor, and whether the activity
+  fits this host's and user's normal management pattern.
+type: detection
+detection_id: c0b40568-b1e9-4b03-8d6c-b096da6da9ab
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: '2026-06-06'
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line match what this rule detects?
+  context: Confirm the alert is a true positive before investing investigation time. The
+    rule fires when AgentExecutor.exe runs with '-powershell' or '-remediationScript' AND
+    is not launched by the Intune agent and not pointed at the in-box WindowsPowerShell
+    v1.0 path. Read the full command line and check which switch fired, the script or
+    folder path in the positional arguments, and the parent process.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run Intune device management tooling?
+  context: AgentExecutor is normally driven only by the Intune Management Extension service
+    on Entra-joined or Intune-enrolled devices. If this host is not Intune-managed, or the
+    user is not associated with device management, an interactive or scripted invocation
+    of AgentExecutor is far harder to explain as routine and shifts the disposition toward
+    abuse.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: Decode the AgentExecutor command line - which script or folder do the positional
+    arguments point to, and is it user-writable?
+  context: The positional arguments carry the operation. The first argument after '-powershell'
+    is the .ps1 script to run; the 6th positional argument is a folder that AgentExecutor
+    will search for an executable named powershell.exe and run as a real EXE. A script or
+    folder under a user-writable location (a user profile, ProgramData, Temp, or a download
+    directory) rather than a signed management path is the abuse pattern. Decode every
+    argument and note the script path and the 6th-argument folder.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:powershell.encoded_command_decode
+  question: Was the spawned PowerShell script or its content encoded or obfuscated, and what
+    does it decode to?
+  context: AgentExecutor runs the target script with ExecutionPolicy Bypass, so the script
+    can contain encoded or obfuscated PowerShell. Base64 (-EncodedCommand / -enc), string
+    concatenation, backtick escaping, and variable substitution are common. Decoding reveals
+    the actual payload - download cradles, reverse shells, or in-memory loading of .NET
+    assemblies. Read the script file referenced by the positional argument as well as the
+    command line.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:powershell.script_block_logging
+  question: Did PowerShell script block logging capture the full content of the script
+    AgentExecutor ran?
+  context: Script block logging records the deobfuscated script content PowerShell actually
+    executed, even when the source script is encoded or obfuscated. This is ground truth
+    about what ran under the ExecutionPolicy Bypass invocation. If PowerShell operational
+    logs are not ingested in this environment, treat zero results as a visibility gap rather
+    than evidence nothing ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- source: template:powershell.powershell_security_bypass
+  question: Were PowerShell security controls bypassed or weakened on this host before this
+    execution?
+  context: AgentExecutor already runs scripts with ExecutionPolicy Bypass, so an operator
+    abusing it may also disable other controls beforehand. Common precursors include AMSI
+    bypass (patching amsi.dll in memory), Defender real-time monitoring changes, and
+    PowerShell downgrade to v2 to evade logging. Finding these precursor events strengthens
+    the case for malicious activity.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- source: template:cue_process_tool.process_chain
+  question: What process spawned AgentExecutor, and is that parent chain expected?
+  context: Legitimate AgentExecutor runs are launched by the Intune Management Extension
+    agent (Microsoft.Management.Services.IntuneWindowsAgent.exe) - and the rule explicitly
+    excludes that parent. Any other parent is the anomaly. An unusual parent such as
+    explorer.exe, a shell, a script host (wscript.exe, mshta.exe), or an Office application
+    points to interactive or scripted abuse rather than managed execution. Walk up the tree
+    to see what spawned the parent as well.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.follow_on
+  question: What child processes did AgentExecutor spawn afterward?
+  context: AgentExecutor's purpose when abused is to spawn powershell.exe (or an EXE named
+    powershell.exe from the 6th-argument folder). The child processes reveal the actual
+    impact - a real PowerShell host running the script, a planted EXE masquerading as
+    powershell.exe, or post-exploitation tools such as cmd.exe, certutil.exe, or rundll32.exe.
+    Identify the child binaries and their full paths and command lines.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: attack:T1218.network_retrieval
+  question: Did the spawned PowerShell or planted EXE make outbound network connections
+    shortly after this execution?
+  context: System binary proxy execution is frequently a stage that retrieves or exfiltrates
+    over the network - a download cradle pulling a second-stage payload, or a planted EXE
+    beaconing out. Connections to a host or port that the device does not normally contact,
+    or to a non-enterprise destination, are worth chasing. Exclude known-good enterprise
+    update and management endpoints when triaging the results.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'true'
+      condition: selection
+    fields:
+      - Image
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired this rule's pattern, what parents and users
+    normally drive it, and does the current alert fit?
+  context: Even a managed binary can be abused. This query mirrors the rule's selection
+    structure scoped to this host, so the parent/user distribution reflects how this
+    specific firing pattern (not generic AgentExecutor usage) has historically run here. A
+    new parent process, an unexpected user account, or an unusual command-line shape is the
+    anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \AgentExecutor.exe
+      - OriginalFileName: AgentExecutor.exe
+      selection_cli:
+        CommandLine|contains:
+        - ' -powershell'
+        - ' -remediationScript'
+      filter_main_pwsh:
+        CommandLine|contains:
+        - C:\Windows\System32\WindowsPowerShell\v1.0\
+        - C:\Windows\SysWOW64\WindowsPowerShell\v1.0\
+      filter_main_intune:
+        ParentImage|endswith: \Microsoft.Management.Services.IntuneWindowsAgent.exe
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_* and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired this rule's pattern in the past week, and does the
+    cross-host distribution look like consistent automation or one-off activity?
+  context: This query mirrors the rule's selection structure with no host scope, so the
+    result is a fleet-wide count of this firing pattern rather than generic usage of the
+    binary. Many hosts firing the same pattern points to a scripted deployment or vendor
+    automation that bypassed the Intune parent; one host or a small unrelated set points to
+    manual operator activity. Use the host distribution and parent consistency to calibrate
+    severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \AgentExecutor.exe
+      - OriginalFileName: AgentExecutor.exe
+      selection_cli:
+        CommandLine|contains:
+        - ' -powershell'
+        - ' -remediationScript'
+      filter_main_pwsh:
+        CommandLine|contains:
+        - C:\Windows\System32\WindowsPowerShell\v1.0\
+        - C:\Windows\SysWOW64\WindowsPowerShell\v1.0\
+      filter_main_intune:
+        ParentImage|endswith: \Microsoft.Management.Services.IntuneWindowsAgent.exe
+      condition: all of selection_* and not 1 of filter_main_*
+    fields:
+    - host.name
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run AgentExecutor or Intune device management tooling?
+  context: Compare this user's current action against their historical behavior. A user who
+    has never driven AgentExecutor is more suspicious than one who does so regularly. User
+    role and typical toolset should align - device management tooling under a non-admin or
+    non-IT account is the deviation worth chasing.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent and AgentExecutor combination historically routine on this host
+    or across the environment, or is the parent unusual for this binary?
+  context: When the alert fires under a service principal, user identity does not attribute
+    behavior - the meaningful pivot is the launch mechanism. A new or rare parent for
+    AgentExecutor on this host or environment-wide is the deviation worth chasing; a parent
+    that already accounts for thousands of prior events is vendor or OS automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or
+    activity spanning multiple endpoints. If the same user drove similar activity on
+    multiple hosts in this window, the scope of the activity may be larger than a single
+    alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent and AgentExecutor combination fire on other hosts in the
+    same window - a coordinated rollout, or activity isolated to this host?
+  context: Under a service principal, asking what else the user did across the network
+    returns agent-telemetry noise. The meaningful question is whether the same launch
+    mechanism - parent process plus spawned binary - fired on other hosts in the alert
+    window. Multiple hosts in the same window points to scheduled or pushed automation; a
+    single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining activity around the alert reveals
+    what led to this event, what happened after, and whether it is part of a larger sequence.
+    Look for reconnaissance, privilege escalation, persistence installation, or data
+    staging that provides broader context.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host - defense tampering, reconnaissance,
+    credential access - may reveal the attack stages that preceded this event and help
+    reconstruct the full timeline. The alert timeline often tells the story leading up to a
+    proxy-execution event.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1218
+      name: System Binary Proxy Execution
+      role: primary
+  attack_chain_coverage:
+    - stage: 1
+      label: proxy_invocation
+      description: "Microsoft-signed AgentExecutor.exe is invoked with -powershell/-remediationScript outside the Intune-managed path to proxy script/EXE execution"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: payload_decode
+      description: "AgentExecutor runs the target script (or planted powershell.exe EXE) with ExecutionPolicy Bypass; decode the script/arguments to identify the payload"
+      mapped_to: Q3
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 3
+      label: network_retrieval
+      description: "Proxy execution commonly retrieves or exfiltrates over the network (download cradle / beacon) after launch"
+      mapped_to: Q9
+      source: attack:T1218.network_retrieval
+  dimension_coverage:
+    - dimension: command_analysis
+      technique: T1218
+      covered_by: Q3
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1218
+      covered_by: Q7
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1218
+      covered_by: Q10
+      source: template:cue_process_tool.baseline_deviation
+      coverage_type: indirect
+  mutable_dispositions:
+    - element: CommandLineRegex
+      dimension: command_analysis
+      specific_values: "rationale only (regex for URLs / script paths / DLL entrypoints)"
+      disposition: context
+      target_question: Q3
+      notes: "No concrete values in brief; mechanism_decode directs analyst to decode the -powershell script path and 6th-argument folder, which is the command-analysis surface for this rule"
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "rationale only (profile unexpected parent-child)"
+      disposition: context
+      target_question: Q7
+      notes: "process_chain frames the Intune-agent parent as the legit baseline and any other parent as the anomaly; rule already excludes the Intune parent"
+    - element: SignedBinaryList
+      dimension: tuning_parameter
+      specific_values: "rationale only (allowlist of signed binaries)"
+      disposition: context
+      target_question: Q10
+      notes: "AgentExecutor is the signed proxy binary; baseline_deviation mirrors the rule's filter (legit pwsh v1.0 path + Intune parent) so the historical pattern reflects allowlisted vs. anomalous firings"
+    - element: RemoteDomainAllowlist
+      dimension: tuning_parameter
+      specific_values: "rationale only (suppress legit enterprise domains)"
+      disposition: context
+      target_question: Q9
+      notes: "network_retrieval question instructs the analyst to exclude known-good enterprise update/management endpoints when triaging outbound connections"
+  dedup_decisions:
+    - dropped: cue_process_tool.baseline
+      reason: "generic AgentExecutor frequency subsumed by the rule-pattern host baseline (cue_process_tool.baseline_deviation, more precise) and the per-user baseline (cue_user_actor.baseline)"
+      kept: cue_process_tool.baseline_deviation
+    - dropped: cue_process_tool.clustering
+      reason: "same-host same-window 'what else ran' overlaps cue_host_context.clustering; kept the host-context version"
+      kept: cue_host_context.clustering
+    - dropped: ""
+      reason: "user_actor pair - non-deduplicable"
+      kept: cue_user_actor.baseline + cue_user_actor.baseline_svc
+    - dropped: ""
+      reason: "user_actor pair - non-deduplicable"
+      kept: cue_user_actor.clustering + cue_user_actor.clustering_svc
+  skipped_templates:
+    - template: universal.endpoint_protection_health
+      reason: "RECOMMENDED-only generic tamper sweep; powershell.powershell_security_bypass (Q6) already surfaces AV/EDR/AMSI/ExecutionPolicy tamper precursors on this host in the -1h window, and cue_host_context.precursor (Q17) carries prior-alert tamper context. Redundant for this rule."
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "logsource 'image_load' (recommended by techniques: T1218) is not covered — pull in cue_image_load.* or author a custom question with `category: image_load`"
+      disposition: declined
+      reason: >-
+        The image_load analytic for T1218 targets DLL-style proxy execution
+        (rundll32/regsvr32/msiexec loading a payload module). This rule's proxy
+        path is process spawn, not module load: AgentExecutor launches a real
+        powershell.exe (or a planted EXE named powershell.exe) that is captured
+        as a child process_creation event, covered by the follow-on child-process
+        question (Q8). No DLL entrypoint is named in the rule or its command line,
+        so an image_load query would return host-wide module loads without
+        precision for this rule's behavior. No compensating attack:T1218.image_load
+        question authored.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - powershell
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 16
+      attack: 1
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 2
+      context: 13
+    logsource_diversity:
+      process_creation: 13
+      powershell: 1
+      network_connection: 1
+      sigma_alert: 1

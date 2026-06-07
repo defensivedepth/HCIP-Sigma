@@ -1,0 +1,423 @@
+name: Suspicious Greedy Compression Using Rar.EXE
+id: c2f36207-45fd-4ca5-8fc2-054f248b29f6
+description: |
+  Detects rar.exe (or a command-line RAR binary) building a password-protected, recursive archive from a system folder or a folder commonly used for staging, such as Recycle Bin, PerfLogs, Temp, Public, or the Windows directory. The rule fires when the archive-creation flags (-hp and -r together) and a staging-folder path are both present, AND either the binary is named rar.exe or the command line carries the archive-add syntax. Legitimate backup and packaging jobs can match, so the investigation should determine what data was selected, whether header encryption was applied to hide filenames, and whether this archiving fits the user, host, and parent process that produced it.
+type: detection
+detection_id: afe52666-401e-4a02-b4ff-5d128990b8cb
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line show a recursive, password-protected RAR archive built from a system or staging folder, and which branch identified the RAR binary?
+  context: Confirm the alert before investing time. The rule fires when the recursive and header-encryption flags appear together with a staging-folder path, AND the RAR binary was identified by either its rar.exe filename or the archive-add command syntax. Note which branch matched, because a binary identified only by command syntax (renamed or relocated rar) is more suspicious than one running as rar.exe.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - Description
+- source: template:universal.host_user_context
+  question: Is this user and host expected to create password-protected RAR archives from system or staging folders?
+  context: Backup operators, packaging pipelines, and IT staff legitimately compress data, but archiving from Recycle Bin, PerfLogs, Temp, Public, or the Windows directory with header encryption is rarely a routine workflow. Whether the user role and host function fit this operation is often the fastest path to a disposition.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What exactly did this RAR invocation do? Decode the full command line, including the source paths, switches, and archive name.
+  context: The full command line reveals which folders were swept, the archive output path, the compression level, and any password or header-encryption flags. Decode each switch to understand whether this is a targeted collection of specific data or a broad recursive sweep of a staging directory.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+        CommandLine|contains|all:
+        - ' -hp'
+        - ' -r '
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:data_staging_exfil.data_scope
+  question: What files or directories were selected for archiving?
+  context: 'The command-line arguments reveal what data was targeted: specific file types, sensitive directories such as finance or HR shares or source code, or broad wildcards indicating bulk collection. The scope of targeted data determines the severity of potential data loss and which business units need to be notified.'
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - TargetFilename
+- source: template:data_staging_exfil.encryption_password
+  question: What encryption or password flags were applied to the archive, and was header encryption used to hide filenames?
+  context: This rule already requires the -hp flag, which encrypts both archive contents and the filename headers so the names inside the archive cannot be inspected. Confirm whether -hp is present, whether a password was supplied inline or passed via stdin or a config file, and what compression level was set. Header encryption being deliberately applied to staged data is a stronger indicator of malicious collection than an unprotected archive.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:data_staging_exfil.archive_destination
+  question: Where was the archive written, and was it moved or copied after creation?
+  context: Data staging typically creates an archive locally, then moves it to a staging location or sends it out. Checking for the .rar output file and any subsequent move or copy on the same host reveals the staging or exfiltration path, whether the data went to cloud storage, removable media, or an external destination. Pair this with outbound network connections from the host in the same window.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: template:cue_process_tool.process_chain
+  question: What process spawned this RAR binary, and is that parent chain expected?
+  context: The parent process reveals how the archiving was invoked. User-driven compression often descends from explorer.exe or a shell the operator opened; scheduled backups descend from the task scheduler or a service. A parent such as a script host, an Office application, or a remote-access tool points to automated or operator-driven collection rather than a routine backup job.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.baseline
+  question: Does this host normally run a command-line RAR binary?
+  context: A RAR binary that has never run on a host is more suspicious than one that runs regularly as part of a backup or packaging workflow. Zero or very low historical counts over the baseline window indicate first-time or rare execution.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously matched this archiving pattern, what parents and users normally drove it, and does the current alert fit that pattern?
+  context: Even legitimate compression tools can be abused. The query mirrors the rule's selection structure scoped to this host, so the resulting parent and user distribution reflects how this specific firing pattern has historically run here, not generic RAR usage. A new parent process, an unexpected user account, or an unusual command-line shape is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_opt_1:
+      - Image|endswith: \rar.exe
+      - Description: Command line RAR
+      selection_opt_2:
+        CommandLine|contains:
+        - '.exe a '
+        - ' a -m'
+      selection_cli_flags:
+        CommandLine|contains|all:
+        - ' -hp'
+        - ' -r '
+      selection_cli_folders:
+        CommandLine|contains:
+        - ' ?:\\\*.'
+        - ' ?:\\\\\*.'
+        - ' ?:\$Recycle.bin\'
+        - ' ?:\PerfLogs\'
+        - ' ?:\Temp'
+        - ' ?:\Users\Public\'
+        - ' ?:\Windows\'
+        - ' %public%'
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (1 of selection_opt_* and all of selection_cli_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.follow_on
+  question: What child processes did this RAR binary spawn afterward?
+  context: The processes spawned by an archiving tool reveal its actual impact. A packaging job typically spawns nothing further; an operator workflow may follow archive creation with a transfer or upload utility, a shell, or a cleanup command. Secondary execution after collection is a chain stage worth confirming.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.clustering
+  question: What other tools ran on this host around the same time?
+  context: Collection rarely occurs in isolation. Activity surrounding the archiving may reveal reconnaissance, credential access, or transfer utilities that together form a staging-and-exfiltration sequence and provide broader context for the investigation.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run command-line RAR archiving?
+  context: Compare this user's current action against their historical behavior. A user who has never compressed data from the command line is more suspicious than one who does so regularly as part of their role. User role and typical toolset should align with command-line archiving.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent and RAR-binary combination historically routine on this host or across the environment, or is the parent unusual for this binary?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior. The meaningful pivot is the launch mechanism: which parent process spawned this RAR binary, and whether that pair is historically common. A new or rare parent for this binary is the deviation worth chasing; a pair that already accounts for thousands of prior events is backup or packaging automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or collection spread across multiple endpoints. If the same user triggered similar archiving on multiple hosts, the scope of potential data loss may be larger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent and RAR-binary combination fire on other hosts in the same window, indicating a coordinated rollout rather than isolated activity?
+  context: Under a service principal, asking what else the user did across the network returns agent-telemetry noise because every host runs system-owned agents constantly. The meaningful question is whether the same launch mechanism, parent process plus spawned binary, fired on other hosts in the alert window. Multiple hosts in the same window points to scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: 'Alerts rarely occur in isolation. Examining activity around the alert reveals the immediate context: what led to this event, what happened after, and whether it is part of a larger collection sequence. Look for reconnaissance, credential access, or transfer utilities running near the archiving.'
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host, such as reconnaissance, credential access, or defense tampering, may reveal the attack stages that preceded the archiving and help reconstruct the full timeline. Collection is often a late stage in a multi-step operation.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+  - id: T1059
+    name: Command and Scripting Interpreter
+    role: primary
+  attack_chain_coverage:
+  - stage: 1
+    label: interpreter_tool_execution
+    description: A command-line RAR binary is executed to compress data.
+    mapped_to: Q1
+    source: template:universal.verify_trigger_match
+  - stage: 2
+    label: obfuscated_arguments
+    description: Archive built recursively with header encryption from a staging folder; arguments decoded to understand the collection.
+    mapped_to: Q3
+    source: template:cue_process_tool.mechanism_decode
+  - stage: 3
+    label: secondary_execution
+    description: Secondary execution following the archiving, such as a transfer utility or shell spawned by the tool.
+    mapped_to: Q10
+    source: template:cue_process_tool.follow_on
+  dimension_coverage:
+  - dimension: command_analysis
+    technique: T1059
+    covered_by: Q3
+    source: template:cue_process_tool.mechanism_decode
+    coverage_type: direct
+  - dimension: parent_process_analysis
+    technique: T1059
+    covered_by: Q7
+    source: template:cue_process_tool.process_chain
+    coverage_type: direct
+  - dimension: time_correlation
+    technique: T1059
+    covered_by: Q11
+    source: template:cue_process_tool.clustering
+    coverage_type: direct
+  - dimension: tuning_parameter
+    technique: T1059
+    covered_by: Q5
+    source: template:data_staging_exfil.encryption_password
+    coverage_type: direct
+  - dimension: user_context
+    technique: T1059
+    covered_by: Q12
+    source: template:cue_user_actor.baseline
+    coverage_type: direct
+  mutable_dispositions:
+  - element: CommandLinePattern
+    dimension: command_analysis
+    specific_values: rationale only
+    disposition: context
+    target_question: Q3
+    notes: Mutable element is a tuning rationale with no concrete values; the rule's own -hp/-r flags drive the mechanism_decode CommandLine|contains constraint.
+  - element: ParentProcessName
+    dimension: parent_process_analysis
+    specific_values: rationale only
+    disposition: context
+    target_question: Q7
+    notes: No specific parent values supplied; parent chain examined in process_chain.
+  - element: TimeWindow
+    dimension: time_correlation
+    specific_values: rationale only
+    disposition: context
+    target_question: Q11
+    notes: Threshold/window is a tuning rationale, not a queryable value; temporal context covered by clustering and host_context.
+  dedup_decisions:
+  - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc
+    reason: user_actor pair — non-deduplicable; emit both (subject vs. launch-mechanism identity dimensions)
+    kept: both
+  - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc
+    reason: user_actor pair — non-deduplicable; emit both (user-network pivot degenerates under service principals)
+    kept: both
+  skipped_templates:
+  - template: universal.endpoint_protection_health
+    reason: >-
+      Rule fires on data collection/archiving (data_staging_exfil confirmed), not payload execution or credential
+      access where tamper-as-precursor is the live disposition question. cue_host_context.precursor (Q17) already
+      surfaces any prior tamper alert on the host via the sigma-alert sweep. Dropped to keep the playbook at the
+      18-question cap with the four always-include user_actor pivots and the must-include data-staging trio.
+  reflection_overrides: []
+  hint_dispositions:
+  - hint: >-
+      Condition uses OR among selection groups: (selection_opt_1 OR selection_opt_2). Q1 (verify_trigger_match) and
+      the playbook description must frame this as 'EITHER ... OR ...', not 'X AND Y AND Z'.
+    disposition: acted_on
+    reason: >-
+      Acted on. Q1 question and context use disjunctive framing for the binary-identification branch (rar.exe
+      filename OR archive-add command syntax) and instruct the analyst to note which branch matched; the playbook
+      description carries the same EITHER/OR framing. Not a declined hint — recorded here for the audit trail.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+  - universal
+  - data_staging_exfil
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 17
+      attack: 0
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 14
+    logsource_diversity:
+      process_creation: 14
+      file_event: 2
+      sigma_alert: 1

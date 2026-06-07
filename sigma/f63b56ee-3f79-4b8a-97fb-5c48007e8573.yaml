@@ -1,0 +1,561 @@
+name: New DNS ServerLevelPluginDll Installed Via Dnscmd.EXE
+id: 15145b28-ed62-4853-8d0f-96f7c2dc5cf0
+description: |
+  Detects dnscmd.exe run with both /config and /serverlevelplugindll, which writes a DLL path into the
+  ServerLevelPluginDll registry value (HKLM\SYSTEM\CurrentControlSet\services\DNS\Parameters). After a DNS
+  service restart, dns.exe loads that DLL in SYSTEM context, so on a domain controller this provides code
+  execution as SYSTEM and a privilege-escalation/persistence path for an account with write access to the DNS
+  server object. Legitimate writes to this value are rare administrator-driven plugin deployments; investigation
+  should confirm who ran the command, what DLL path was registered, whether that DLL was loaded by dns.exe, and
+  whether the change was authorized.
+type: detection
+detection_id: f63b56ee-3f79-4b8a-97fb-5c48007e8573
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-06
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the dnscmd command line contain both /config and /serverlevelplugindll, and what DLL path was supplied?
+  context: Confirm the alert is real by reviewing the exact command line against the detection criteria — the rule
+    fires only when dnscmd.exe runs with both /config and /serverlevelplugindll. The argument after
+    /serverlevelplugindll is the DLL path being registered; a UNC path (\\host\share\name.dll) or a path outside
+    System32 is the value that will be loaded by dns.exe after a service restart.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to register a DNS server plugin DLL via dnscmd?
+  context: Registering a ServerLevelPluginDll is a rare administrative action normally limited to DNS server
+    maintenance on a domain controller. Knowing whether the account holds delegated write access to the DNS
+    server object (for example DnsAdmins membership) and whether this host is a DNS server is often the fastest
+    way to separate an authorized plugin deployment from an escalation attempt.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:registry.registry_key_context
+  question: What DLL path was written to the ServerLevelPluginDll registry value, and is it a UNC or non-System32 location?
+  context: The dnscmd command populates HKLM\SYSTEM\CurrentControlSet\services\DNS\Parameters\ServerLevelPluginDll
+    (REG_SZ) with the supplied DLL path. The value data is what dns.exe will LoadLibrary after a service restart,
+    so it determines what runs as SYSTEM. A UNC path or a path under a user-writable directory is the actionable
+    detail; a missing or empty value means the write may not have taken effect.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+- source: template:parent_child.parent_process_legitimacy
+  question: What process spawned dnscmd.exe, and what started that parent?
+  context: dnscmd is normally launched by an interactive administrator shell (cmd.exe or powershell.exe under an
+    admin logon) or by a deployment tool. A parent such as a script host, an Office application, or a remote-execution
+    service handler points toward operator activity rather than routine DNS administration. Tracing the parent's own
+    origin shows whether the chain began with a legitimate logon or with a remote/automated trigger.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- source: template:parent_child.sibling_processes
+  question: What other child processes did the same parent spawn around this time?
+  context: If the parent that launched dnscmd also spawned other tooling, the broader objective becomes visible.
+    A parent that additionally ran service-control commands (sc stop/start dns, dnscmd /restart) or credential and
+    discovery tools alongside the plugin registration indicates an orchestrated escalation rather than an isolated
+    administrative command.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: attack:T1574.001.dll_drop
+  question: Was a plugin DLL written to disk or to a share on this host around the time of the registration?
+  context: The registered path must be reachable by the DNS server before the DLL can load. A DLL file created on
+    this host (or staged to a local share) near the registration is the payload itself; its hash and any
+    alternate-data-stream or zone marker help establish where it came from. Absence of a local write suggests the
+    DLL lives on a remote UNC share, which the image-load check then confirms.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: create_stream_hash
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith: .dll
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - Hash
+      - Contents
+- source: attack:T1574.001.dll_load
+  question: Did dns.exe load a non-Microsoft or UNC-path DLL after the registration?
+  context: The registry write alone does nothing until the DNS service restarts; the proof of execution is dns.exe
+    loading the registered DLL in SYSTEM context. A module loaded into dns.exe from a UNC path or that is unsigned
+    confirms the plugin took effect. The presence of side-effect loads (icmp.dll, oleaut32.dll) alongside an
+    unexpected module is the fingerprint of a configured server-level plugin.
+  range: +/-12h
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith: \dns.exe
+      filter_microsoft:
+        Signed: 'true'
+        SignatureStatus: Valid
+      condition: selection and not filter_microsoft
+    fields:
+      - ImageLoaded
+      - Signed
+      - SignatureStatus
+      - Hashes
+- source: template:registry.registry_related_modifications
+  question: Were other registry modifications made on this host in the same window?
+  context: An operator who registers a DNS plugin DLL often makes adjacent registry changes — service start-type
+    edits, security-setting changes, or additional persistence keys. Clusters of registry writes from the same host
+    and window reveal whether the plugin registration was a single action or part of a wider configuration change.
+  range: +/-30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_reg:
+        Image|endswith:
+          - '\reg.exe'
+          - '\regedit.exe'
+        CommandLine|contains:
+          - ' add '
+          - ' delete '
+          - ' import '
+          - '/s '
+      condition: selection and selection_reg
+    fields:
+      - CommandLine
+- source: template:registry.registry_value_persistence_check
+  question: Does the registered DLL exist on disk at the registered path, and what is its hash?
+  context: The persistence is only effective if the DLL referenced by ServerLevelPluginDll is present and exports
+    DnsPluginInitialize, DnsPluginQuery, and DnsPluginCleanup — dns.exe refuses to start otherwise. Confirming the
+    file exists at the registered path and capturing its hash determines whether the mechanism is armed and what
+    would run as SYSTEM on the next service restart.
+  range: +15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - Hashes
+- source: template:lolbin.renamed_binary_check
+  question: Was dnscmd.exe executed from its expected System32 path?
+  context: dnscmd.exe normally runs from C:\Windows\System32. Execution from a user-writable or temp directory
+    suggests the binary was copied or renamed to evade path-based allowlists, which would shift the assessment
+    toward deliberate operator activity rather than routine DNS administration.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- source: template:lolbin.technique_class_lateral
+  question: Were other persistence or service-tampering LOLBins used on this host recently?
+  context: Operators who register a DNS plugin DLL for persistence often pair it with other living-off-the-land
+    tooling — service control, scheduled tasks, or registry edits via signed system binaries. Finding sc.exe,
+    schtasks.exe, reg.exe, or similar binaries used for persistence or service manipulation in the same period
+    strengthens the case for intentional activity over a one-off administrative command.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_img:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+          - '\netsh.exe'
+          - '\wevtutil.exe'
+          - '\bcdedit.exe'
+          - '\vssadmin.exe'
+          - '\diskshadow.exe'
+      condition: selection and selection_img
+    fields:
+      - Image
+      - CommandLine
+- source: template:lolbin.historical_lolbin_baseline
+  question: How often has this host run the dnscmd plugin-registration pattern over the past 90 days, and what command shapes are typical?
+  context: A ServerLevelPluginDll registration with no prior history on this host is more suspicious than one seen
+    regularly under stable administration. The query mirrors the rule's selection scoped to this host, so the count
+    reflects the specific firing pattern rather than generic dnscmd usage; the command-line projection lets typical
+    invocation shapes be compared against the alerting one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \dnscmd.exe
+        CommandLine|contains|all:
+        - /config
+        - /serverlevelplugindll
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - CommandLine
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run dnscmd or perform DNS server administration?
+  context: Compare the account against its own history. A user who has never run dnscmd or managed DNS — particularly
+    one whose role does not include DNS administration — registering a plugin DLL is the deviation worth chasing.
+    Pair the count with the account's role and its membership in groups delegated write access to the DNS server object.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent-plus-dnscmd launch combination historically routine on this host or across the environment?
+  context: When the alert fires under a service principal rather than a named user, identity does not attribute the
+    action and the launch mechanism becomes the meaningful pivot. A parent process that has spawned dnscmd many
+    times before reflects established automation; a new or rare parent for dnscmd is the deviation to investigate.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: After identifying the account, check its activity across all hosts in the surrounding window. The same
+    user touching multiple DNS servers or domain controllers, or running discovery and credential tooling
+    elsewhere, indicates the scope reaches beyond this single host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did the same parent-plus-dnscmd combination fire on other hosts in the same window?
+  context: Under a service principal, a user-wide network sweep returns agent-telemetry noise, so the meaningful
+    question is whether the same launch mechanism appeared on other hosts in the alert window. The same parent
+    spawning dnscmd across several DNS servers points to a pushed or scheduled rollout; a single host points to a
+    host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: A privilege-escalation foothold on a DNS server or domain controller is rarely the first step. Earlier
+    detections on the same host — credential access, discovery, or defense tampering — may reveal how the operator
+    gained the position to register the plugin and help reconstruct the timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously run the dnscmd plugin-registration pattern, what parents and users drove it, and does the current alert fit?
+  context: The query mirrors the rule's selection scoped to this host, so the resulting parent and user distribution
+    reflects how this specific firing pattern has historically run here rather than generic dnscmd usage. A new
+    parent process or an unexpected account is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \dnscmd.exe
+        CommandLine|contains|all:
+        - /config
+        - /serverlevelplugindll
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1574.001
+      name: Hijack Execution Flow - DLL
+      role: primary
+    - id: T1112
+      name: Modify Registry
+      role: secondary
+    - id: T1574
+      name: Hijack Execution Flow
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: registry_value_write
+      description: dnscmd /config /serverlevelplugindll writes the DLL path into the ServerLevelPluginDll registry value
+      mapped_to: Q3
+      source: template:registry.registry_key_context
+    - stage: 2
+      label: dll_staged_to_disk
+      description: The plugin DLL is created on disk or staged to a share so it is reachable by the DNS server
+      mapped_to: Q6
+      source: attack:T1574.001.dll_drop
+    - stage: 3
+      label: dll_loaded_by_dns_service
+      description: After a DNS service restart, dns.exe loads the registered DLL in SYSTEM context
+      mapped_to: Q7
+      source: attack:T1574.001.dll_load
+  dimension_coverage:
+    - dimension: time_correlation
+      technique: T1574.001
+      covered_by: Q8
+      source: template:registry.registry_related_modifications
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1574.001
+      covered_by: Q3
+      source: template:registry.registry_key_context
+      coverage_type: direct
+    - dimension: file_path_analysis
+      technique: T1574
+      covered_by: Q6
+      source: attack:T1574.001.dll_drop
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1112
+      covered_by: Q4
+      source: template:parent_child.parent_process_legitimacy
+      coverage_type: direct
+  mutable_dispositions:
+    - element: RegistryKeyPathPatterns
+      dimension: tuning_parameter
+      specific_values: HKLM\SYSTEM\CurrentControlSet\services\DNS\Parameters\ServerLevelPluginDll
+      disposition: query_injection
+      target_question: Q3
+      notes: Injected the exact registry value path into registry_key_context TargetObject|endswith selection.
+    - element: AllowedDllPaths
+      dimension: tuning_parameter
+      specific_values: 'C:\Windows\System32 (legitimate); UNC and non-System32 paths flagged'
+      disposition: new_question
+      target_question: Q7
+      notes: dll_load question filters out Microsoft-signed/valid modules so non-System32 / UNC / unsigned loads into dns.exe surface.
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: rationale only (correlation interval between registry write, file create, and module load)
+      disposition: context
+      target_question: Q8
+      notes: Realized as adjacent-window queries — registry_related_modifications (+/-30m), dll_drop (+/-4h), dll_load (+/-12h).
+    - element: HashBaseline
+      dimension: tuning_parameter
+      specific_values: rationale only (baseline hashes for legitimate DLLs)
+      disposition: context
+      target_question: Q6
+      notes: dll_drop and registry_value_persistence_check project Hash/Hashes so the registered DLL can be reputation-checked.
+    - element: ProcessAllowList
+      dimension: tuning_parameter
+      specific_values: rationale only (apps expected to load DLLs from non-standard locations)
+      disposition: context
+      target_question: Q7
+      notes: dns.exe is the only loader of interest here; no generic process allowlist needed.
+    - element: ServiceBaseline
+      dimension: tuning_parameter
+      specific_values: rationale only (expected registry keys and service paths)
+      disposition: context
+      target_question: Q14
+      notes: Covered by historical baseline of the rule's pattern on this host.
+    - element: ParentProcessAllowList
+      dimension: parent_process_analysis
+      specific_values: 'rationale only (legitimate registry tools e.g. regedit.exe, msiexec.exe)'
+      disposition: context
+      target_question: Q4
+      notes: parent_process_legitimacy examines the dnscmd parent; legitimate vs operator parent is the analyst judgment.
+    - element: SignatureCheck
+      dimension: tuning_parameter
+      specific_values: flag unsigned executables / abnormal lineage
+      disposition: query_injection
+      target_question: Q7
+      notes: dll_load filters Signed=true/SignatureStatus=Valid to surface unsigned module loads into dns.exe.
+  dedup_decisions:
+    - dropped: cue_process_tool.process_chain
+      reason: parent_child technique set active — parent_process_legitimacy is more specific for "who spawned dnscmd"
+      kept: parent_child.parent_process_legitimacy
+    - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc
+      reason: user_actor pair — non-deduplicable
+      kept: both
+    - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc
+      reason: user_actor pair — non-deduplicable
+      kept: both
+  skipped_templates:
+    - template: cue_process_tool.mechanism_decode
+      reason: 'replaced_by: registry.registry_key_context — Phase 2 analysis is the registry value write, not CLI decode'
+    - template: cue_process_tool.scope
+      reason: REFLECTED fleet-pattern overlaps cue_process_tool.baseline_deviation (host-scoped, kept); dropped to stay at the 18-question cap, host-scoped deviation is more actionable for triage
+    - template: cue_process_tool.baseline
+      reason: generic dnscmd frequency superseded by historical_lolbin_baseline and baseline_deviation which count the rule's specific pattern
+    - template: cue_process_tool.follow_on
+      reason: child processes of dnscmd are not the payload path — execution flows through dns.exe DLL load (Q7), not dnscmd children
+    - template: cue_process_tool.clustering
+      reason: host-around-time context covered by lolbin.technique_class_lateral and registry_related_modifications
+    - template: cue_host_context.clustering
+      reason: redundant with technique_class_lateral and registry_related_modifications on this host
+    - template: universal.endpoint_protection_health
+      reason: rule is privilege-escalation/persistence, not execution/credential-centric; precursor question already surfaces prior tamper alerts on the host
+    - template: persistence_scope.process_based_persistence
+      reason: persistence here is the DLL-load mechanism, covered by dll_load/dll_drop and technique_class_lateral; generic schtasks/sc sweep adds little for a DNS-plugin rule
+    - template: persistence_scope.file_based_persistence
+      reason: Startup-folder/Run-key drops are not this technique's persistence path; the plugin DLL drop is covered by dll_drop (Q6)
+    - template: organizational_context.change_ticket
+      reason: dropped at 18-question cap; host_user_context already establishes whether the action was expected/authorized
+    - template: organizational_context.human_recall
+      reason: dropped at 18-question cap; authorization judgment carried by host_user_context
+    - template: organizational_context.timing_alignment
+      reason: dropped at 18-question cap
+    - template: organizational_context.procedural_consistency
+      reason: dropped at 18-question cap
+  reflection_overrides: []
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - registry
+    - parent_child
+    - lolbin
+    - cue_user_actor
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 16
+      attack: 2
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 15
+    logsource_diversity:
+      process_creation: 13
+      registry_set: 1
+      create_stream_hash: 1
+      image_load: 1
+      file_event: 1
+      sigma_alert: 1

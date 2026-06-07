@@ -1,0 +1,454 @@
+name: Sysprep on AppData Folder
+id: e0aa70ca-08e3-4bd4-b093-cec36fc5acc0
+description: |
+  Detects sysprep.exe running with a path under a user AppData folder in its command line. Sysprep is a legitimate Windows system-preparation utility that normally operates on OS images and system directories, so an AppData path argument is anomalous and has been observed where a binary placed in a user profile is launched or referenced through sysprep to blend with a trusted system process. Investigation should confirm the exact command line, identify what spawned sysprep and what it spawned in turn, and determine whether the user, host, and parent chain are consistent with legitimate imaging or deployment activity.
+type: detection
+detection_id: d5b9ae7a-e6fc-405e-80ff-2ff9dcc64e7e
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: '2026-06-06'
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the alerting event show sysprep.exe running with an AppData path in its command line?
+  context: Before investing investigation time, confirm the alert is a true positive by reviewing the exact command line and process image against the rule's criteria, which require the process image to end in sysprep.exe and the command line to contain an AppData path. Note the full AppData path and any referenced file so it can be carried into the decode and child-process questions.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run sysprep with a user-profile path?
+  context: Legitimate sysprep activity is tied to system imaging, deployment, and OS preparation and normally runs on build or reference machines under an administrator or deployment service account against system directories, not user AppData. A user or host with no imaging or deployment role running sysprep against an AppData path is the deviation worth chasing.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What exactly did sysprep do? Decode the full command line and resolve the AppData path it references.
+  context: The full command line reveals the specific action taken. Resolve the AppData path, identify any file it points at, and decode any flags or parameters. Because sysprep operating on a user-profile path is itself the anomaly, the referenced file and the directory it sits in are the key artifacts to pivot on next.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:cue_process_tool.process_chain
+  question: What process spawned sysprep and is that parent chain expected?
+  context: The parent process reveals how sysprep was invoked. Legitimate imaging runs sysprep from deployment tooling or an interactive administrative shell. Parents such as Office applications, mshta.exe, wscript.exe, or a process running from a user-writable directory point toward macro-driven or staged execution rather than genuine OS preparation.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.follow_on
+  question: What child processes did sysprep spawn afterward?
+  context: The processes spawned after sysprep reveal its actual impact. Legitimate sysprep has a predictable, narrow set of children tied to system preparation; spawning command interpreters, script hosts, or a binary out of the referenced AppData directory points toward sysprep being used as a launch wrapper for other code.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in the hour before the alert?
+  context: Tampering typically precedes payload execution. The query surfaces direct attempts to disable protection services, flip protection flags, add broad exclusions, clear logs, or patch in-memory inspection. Zero rows is a useful signal that protection looks healthy; kernel-level driver tampering and in-memory patches will not appear here. Populated rows shift the disposition toward operator preparation, so review the parent process and signing chain to identify the writer.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+- source: template:cue_process_tool.baseline
+  question: Does this host normally run sysprep?
+  context: A process that has never been seen on a host is more suspicious than one that runs regularly. Sysprep is normally absent from day-to-day endpoints and concentrated on build or reference machines; zero or very low historical counts on this host indicate first-time or rare execution that fits the abuse pattern.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired the rule's pattern, what parents and users normally drive that activity, and does the current alert fit?
+  context: Even legitimate tools can be abused. The query mirrors the rule's selection structure scoped to this host, so the resulting parent and user distribution reflects how the rule's specific firing pattern (sysprep with an AppData path) has historically run here. A new parent process, an unexpected user account, or an unusual command-line shape is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \sysprep.exe
+        CommandLine|contains: \AppData\
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run sysprep?
+  context: Compare this user's current action against their historical behavior. A user who has never run sysprep is more suspicious than one who does so regularly, and the result should align with their role. An imaging or deployment engineer running sysprep is routine; a standard user or an account with no build responsibilities is the deviation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent and sysprep combination historically routine on this host or across the environment, or is the parent unusual for sysprep?
+  context: When the alert fires under a service principal, user identity does not attribute behavior, so the meaningful pivot is the launch mechanism, which is the parent process that spawned sysprep and whether that pair is historically common. A new or rare parent for sysprep on this host or environment-wide is the deviation worth chasing; a pair that already accounts for many prior events is deployment or OS automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints. If the same user triggered similar activity on several hosts, the scope of the activity may be larger than a single endpoint.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent and sysprep combination fire on other hosts in the same window, indicating a coordinated rollout rather than isolated activity?
+  context: Under a service principal, asking what else the user did across the network returns agent-telemetry noise because every host runs system-owned agents constantly. The meaningful question is whether the same launch mechanism, the parent process plus sysprep, fired on other hosts in the alert window. Multiple hosts in the same window points to scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: 'Alerts rarely occur in isolation. Examining activity around the alert reveals the immediate context, including what led to this event, what happened after, and whether it is part of a larger sequence. Look for reconnaissance, privilege escalation, or persistence mechanisms in the surrounding process activity.'
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired the rule's pattern in the past week, and does the cross-host distribution look like consistent automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of the rule's firing pattern rather than generic sysprep usage. Many hosts firing the same pattern points to scripted deployment or imaging automation; one host or a small unrelated set points to manual operator activity. Use the host distribution and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \sysprep.exe
+        CommandLine|contains: \AppData\
+      condition: selection
+    fields:
+    - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host, such as defense tampering, reconnaissance, or credential access, may reveal the attack stages that preceded this event and help reconstruct the full timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1059
+      name: Command and Scripting Interpreter
+      role: primary
+  attack_chain_coverage:
+    - stage: 1
+      label: interpreter_execution
+      description: "Scripting/command interpreter (here sysprep.exe used as the execution vehicle) starts with anomalous arguments — an AppData path"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: argument_decode
+      description: "Encoded/obfuscated or anomalous arguments are decoded to determine the operational purpose"
+      mapped_to: Q3
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 3
+      label: secondary_execution
+      description: "Secondary execution events follow the interpreter — child processes spawned afterward"
+      mapped_to: Q5
+      source: template:cue_process_tool.follow_on
+  dimension_coverage:
+    - dimension: command_analysis
+      technique: T1059
+      covered_by: Q3
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1059
+      covered_by: Q4
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1059
+      covered_by: Q13
+      source: template:cue_host_context.clustering
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1059
+      covered_by: Q1
+      source: template:universal.verify_trigger_match
+      coverage_type: indirect
+    - dimension: user_context
+      technique: T1059
+      covered_by: Q2
+      source: template:universal.host_user_context
+      coverage_type: direct
+  mutable_dispositions:
+    - element: CommandLinePattern
+      dimension: command_analysis
+      specific_values: "rationale only (tunable encoded/uncommon script patterns)"
+      disposition: context
+      target_question: Q3
+      notes: "No concrete values in the analytic; the rule's own \\AppData\\ command-line pattern is the queryable constraint and is carried by the verify_trigger_match and reflected baseline_deviation/scope queries. mechanism_decode context directs the analyst to resolve the AppData path and any referenced file."
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "rationale only (varies across managed/unmanaged workstations)"
+      disposition: context
+      target_question: Q4
+      notes: "No concrete values; parent-chain analysis covered by process_chain (Q4) and parent-pivot baseline/clustering (Q10, Q12)."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only (restrict to work hours / admin maintenance windows)"
+      disposition: context
+      target_question: Q13
+      notes: "Threshold-style rationale, not directly queryable. Host clustering (+/-15m) and precursor (-6h) surface the surrounding-time context."
+  dedup_decisions:
+    - dropped: cue_process_tool.clustering
+      reason: "near-identical to cue_host_context.clustering — both host-scoped +/-15m process_creation aggregations of surrounding activity; host_context version aggregates Image+ParentImage (richer) and supersedes the Image-only cue_process_tool version"
+      kept: cue_host_context.clustering
+    - dropped: none
+      reason: "user_actor pair — non-deduplicable: cue_user_actor.baseline + cue_user_actor.baseline_svc both emitted (Q9, Q10); subject vs. launch-mechanism pivots"
+      kept: cue_user_actor.baseline + cue_user_actor.baseline_svc
+    - dropped: none
+      reason: "user_actor pair — non-deduplicable: cue_user_actor.clustering + cue_user_actor.clustering_svc both emitted (Q11, Q12); subject vs. launch-mechanism pivots"
+      kept: cue_user_actor.clustering + cue_user_actor.clustering_svc
+  skipped_templates: []
+  reflection_overrides: []
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+  generation_stats:
+    total_questions: 15
+    source_counts:
+      template: 15
+      attack: 0
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 12
+    logsource_diversity:
+      process_creation: 14
+      sigma_alert: 1

@@ -1,0 +1,507 @@
+name: File Decoded From Base64/Hex Via Certutil.EXE
+id: 60439e62-38f4-4f17-a766-4b846b29a918
+description: |
+  Detects certutil.exe running with the -decode or -decodehex flag, which decodes a base64 or hex encoded file back into its
+  original form. The rule fires when the process is certutil.exe (by Image name or OriginalFileName) AND the command line contains
+  -decode or -decodehex. certutil is a Microsoft-signed system binary, so attackers use these flags as a living-off-the-land
+  primitive to turn a benign-looking encoded file on disk into an executable payload before running it, often after the encoded
+  file was wrapped in PEM-style certificate headers. Legitimate certificate and PKI workflows rarely use the decode verbs, so
+  the investigation should establish what file was decoded, where its output landed, and whether anything executed it afterward.
+type: detection
+detection_id: cc9cbe82-7bc0-4ef5-bc23-bbfb83947be7
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: '2026-06-06'
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the certutil command line contain -decode or -decodehex, and is the process certutil.exe?
+  context: Confirm the alert is a true positive by reviewing the exact command line and process identity. The rule requires both
+    that the process is certutil.exe (by Image name or OriginalFileName) and that the command line carries -decode or -decodehex.
+    Read the source file and the output file named in the command — they identify what was decoded and where the decoded result
+    was written.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to decode files with certutil?
+  context: Legitimate administrative and PKI activity rarely invokes certutil's decode verbs. Knowing whether the user role and
+    host function are consistent with command-line file decoding is often the fastest way to separate a true positive from a
+    routine operation.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:obfuscation.encoded_payload_decode
+  question: What is the encoded source file, what is the decoded output path, and what does the decoded content turn out to be?
+  context: The decode verb's two file arguments are the operative detail — the first is the encoded input, the second is the
+    decoded output. Attackers wrap an executable in PEM-style -----BEGIN CERTIFICATE----- headers so certutil decodes it back
+    to a runnable PE while resembling a benign certificate operation. Retrieve the output file and inspect it to determine whether
+    it is an executable, a script, or data, and what operation it would perform.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:universal.evidence_preservation
+  question: Is the decoded output file still on disk for analysis?
+  context: The second argument to -decode/-decodehex is the decoded output path. Checking whether that file still exists on disk
+    enables hash lookups, sandbox submission, or content review. Attackers frequently delete the encoded input and the decoded
+    output after execution, so absence is itself informative.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: template:lolbin.renamed_binary_check
+  question: Was certutil.exe executed from its expected System32 or SysWOW64 path?
+  context: certutil normally runs from C:\Windows\System32\certutil.exe or C:\Windows\SysWOW64\certutil.exe. A copy running from
+    a user temp, Downloads, or ProgramData directory may have been relocated or renamed to evade path-based allowlists, which
+    raises the suspicion of the decode operation.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- source: template:cue_process_tool.process_chain
+  question: What process spawned certutil and is that parent chain expected?
+  context: The parent process reveals how certutil was invoked. Decode operations driven by explorer.exe or an interactive shell
+    differ from those spawned by mshta.exe, wscript.exe, Office applications, or a script host, which point to macro or script-driven
+    execution. The launching parent helps distinguish routine usage from operator tooling on this host.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.follow_on
+  question: What child processes did certutil spawn afterward, and did the decoded output execute?
+  context: A decode operation that is immediately followed by execution of the decoded file is the core abuse pattern. Child
+    processes such as cmd.exe, powershell.exe, or a freshly written executable in a user-writable directory indicate the decoded
+    payload ran. Legitimate decode usage typically has no execution follow-on.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:download_tool.directory_activity
+  question: What other file activity occurred in the directory where the decoded output landed?
+  context: Attackers often stage several files in the same directory, or the decoded file triggers further writes such as extraction,
+    configuration drops, or additional decoded artifacts. Examining directory-level file activity reveals the broader scope of
+    the staging operation around the decode.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains|expand: '%file_dirs%'
+      filter_self:
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection and not filter_self
+    fields:
+      - TargetFilename
+      - Image
+- source: template:download_tool.payload_analysis
+  question: Can you retrieve and analyze the decoded output file from a safe environment?
+  context: If the decoded file is still on disk, submitting its hash to threat intelligence services or detonating it in a sandbox
+    reveals whether it is a known malicious payload, a legitimate tool, or something novel needing deeper analysis. The decode
+    output named in the certutil command line is the file to retrieve.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Hashes
+- source: template:cue_process_tool.baseline
+  question: Does this host normally run certutil at all?
+  context: A binary that has rarely or never run on a host is more suspicious than one that runs regularly. Zero or very low
+    historical counts over 90 days indicate first-time or rare certutil use on this host, regardless of which verb was passed.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously decoded files with certutil, what parents and users normally drove it, and does this
+    alert fit that pattern?
+  context: Even common tools can be abused. This query mirrors the rule's selection — certutil with -decode or -decodehex — scoped
+    to this host, so the resulting parent and user distribution reflects how this specific decode pattern has historically run
+    here, not generic certutil usage. A new parent process, an unexpected user, or an unusual command-line shape is the deviation
+    worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \certutil.exe
+      - OriginalFileName: CertUtil.exe
+      selection_cli:
+        CommandLine|contains|windash:
+        - '-decode '
+        - '-decodehex '
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_user_actor.baseline
+  question: Does this user normally decode files with certutil?
+  context: Compare this user's current action against their historical behavior. A user who has never run certutil is more suspicious
+    than one who does so regularly, and the user's role and typical toolset should align with command-line file decoding. This
+    pivot is meaningful only when the alert fires under a named user account.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent-and-certutil launch combination historically routine on this host or across the environment?
+  context: When the alert fires under a service principal such as SYSTEM, LOCAL SERVICE, NETWORK SERVICE, or a computer account,
+    user identity does not attribute the behavior. The meaningful pivot is the launch mechanism — which parent process spawned
+    certutil, and whether that pair is historically common. A new or rare parent for certutil is the deviation worth chasing;
+    a pair already responsible for thousands of prior events is vendor or OS automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints. If
+    the same user triggered similar activity on several hosts, the scope of compromise may be larger. This pivot is meaningful
+    only when the alert fires under a named user account.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent-and-certutil combination fire on other hosts in the same window, or is the activity isolated
+    to this host?
+  context: Under a service principal, asking what else the user did across the network returns agent-telemetry noise because
+    every host runs SYSTEM-owned agents constantly. The meaningful question is whether the same launch mechanism — parent process
+    plus spawned certutil — fired on other hosts in the alert window. Multiple hosts in the same window points to scheduled or
+    pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:lolbin.technique_class_lateral
+  question: Were any other encode/decode or download LOLBins used on this host recently?
+  context: Attackers who use one living-off-the-land binary often use several. If certutil decoded a payload, check whether expand,
+    extrac32, makecab, bitsadmin, curl, or other transfer and extraction binaries were also used to stage or move files. Multiple
+    such binaries performing related actions strengthens the case for hands-on activity.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_img:
+        Image|endswith:
+          - '\bitsadmin.exe'
+          - '\curl.exe'
+          - '\esentutl.exe'
+          - '\expand.exe'
+          - '\extrac32.exe'
+          - '\makecab.exe'
+          - '\replace.exe'
+          - '\hh.exe'
+      condition: selection and selection_img
+    fields:
+      - Image
+      - CommandLine
+- source: template:lolbin.historical_lolbin_baseline
+  question: How often has this host decoded files with certutil over the past 90 days, and what command-line shapes are typical?
+  context: A decode pattern with no prior history on a host is more suspicious than one used regularly under stable parents. This
+    query mirrors the rule's selection — certutil with -decode or -decodehex — scoped to this host, so the count reflects this
+    specific decode pattern rather than generic certutil usage. The command-line projection lets you compare typical invocation
+    shapes against the alerting one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \certutil.exe
+      - OriginalFileName: CertUtil.exe
+      selection_cli:
+        CommandLine|contains|windash:
+        - '-decode '
+        - '-decodehex '
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - CommandLine
+- source: attack:T1027.time_correlation
+  question: In the minutes around the decode, what scripts or suspicious parents created encoded or archive files on this host?
+  context: Obfuscation detection correlates script or suspicious-parent execution with creation of encoded, compressed, or encrypted
+    files such as .b64, .hex, .zip, .7z, or .enc. A tight window between an encoded file appearing and certutil decoding it points
+    to a stage-then-decode sequence; widen or narrow the window to the cadence of this host's activity. File creations clustered
+    around the alert that feed into or follow from the decode are the time-correlated artifacts to reconstruct.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains:
+          - '.b64'
+          - '.hex'
+          - '.zip'
+          - '.7z'
+          - '.enc'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1027
+      name: Obfuscated Files or Information
+      role: primary
+  attack_chain_coverage:
+    - stage: 1
+      label: encoded_file_staged
+      description: An encoded, compressed, or encrypted file is written to disk by a script or suspicious parent
+      mapped_to: Q18
+      source: attack:T1027.time_correlation
+    - stage: 2
+      label: decode_execution
+      description: certutil -decode / -decodehex converts the encoded file back to its original form
+      mapped_to: Q3
+      source: template:obfuscation.encoded_payload_decode
+    - stage: 3
+      label: decoded_payload_run
+      description: The decoded output is executed or further staged
+      mapped_to: Q7
+      source: template:cue_process_tool.follow_on
+  dimension_coverage:
+    - dimension: obfuscation_check
+      technique: T1027
+      covered_by: Q3
+      source: template:obfuscation.encoded_payload_decode
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1027
+      covered_by: Q18
+      source: attack:T1027.time_correlation
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1027
+      covered_by: Q6
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1027
+      covered_by: Q12
+      source: template:cue_user_actor.baseline
+      coverage_type: direct
+  mutable_dispositions:
+    - element: PayloadEntropyThreshold
+      dimension: obfuscation_check
+      specific_values: rationale only
+      disposition: context
+      target_question: Q3
+      notes: No numeric threshold supplied by the brief; entropy is not directly queryable from process_creation. The decode-output
+        inspection in Q3 substitutes content review for entropy scoring.
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: rationale only
+      disposition: context
+      target_question: Q18
+      notes: No fixed window value supplied; Q18 uses a +/-15m correlation window and its context tells the analyst to widen or
+        narrow it to the host's cadence.
+    - element: SuspiciousParentProcessList
+      dimension: tuning_parameter
+      specific_values: rationale only
+      disposition: context
+      target_question: Q6
+      notes: No concrete parent list supplied (environment-specific by design). Q6 surfaces the actual parent and Q11/Q13 baseline
+        whether that parent is routine, which is the analyst-side equivalent of tuning the suspicious-parent list.
+  dedup_decisions:
+    - dropped: cue_process_tool.mechanism_decode
+      reason: Phase 2 analysis is provided by the more decode-specific obfuscation.encoded_payload_decode; the cue host+binary
+        decode question would near-duplicate it. Kept the technique-set version per within-phase specificity rule.
+      kept: obfuscation.encoded_payload_decode
+    - dropped: download_tool.download_success_verification
+      reason: Query is identical (file_event TargetFilename|endswith %file_paths% on host) to universal.evidence_preservation,
+        which already confirms the decoded output landed on disk. Rule decodes rather than downloads, so the success-verification
+        framing adds no distinct angle.
+      kept: universal.evidence_preservation
+    - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc pair
+      reason: user_actor pair — non-deduplicable
+      kept: both (Q12 user-pivot, Q13 service_principal_substitute)
+    - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc pair
+      reason: user_actor pair — non-deduplicable
+      kept: both (Q14 user-pivot, Q15 service_principal_substitute)
+  skipped_templates:
+    - template: cue_process_tool.clustering
+      reason: cue_host_context.clustering and the same-time-window correlation in Q18 already cover host-local concurrent activity;
+        dropped to stay within the 18-question cap.
+    - template: cue_process_tool.scope
+      reason: lolbin.historical_lolbin_baseline (Q17, REFLECTED) already counts the rule's decode pattern over the host, and
+        lolbin.technique_class_lateral covers cross-binary fleet behavior; the REFLECTED fleet-scope scope question would add
+        a third near-overlapping count under the cap.
+    - template: cue_host_context.clustering
+      reason: Concurrent host activity is covered by Q18 (file creations around the decode) and Q15 (cross-host launch correlation);
+        dropped to stay within the 18-question cap.
+    - template: cue_host_context.precursor
+      reason: Prior-alert timeline is lower-value than the decode-execution chain for this rule; dropped under the 18-question
+        cap in favor of the follow-on and time-correlation questions that carry the decode-specific signal.
+    - template: universal.endpoint_protection_health
+      reason: Recommended (not must_include). This decode rule fires on an obfuscation precursor, not on payload execution or
+        credential access; defense_tampering is not a confirmed set and no tamper-as-precursor question is otherwise present.
+        Dropped under the 18-question cap to keep the decode-chain coverage intact.
+  reflection_overrides: []
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - obfuscation
+    - download_tool
+    - lolbin
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 17
+      attack: 1
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 15
+    logsource_diversity:
+      process_creation: 13
+      file_event: 5

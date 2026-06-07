@@ -1,0 +1,634 @@
+name: HackTool - CoercedPotato Execution
+id: 3493cbf8-3478-4971-b286-75ff6b849efc
+description: |
+  Detects execution of CoercedPotato, a local privilege-escalation tool that abuses SeImpersonatePrivilege or
+  SeAssignPrimaryToken to elevate a service account to SYSTEM. The rule fires when any one of three signals is present:
+  the child Image ends in CoercedPotato.exe, the command line carries the --exploitId argument, or the binary's import
+  hash matches a known build. The tool stands up a local named pipe, coerces an RPC interface (MS-RPRN PrinterBug or
+  MS-EFSR PetitPotam) so a SYSTEM-owned process connects to that pipe, impersonates the connecting token, and spawns a
+  chosen binary as SYSTEM. Determine which signal fired, decode the requested command and exploit interface, and confirm
+  whether a SYSTEM-context process was launched as a result.
+type: detection
+detection_id: e8d34729-86a4-4140-adfd-0a29c2106307
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-06
+questions:
+- source: template:universal.verify_trigger_match
+  question: Did this alert fire on the CoercedPotato image name, the --exploitId argument, or a known import hash?
+  context: >-
+    The rule fires when at least one of three independent signals matches — the Image ends in CoercedPotato.exe, the
+    command line contains the --exploitId argument, or the file's import hash matches a known build. Confirm which branch
+    fired, because it shapes the rest of the investigation. An import-hash-only match means the file was renamed away from
+    CoercedPotato.exe, so the binary name in the alert is not the tool's original name; an --exploitId-only match means a
+    differently named loader passed the tool's argument. Record the matching Image, CommandLine, and Hashes before
+    continuing.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - Hashes
+- source: template:hacking_tool.authorized_engagement
+  question: Is this CoercedPotato execution part of an authorized penetration test or red team engagement?
+  context: >-
+    Privilege-escalation tools are used in sanctioned security assessments. Check whether a pentest or red team exercise
+    is active on this host or network segment, and whether the operator, timing, and target account match the engagement
+    scope. An authorized engagement with matching activity resolves the alert without further analysis.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is the account that ran this binary expected to perform privilege escalation on this host?
+  context: >-
+    CoercedPotato is designed to run from a service account that holds SeImpersonatePrivilege — typically LOCAL SERVICE,
+    NETWORK SERVICE, an IIS application pool identity, or a database service account. A SYSTEM-bound escalation tool
+    launched by one of those principals on a server role is consistent with the technique; the same tool run by an
+    interactive user account is unusual and worth scrutiny. Note the host's function and the launching account.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What command and exploit options did this tool run with? Decode the -c, -i, and --exploitId arguments.
+  context: >-
+    The command line carries the operation. The -c (or --command) value is the binary the tool will launch as SYSTEM
+    (commonly cmd.exe or powershell.exe). The -i (interface) and --exploitId values select which RPC coercion path is
+    used — ms-rprn (PrinterBug) or ms-efsr (PetitPotam) and a specific RPC function index. The query returns CoercedPotato
+    executions on this host within the window so multi-step or repeated invocations are visible together.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:hacking_tool.tool_capability_used
+  question: Which RPC interface and exploit index were selected, and what binary was requested as SYSTEM?
+  context: >-
+    CoercedPotato exposes distinct coercion paths. The --exploitId value combined with the -i interface selects a
+    specific RPC function — for example ms-rprn index 0 is RpcRemoteFindFirstPrinterChangeNotificationEx, and ms-efsr
+    index 0 is EfsRpcOpenFileRaw. The -c value is the program to be executed in SYSTEM context. Reading these from the
+    alerting command line determines the coercion mechanism and the payload, which scope the response.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: attack:T1055.access_verification
+  question: Which SYSTEM-owned process connected to the coerced named pipe, and was a token impersonated from it?
+  context: >-
+    The escalation works by getting a privileged process to authenticate to a local named pipe the tool controls, then
+    impersonating that connection's token. The auth source depends on the interface — MS-RPRN coercion draws the
+    connection from spoolsv.exe, MS-EFSR coercion from lsass.exe. Look for one of those processes connecting to a local
+    pipe immediately before a new SYSTEM-context child appears, and for handle-access or named-pipe events tying the tool
+    process to that pipe. This is the step that proves token theft rather than a failed attempt.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - '\spoolsv.exe'
+          - '\lsass.exe'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - User
+- source: template:uac_bypass.elevated_action_after_bypass
+  question: What action ran at SYSTEM or high integrity on this host right after the escalation?
+  context: >-
+    Token theft is a means to an end. The chosen -c binary spawns in SYSTEM context, and the operator's next steps run at
+    that integrity level — credential dumping, persistence installation, security-tool tampering, or remote-execution
+    staging. Examining SYSTEM and high-integrity processes spawned shortly after the alert reveals the objective and the
+    blast radius.
+  range: +30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        IntegrityLevel:
+          - 'High'
+          - 'System'
+          - 'S-1-16-16384'
+          - 'S-1-16-12288'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - IntegrityLevel
+- source: template:cue_process_tool.process_chain
+  question: What process spawned this tool, and is that parent chain expected?
+  context: >-
+    The parent process shows how the tool was launched. A service-account parent such as an IIS worker (w3wp.exe), a
+    database service, or a generic svchost-hosted service is consistent with the technique's target accounts. An
+    interactive shell, a script host, or an Office application as the parent points to hands-on-keyboard or delivery via a
+    document or script. Walk up to the parent's own parent if the immediate parent is itself a launcher.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.follow_on
+  question: What child processes did this tool spawn afterward?
+  context: >-
+    The processes the tool launches reveal its actual effect. A successful escalation produces the requested -c binary
+    (cmd.exe, powershell.exe, or another program) running as SYSTEM; subsequent children of that process carry the
+    post-escalation activity. An absence of spawned children may indicate a failed or blocked attempt.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_user_actor.baseline
+  question: Has this user account run this binary before on any host?
+  context: >-
+    Compare the launching account against its own history. An account that has never run this tool is more notable than
+    one with a recurring pattern. This pivot is meaningful when the alert fires under a named human account; when it fires
+    under a service principal, treat a zero count as expected and rely on the launch-mechanism baseline instead.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent-and-binary combination historically routine on this host or across the environment?
+  context: >-
+    When the alert fires under a service principal, the account name does not attribute behavior — the meaningful pivot is
+    the launch mechanism. A parent process that already accounts for many prior launches of this binary is established
+    automation; a new or rare parent for this binary is the deviation worth chasing. This answers whether the mechanism is
+    routine, independent of which account holds the token.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user account do across the network in the surrounding window?
+  context: >-
+    Tracking the account's activity across hosts reveals whether the escalation is isolated or part of movement across
+    endpoints. If the same account triggered related activity on other hosts in the window, the scope is broader. This
+    pivot is informative for a human account; under a service principal it returns agent-telemetry noise, so the
+    launch-mechanism spread is the meaningful read in that case.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent-and-binary combination fire on other hosts in the same window?
+  context: >-
+    Under a service principal, asking what the account did network-wide returns constant SYSTEM-owned agent noise. The
+    answerable question is whether the same launch mechanism — parent process plus spawned binary — appeared on other
+    hosts in the alert window. Several hosts in the window points to scheduled or pushed automation; a single host points
+    to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host previously matched this rule's pattern, what parents and accounts drove it, and does this alert fit?
+  context: >-
+    The query mirrors the rule's selection structure scoped to this host, so the resulting parent and account distribution
+    reflects how this specific firing pattern has run here historically, not generic binary usage. A new parent process,
+    an unexpected account, or an unfamiliar command-line shape is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_loader_img:
+        Image|endswith: \CoercedPotato.exe
+      selection_params:
+        CommandLine|contains: ' --exploitId '
+      selection_loader_imphash:
+        Hashes|contains:
+        - IMPHASH=A75D7669DB6B2E107A44C4057FF7F7D6
+        - IMPHASH=F91624350E2C678C5DCBE5E1F24E22C9
+        - IMPHASH=14C81850A079A87E83D50CA41C709A15
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (1 of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.scope
+  question: Have other hosts matched this rule's pattern in the past week, and is the spread automation or one-off activity?
+  context: >-
+    The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of this
+    firing pattern rather than generic use of the binary. Many hosts matching the same pattern points to scripted
+    deployment or vendor tooling; one host or a small unrelated set points to manual operator activity. Use the host
+    distribution to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_loader_img:
+        Image|endswith: \CoercedPotato.exe
+      selection_params:
+        CommandLine|contains: ' --exploitId '
+      selection_loader_imphash:
+        Hashes|contains:
+        - IMPHASH=A75D7669DB6B2E107A44C4057FF7F7D6
+        - IMPHASH=F91624350E2C678C5DCBE5E1F24E22C9
+        - IMPHASH=14C81850A079A87E83D50CA41C709A15
+      condition: 1 of selection_*
+    fields:
+    - host.name
+- source: template:hacking_tool.tool_specific_artifacts
+  question: Did this process write any files on the host?
+  context: >-
+    Even after the original process exits, file artifacts can confirm execution and reveal scope. The query returns files
+    created by the tool's process on this host so the analyst can identify dropped payloads, output, or staged content.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in the hour before the alert?
+  context: >-
+    Operators often weaken protection before running a hands-on escalation tool. The query surfaces direct attempts to
+    disable AV/EDR services, flip Defender settings, add broad exclusions, clear logs, or patch AMSI/ETW. Zero rows is a
+    useful healthy signal — kernel-driver tampering and in-memory patches will not appear here. Populated rows shift the
+    disposition toward operator preparation; review the parent process and signer to identify the writer.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Escalation rarely happens in isolation. Earlier detections on the same host — reconnaissance, initial execution,
+    defense tampering, or credential access — help reconstruct what preceded the escalation and place it in a timeline.
+    The ordering of alerts often tells the story of how the operator reached this point.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1055
+      name: Process Injection
+      role: primary
+  attack_chain_coverage:
+    - stage: 1
+      label: tool_invocation
+      description: "CoercedPotato is launched with a target command (-c) and a coercion interface/exploit selection (-i, --exploitId)"
+      mapped_to: Q4
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 2
+      label: rpc_coercion
+      description: "Tool stands up a local named pipe and coerces an RPC interface (MS-RPRN via spoolsv.exe or MS-EFSR via lsass.exe) so a SYSTEM-owned process connects to the pipe"
+      mapped_to: Q6
+      source: attack:T1055.access_verification
+    - stage: 3
+      label: token_impersonation
+      description: "Tool impersonates the connecting SYSTEM token (ImpersonateNamedPipeClient/OpenThreadToken/DuplicateTokenEx) and acquires a usable handle"
+      mapped_to: Q6
+      source: attack:T1055.access_verification
+    - stage: 4
+      label: elevated_execution
+      description: "CreateProcessWithTokenW spawns the chosen -c binary in SYSTEM context; post-elevation actions run at high/system integrity"
+      mapped_to: Q7
+      source: template:uac_bypass.elevated_action_after_bypass
+  dimension_coverage:
+    - dimension: access_verification
+      technique: T1055
+      covered_by: Q6
+      source: attack:T1055.access_verification
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1055
+      covered_by: Q6
+      source: attack:T1055.access_verification
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1055
+      covered_by: Q6
+      source: attack:T1055.access_verification
+      coverage_type: direct
+  mutable_dispositions:
+    - element: AccessMask
+      dimension: access_verification
+      specific_values: "PROCESS_VM_WRITE (generic injection mask)"
+      disposition: context
+      target_question: Q6
+      notes: >-
+        The generic T1055 injection mask (e.g. PROCESS_VM_WRITE) does not match CoercedPotato's mechanism, which steals a
+        token via named-pipe impersonation (OpenThreadToken/DuplicateTokenEx) rather than writing into a remote process.
+        The access_verification dimension is reframed to the actual mechanism — which SYSTEM-owned process connected to the
+        coerced pipe and whether its token was impersonated — and covered in Q6 context rather than a literal GrantedAccess
+        selection that the rule's events do not carry.
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only (correlation window between coercion, impersonation, and elevated spawn)"
+      disposition: context
+      target_question: Q6
+      notes: >-
+        Time correlation is expressed as the +/-5m window in which the coercion source process (spoolsv.exe/lsass.exe)
+        connects and a SYSTEM-context child appears. No threshold value to inject; the +/-5m range plus the +30m
+        post-elevation range (Q7) carry the correlation.
+    - element: InjectedProcessList
+      dimension: tuning_parameter
+      specific_values: "spoolsv.exe (MS-RPRN), lsass.exe (MS-EFSR)"
+      disposition: query_injection
+      target_question: Q6
+      notes: >-
+        Generic T1055 names lsass.exe/explorer.exe as common injection targets. For CoercedPotato the relevant
+        high-value processes are the auth-source processes the coercion draws from — spoolsv.exe (PrinterBug) and
+        lsass.exe (PetitPotam). These exact Image values are injected into Q6's selection.
+  dedup_decisions:
+    - dropped: cue_user_actor.baseline
+      kept: cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable; both emitted (user-pivot Q10 + service_principal_substitute Q11). CoercedPotato characteristically fires under LOCAL SERVICE / NETWORK SERVICE / IIS / SQL service principals, so the substitute is load-bearing."
+    - dropped: cue_user_actor.clustering
+      kept: cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable; both emitted (user-pivot Q12 + service_principal_substitute Q13)."
+    - dropped: cue_process_tool.clustering
+      kept: cue_host_context.clustering
+      reason: "cue_process_tool.clustering (what other tools ran on host +/-15m) overlaps cue_host_context's host-window sweep; dropped to stay within question cap and avoid a near-identical host.name aggregation. Host-window context retained via cue_host_context.precursor (prior alerts)."
+    - dropped: uac_bypass.other_escalation_attempts
+      kept: cue_host_context.precursor
+      reason: "Both are host-scoped sigma-alert sweeps; per the template's own notes_to_llm, for a named hacking-tool detection it overlaps tool-specific coverage. cue_host_context.precursor (Q18) provides the prior-alert timeline; other_escalation_attempts is the same event.module:sigma host sweep and was dropped to avoid duplication."
+  skipped_templates:
+    - template: uac_bypass.bypass_technique_registry_artifacts
+      reason: "Template notes_to_llm: for potato exploits (CoercedPotato, LocalPotato, PrintSpoofer) the registry-write framing is not relevant — replace with 'what service/COM object was coerced to obtain the SYSTEM token'. Realized as attack:T1055.access_verification (Q6)."
+    - template: cue_process_tool.baseline
+      reason: "Generic Image|endswith host-baseline (does this host run this tool, -90d) is subsumed by cue_process_tool.baseline_deviation (Q14), which mirrors the rule's full selection structure scoped to host over -14d and returns the parent/user distribution — a more precise baseline for this rule's firing pattern."
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: >-
+        logsource 'image_load' (recommended by techniques: T1055) is not covered — pull in cue_image_load.* or author a
+        custom question with `category: image_load`
+      disposition: declined
+      reason: >-
+        The generic T1055 image_load analytic targets reflective/unusual DLL loads inside a victim process during classic
+        injection. CoercedPotato does not inject a DLL — it impersonates a named-pipe token and calls CreateProcessWithTokenW,
+        which leaves no anomalous image_load on a remote process. An image_load query would return ordinary module loads of
+        CoercedPotato.exe itself with no precision for this mechanism. The mechanism is covered via process_creation evidence
+        in Q6 (coercion source + elevated spawn) instead.
+    - hint: >-
+        logsource 'process_access' (recommended by techniques: T1055) is not covered and no template family exists — author
+        a custom question with `category: process_access`
+      disposition: declined
+      reason: >-
+        process_access (Sysmon EID 10) detects handle opens against a target process with injection-class access masks
+        (PROCESS_VM_WRITE, etc.). CoercedPotato's token theft uses OpenThreadToken against the impersonating thread, not a
+        cross-process VM-write handle, so a process_access GrantedAccess query keyed to injection masks would not surface
+        this tool's behavior. The token-acquisition step is covered behaviorally in Q6 (which SYSTEM process connected and
+        whether its token was impersonated) using available process_creation evidence. No process_access question authored.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - hacking_tool
+    - uac_bypass
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 17
+      attack: 1
+      llm_generated: 0
+    phase_distribution:
+      triage: 3
+      analysis: 2
+      context: 13
+    logsource_diversity:
+      process_creation: 16
+      file_event: 1
+      sigma_alert: 1

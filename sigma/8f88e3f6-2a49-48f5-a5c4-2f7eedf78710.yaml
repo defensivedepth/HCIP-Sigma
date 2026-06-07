@@ -1,0 +1,537 @@
+name: Java Running with Remote Debugging
+id: 3040e78d-1f76-4e25-9381-d3e299a27178
+description: |
+  Detects a Java process started with the JDWP socket transport enabled and bound to something other than localhost,
+  which exposes the Java Debug Wire Protocol to remote clients. JDWP has no authentication, so any client that can reach
+  the listening socket can attach as a debugger and execute arbitrary code inside the JVM, effectively granting remote code
+  execution on the host. The rule fires when the command line contains the dt_socket transport with an explicit address AND
+  references an older JRE/JDK install path (jre1./jdk1.) AND the address is not pinned to 127.0.0.1 or localhost. This is
+  usually a development debug flag that was never removed before production deployment, but it is also a target attackers
+  scan for and exploit. The investigation should determine the bind address and port, whether the exposure was intentional,
+  what the JVM did after start, and whether any unexpected child processes or outbound activity followed.
+type: detection
+detection_id: 8f88e3f6-2a49-48f5-a5c4-2f7eedf78710
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line show JDWP socket debugging bound to a non-localhost address on an older JRE/JDK?
+  context: Confirm the alert is a true positive by reviewing the exact command line. The rule fires when the dt_socket
+    transport with an explicit address is present, an older jre1./jdk1. install path is referenced, and the address is not
+    pinned to 127.0.0.1 or localhost. Read the address value to see whether it binds all interfaces (address=*:) or a
+    specific reachable host/IP, which determines whether the JDWP port is actually exposed to the network.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run a Java application with remote debugging enabled?
+  context: Remote debugging is a legitimate development activity but rarely belongs on a production or general-purpose host.
+    Knowing whether this host runs a Java application server and whether the user or service account is one that would
+    legitimately start a JVM with debug flags is often the fastest way to separate a leftover dev flag from an exposed
+    target.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What does the full JDWP agent string specify for bind address, port, and listen mode?
+  context: The full command line reveals exactly how debugging was configured. Decode the -agentlib:jdwp or -Xrunjdwp
+    agent string. An address of the form star-colon-port binds all interfaces and is network-exposed, while a host-colon-port
+    form binds a specific reachable interface. server=y means the JVM listens for a debugger, while server=n has the JVM
+    connect outward to a listening debugger, and suspend=y holds main until a debugger attaches. Note the port and whether
+    any onthrow or launch option chains a script on an exception.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains: 'transport=dt_socket,address='
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: attack:T1203.application_origin
+  question: Did the parent application crash, exit abnormally, or load from an unusual location around the time the JVM started?
+  context: Client-side exploitation often shows up as an abnormal exit or crash of the application that hosts or launches the
+    code, immediately before unexpected execution. Application channel events on this host in the surrounding window can show
+    whether the launching application faulted or restarted, which would point to an exploited process rather than a planned
+    debug session. If application logs are not collected in this environment, treat zero results as a visibility gap rather
+    than evidence nothing happened.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: application
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Provider_Name
+      - EventID
+- source: attack:T1203.file_path_analysis
+  question: What files were written into user-writable paths on this host around the time of the alert?
+  context: Client-execution chains frequently drop or stage a payload in writable locations (Downloads, %TEMP%, %APPDATA%,
+    OneDrive, application startup folders) shortly before or after the suspect execution. New executables, scripts, or
+    archives in these paths near the alert time may be the staged second stage. Scope file events by path so this does not
+    return every file write on the host.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains:
+          - '\Downloads\'
+          - '\Temp\'
+          - '\AppData\'
+          - '\OneDrive\'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: template:cue_process_tool.process_chain
+  question: What process spawned this Java process, and is that parent chain expected for a debug-enabled JVM?
+  context: The parent process reveals how the JVM was invoked. A launch from a service wrapper, application server, or
+    startup script is consistent with a deployed application; a launch from a shell, scripting host, or an unexpected parent
+    can indicate the debug flag was set interactively or as part of exploitation. The immediate parent is visible in the
+    alert, so use this to identify what spawned the parent and what else that parent spawned.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.follow_on
+  question: What child processes did this Java process spawn afterward?
+  context: A JVM with an exposed JDWP port can be driven by a remote debugger to call Runtime.exec and spawn arbitrary
+    commands. Children such as cmd.exe, powershell.exe, wscript.exe, mshta.exe, rundll32.exe, regsvr32.exe, msiexec.exe, or
+    curl.exe are rare for a normal application server and point to hands-on use of the debug channel for post-exploitation.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith: '\java.exe'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: attack:T1203.outbound_egress
+  question: Did this host establish outbound connections to unexpected destinations shortly after the JVM started?
+  context: After client execution, a payload commonly establishes outbound command-and-control. Correlate egress from this
+    host in the window after the alert and look for connections to recently registered domains, raw IPs, or destinations
+    outside known update and proxy infrastructure. Exclude routine system and update traffic so attacker callbacks stand out.
+  range: +1h
+  query: |
+    aggregation: true
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      filter_known:
+        Image|endswith:
+          - '\svchost.exe'
+          - '\SearchApp.exe'
+          - '\OneDrive.exe'
+      condition: selection and not filter_known
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Image
+- source: template:initial_access.delivery_vector
+  question: What request or invocation triggered this Java execution with the debug flag?
+  context: For an application server, identify what drove the JVM to start with these arguments -- a deployment or startup
+    script, a web request to a public-facing service, or an interactive session. Reviewing the parent command line and any
+    front-end access records shows whether the debug exposure was a deliberate deploy-time setting or the result of an
+    externally driven action, which enables blocking at the perimeter and finding other affected systems.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+- source: template:initial_access.campaign_scope
+  question: Did the same JDWP exposure pattern fire on other hosts?
+  context: A debug flag baked into a shared deployment image or startup script will surface on every host that runs that
+    build, not just this one. Searching for the same rule across the fleet reveals how broadly JDWP is exposed and which
+    additional systems present the same network-reachable, unauthenticated RCE surface.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        rule.uuid|expand: '%rule.uuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:initial_access.application_patch_status
+  question: Is this Java runtime a supported, patched build, and what application does it serve?
+  context: The rule keys on an older jre1./jdk1. install path, which is already visible in the alerting command line.
+    Confirm the exact JRE/JDK version and determine whether it is a current, supported build, and identify the parent
+    application it backs. An outdated JVM signals stale deployment hygiene and may carry known RCE vulnerabilities
+    independent of the JDWP exposure, and the same runtime is likely deployed on other hosts that need checking.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired the JDWP-exposure pattern, what parents and users normally drive it, and does
+    this alert fit that pattern?
+  context: Even a legitimately debug-enabled service has a stable launch profile. The query mirrors the rule's selection
+    scoped to this host, so the resulting parent and user distribution reflects how this specific exposure pattern has run
+    here before. A new parent process, an unexpected user account, or an unusual command-line shape is the deviation worth
+    chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_jdwp_transport:
+        CommandLine|contains: transport=dt_socket,address=
+      selection_old_jvm_version:
+        CommandLine|contains:
+        - jre1.
+        - jdk1.
+      exclusion:
+        CommandLine|contains:
+        - address=127.0.0.1
+        - address=localhost
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_* and not exclusion) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired the JDWP-exposure pattern in the past week, and does the cross-host distribution look like
+    a shared build or one-off activity?
+  context: The query mirrors the rule's selection with no host scope, so the result is a fleet-wide count of this specific
+    exposure pattern rather than generic Java usage. Many hosts firing the same pattern points to a shared deployment image
+    or startup script carrying a leftover debug flag; one host or a small unrelated set points to a targeted or manual
+    change. Use the host distribution and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_jdwp_transport:
+        CommandLine|contains: transport=dt_socket,address=
+      selection_old_jvm_version:
+        CommandLine|contains:
+        - jre1.
+        - jdk1.
+      exclusion:
+        CommandLine|contains:
+        - address=127.0.0.1
+        - address=localhost
+      condition: all of selection_* and not exclusion
+    fields:
+    - host.name
+- source: template:cue_user_actor.baseline
+  question: Does this user normally start Java processes with debug arguments?
+  context: Compare this user's current action against their historical behavior. A user or account that has never started a
+    JVM with JDWP debug flags is more suspicious than one that does so regularly as part of development or operations work.
+    User role and typical toolset should align with starting a debug-enabled application server.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        CommandLine|contains: 'transport=dt_socket,address='
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent-plus-Java launch combination historically routine on this host or across the environment, or is
+    the parent unusual for this JVM?
+  context: When the alert fires under a service principal, user identity does not attribute behavior; the meaningful pivot is
+    the launch mechanism. Whether the parent that spawned this debug-enabled JVM is a historically common pair on this host
+    or environment-wide separates a deployed service wrapper from a new or rare launcher. A pair that already accounts for
+    many prior events is deployment automation; a new one is the deviation worth chasing.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        CommandLine|contains: 'transport=dt_socket,address='
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints.
+    If the same user triggered similar activity on more than one host, the scope of the exposure or the operator's reach may
+    be larger than this single alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent-plus-Java launch combination fire on other hosts in the same window -- a coordinated rollout
+    or activity isolated to this host?
+  context: Under a service principal, asking what else the user did across the network returns agent-telemetry noise. The
+    meaningful question is whether the same launch mechanism -- the parent process spawning this debug-enabled JVM -- fired
+    on other hosts in the alert window. Multiple hosts in the same window points to scheduled or pushed deployment; a single
+    host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        CommandLine|contains: 'transport=dt_socket,address='
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host -- reconnaissance, scanning of internal
+    services, or defense tampering -- may reveal the stages that preceded this event and help reconstruct whether the JDWP
+    exposure was discovered and acted on.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1203
+      name: Exploitation for Client Execution
+      role: primary
+  attack_chain_coverage:
+    - stage: 1
+      label: application_crash_or_abnormal_load
+      description: "Client/host application experiences a crash, abnormal exit, or loads from an unusual location"
+      mapped_to: Q4
+      source: attack:T1203.application_origin
+    - stage: 2
+      label: file_drop_user_writable
+      description: "Payload dropped or modified in user-writable paths"
+      mapped_to: Q5
+      source: attack:T1203.file_path_analysis
+    - stage: 3
+      label: unexpected_child_spawn
+      description: "Unexpected child process (powershell/cmd/mshta/rundll32/wscript/installer) spawned"
+      mapped_to: Q7
+      source: template:cue_process_tool.follow_on
+    - stage: 4
+      label: outbound_c2
+      description: "Outbound C2-like connection established shortly after"
+      mapped_to: Q8
+      source: attack:T1203.outbound_egress
+  dimension_coverage:
+    - dimension: file_path_analysis
+      technique: T1203
+      covered_by: Q5
+      source: attack:T1203.file_path_analysis
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1203
+      covered_by: Q8
+      source: attack:T1203.outbound_egress
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1203
+      covered_by: Q7
+      source: template:cue_process_tool.follow_on
+      coverage_type: direct
+  mutable_dispositions:
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "15m correlation window between crash/write/child/network"
+      disposition: context
+      target_question: Q4
+      notes: "+/-15m windows used on application-origin and file-drop questions; +1h on outbound egress to allow C2 to follow execution"
+    - element: HighRiskChildren
+      dimension: tuning_parameter
+      specific_values: "powershell.exe, cmd.exe, wscript.exe, mshta.exe, rundll32.exe, regsvr32.exe, msiexec.exe, curl.exe"
+      disposition: context
+      target_question: Q7
+      notes: "Enumerated in follow_on context; query scoped to children of java.exe (entity-scoped by parent) so the list is the analyst's read filter, not a query constraint"
+    - element: UserPaths
+      dimension: file_path_analysis
+      specific_values: "Downloads, %TEMP%, %APPDATA%, OneDrive"
+      disposition: query_injection
+      target_question: Q5
+      notes: "Injected into TargetFilename|contains on the file_event question"
+    - element: AllowedPlugins
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q8
+      notes: "Updater/add-in suppression is a tuning rationale; no concrete value list to inject"
+    - element: EgressAllowlist
+      dimension: tuning_parameter
+      specific_values: "known update/CDN domains, proxy egress CIDRs"
+      disposition: query_injection
+      target_question: Q8
+      notes: "Represented as filter_known excluding svchost/OneDrive/SearchApp system egress; specific CDN/CIDR allowlists are environment-coupled and left to the analyst"
+  dedup_decisions:
+    - dropped: cue_process_tool.process_chain
+      reason: "user_actor service-principal pair (baseline + baseline_svc, clustering + clustering_svc) kept as four non-deduplicable questions per AGENTS.md"
+      kept: cue_user_actor.baseline, cue_user_actor.baseline_svc, cue_user_actor.clustering, cue_user_actor.clustering_svc
+  skipped_templates:
+    - template: cue_process_tool.baseline
+      reason: "Historical-frequency baseline subsumed by cue_user_actor.baseline (user+pattern) and cue_process_tool.baseline_deviation (host+pattern); both scope on the rule's CommandLine pattern, which the Image-based baseline cannot do for this CommandLine-only rule"
+    - template: cue_process_tool.clustering
+      reason: "Same-time tool clustering subsumed by cue_host_context.precursor (prior alerts) and the outbound-egress/file-drop chain questions; dropped to stay within the 18-question cap"
+    - template: cue_host_context.clustering
+      reason: "General host-activity clustering overlaps cue_host_context.precursor and the application-origin question; dropped to stay within the 18-question cap"
+    - template: cue_network_endpoint.mechanism_decode
+      reason: "The JDWP endpoint is the JVM's own bind address parsed from CommandLine in the mechanism_decode question, not a separate outbound destination; the outbound-egress chain question covers post-exploitation network activity. No standalone DestinationIp lookup applies"
+    - template: cue_network_endpoint.baseline
+      reason: "No external destination IP in the rule; the address in CommandLine is a local bind target, so a per-destination baseline does not apply"
+    - template: universal.endpoint_protection_health
+      reason: "Recommended-only generic tamper sweep; at the 18-question cap the four service-principal pair questions plus the full T1203 chain (application-origin, file-drop, follow-on, egress) are higher-value for this execution-exposure rule. Prior tamper activity is still surfaced by cue_host_context.precursor"
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "CommandLine-only detection -- no Image field in rule. Use CommandLine pattern matching for scoping, not Image-based queries"
+      disposition: acted-on
+      reason: >-
+        Non-reflected cue queries that defaulted to Image|endswith '%Image%' were
+        rewritten to scope on the rule's CommandLine pattern: mechanism_decode,
+        cue_user_actor.baseline, baseline_svc, and clustering_svc now use
+        CommandLine|contains 'transport=dt_socket,address='. follow_on keeps
+        ParentImage|endswith '\java.exe' (a literal, not the %Image% placeholder)
+        because the chain stage is specifically java's children.
+    - hint: "cue_network_endpoint: derived: IP regex in CommandLine"
+      disposition: acted-on
+      reason: >-
+        The derived network endpoint is the JDWP bind address in the command line.
+        Acted on by decoding the address/port in the mechanism_decode question and
+        by authoring the outbound-egress chain question (Q8) for post-exploitation
+        network activity.
+    - hint: "dimension 'file_path_analysis' (techniques: T1203) is uncovered -- author a custom attack:T1203.file_path_analysis question"
+      disposition: acted-on
+      reason: >-
+        Authored Q5 attack:T1203.file_path_analysis with category file_event and
+        TargetFilename|contains on the UserPaths writable directories.
+    - hint: "logsource 'application' (recommended by techniques: T1203) is not covered -- author a custom question with category: application"
+      disposition: acted-on
+      reason: >-
+        Authored Q4 attack:T1203.application_origin with category application to
+        cover chain stage 1 (application crash / abnormal exit).
+    - hint: "logsource 'file_event' (recommended by techniques: T1203) is not covered -- author a custom question with category: file_event"
+      disposition: acted-on
+      reason: >-
+        Covered by Q5 (attack:T1203.file_path_analysis), which uses category
+        file_event scoped by TargetFilename.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - initial_access
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 15
+      attack: 3
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 15
+    logsource_diversity:
+      process_creation: 13
+      application: 1
+      file_event: 1
+      network_connection: 1
+      sigma_alert: 2

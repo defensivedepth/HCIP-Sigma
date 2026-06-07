@@ -1,0 +1,631 @@
+name: Suspicious WMIC Execution Via Office Process
+id: 34541588-8b0c-4729-936e-8105e0184d01
+description: |
+  Detects an Office application (Word, Excel, PowerPoint, Publisher, Visio, Access, Equation Editor, OneNote, or WordPad)
+  spawning wmic.exe with a "process call create" command that launches a proxy-execution binary such as regsvr32, rundll32,
+  msiexec, mshta, verclsid, wscript, or cscript. The rule fires only when all three conditions match together: an Office
+  parent, the WMIC image or original filename, and the WMIC command-line pattern combining process/create/call with one of
+  the proxy keywords. Legitimately, Office almost never invokes wmic.exe to launch another interpreter; this pattern is a
+  documented macro-execution trick that breaks the visible Office-to-payload parent-child chain by routing the launch through
+  WMI. Investigation should confirm what document drove the macro, decode the full WMIC command and the proxied payload, and
+  check whether the proxy binary loaded a module or reached out to the network afterward.
+type: detection
+detection_id: e1693bc8-7168-4eab-8718-cdcaa68a1738
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-06
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line match what this rule detects, with an Office parent launching WMIC to proxy a child binary?
+  context: >-
+    Confirm the alert is a true positive by reviewing the triggering event against all three required conditions together:
+    the parent is an Office application, the image is wmic.exe (or OriginalFileName wmic.exe), and the command line combines
+    process, create, and call with one of the proxy keywords (regsvr32, rundll32, msiexec, mshta, verclsid, wscript, cscript).
+    All three must hold for the rule to fire, so verify each one rather than assuming.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - OriginalFileName
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to invoke WMIC from an Office application?
+  context: >-
+    Office applications launching wmic.exe to start another interpreter is not part of normal document workflows. Knowing
+    whether this user routinely runs administrative WMI commands and whether this host is an admin workstation helps separate
+    a rare-but-legitimate scripted task from macro-driven execution.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:parent_child.parent_process_legitimacy
+  question: Is this Office application expected to spawn WMIC, and what started the Office process itself?
+  context: >-
+    The Office-to-WMIC relationship is the core signal. Tracing the Office parent's own origin shows whether it was launched
+    interactively by a user opening a document or by some other process. A macro spawning wmic.exe to proxy a payload is the
+    pattern this rule targets; identifying the document that drove it is the next step.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- source: template:cue_process_tool.mechanism_decode
+  question: What exactly did the WMIC command do? Decode the full process-call-create argument and the proxied payload.
+  context: >-
+    The WMIC command line carries the real action. Parse the "process call create" argument to recover the full command WMIC
+    was told to spawn, including the proxy binary (regsvr32, rundll32, msiexec, mshta, verclsid, wscript, or cscript) and its
+    arguments. Look for a remote scriptlet or DLL path, a switch such as regsvr32 -s, and any URL or user-writable file path
+    that the proxy binary will load or execute.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:initial_access.delivery_vector
+  question: What document or email attachment triggered this execution?
+  context: >-
+    Office spawning WMIC almost always traces back to a macro or embedded object in a delivered file. Check the parent command
+    line for the document filename and determine whether it arrived by email, web download, or a share. Identifying the
+    document enables blocking it at the perimeter and searching for other recipients.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+- source: template:initial_access.application_patch_status
+  question: Is this Office installation fully patched against macro, OLE, and DDE execution issues?
+  context: >-
+    Some macro-execution and document-handling weaknesses depend on the Office version. Confirming patch level helps establish
+    whether the execution relied on a known vulnerability and identifies other similarly unpatched systems at risk. Patch
+    status also helps distinguish exploitation of a known issue from a novel one.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+- source: template:parent_child.sibling_processes
+  question: What other child processes did the same Office parent spawn?
+  context: >-
+    If the Office macro spawned wmic.exe, it likely spawned other processes too. Examining siblings of the WMIC process under
+    the same parent reveals the full scope of macro activity -- additional interpreters, downloaders, or persistence tools
+    launched from the same document.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:universal.evidence_preservation
+  question: Are the files referenced by the proxied command still on disk for analysis?
+  context: >-
+    The proxied command frequently names a file -- a scriptlet, DLL, or payload the proxy binary will load, often dropped to
+    a user-writable path. Checking whether those files still exist enables hash lookups, sandbox submission, and content
+    review. The file paths come from the decoded WMIC command line.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: attack:T1218.010.image_load
+  question: Did the proxied binary load a scriptlet or DLL shortly after WMIC launched it?
+  context: >-
+    Proxy-execution binaries such as regsvr32 and rundll32 work by loading a module -- a .sct/.ocx scriptlet or a DLL,
+    sometimes from a temporary directory or a user-writable path. A module load from outside System32 or SysWOW64 by the
+    proxied binary right after the WMIC launch is the operational payload step. Correlate the load time and path against the
+    decoded command.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - '\regsvr32.exe'
+          - '\rundll32.exe'
+          - '\msiexec.exe'
+          - '\mshta.exe'
+          - '\verclsid.exe'
+          - '\wscript.exe'
+          - '\cscript.exe'
+      condition: selection
+    fields:
+      - Image
+      - ImageLoaded
+      - Signed
+- source: attack:T1218.010.network_connection
+  question: Did the proxied binary make outbound network connections after WMIC launched it?
+  context: >-
+    Proxy-execution binaries are commonly used to fetch or beacon to a remote host after launch -- regsvr32 retrieving a
+    remote scriptlet, rundll32 or mshta reaching out for a second stage. An outbound connection from the proxied binary in
+    the minutes after the WMIC launch identifies the destination to block and pivots the investigation toward command and
+    control. Exclude known-good update or proxy destinations when reviewing results.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - '\regsvr32.exe'
+          - '\rundll32.exe'
+          - '\msiexec.exe'
+          - '\mshta.exe'
+          - '\wscript.exe'
+          - '\cscript.exe'
+        Initiated: 'true'
+      condition: selection
+    fields:
+      - Image
+      - DestinationIp
+      - DestinationPort
+- source: template:lolbin.renamed_binary_check
+  question: Was WMIC executed from its expected System32 path?
+  context: >-
+    WMIC normally runs from C:\Windows\System32\wbem\WMIC.exe. A wmic.exe running from a user temp directory or another
+    non-standard path, or one whose OriginalFileName is wmic.exe while the image name differs, may have been copied or
+    renamed to evade path-based allowlists. Compare the image path against the expected location.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- source: template:lolbin.technique_class_lateral
+  question: Were any other proxy-execution LOLBins used on this host recently?
+  context: >-
+    Operators who proxy execution through one trusted binary often use several. If WMIC launched regsvr32, check whether
+    rundll32, mshta, msiexec, installutil, or similar binaries were also used to run code on this host in the same window.
+    Multiple proxy-execution binaries performing the same kind of launch strengthens the case for hands-on activity.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_img:
+        Image|endswith:
+          - '\rundll32.exe'
+          - '\regsvr32.exe'
+          - '\mshta.exe'
+          - '\msbuild.exe'
+          - '\cmstp.exe'
+          - '\msiexec.exe'
+          - '\forfiles.exe'
+          - '\pcalua.exe'
+          - '\presentationhost.exe'
+          - '\control.exe'
+          - '\infdefaultinstall.exe'
+          - '\msdt.exe'
+          - '\mavinject.exe'
+          - '\installutil.exe'
+          - '\xwizard.exe'
+          - '\verclsid.exe'
+      condition: selection and selection_img
+    fields:
+      - Image
+      - CommandLine
+- source: template:lolbin.historical_lolbin_baseline
+  question: How often has this host fired the Office-to-WMIC proxy pattern over the past 90 days, and what command-line shapes are typical?
+  context: >-
+    A pattern with no prior history on a host is more suspicious than one seen routinely under stable parents. This query
+    mirrors the rule's full selection structure scoped to this host, so the count reflects the rule's specific firing pattern
+    rather than generic WMIC usage. The command-line projection lets you compare typical invocation shapes against the
+    alerting one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_parent:
+        ParentImage|endswith:
+        - \WINWORD.EXE
+        - \EXCEL.EXE
+        - \POWERPNT.exe
+        - \MSPUB.exe
+        - \VISIO.exe
+        - \MSACCESS.EXE
+        - \EQNEDT32.EXE
+        - \ONENOTE.EXE
+        - \wordpad.exe
+        - \wordview.exe
+      selection_wmic_img:
+      - Image|endswith: \wbem\WMIC.exe
+      - OriginalFileName: wmic.exe
+      selection_wmic_cli:
+        CommandLine|contains|all:
+        - process
+        - create
+        - call
+        CommandLine|contains:
+        - regsvr32
+        - rundll32
+        - msiexec
+        - mshta
+        - verclsid
+        - wscript
+        - cscript
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - CommandLine
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run WMIC?
+  context: >-
+    Compare this user's current action against their historical behavior. A user who has never run wmic.exe is more
+    suspicious than an administrator who runs WMI commands regularly. User role and typical toolset should align with
+    command-line WMI execution.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this Office-parent and WMIC combination historically routine on this host or across the environment, or is the parent unusual for WMIC?
+  context: >-
+    When the alert fires under a service principal, user identity does not attribute the behavior. The meaningful pivot is
+    the launch mechanism: an Office application spawning wmic.exe. A new or rare Office parent for WMIC on this host or
+    environment-wide is the deviation worth chasing; a pair that already accounts for many prior events is more likely
+    automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: >-
+    Tracking the user's activity across all hosts reveals lateral movement or activity on multiple endpoints. If the same
+    user triggered similar activity elsewhere, the scope of the incident may be larger than this single host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same Office-parent and WMIC combination fire on other hosts in the same window, or is it isolated to this host?
+  context: >-
+    Under a service principal, asking what else the user did across the network returns agent-telemetry noise. The meaningful
+    question is whether the same launch mechanism -- an Office application spawning wmic.exe -- fired on other hosts in the
+    alert window. Multiple hosts in the same window points to a phishing wave or pushed automation; a single host points to a
+    host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:initial_access.campaign_scope
+  question: Were other users or systems hit by the same delivery vector?
+  context: >-
+    Document-borne execution rarely targets a single user. If this rule fired on one host, the same malicious document may
+    have reached others. Correlating this detection across hosts reveals campaign breadth and identifies additional systems
+    that need investigation.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        rule.uuid|expand: '%rule.uuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1047
+      name: Windows Management Instrumentation
+      role: primary
+    - id: T1204.002
+      name: Malicious File
+      role: secondary
+    - id: T1218.010
+      name: Regsvr32
+      role: secondary
+    - id: T1204
+      name: User Execution
+      role: secondary
+    - id: T1218
+      name: System Binary Proxy Execution
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: malicious_document_open
+      description: User opens an Office document; the Office application records the open and a macro begins execution.
+      mapped_to: Q5
+      source: template:initial_access.delivery_vector
+    - stage: 2
+      label: wmi_proxy_launch
+      description: The Office macro invokes wmic.exe process call create to launch a proxy-execution binary, breaking the visible Office-to-payload parent-child chain.
+      mapped_to: Q4
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 3
+      label: proxy_module_load
+      description: The proxied binary (regsvr32/rundll32/mshta/etc.) loads a scriptlet or DLL as its operational payload.
+      mapped_to: Q9
+      source: attack:T1218.010.image_load
+    - stage: 4
+      label: proxy_network_egress
+      description: The proxied binary makes outbound connections to fetch a stage or beacon to command and control.
+      mapped_to: Q10
+      source: attack:T1218.010.network_connection
+  dimension_coverage:
+    - dimension: file_path_analysis
+      technique: T1204.002
+      covered_by: Q8
+      source: template:universal.evidence_preservation
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1204.002
+      covered_by: Q7
+      source: template:parent_child.sibling_processes
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1047
+      covered_by: Q12
+      source: template:lolbin.technique_class_lateral
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1047
+      covered_by: Q2
+      source: template:universal.host_user_context
+      coverage_type: direct
+    - dimension: command_analysis
+      technique: T1218
+      covered_by: Q4
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1218
+      covered_by: Q3
+      source: template:parent_child.parent_process_legitimacy
+      coverage_type: direct
+  mutable_dispositions:
+    - element: SuspiciousCommandPatterns
+      dimension: tuning_parameter
+      specific_values: "wmic process call create; the proxy keywords regsvr32, rundll32, msiexec, mshta, verclsid, wscript, cscript"
+      disposition: context
+      target_question: Q4
+      notes: "Rule's own selection already enforces these via CommandLine|contains|all + CommandLine|contains; mechanism_decode context directs the analyst to decode them. verify_trigger_match (Q1) re-displays the matched values."
+    - element: HighRiskChildren
+      dimension: tuning_parameter
+      specific_values: "rundll32, regsvr32, mshta, msiexec, installutil, cmstp, msbuild, forfiles, pcalua, presentationhost, control, infdefaultinstall, msdt, mavinject, xwizard, verclsid"
+      disposition: query_injection
+      target_question: Q12
+      notes: "Proxy-execution LOLBin list injected into technique_class_lateral selection_img; wmic.exe excluded as the rule's own binary."
+    - element: ParentApps
+      dimension: tuning_parameter
+      specific_values: "WINWORD, EXCEL, POWERPNT, MSPUB, VISIO, MSACCESS, EQNEDT32, ONENOTE, wordpad, wordview"
+      disposition: query_injection
+      target_question: Q13
+      notes: "Office parent list preserved verbatim in the reflected historical_lolbin_baseline detection block."
+    - element: UserPaths
+      dimension: file_path_analysis
+      specific_values: "Downloads, %TEMP%, %APPDATA%, user profile staging"
+      disposition: context
+      target_question: Q8
+      notes: "evidence_preservation scopes on %file_paths% derived from the decoded command; context names user-writable drop locations."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "0-5m file-to-spawn; minutes from launch to module load / egress"
+      disposition: query_injection
+      target_question: Q9
+      notes: "+/-15m correlation window on image_load and network_connection questions ties the proxy payload step to the WMIC launch."
+    - element: WMIQueryScope
+      dimension: tuning_parameter
+      specific_values: "rationale only (\\root\\cimv2, \\root\\subscription namespaces)"
+      disposition: context
+      target_question: Q4
+      notes: "Rule fires on wmic.exe command-line WMI (process call create), not WMI provider events; namespace scoping is rationale, not a process_creation queryable field."
+    - element: AllowedDLLPaths
+      dimension: tuning_parameter
+      specific_values: "C:\\Windows\\System32 expected; loads outside it suspicious"
+      disposition: context
+      target_question: Q9
+      notes: "image_load question context directs the analyst to flag module loads from outside System32/SysWOW64."
+  dedup_decisions:
+    - dropped: cue_process_tool.process_chain
+      reason: "parent_process is the primary cue and parent_child technique set is active — parent_process_legitimacy (Q3) covers the parent chain more specifically; per brief hint."
+      kept: parent_child.parent_process_legitimacy
+    - dropped: cue_parent_process.mechanism_decode
+      reason: "parent_child technique set active — parent_process_legitimacy (Q3) is the more specific parent-origin question."
+      kept: parent_child.parent_process_legitimacy
+    - dropped: cue_user_actor.baseline / baseline_svc pair retained
+      reason: "user_actor pair — non-deduplicable"
+      kept: both cue_user_actor.baseline and cue_user_actor.baseline_svc
+    - dropped: cue_user_actor.clustering / clustering_svc pair retained
+      reason: "user_actor pair — non-deduplicable"
+      kept: both cue_user_actor.clustering and cue_user_actor.clustering_svc
+  skipped_templates:
+    - template: cue_parent_process.baseline
+      reason: "Superseded by cue_user_actor.baseline_svc (Q15), which performs the same parent.name+Image historical aggregation; kept under 18-question cap."
+    - template: cue_parent_process.follow_on
+      reason: "Subsumed by parent_child.sibling_processes (Q7), which surfaces children of the same parent instance."
+    - template: cue_parent_process.clustering
+      reason: "Subsumed by parent_child.sibling_processes (Q7) and host-context coverage; kept under 18-question cap."
+    - template: cue_parent_process.scope
+      reason: "Subsumed by cue_user_actor.clustering_svc (Q17), which checks the same Office-parent+WMIC mechanism across hosts in the alert window."
+    - template: cue_process_tool.baseline
+      reason: "Superseded by lolbin.historical_lolbin_baseline (Q13), which baselines the rule's full selection on this host rather than the bare binary."
+    - template: cue_host_context.clustering
+      reason: "Host-wide activity coverage; dropped to stay within the 18-question cap. sibling_processes (Q7) and user clustering (Q16) carry the immediate-context signal."
+    - template: cue_host_context.precursor
+      reason: "Prior-alert timeline; dropped under 18-question cap. campaign_scope (Q18) and host-level pivots cover cross-event scope for this delivery-driven rule."
+    - template: universal.endpoint_protection_health
+      reason: "RECOMMENDED, not must_include. Dropped under the 18-question cap; defense_tampering is not a confirmed technique set for this rule and the disposition turns on the document and proxied payload, not on prior AV tampering."
+    - template: persistence_scope.process_based_persistence
+      reason: "RECOMMENDED. is_persistence_rule is false; the rule detects a proxy-execution launch, not persistence installation. Dropped under the 18-question cap."
+    - template: persistence_scope.file_based_persistence
+      reason: "RECOMMENDED. is_persistence_rule is false; file-based persistence drops are out of the immediate proxy-execution chain. Dropped under the 18-question cap."
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "logsource 'create_stream_hash' (recommended by techniques: T1204.002) is not covered and no template family exists — author a custom question with `category: create_stream_hash`"
+      disposition: declined
+      reason: >-
+        The rule fires on the Office-to-WMIC proxy-execution chain in process_creation, not on file delivery. create_stream_hash
+        surfaces mark-of-the-web / URL-zone stream evidence on the dropped document, which is upstream of this detection. The
+        delivery document is investigated by delivery_vector (Q5) and any proxied file is preserved by evidence_preservation
+        (Q8) via %file_paths%; adding a create_stream_hash sweep would not refine the proxy-execution disposition. No
+        compensating attack:T1204.002.create_stream_hash question authored.
+    - hint: "logsource 'wmi' (recommended by techniques: T1047) is not covered and no template family exists — author a custom question with `category: wmi`"
+      disposition: declined
+      reason: >-
+        This rule detects command-line WMI via wmic.exe process call create (a process_creation event), not WMI provider
+        operational events (5857-5861). The WMIC command and its proxied payload are decoded by mechanism_decode (Q4); the
+        proxy binary's module load and egress are covered by Q9 and Q10. WMI provider-event logging targets WMI event-subscription
+        and remote-method abuse, which is a different mechanism than the synchronous wmic.exe launch this rule fires on. No
+        compensating attack:T1047.wmi question authored.
+  contextual_sets:
+    included: []
+    excluded:
+      - id: ransomware_impact
+        confidence: low
+        reason: "Keyword 'ransomware' appears only in a reference write-up, not in the rule title, tags, or detection logic. The rule detects a generic Office-to-WMIC proxy-execution chain; impact-stage questions would not fit the proxy-launch behavior this rule fires on."
+      - id: network_scope
+        confidence: low
+        reason: "Same incidental 'ransomware' reference match. Network egress from the proxied binary is already covered specifically by attack:T1218.010.network_connection (Q10); a generic network_scope set would duplicate it without adding precision."
+  technique_sets_applied:
+    - universal
+    - initial_access
+    - parent_child
+    - lolbin
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 16
+      attack: 2
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 15
+    logsource_diversity:
+      process_creation: 14
+      file_event: 1
+      image_load: 1
+      network_connection: 1
+      sigma_alert: 1

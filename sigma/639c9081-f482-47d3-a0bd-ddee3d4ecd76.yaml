@@ -1,0 +1,520 @@
+name: All Backups Deleted Via Wbadmin.EXE
+id: fc99c870-82a0-4ac2-ba0b-a6749e107178
+description: |
+  Detects wbadmin.exe being run to delete all backups, where the command line contains both "delete" and "backup" together with the "keepVersions:0" selector that removes every retained backup version. Legitimate administrators occasionally prune backups, but the "keep zero versions" form removes all recovery points at once and is the canonical wbadmin invocation used to inhibit recovery before file encryption or other destructive impact. Determine whether the deletion was authorized backup maintenance or part of a recovery-inhibition sequence by examining the surrounding destructive commands, the launching process, and whether the same activity is spreading across hosts.
+type: detection
+detection_id: 639c9081-f482-47d3-a0bd-ddee3d4ecd76
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the wbadmin command line delete all backups with the keepVersions:0 selector?
+  context: Before investing investigation time, confirm the alert is a true positive by reviewing the exact command line and process details. The rule fires when wbadmin.exe (by image name or original filename) runs a command line containing both "delete" and "backup" along with "keepVersions:0", the selector that removes every retained backup version rather than pruning a specific count.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to delete all Windows Server backups?
+  context: Legitimate backup maintenance is performed by backup operators or administrators on server platforms that run Windows Backup. Knowing whether the user role and host function are consistent with deleting every backup version is often the fastest path to distinguishing authorized maintenance from a recovery-inhibition action.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:defense_tampering.what_was_disabled
+  question: What backup target and selectors were specified in the wbadmin command, and did the deletion target system state or all backups?
+  context: The full command line reveals exactly what recovery capability was destroyed. Decode whether the deletion targeted "systemstatebackup" or general backups, whether keepVersions:0 removed all versions, and whether a -backupTarget, -machine, or -quiet flag was present. The -quiet flag suppresses prompts and is required for unattended use; its presence points to scripted rather than interactive operation.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:ransomware_impact.recovery_options_assessment
+  question: What recovery-inhibiting commands were executed on this host?
+  context: Recovery inhibition is usually chained across several utilities, such as deleting shadow copies (vssadmin, wmic), disabling boot recovery (bcdedit), deleting backups (wbadmin), and disabling the Windows Recovery Environment (reagentc). This query surfaces all recovery-inhibiting commands on the host, revealing the full scope of recovery destruction. Verify whether each action succeeded by checking system state directly (wbadmin get versions, vssadmin list shadows, bcdedit /enum, reagentc /info) and confirm whether offline or off-host backups remain.
+  range: +24h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_recovery:
+        Image|endswith:
+          - '\vssadmin.exe'
+          - '\wmic.exe'
+          - '\bcdedit.exe'
+          - '\wbadmin.exe'
+          - '\reagentc.exe'
+          - '\diskshadow.exe'
+      selection_cmdline:
+        CommandLine|contains:
+          - 'delete shadows'
+          - 'shadowcopy delete'
+          - 'recoveryenabled'
+          - 'bootstatuspolicy'
+          - 'delete catalog'
+          - 'delete systemstatebackup'
+          - 'boot.ini'
+          - 'winre.wim'
+          - '/disable'
+      condition: selection and (selection_recovery or selection_cmdline)
+    fields:
+      - Image
+      - CommandLine
+- source: template:ransomware_impact.destruction_scope_on_host
+  question: What other destructive or recovery-inhibiting actions occurred on this host?
+  context: Recovery inhibition rarely happens alone. Deleting backups is frequently chained with stopping security services, clearing event logs, changing file permissions, and deleting volume shadow copies. Finding the complete set of destructive commands in a tight window reveals whether this is an automated destruction sequence rather than an isolated maintenance action.
+  range: +/-30m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_destructive:
+        Image|endswith:
+          - '\vssadmin.exe'
+          - '\wmic.exe'
+          - '\bcdedit.exe'
+          - '\wbadmin.exe'
+          - '\cipher.exe'
+          - '\fsutil.exe'
+          - '\icacls.exe'
+          - '\takeown.exe'
+          - '\attrib.exe'
+          - '\sc.exe'
+          - '\net.exe'
+          - '\net1.exe'
+          - '\powershell.exe'
+          - '\taskkill.exe'
+      condition: selection and selection_destructive
+    fields:
+      - Image
+      - User
+- source: template:cue_process_tool.process_chain
+  question: What process spawned wbadmin.exe and is that parent chain expected?
+  context: The parent process reveals how wbadmin was invoked. Authorized backup maintenance typically runs from an interactive shell launched by an administrator or from a known backup-automation parent. A parent such as cmd.exe or powershell.exe executing a script, or an unexpected application, points to scripted destruction rather than a deliberate administrative action.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:defense_tampering.activity_after_tampering
+  question: What activity occurred on this host after the backups were deleted?
+  context: Backups are deleted to remove recovery options before an action that would otherwise be reversible. Examining process activity immediately after the deletion reveals what the destruction was meant to enable, such as file encryption, additional service stops, or data staging. Correlate this window with file events and network connections on the host.
+  range: +1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - User
+- source: template:defense_tampering.other_tampering_activity
+  question: Were other defense tampering actions performed on this host?
+  context: Operators who delete backups often disable several controls in the same operation. Stopping Defender, clearing event logs, and deleting shadow copies alongside the backup deletion creates maximum coverage. Multiple tampering events from the same user or parent process indicate several controls were targeted together rather than an isolated maintenance command.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_tamper:
+        Image|endswith:
+          - '\wevtutil.exe'
+          - '\vssadmin.exe'
+          - '\bcdedit.exe'
+          - '\wbadmin.exe'
+          - '\netsh.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\powershell.exe'
+        CommandLine|contains:
+          - 'cl '
+          - 'clear-log'
+          - 'delete shadows'
+          - 'recoveryenabled'
+          - 'DisableRealtimeMonitoring'
+          - 'advfirewall'
+          - 'stop'
+          - 'delete'
+      condition: selection and selection_tamper
+    fields:
+      - Image
+      - User
+- source: attack:T1490.registry_set
+  question: Was the Windows Recovery Environment disabled through a recovery-related registry change on this host?
+  context: Backup deletion is one of several recovery-inhibition vectors; another is disabling the Windows Recovery Environment, which records its enabled state in registry values. A registry write that flips the recovery environment to disabled around the time of the backup deletion indicates the operator is closing multiple recovery paths rather than performing routine backup maintenance. If recovery-related registry events are not collected in this environment, treat zero results as a visibility gap rather than evidence nothing changed.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|contains:
+          - '\WindowsRE'
+          - '\ReAgent'
+          - '\SystemRestore\DisableSR'
+          - '\BCD'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+- source: template:ransomware_impact.encryption_or_ransom_indicators
+  question: Are there signs of file encryption, ransom notes, or unknown binary execution on this host after the deletion?
+  context: Recovery-inhibiting actions such as backup destruction typically precede file encryption by minutes. Checking process activity after the deletion, filtered to surface non-system binaries, helps determine whether an encryption phase has started. Also check for ransom notes and mass file renames through file event data or the endpoint console.
+  range: +30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      filter_known:
+        Image|startswith:
+          - 'C:\Program Files'
+          - 'C:\Windows\System32\svchost'
+          - 'C:\Windows\System32\wbem'
+      condition: selection and not filter_known
+    fields:
+      - Image
+      - CommandLine
+      - CurrentDirectory
+- source: template:ransomware_impact.network_wide_impact
+  question: Is this same backup-deletion alert firing on other hosts in the environment?
+  context: Recovery-inhibition sequences often execute across many hosts simultaneously or in rapid succession. Finding the same alert on multiple hosts indicates network-wide execution and determines the scope for containment and incident response. A spread across several hosts in a short window points to coordinated, pushed activity rather than a single administrator pruning backups.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        rule.uuid|expand: '%rule.uuid%'
+      condition: selection
+    fields:
+      - host.name
+      - rule.name
+      - event.severity_label
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously deleted backups with this pattern, what parents and users normally drove it, and does the current alert fit?
+  context: Even legitimate backup pruning leaves a baseline. The query mirrors the rule's selection scoped to this host, so the parent and user distribution reflects how this specific deletion pattern has historically run here rather than generic wbadmin usage. A new parent process, an unexpected user account, or a first-time appearance of this pattern is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \wbadmin.exe
+      - OriginalFileName: WBADMIN.EXE
+      selection_cli:
+        CommandLine|contains|all:
+        - delete
+        - backup
+        CommandLine|contains: keepVersions:0
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired this backup-deletion pattern in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: The query mirrors the rule's selection with no host scope, so the result is a fleet-wide count of this specific deletion pattern rather than generic wbadmin usage. Many hosts firing the same pattern points to scripted deployment or backup-rotation automation; one host or a small unrelated set points to manual operator activity. Use the host distribution and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \wbadmin.exe
+      - OriginalFileName: WBADMIN.EXE
+      selection_cli:
+        CommandLine|contains|all:
+        - delete
+        - backup
+        CommandLine|contains: keepVersions:0
+      condition: all of selection_*
+    fields:
+    - host.name
+- source: template:persistence_scope.process_based_persistence
+  question: Were process-based persistence mechanisms installed on this host around the deletion?
+  context: Destructive impact is frequently preceded or followed by persistence so the operator retains access. Scheduled tasks, services, registry Run key writes, BITS jobs, or WMI subscriptions installed in the same timeframe as the backup deletion indicate intentional foothold stacking rather than an isolated maintenance command.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run wbadmin on hosts across the environment?
+  context: Compare this user's current action against their historical behavior. A user who has never run wbadmin, or never deleted backups, is more notable than a backup operator who does so on a schedule. The user's role and typical toolset should align with deleting all backup versions.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent and wbadmin combination historically routine on this host or environment-wide, or is the parent unusual for this binary?
+  context: When the alert fires under a service principal, user identity does not attribute the behavior; the meaningful pivot is the launch mechanism. A parent process that has spawned wbadmin many times before reflects established automation, while a new or rare parent for wbadmin is the deviation worth chasing.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or destruction spanning multiple endpoints. If the same user triggered similar activity on several hosts in this window, the scope of the impact may be larger than the alerting host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent and wbadmin combination fire on other hosts in the same window, indicating a coordinated rollout?
+  context: Under a service principal, tracking activity by user returns agent-telemetry noise because every host runs service-owned processes constantly. The meaningful question is whether the same launch mechanism (parent process plus spawned binary) fired on other hosts in the alert window. Multiple hosts in the same window points to scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1490
+      name: Inhibit System Recovery
+      role: primary
+  attack_chain_coverage:
+    - stage: 1
+      label: recovery_inhibition_via_native_utility
+      description: "Native utility (wbadmin) run with arguments to delete all backups, removing recovery points before destructive impact"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 1
+      label: command_decode
+      description: "Decode the specific wbadmin selectors (keepVersions:0, systemstatebackup, -quiet) to confirm all backups were targeted"
+      mapped_to: Q3
+      source: template:defense_tampering.what_was_disabled
+    - stage: 1
+      label: full_recovery_destruction_scope
+      description: "The deletion is one step in a recovery-inhibition chain spanning vssadmin/bcdedit/reagentc; surface the full set"
+      mapped_to: Q4
+      source: template:ransomware_impact.recovery_options_assessment
+  dimension_coverage:
+    - dimension: command_analysis
+      technique: T1490
+      covered_by: Q3
+      source: template:defense_tampering.what_was_disabled
+      coverage_type: direct
+    - dimension: network_indicators
+      technique: T1490
+      covered_by: Q11
+      source: template:ransomware_impact.network_wide_impact
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1490
+      covered_by: Q5
+      source: template:ransomware_impact.destruction_scope_on_host
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1490
+      covered_by: Q6
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+  mutable_dispositions:
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only (rapid recovery-feature changes over short intervals)"
+      disposition: context
+      target_question: Q5
+      notes: "destruction_scope_on_host uses +/-30m and activity_after_tampering uses +1h to capture rapid chained recovery destruction; no specific threshold value to inject"
+    - element: CommandLinePattern
+      dimension: command_analysis
+      specific_values: "/all, /quiet, -delete (destructive flag variations)"
+      disposition: context
+      target_question: Q3
+      notes: "what_was_disabled is KEEP_EXACT (ProcessGuid-scoped redisplay); flag-variation values incorporated into Q3 context (keepVersions:0, systemstatebackup, -quiet) rather than the query. Verify_trigger (Q1) is entity-scoped so already matches the rule's exact CommandLine|contains|all pattern."
+    - element: ParentProcessContext
+      dimension: tuning_parameter
+      specific_values: "rationale only (common parent-child chains, e.g. powershell -> diskshadow)"
+      disposition: new_question
+      target_question: Q6
+      notes: "process_chain question retrieves and evaluates the parent that spawned wbadmin"
+  dedup_decisions:
+    - dropped: cue_process_tool.mechanism_decode
+      reason: "replaced_by defense_tampering.what_was_disabled (more specific tampering-target framing); recorded in hints[0]"
+      kept: defense_tampering.what_was_disabled
+    - dropped: defense_tampering.protection_status
+      reason: "must_include defense_tampering question, but it asks whether a security CONTROL is currently restored; for backup deletion the equivalent 'is recovery still possible' check is already covered by recovery_options_assessment which directs verifying wbadmin get versions / system state. Dropped to stay within 18-question cap without redundant manual-status redisplay."
+      kept: ransomware_impact.recovery_options_assessment
+    - dropped: cue_process_tool.baseline
+      reason: "generic Image-scoped historical frequency subsumed by baseline_deviation, which scopes to the rule's exact keepVersions:0 deletion pattern on this host"
+      kept: cue_process_tool.baseline_deviation
+    - dropped: cue_user_actor.baseline pair (kept) / cue_user_actor.clustering pair (kept)
+      reason: "user_actor pairs are non-deduplicable per AGENTS.md — both user-pivot and service-principal substitute emitted"
+      kept: cue_user_actor.baseline + cue_user_actor.baseline_svc + cue_user_actor.clustering + cue_user_actor.clustering_svc
+    - dropped: network_scope.same_action_other_hosts
+      reason: "cross-host same-action coverage subsumed by ransomware_impact.network_wide_impact (rule.uuid alert correlation) and cue_user_actor.clustering_svc (parent+binary cross-host)"
+      kept: ransomware_impact.network_wide_impact
+    - dropped: network_scope.actor_activity_network_wide
+      reason: "user network-wide activity covered by cue_user_actor.clustering"
+      kept: cue_user_actor.clustering
+  skipped_templates:
+    - template: cue_process_tool.mechanism_decode
+      reason: "replaced_by: defense_tampering.what_was_disabled"
+    - template: cue_process_tool.follow_on
+      reason: "child processes of wbadmin covered by activity_after_tampering (+1h host activity) and encryption_or_ransom_indicators (post-deletion non-system binaries)"
+    - template: cue_process_tool.clustering
+      reason: "around-the-time host activity covered by destruction_scope_on_host (+/-30m) and other_tampering_activity (+/-1h)"
+    - template: cue_host_context.clustering
+      reason: "host-around-time context covered by destruction_scope_on_host and other_tampering_activity"
+    - template: cue_host_context.precursor
+      reason: "prior-alert context partially covered by recovery_options_assessment and other_tampering_activity sweeps; dropped to fit 18-question cap on an impact-stage rule where forward-looking and same-window destruction questions carry more weight than earlier alerts"
+    - template: universal.endpoint_protection_health
+      reason: "defense_tampering technique set is confirmed; its what_was_disabled and other_tampering_activity questions are more specific and supersede the generic host-tamper sweep (per template notes_to_llm drop-condition a)"
+    - template: network_scope.actor_authentication_trail
+      reason: "authentication-trail (4624/4625) pivot is lower-value for a host-local destructive-impact rule; cross-host scope already covered by network_wide_impact and clustering_svc"
+    - template: persistence_scope.file_based_persistence
+      reason: "one persistence question (process_based_persistence) retained to honor the defense_tampering->persistence_scope cascade; the file_event variant dropped to fit the 18-question cap"
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "logsource 'registry_set' (recommended by techniques: T1490) is not covered — pull in cue_registry_key.* or author a custom question with `category: registry_set`"
+      disposition: acted_on
+      reason: >-
+        Authored Q9 (attack:T1490.registry_set) as a custom registry_set
+        question targeting recovery-related registry objects (WindowsRE,
+        ReAgent, SystemRestore DisableSR, BCD). T1490's registry_set analytic
+        covers REAgentC / recovery-environment state changes, a distinct
+        recovery-inhibition vector from the wbadmin command-line deletion the
+        rule fires on; the custom question crosses that logsource boundary.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - defense_tampering
+    - ransomware_impact
+    - network_scope
+    - persistence_scope
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 17
+      attack: 1
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 15
+    logsource_diversity:
+      process_creation: 16
+      sigma_alert: 1
+      registry_set: 1

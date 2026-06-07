@@ -1,0 +1,475 @@
+name: Remote Access Tool - ScreenConnect Server Web Shell Execution
+id: 3f2c8a1d-6b4e-4d9a-9c5f-7e1a2b3c4d5e
+description: |
+  Detects the ScreenConnect server application process (ScreenConnect.Service.exe) spawning a command interpreter
+  (cmd.exe) or the C# compiler (csc.exe). The server-side application should not launch child shells or compile code
+  under normal operation, so this pairing points to web shell execution following exploitation of the public-facing
+  ScreenConnect server (for example, authentication-bypass plus path-traversal extension upload that lands an ASP.NET
+  file in a web-accessible directory). The csc.exe child is the just-in-time compilation step ASP.NET performs when a
+  newly dropped web page is first requested; the cmd.exe child is direct command execution through that page. The
+  investigation should confirm the parent-child pairing, decode what the child shell did, identify the originating web
+  request, and determine the patch status of the exposed server.
+type: detection
+detection_id: b19146a3-25d4-41b4-928b-1e2a92641b1b
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Did the ScreenConnect server process spawn cmd.exe or csc.exe as detected?
+  context: Before investing investigation time, confirm the alert is a true positive by reviewing the triggering event.
+    The rule fires when a process whose parent image ends in ScreenConnect.Service.exe spawns a child whose image ends
+    in cmd.exe or csc.exe. Confirm the ParentImage is the server-side application process and not the client-side
+    ScreenConnect.ClientService.exe, which carries a different and lower-confidence meaning.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+- source: template:universal.host_user_context
+  question: Is this host expected to run the ScreenConnect server, and should the server process ever launch shells?
+  context: A ScreenConnect server is an Internet-facing application that hosts and manages remote sessions; the server
+    process spawning a command interpreter or compiler is outside its normal operation. Confirm whether this host is a
+    sanctioned ScreenConnect server and whether any maintenance or update activity could explain a child process,
+    rather than exploitation.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:parent_child.parent_process_legitimacy
+  question: What started the ScreenConnect server process, and is its execution chain expected?
+  context: The parent-child relationship is the core signal for this detection. Tracing the server process back to its
+    own parent confirms it is the legitimate installed service rather than a relocated or impersonating binary, and
+    establishes the baseline against which the child shell stands out as anomalous.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- source: template:cue_parent_process.mechanism_decode
+  question: What exactly did the child shell or compiler do? Decode its full command line.
+  context: The child command line reveals the operational purpose of the web shell. For cmd.exe, decode the executed
+    command, any downloaded or staged file paths, and chained commands. For csc.exe, the command line names the source
+    file being compiled and the output assembly path, which points back to the dropped ASP.NET web page that triggered
+    just-in-time compilation. Scoping to the alerting server instance keeps the result to the shells this server spawned.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - CurrentDirectory
+- source: attack:T1190.web_shell_artifact
+  question: Does the csc.exe or cmd.exe command line reference a source or page file in a web-accessible server directory?
+  context: ASP.NET compiles a newly requested page on first access, so a csc.exe child typically names a source file
+    under a temporary compilation directory that maps back to a freshly dropped web page. A stray page or extension
+    file outside the expected per-extension layout is the web shell itself. Identify the referenced file path so the
+    on-disk artifact can be located, preserved, and removed.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+      - Image
+- source: attack:T1190.image_load
+  question: Did the ScreenConnect server process or its child load non-standard or unsigned modules around the alert time?
+  context: Exploitation of a public-facing application often manifests as the server process loading modules outside its
+    normal set, or a compiled web shell assembly being loaded into the worker. Reviewing modules loaded by the server
+    process and its child on this host surfaces injected or freshly compiled code that the process-creation view alone
+    does not show. If module-load telemetry is not collected in this environment, treat zero results as a visibility
+    gap rather than evidence nothing loaded.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|contains:
+          - \ScreenConnect.Service.exe
+          - \cmd.exe
+          - \csc.exe
+      condition: selection
+    fields:
+      - Image
+      - ImageLoaded
+      - Signed
+      - Signature
+- source: template:initial_access.delivery_vector
+  question: What web request triggered this execution on the ScreenConnect server?
+  context: Server-side exploitation begins with a crafted request to the public application endpoint. Identifying the
+    originating request, the source address, and the targeted path enables blocking at the perimeter and reveals whether
+    the request matched a known exploitation pattern such as path traversal or an unauthenticated setup-wizard call.
+    The web server access logs on the host carry the request that immediately preceded this process spawn.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+- source: attack:T1190.error_rate_spike
+  question: Did the ScreenConnect server produce a spike of HTTP 4xx or 5xx responses shortly before the alert?
+  context: Exploitation attempts against a public-facing application frequently generate elevated 4xx or 5xx responses
+    as the attacker probes endpoints, sends malformed input, or triggers server errors before a successful request lands.
+    A burst of error responses on the server within roughly fifteen minutes before the child spawn corroborates an
+    exploitation attempt and helps bound the attack window. This is answered from the server web access and error logs;
+    the redisplayed alert event can be ignored.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:initial_access.application_patch_status
+  question: Is the ScreenConnect server patched against the known authentication-bypass and path-traversal vulnerabilities?
+  context: Server-side exploitation here depends on known vulnerabilities in the ScreenConnect application, including an
+    authentication bypass and a path-traversal flaw that allow an unauthenticated attacker to create an administrator
+    and upload a web-accessible file. An unpatched version confirms exploitation was possible and flags other
+    similarly exposed instances as at risk. Patch status also separates exploitation of a known issue from a novel one.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+- source: template:remote_access_tool.tool_authorization
+  question: Is this ScreenConnect server an authorized, inventoried deployment, and were administrator accounts recently added?
+  context: A sanctioned ScreenConnect server is expected on an inventory, but the exploitation chain creates a new
+    administrator account recorded in the server's user store. Confirm the server is authorized and review the user
+    store for accounts added around the alert time, since an attacker-created admin grants full control over every
+    managed endpoint, not just this host.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+- source: template:remote_access_tool.connection_destination
+  question: What outbound connections did the server process or its child make after the alert?
+  context: Post-exploitation often includes an outbound callback or the staging of a secondary remote-access tool for
+    persistence. Connections from the server process or the spawned shell to addresses outside the expected vendor and
+    update infrastructure point to command-and-control or tooling download. Connections to unfamiliar external
+    addresses warrant blocking and further scoping.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationHostname
+      - DestinationPort
+- source: template:cue_parent_process.follow_on
+  question: What other child processes did the ScreenConnect server process spawn?
+  context: An attacker who reaches code execution through the server process typically runs more than one command in
+    sequence — reconnaissance, account creation, tool staging, and persistence. Enumerating every child the server
+    process spawned around the alert reveals the full scope of activity initiated through the web shell.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        process.parent.name|expand: '%ParentName%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_user_actor.baseline
+  question: Does this user account normally run command interpreters or compilers on this host?
+  context: Compare the account credited with the child process against its historical behavior. The server process
+    typically runs under a service identity, so a child shell attributed to an interactive or unexpected account, or to
+    an account with no prior history of running these tools here, is more suspicious than one tied to known maintenance.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is the ScreenConnect server spawning cmd.exe or csc.exe historically routine on this host or across the environment?
+  context: When the alert fires under a service identity, user attribution is uninformative; the meaningful pivot is the
+    launch mechanism. A new or rare pairing of the server process with cmd.exe or csc.exe on this host or across the
+    environment is the deviation worth chasing, whereas a pairing that already accounts for many prior events likely
+    reflects a benign update or maintenance routine.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:initial_access.campaign_scope
+  question: Did the same detection fire on other ScreenConnect servers in the environment?
+  context: A publicly exposed, unpatched ScreenConnect server is rarely the only one in an environment. The same rule
+    firing on other hosts indicates additional servers were reached by the same exploitation and need investigation and
+    remediation. A single occurrence is more likely targeted but still requires the exposed server to be patched.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        rule.uuid|expand: '%rule.uuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Server-side exploitation often produces a sequence of detections — probing, web shell drop, account creation,
+    tool staging. Earlier alerts on the same host help reconstruct the timeline and reveal whether the web shell
+    execution was preceded by reconnaissance or followed by persistence and lateral movement.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1190
+      name: Exploit Public-Facing Application
+      role: primary
+  attack_chain_coverage:
+    - stage: 1
+      label: abnormal_request
+      description: "Adversary sends crafted HTTP/S input to the Internet-facing ScreenConnect server endpoint"
+      mapped_to: Q7
+      source: template:initial_access.delivery_vector
+    - stage: 2
+      label: error_spike
+      description: "Elevated 4xx/5xx responses or unusual methods/paths on the public endpoint"
+      mapped_to: Q8
+      source: attack:T1190.error_rate_spike
+    - stage: 3
+      label: server_spawns_child
+      description: "Server process spawns shell/LOLbins (cmd.exe) or compiles a web page (csc.exe) or loads non-standard modules"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 4
+      label: outbound_callback
+      description: "Optional outbound callback or secondary-tool staging from the host"
+      mapped_to: Q11
+      source: template:remote_access_tool.connection_destination
+  dimension_coverage:
+    - dimension: time_correlation
+      technique: T1190
+      covered_by: Q8
+      source: attack:T1190.error_rate_spike
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1190
+      covered_by: Q4
+      source: template:cue_parent_process.mechanism_decode
+      coverage_type: direct
+  mutable_dispositions:
+    - element: PublicVIPs
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q7
+      notes: "No concrete IPs in brief; delivery_vector question directs analyst to the originating web request and source address"
+    - element: SuspiciousPatterns
+      dimension: tuning_parameter
+      specific_values: "../, union select, cmd=, ${jndi:, rO0AB, %00, ${env:}"
+      disposition: context
+      target_question: Q7
+      notes: "Exploit-input regex set is web-log-side; named generically (path traversal, malformed input) in delivery_vector and error_rate_spike context — process_creation queries cannot match request bodies"
+    - element: ErrorRateThreshold
+      dimension: tuning_parameter
+      specific_values: ">5 in 5m"
+      disposition: context
+      target_question: Q8
+      notes: "Threshold paraphrased in error_rate_spike context; answered from server error logs, not directly queryable in process_creation"
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "15 minutes"
+      disposition: context
+      target_question: Q8
+      notes: "Correlation horizon (~15m) reflected in error_rate_spike context and -1h query range"
+    - element: AllowedChildList
+      dimension: tuning_parameter
+      specific_values: "msbuild.exe in CI; benign app-pool children"
+      disposition: context
+      target_question: Q14
+      notes: "Known-good parent+child pairings surfaced via baseline_svc historical frequency rather than a static allowlist"
+  dedup_decisions:
+    - dropped: cue_process_tool.mechanism_decode
+      reason: "Phase 2 decode covered by cue_parent_process.mechanism_decode scoped to ParentProcessGuid; the two mechanism_decode cues collapse to one decode question for this parent-driven rule"
+      kept: cue_parent_process.mechanism_decode
+    - dropped: cue_process_tool.process_chain
+      reason: "parent_process is primary cue and ParentImage is in detection — hint 2; parent origin covered by parent_child.parent_process_legitimacy"
+      kept: parent_child.parent_process_legitimacy
+    - dropped: cue_parent_process.clustering
+      reason: "host-and-time clustering of the same parent overlaps cue_parent_process.follow_on (same parent, same host, same window); follow_on already enumerates children"
+      kept: cue_parent_process.follow_on
+    - dropped: cue_parent_process.baseline
+      reason: "parent-child historical frequency covered by cue_user_actor.baseline_svc (parent.name + Image over 90d), which is the service-principal-correct framing for a server process"
+      kept: cue_user_actor.baseline_svc
+    - dropped: cue_user_actor.clustering
+      reason: "user-pivot network clustering degenerates under the server service identity; baseline_svc and follow_on carry the launch-mechanism and same-parent scope. Pair partner clustering_svc also dropped to stay within 18-question cap"
+      kept: cue_user_actor.baseline_svc
+    - dropped: cue_user_actor.clustering_svc
+      reason: "parent+binary cross-host rollout question overlaps initial_access.campaign_scope (same rule across hosts) for this server-exploitation rule; campaign_scope is the more direct scope question"
+      kept: template:initial_access.campaign_scope
+    - dropped: cue_process_tool.baseline
+      reason: "host-level binary baseline subsumed by cue_user_actor.baseline_svc parent+binary frequency, which is more specific to this parent-driven rule"
+      kept: cue_user_actor.baseline_svc
+    - dropped: cue_parent_process.scope
+      reason: "enterprise-wide parent-child scope overlaps initial_access.campaign_scope (same rule across hosts); campaign_scope answers the cross-host question directly via alert correlation"
+      kept: template:initial_access.campaign_scope
+    - dropped: cue_host_context.clustering
+      reason: "host-wide activity around the alert overlaps cue_parent_process.follow_on (children of the server process) plus cue_host_context.precursor (prior alerts); dropped to stay within the 18-question cap"
+      kept: cue_parent_process.follow_on
+    - dropped: remote_access_tool.active_session_context
+      reason: "helpdesk-ticket framing fits client-side remote support, not a server process spawning shells; tool_authorization repurposed to cover server authorization plus the attacker-created-admin audit"
+      kept: template:remote_access_tool.tool_authorization
+    - dropped: parent_child.sibling_processes
+      reason: "ParentProcessGuid sibling enumeration is identical in intent to cue_parent_process.follow_on (other children of the same parent); kept the cue version scoped to this host"
+      kept: template:cue_parent_process.follow_on
+  skipped_templates:
+    - template: universal.endpoint_protection_health
+      reason: "Rule fires on the initial server-side execution surface, not a hands-on-keyboard payload stage; tamper-as-precursor is not the live question and cue_host_context.precursor already surfaces any prior tamper alerts on the host"
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "cmd.exe: too common for Image-based scoping — use CommandLine patterns for mechanism_decode"
+      disposition: declined
+      reason: >-
+        Acted on in spirit but not via CommandLine patterns: the rule has empty
+        commandline_values (it is a field-only parent+child rule), so there are no
+        rule CommandLine tokens to filter on. Instead of host+Image scoping for the
+        mechanism_decode question, the decode query is scoped to the exact alerting
+        parent instance via ParentProcessGuid + host.name, which returns only the
+        children this specific ScreenConnect.Service.exe spawned rather than every
+        cmd.exe on the host. This achieves the hint's precision goal without inventing
+        CommandLine values the rule does not constrain.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - initial_access
+    - remote_access_tool
+    - parent_child
+  generation_stats:
+    total_questions: 16
+    source_counts:
+      template: 13
+      attack: 3
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 2
+      context: 12
+    logsource_diversity:
+      process_creation: 12
+      image_load: 1
+      network_connection: 1
+      sigma_alert: 2

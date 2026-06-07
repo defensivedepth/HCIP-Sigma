@@ -1,0 +1,553 @@
+name: Uncommon Child Process Of Setres.EXE
+id: c6e6d68a-1411-4d14-a893-7481d164c128
+description: |
+  Detects setres.exe spawning a child process whose Image path contains "\choice"
+  while excluding the legitimate choice.exe under System32 or SysWOW64. setres.exe is
+  a Windows Server display-resolution utility that launches a binary named "choice"
+  from its current working directory, so an attacker who drops a renamed payload named
+  "choice" alongside it gets arbitrary code executed through a trusted parent — a form
+  of proxied, indirect execution. Investigation should confirm what the child binary
+  actually is and where it lives, identify what launched setres.exe, and determine
+  whether the spawned child reached out to the network or dropped further artifacts.
+type: detection
+detection_id: 835e75bf-4bfd-47a4-b8a6-b766cac8bcb7
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the alert show setres.exe as the parent spawning a child whose image path contains "\choice" from a non-System32 location?
+  context: Confirm the alert is a true positive by reviewing the exact parent and child image paths. The rule fires only when the parent ends in setres.exe AND the child image path contains "\choice" AND the child is not the legitimate choice.exe under System32 or SysWOW64. Verify the child's full path before investing further.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+- source: template:universal.host_user_context
+  question: Is this host expected to run setres.exe, and is this user expected to perform display-resolution or server-configuration tasks here?
+  context: setres.exe ships only on Windows Server SKUs and is normally used to set screen resolution during configuration. A workstation running it, or a standard user invoking it interactively, is a fast discriminator between routine server administration and abuse of the binary as an execution proxy.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:parent_child.parent_process_legitimacy
+  question: What started setres.exe, and is that launch chain expected on this host?
+  context: The parent-child relationship is the core signal here. setres.exe is rarely launched interactively; tracing setres.exe's own origin (its grandparent) reveals whether this was a hands-on-keyboard launch from a shell or script versus a routine configuration process. An unexpected launcher for setres.exe is the deviation worth chasing.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- source: template:parent_child.sibling_processes
+  question: What other child processes did this setres.exe instance spawn?
+  context: If setres.exe was used to proxy execution, it may have launched more than the one child that triggered the alert. Examining the siblings of the alerting child reveals whether the same setres.exe instance orchestrated multiple stages. ParentProcessGuid scopes to the exact parent instance; host.name is the fallback when it resolves to NODATA.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in the hour before the alert?
+  context: Proxied execution through a trusted binary is often staged after an operator weakens protection. This query surfaces direct attempts to disable AV/EDR services, flip Defender flags, add broad exclusions, clear logs, or patch AMSI/ETW. Zero rows is a useful "protection looks healthy" signal; populated rows shift the disposition toward operator preparation, so review the parent process and signing chain of any hits.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+- source: template:cue_parent_process.mechanism_decode
+  question: What is setres.exe's own command line, and what spawned it?
+  context: setres.exe's process_creation event shows the resolution flags it was invoked with and confirms its own parent. A setres.exe launched from an interactive shell or scripting host, rather than as part of a server-configuration sequence, reframes the spawned child as the deliberate payload rather than incidental output of a configuration task.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+- source: template:cue_process_tool.mechanism_decode
+  question: What exactly is the "choice" child binary, and what did its command line do?
+  context: The child whose path contains "\choice" is the proxied payload. Decode its full command line, flags, and any URLs or script paths. Because setres.exe launches "choice" from its working directory, a renamed payload (e.g., choice.exe, choice.com, or choice.cmd dropped in a non-System32 path) is the abuse pattern; high-risk indirect-execution children include powershell.exe, cmd.exe, rundll32.exe, regsvr32.exe, mshta.exe, and curl.exe content invoked this way.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|contains|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: attack:T1202.file_artifact
+  question: What "choice"-named files exist in the working directory that setres.exe launched from?
+  context: setres.exe resolves "choice" from its current working directory, so abuse requires an attacker-dropped file such as choice.exe, choice.com, or choice.cmd outside System32. File events scoped to the spawned child's paths reveal when and by what the renamed payload was written, which distinguishes a freshly staged binary from a long-present file.
+  range: -24h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains|expand: '%file_dirs%'
+      filter_choice:
+        TargetFilename|contains: '\choice'
+      condition: selection and filter_choice
+    fields:
+      - TargetFilename
+      - Image
+      - User
+- source: attack:T1218.proxied_child_network
+  question: Did the "choice" child binary make any outbound network connections?
+  context: Proxied execution through a trusted parent frequently exists to run a downloader or beacon. Network connections initiated by the spawned child, correlated to its process instance, indicate retrieval of a follow-on payload or command-and-control. Absence of network activity points toward purely local actions such as dropping or modifying files.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|contains|expand: '%Image%'
+        Initiated: 'true'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: The indirect-execution chain ties together the launcher, the spawned child, and any follow-on actions within a short window. Aggregating process activity around the alert surfaces the immediate context — what led to setres.exe running and what happened after the child executed — while collapsing repetitive agent telemetry into high-count rows so novel parent-child pairs stand out.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_parent_process.baseline
+  question: Has setres.exe spawned a child whose image path contains "\choice" on this host before?
+  context: Historical frequency of this specific parent-child pairing distinguishes routine from anomalous. setres.exe legitimately launching the System32 choice.exe is excluded by the rule, so any prior occurrence of this exact non-System32 pairing is itself notable. Zero or very low counts indicate a novel spawning relationship.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        process.parent.name|expand: '%ParentName%'
+        Image|contains|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:cue_process_tool.baseline
+  question: Does this host normally run a binary named "choice" from this location?
+  context: A "choice"-named binary that has never been seen at this path is more suspicious than one that runs regularly. The legitimate choice.exe lives under System32; an aggregation showing prior executions from a different directory reframes the disposition, while zero counts indicate first-time execution of the renamed payload.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|contains|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run setres.exe or trigger this kind of server-configuration activity?
+  context: Compare this user's current action against their historical behavior. A user who has never run setres.exe is more suspicious than a server administrator who does so routinely. setres.exe is a server-only tool, so the user's role and the host's function should both align with display-resolution or configuration work.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|contains|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is the setres.exe to "choice" launch mechanism historically routine on this host or across the environment, or is it new?
+  context: When the alert fires under a service principal, user identity does not attribute behavior; the meaningful pivot is the launch mechanism — which parent spawned which binary, and whether that pair is historically common. A new or rare setres.exe-to-choice pairing is the deviation worth chasing, whereas a pair already accounting for many prior events points to OS or vendor automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|contains|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints. If the same user triggered similar indirect-execution activity on other hosts, the scope of the operation may be larger than a single alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same setres.exe to "choice" launch fire on other hosts in the same window, or is it isolated to this host?
+  context: Under a service principal, a user-pivot across the network returns agent-telemetry noise. The meaningful question is whether the same launch mechanism — setres.exe spawning a "choice"-named child — fired on other hosts in the alert window. Multiple hosts in the same window points to scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|contains|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Indirect execution through a trusted binary is usually a mid-chain action rather than an entry point. Earlier detections on the same host — defense tampering, reconnaissance, credential access — may reveal the stages that preceded this event and help reconstruct the full timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1218
+      name: System Binary Proxy Execution
+      role: primary
+    - id: T1202
+      name: Indirect Command Execution
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: indirection_utility_launch
+      description: "A trusted indirection utility (setres.exe) is launched, itself the proxy for execution"
+      mapped_to: Q6
+      source: template:cue_parent_process.mechanism_decode
+    - stage: 2
+      label: secondary_program_spawn
+      description: "The utility spawns a secondary program/command (the renamed 'choice' child)"
+      mapped_to: Q7
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 3
+      label: network_or_file_effect
+      description: "The spawned child opens outbound network connections and/or drops files in the working directory"
+      mapped_to: Q9
+      source: attack:T1218.proxied_child_network
+  dimension_coverage:
+    - dimension: command_analysis
+      technique: T1218
+      covered_by: Q7
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1218
+      covered_by: Q3
+      source: template:parent_child.parent_process_legitimacy
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1218
+      covered_by: Q7
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: indirect
+    - dimension: time_correlation
+      technique: T1202
+      covered_by: Q10
+      source: template:cue_host_context.clustering
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1202
+      covered_by: Q13
+      source: template:cue_user_actor.baseline
+      coverage_type: direct
+  mutable_dispositions:
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "rationale only (profile unexpected parent-child relationships)"
+      disposition: context
+      target_question: Q3
+      notes: "Parent is fixed by the rule (setres.exe); parent legitimacy and origin chain addressed in parent_process_legitimacy."
+    - element: SignedBinaryList
+      dimension: tuning_parameter
+      specific_values: "rationale only (msiexec.exe, regsvr32.exe — example allow-list)"
+      disposition: context
+      target_question: Q7
+      notes: "Rule's proxy binary is setres.exe, not in the example list; high-risk indirect-execution children named in Q7 context."
+    - element: CommandLineRegex
+      dimension: command_analysis
+      specific_values: "rationale only (URLs, script paths, DLL entrypoints)"
+      disposition: context
+      target_question: Q7
+      notes: "Decoded in mechanism_decode; rule has no commandline_values to inject as a literal filter."
+    - element: RemoteDomainAllowlist
+      dimension: tuning_parameter
+      specific_values: "rationale only (suppress legitimate enterprise domains)"
+      disposition: context
+      target_question: Q9
+      notes: "Egress allow-listing is an environment tuning concern; child network question surfaces destinations for the analyst to triage."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "10-30 minutes (launcher to child/network correlation)"
+      disposition: context
+      target_question: Q10
+      notes: "Correlation window realized as the +/-15m clustering range around the alert."
+    - element: AllowedUtilities
+      dimension: tuning_parameter
+      specific_values: "forfiles, wsl, ssh (admin/jumphost allow-list)"
+      disposition: context
+      target_question: Q14
+      notes: "Rule's indirection utility is setres.exe; routine-vs-novel launch mechanism profiled in baseline_svc."
+    - element: HighRiskChildren
+      dimension: tuning_parameter
+      specific_values: "powershell.exe, cmd.exe, rundll32.exe, regsvr32.exe, mshta.exe, msiexec.exe, curl.exe, bitsadmin.exe"
+      disposition: context
+      target_question: Q7
+      notes: "High-risk child list named in Q7 context to guide identification of the proxied payload."
+    - element: UserContext
+      dimension: user_context
+      specific_values: "rationale only (standard/interactive user vs. server/CI agent)"
+      disposition: context
+      target_question: Q2
+      notes: "host_user_context and user-actor baseline both turn on whether a server-only tool fits the user/host role."
+    - element: DestCIDRs
+      dimension: tuning_parameter
+      specific_values: "rationale only (known-good egress for SSH/WSL automation)"
+      disposition: context
+      target_question: Q9
+      notes: "Egress CIDR tuning is environment-specific; child network question exposes DestinationIp/Port for triage."
+  dedup_decisions:
+    - dropped: cue_process_tool.process_chain
+      reason: "parent_process is primary cue and parent_child technique set active — parent_process_legitimacy (Q3) and parent mechanism_decode (Q6) subsume the process_chain question."
+      kept: parent_child.parent_process_legitimacy
+  skipped_templates:
+    - template: cue_parent_process.follow_on
+      reason: "Subsumed by parent_child.sibling_processes (Q4), which scopes children to the exact ParentProcessGuid instance rather than all instances of the parent binary."
+    - template: cue_parent_process.clustering
+      reason: "Subsumed by cue_host_context.clustering (Q10) for around-alert activity; parent-scoped variant adds no unique field beyond Image/CommandLine already surfaced by sibling_processes."
+    - template: cue_parent_process.scope
+      reason: "Cross-host scope of the parent-child pair is covered by the service-principal clustering substitute (Q16), which checks the same parent+binary pairing on other hosts in the alert window."
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "logsource 'image_load' (recommended by techniques: T1218) is not covered — pull in cue_image_load.* or author a custom question with `category: image_load`"
+      disposition: declined
+      reason: >-
+        T1218 image_load analytics target DLL-based proxy execution (rundll32/regsvr32
+        loading externally hosted modules). This rule's abuse path is setres.exe
+        spawning a child EXE/COM/CMD named "choice" from its working directory — a
+        process_creation event, not a module load. Q7 (process_tool.mechanism_decode)
+        decodes the spawned child binary and Q9 (attack:T1218.proxied_child_network)
+        covers its outbound activity, which together cover the proxy-execution effect
+        without an image_load query. No compensating attack:T1218.image_load question
+        authored.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - parent_child
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 15
+      attack: 2
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 2
+      context: 13
+    logsource_diversity:
+      process_creation: 14
+      file_event: 1
+      network_connection: 1
+      sigma_alert: 1

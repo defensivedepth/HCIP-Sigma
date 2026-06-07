@@ -1,0 +1,548 @@
+name: Scheduled Task Executing Payload from Registry
+id: 804e4042-b8d6-4863-83e9-b448ee59b658
+description: |
+  Detects creation of a scheduled task (schtasks.exe /Create) whose run command launches PowerShell to read
+  a payload stored in the Windows Registry, using Get-ItemProperty or the gp alias against an HKCU/HKLM/registry::
+  hive path. The rule fires when all of these conditions hold together AND the command line does NOT already
+  contain FromBase64String or encodedcommand. Storing payload bytes in the registry and re-reading them from a
+  recurring scheduled task is a fileless persistence pattern: the task survives reboot and re-executes the
+  registry-resident payload on a schedule. Legitimate administrative scripts rarely combine task creation with
+  PowerShell registry reads in one command line, so the investigation should confirm what the task runs, where
+  the registry payload lives, and whether the task is still registered.
+type: detection
+detection_id: 86588b36-c6d3-465f-9cee-8f9093e07798
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line create a scheduled task whose run command reads a registry-stored payload via PowerShell?
+  context: Before investing investigation time, confirm this is a true positive. The command line should be a schtasks.exe /Create that ties together a registry read (Get-ItemProperty or the gp alias against HKCU:, HKLM:, registry::, or HKEY_) without an explicit FromBase64String or encodedcommand token. Review the full Image, OriginalFileName, and CommandLine against these criteria.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to create scheduled tasks that run PowerShell registry reads?
+  context: Legitimate administrative activity can trigger this detection. Knowing whether the user role and host function normally involve scheduled-task creation, and whether this account routinely runs PowerShell against the registry, is often the fastest path to separating a true positive from routine operations.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:organizational_context.change_ticket
+  question: Was there a change ticket, maintenance window, or documented approval for this scheduled task?
+  context: Many organizations require change tickets for persistence mechanisms such as scheduled tasks. A corresponding ticket suggests authorized deployment; absence of one when policy requires it suggests the task was created outside normal process. This check can quickly close a false positive or escalate a true positive.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:scheduled_task.task_configuration
+  question: What scheduled task was created, and what command does its run action execute?
+  context: The schtasks command line carries the task name (/TN), the command to run (/TR), the schedule (/SC and /MO), and the run-as account (/RU). Identify the task name, the full /TR PowerShell command, the schedule type, and whether it runs as SYSTEM. A GUID-style or randomized task name running a recurring PowerShell registry read is the persistence payload.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: llm_generated
+  question: Which registry path does the task's PowerShell command read from, and is that location holding a payload rather than configuration?
+  context: The /TR command references a registry path via Get-ItemProperty or gp against an HKCU:, HKLM:, registry::, or HKEY_ hive. Identify the exact key and value name. Randomized key/value names under HKCU\Software (for example HKCU\SOFTWARE\<random>) holding large opaque value data are a fileless payload store, not normal application configuration.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:powershell.encoded_command_decode
+  question: Does the task's PowerShell command decode or transform the registry value before running it?
+  context: The rule fires specifically when FromBase64String and encodedcommand are absent from the command line, but the payload may still be transformed once read. Reconstruct what the PowerShell does with the registry value -- decoding, casting bytes to a string, or piping into Invoke-Expression/IEX or [Reflection.Assembly]::Load. The decoded content reveals whether the task runs a download cradle, a reverse shell, or an in-memory .NET loader.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: attack:T1053.005.security
+  question: Does the task-creation audit record show the same task, and what run-as principal and trigger were registered?
+  context: Task Scheduler writes an audit event when a task is registered, capturing the task name, the registered command, the trigger, and the account that created it. Comparing the audited registration against the command line confirms the task took effect and surfaces a run-as principal (SYSTEM is high-risk) or recurring trigger that the process command line alone may not make obvious. If task-registration auditing is not collected in this environment, treat absence as a visibility gap rather than evidence the task did not register.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      category: security
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID:
+          - 4698
+          - 4702
+      condition: selection
+    fields:
+      - TaskName
+      - TaskContent
+      - SubjectUserName
+- source: template:scheduled_task.task_trigger_and_timing
+  question: When is the task scheduled to run, and has the scheduler already launched it?
+  context: The trigger determines when the persistence activates. Recurring schedules (for example every few minutes) may have already executed multiple times; logon or boot triggers fire on next session start. Processes spawned by the Task Scheduler service after task creation reveal whether the registry payload has already run.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith: '\svchost.exe'
+        ParentCommandLine|contains: 'Schedule'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:scheduled_task.task_still_present
+  question: Is the scheduled task still registered on the system?
+  context: Persistence is only effective if the task still exists; some operators delete the task after it runs to reduce artifacts. Confirming the task is still present (schtasks /query /tn <name> /v or the Task Scheduler view on the host) determines whether the mechanism is active and requires remediation. Use the task name recovered from the run command.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:cue_process_tool.process_chain
+  question: What process spawned schtasks.exe, and is that parent chain expected?
+  context: The parent process reveals how the task creation was invoked. Logon-driven administration typically shows explorer.exe or a console shell; service-driven automation shows services.exe. Unusual parents such as wscript.exe, mshta.exe, regsvr32.exe, or an Office application point to script or macro-driven execution rather than an interactive admin.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_user_actor.baseline
+  question: Does this user normally create scheduled tasks with schtasks.exe?
+  context: Compare this user's current action against their historical behavior. A user who has never run schtasks.exe is more suspicious than one who creates tasks routinely. The result is grouped by host so account activity that spans multiple endpoints is visible. User role and typical toolset should align with creating persistence.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent-and-schtasks.exe combination historically routine on this host or across the environment?
+  context: When the alert fires under SYSTEM or a service account, user identity does not attribute the behavior; the meaningful pivot is the launch mechanism. A parent process that already accounts for many prior schtasks.exe executions is automation; a new or rare parent for this binary is the deviation worth chasing.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the account's activity across all hosts reveals lateral movement or repeated persistence installs. If the same user created similar tasks on multiple endpoints, the scope of the operation is larger than this single host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent-and-schtasks.exe combination fire on other hosts in the same window, or is the activity isolated to this host?
+  context: Under a service principal, the user-pivot returns broad agent-telemetry noise. The meaningful question is whether the same launch mechanism -- the parent process spawning schtasks.exe -- fired on other hosts in the alert window. Multiple hosts in the same window points to a pushed or scheduled rollout; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:lolbin.renamed_binary_check
+  question: Was schtasks.exe executed from its expected System32 path?
+  context: schtasks.exe executed from outside System32 or SysWOW64 may indicate the binary was copied or renamed to evade path-based allowlists. Confirm the Image path and OriginalFileName so a relocated or renamed scheduler binary is not mistaken for the system one.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- source: template:lolbin.historical_lolbin_baseline
+  question: How often has this host fired this scheduled-task-from-registry pattern over the past 90 days, and what command shapes are typical?
+  context: A pattern with no prior history on a host is more suspicious than one seen regularly under stable parents. The query mirrors the rule's selection structure scoped to this host, so the count reflects this specific firing pattern rather than all schtasks.exe usage. The CommandLine projection lets you compare typical invocations against the alerting one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_img:
+      - Image|endswith: \schtasks.exe
+      - OriginalFileName: schtasks.exe
+      selection_cli_create:
+        CommandLine|contains: /Create
+      selection_cli_get:
+        CommandLine|contains:
+        - Get-ItemProperty
+        - ' gp '
+      selection_cli_hive:
+        CommandLine|contains:
+        - 'HKCU:'
+        - 'HKLM:'
+        - 'registry::'
+        - HKEY_
+      filter_main_encoding:
+        CommandLine|contains:
+        - FromBase64String
+        - encodedcommand
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_* and not 1 of filter_*) and _pb_scope
+    fields:
+    - CommandLine
+- source: template:persistence_scope.process_based_persistence
+  question: Were other process-based persistence mechanisms installed on this host around the same time?
+  context: Operators rarely rely on a single persistence mechanism. Around the time this task was created, look for additional scheduled tasks, service creation, registry Run-key writes, BITS jobs, or WMI subscriptions. Multiple persistence installs in the same window indicate intentional stacking rather than an isolated administrative action.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host -- defense tampering, reconnaissance, or credential access -- may reveal the stages that preceded this persistence install and help reconstruct the timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1053.005
+      name: Scheduled Task
+      role: primary
+    - id: T1059.001
+      name: PowerShell
+      role: secondary
+    - id: T1053
+      name: Scheduled Task/Job
+      role: secondary
+    - id: T1059
+      name: Command and Scripting Interpreter
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: task_creation
+      description: "Actor creates a scheduled task via schtasks.exe /Create"
+      mapped_to: Q4
+      source: template:scheduled_task.task_configuration
+    - stage: 2
+      label: registry_payload_read
+      description: "Task run command launches PowerShell to read a payload from the registry via Get-ItemProperty/gp"
+      mapped_to: Q5
+      source: llm_generated
+    - stage: 3
+      label: payload_transform_execute
+      description: "PowerShell decodes/transforms the registry value and executes it"
+      mapped_to: Q6
+      source: template:powershell.encoded_command_decode
+    - stage: 4
+      label: task_registration_audit
+      description: "Task Scheduler registers the task (Event 4698/4702) and the scheduler later executes it"
+      mapped_to: Q7
+      source: attack:T1053.005.security
+    - stage: 5
+      label: scheduled_execution
+      description: "Task Scheduler launches the registered command on its trigger"
+      mapped_to: Q8
+      source: template:scheduled_task.task_trigger_and_timing
+  dimension_coverage:
+    - dimension: obfuscation_check
+      technique: T1053.005
+      covered_by: Q6
+      source: template:powershell.encoded_command_decode
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1053.005
+      covered_by: Q8
+      source: template:scheduled_task.task_trigger_and_timing
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1053.005
+      covered_by: Q4
+      source: template:scheduled_task.task_configuration
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1053.005
+      covered_by: Q2
+      source: template:universal.host_user_context
+      coverage_type: direct
+    - dimension: command_analysis
+      technique: T1053
+      covered_by: Q1
+      source: template:universal.verify_trigger_match
+      coverage_type: direct
+    - dimension: execution_context
+      technique: T1053
+      covered_by: Q10
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1059.001
+      covered_by: Q10
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+  mutable_dispositions:
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q8
+      notes: "No concrete threshold value; trigger/timing question carries the correlation window via the scheduler-child query"
+    - element: UserContext
+      dimension: user_context
+      specific_values: "rationale only (SYSTEM / non-standard accounts)"
+      disposition: context
+      target_question: Q2
+      notes: "SYSTEM run-as called out in context of host_user_context and task_configuration; no queryable value"
+    - element: TaskNamePattern
+      dimension: tuning_parameter
+      specific_values: "rationale only (randomized/GUID task names)"
+      disposition: context
+      target_question: Q4
+      notes: "GUID/randomized task-name guidance added to task_configuration context"
+    - element: CommandLineEntropyThreshold
+      dimension: obfuscation_check
+      specific_values: "rationale only (no threshold value)"
+      disposition: context
+      target_question: Q6
+      notes: "Decode/transform question covers obfuscation; entropy is not directly queryable"
+    - element: CommandLineRegex
+      dimension: command_analysis
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q1
+      notes: "Rule's own selection (Get-ItemProperty/gp + hive refs) already encodes the command pattern"
+    - element: CommandLinePattern
+      dimension: command_analysis
+      specific_values: "rationale only (-enc/-nop regex)"
+      disposition: context
+      target_question: Q6
+      notes: "Rule fires when encodedcommand absent; transform question covers the in-line decode path instead"
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "rationale only (Office, mshta abnormal parents)"
+      disposition: context
+      target_question: Q10
+      notes: "Abnormal-parent guidance injected into process_chain context"
+  dedup_decisions:
+    - dropped: cue_user_actor.baseline
+      reason: "user_actor pair — non-deduplicable; emit BOTH user-pivot and service-principal substitute"
+      kept: cue_user_actor.baseline_svc
+    - dropped: cue_user_actor.clustering
+      reason: "user_actor pair — non-deduplicable; emit BOTH user-pivot and service-principal substitute"
+      kept: cue_user_actor.clustering_svc
+    - dropped: cue_process_tool.baseline
+      reason: "host-binary baseline subsumed by the reflected lolbin.historical_lolbin_baseline (rule-pattern scoped); it counts only this firing pattern, not generic schtasks usage"
+      kept: lolbin.historical_lolbin_baseline
+    - dropped: cue_process_tool.baseline_deviation
+      reason: "reflected host-pattern baseline (parents/users that drove this rule's firing on this host) fully overlaps lolbin.historical_lolbin_baseline, which is the same reflected host-pattern baseline scoped to this firing; kept the lolbin variant because it also satisfies the LOLBin hint. Dropped to enforce the 18-question hard cap (was 20)"
+      kept: lolbin.historical_lolbin_baseline
+    - dropped: organizational_context.procedural_consistency
+      reason: "the how-do-you-normally-deploy-tasks human-attribution question overlaps organizational_context.change_ticket (authorized-deployment check) and universal.host_user_context (is this user/host expected to create such tasks); dropped to enforce the 18-question hard cap (was 20)"
+      kept: organizational_context.change_ticket
+    - dropped: cue_process_tool.scope
+      reason: "fleet-pattern reflected scope overlaps lolbin.historical_lolbin_baseline (host-pattern) and clustering_svc cross-host check; dropped the fleet variant to stay under the 18-question cap"
+      kept: lolbin.historical_lolbin_baseline
+    - dropped: cue_process_tool.follow_on
+      reason: "child-process follow-on subsumed by scheduled_task.task_trigger_and_timing, which is the specific scheduler-child question for this rule"
+      kept: scheduled_task.task_trigger_and_timing
+    - dropped: cue_process_tool.clustering
+      reason: "host-wide tool clustering subsumed by cue_host_context.precursor (prior alerts) and persistence_scope.process_based_persistence (concurrent persistence tools)"
+      kept: persistence_scope.process_based_persistence
+    - dropped: cue_host_context.clustering
+      reason: "host activity clustering overlaps persistence_scope.process_based_persistence and precursor; dropped to stay under the 18-question cap"
+      kept: persistence_scope.process_based_persistence
+  skipped_templates:
+    - template: cue_process_tool.mechanism_decode
+      reason: "replaced_by scheduled_task.task_configuration (and registry.registry_key_context) — more specific decode for this rule"
+    - template: obfuscation.encoded_payload_decode
+      reason: "replaced_by powershell.encoded_command_decode — PowerShell is the parent interpreter for the registry payload"
+    - template: powershell.script_block_logging
+      reason: "rule fires on schtasks.exe process_creation, not PowerShell launch; the /TR PowerShell has not yet executed at detection time, so 4104 script-block content for the task payload is captured by the trigger/timing and decode questions once the scheduler runs it"
+    - template: powershell.powershell_security_bypass
+      reason: "rule explicitly excludes FromBase64String/encodedcommand and detects no AMSI/EP-bypass token; bypass-precursor sweep adds noise without coverage the precursor-alert question already provides"
+    - template: registry.registry_key_context
+      reason: "template is KEEP_EXACT on registry_set logsource (TargetObject/Details from a Sysmon 13/14 event sharing the alert ProcessGuid); this rule reads the registry inside the schtasks /TR PowerShell command line and emits no registry_set event tied to the schtasks ProcessGuid, so the registry path is recovered from CommandLine instead — authored as an llm_generated question (Q6) rather than the template query"
+    - template: registry.registry_related_modifications
+      reason: "rule reads a registry value via PowerShell, it does not write registry keys via reg.exe; reg.exe-write clustering query does not match this rule's behavior"
+    - template: registry.registry_value_persistence_check
+      reason: "persistence here is the scheduled task plus a registry-resident payload read at runtime, not a Run-key pointing to an on-disk executable; no %file_paths% is written by the rule, so the file-existence check does not apply"
+    - template: organizational_context.human_recall
+      reason: "change_ticket and procedural_consistency already cover the human-attribution path; dropped to stay under the 18-question cap"
+    - template: organizational_context.timing_alignment
+      reason: "task trigger/timing question covers when the activity runs; off-hours judgment folded into host_user_context"
+    - template: universal.endpoint_protection_health
+      reason: "recommended generic tamper sweep; cue_host_context.precursor already surfaces prior tamper alerts on this host and the rule is persistence-creation, not a hands-on-keyboard execution whose disposition turns on prior AV/EDR weakening"
+    - template: persistence_scope.file_based_persistence
+      reason: "this rule's persistence is registry-resident payload plus scheduled task, not a Startup-folder/Run-key file drop; process_based_persistence covers the concurrent-mechanism question more relevantly"
+    - template: lolbin.technique_class_lateral
+      reason: "the other-LOLBins-same-objective sweep targets download/proxy-exec objectives; this rule's objective is persistence via task creation, already covered by persistence_scope.process_based_persistence which enumerates the persistence LOLBin set"
+  hint_dispositions:
+    - hint: "logsource 'image_load' (recommended by techniques: T1059.001) is not covered — pull in cue_image_load.* or author a custom question with `category: image_load`"
+      disposition: declined
+      reason: >-
+        The rule fires on the schtasks.exe /Create process_creation event; the
+        PowerShell named in the task's /TR string has not executed at detection
+        time, so there is no .NET-hosted PowerShell process whose image_load
+        (EventCode 7) assembly chain could be inspected. image_load coverage of
+        the launching schtasks.exe binary is irrelevant to the registry-read
+        payload. The runtime payload execution is instead covered by the
+        scheduler-child execution question (scheduled_task.task_trigger_and_timing)
+        and the decode/transform question (powershell.encoded_command_decode).
+        No compensating attack:T1059.001.image_load question authored.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - powershell
+    - registry
+    - scheduled_task
+    - organizational_context
+    - persistence_scope
+    - lolbin
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 16
+      attack: 1
+      llm_generated: 1
+    phase_distribution:
+      triage: 2
+      analysis: 3
+      context: 13
+    logsource_diversity:
+      process_creation: 16
+      security: 1
+      sigma_alert: 1

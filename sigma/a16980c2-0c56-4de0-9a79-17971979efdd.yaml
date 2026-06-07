@@ -1,0 +1,732 @@
+name: Cmd.EXE Missing Space Characters Execution Anomaly
+id: 4da1ead9-9be7-4476-9813-217db82d9eef
+description: |
+  Detects cmd.exe command lines that omit the space before or after the /C, /K, or /R
+  flag, where either the flag runs directly against the next character (e.g. cmd.exe/cwhoami),
+  the binary and flag are joined (cmd.exe/c, "cmd/c, \cmd/c), or a spaceless flag is
+  immediately followed by a known tool (/cwhoami, /kpowershell, /cbitsadmin). The rule fires
+  when at least one of these three spaceless patterns matches AND none of the benign filters
+  (a trailing space after the flag, a bundled editor path, or a bare cmd.exe /c) apply.
+  cmd.exe parses these spaceless forms on some Windows versions, so this layout executes the
+  trailing command while evading naive regex detections that expect a space after the flag.
+  Legitimate batch generators and shells emit a space after the flag, so the spaceless form is
+  rarely typed by hand outside of a typo. Determine what command actually ran, what launched
+  cmd.exe, and whether the user, host, and parent chain are expected to produce this layout.
+type: detection
+detection_id: a16980c2-0c56-4de0-9a79-17971979efdd
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line match the spaceless cmd flag pattern this rule detects?
+  context: >-
+    Confirm the alert is a true positive before investing investigation time. The rule fires
+    when the command line matches EITHER a joined binary-and-flag form (cmd.exe/c, "cmd/c,
+    \cmd/c and the /k and /r equivalents), OR a spaceless flag directly followed by a known
+    tool (/cwhoami, /cpowershell, /cschtasks, /cbitsadmin, /ccertutil and their /k variants),
+    OR a flag with no trailing space (cmd.exe /c, cmd /k) that is not followed by the benign
+    trailing-space form. Note which of the three branches fired: a joined-tool branch
+    (/cpowershell, /cbitsadmin) tells you the downstream tool directly, while a joined
+    binary-and-flag branch leaves the actual command in the rest of the line to be decoded.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run cmd.exe with a spaceless flag layout?
+  context: >-
+    Legitimate administrative scripting can trigger many detections, but the spaceless flag
+    form is almost never produced by hand-typed or generated batch jobs. Knowing whether this
+    user routinely runs command-shell automation and whether this host is a build server,
+    jump box, or developer workstation that runs unusual tooling is often the fastest way to
+    separate a typo or odd-but-benign generator from operator obfuscation.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What command did cmd.exe actually run after the spaceless flag? Decode the full command line.
+  context: >-
+    The spaceless layout hides the real command from regex that expects a delimiter. Read past
+    the flag and decode whatever follows: chained commands joined by & or &&, quoted paths whose
+    outer quotes cmd strips, environment-variable expansion, and any downstream tool invoked
+    (whoami, powershell, schtasks, bitsadmin, certutil). This is scoped to the single triggering
+    event because cmd.exe is too common for host-wide binary scoping; the spaceless command line
+    is the payload to interpret.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:powershell.encoded_command_decode
+  question: If cmd launched PowerShell, was that PowerShell command encoded or obfuscated, and what does it decode to?
+  context: >-
+    Two of the rule's joined-tool patterns (/cpowershell, /kpowershell) spawn PowerShell from
+    cmd. When that happens, inspect the PowerShell arguments for -EncodedCommand / -enc base64,
+    string concatenation, backtick escaping, or variable substitution used to hide intent.
+    Decoding reveals the actual payload such as download cradles, reverse shells, or in-memory
+    .NET assembly loads. If the spaceless command did not invoke PowerShell, this question does
+    not apply and the result simply redisplays the alert.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:cue_process_tool.process_chain
+  question: What process spawned this cmd.exe and is that parent chain expected?
+  context: >-
+    The parent process reveals how cmd.exe was invoked. Interactive use commonly descends from
+    explorer.exe or a terminal; scripted use descends from a scheduler or service. Office
+    applications, mshta.exe, wscript.exe, or a browser/helper spawning a cmd.exe with a
+    spaceless flag points to a macro or exploitation chain rather than routine administration.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.follow_on
+  question: What child processes did this cmd.exe spawn afterward?
+  context: >-
+    The processes cmd.exe launches reveal its actual impact. The joined-tool patterns name the
+    intended downstream tool directly, but the joined binary-and-flag patterns hide it in the
+    rest of the line. Look for whoami, powershell.exe, schtasks.exe, bitsadmin.exe, certutil.exe,
+    or other post-exploitation tools spawned as children of the alerting cmd.exe.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:powershell.script_block_logging
+  question: If PowerShell ran, did script block logging capture the full deobfuscated script content?
+  context: >-
+    When cmd launched PowerShell, Event ID 4104 records the deobfuscated script content that
+    PowerShell actually executed, even when the command line was encoded. This is ground truth
+    that bypasses attacker obfuscation. If PowerShell operational logs are not ingested in this
+    environment, treat zero results as a visibility gap rather than evidence that nothing ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- source: template:powershell.powershell_security_bypass
+  question: Were PowerShell or AV security controls weakened on this host in the hour before this execution?
+  context: >-
+    Operators frequently disable or bypass protections before running a payload. Common
+    precursors include AMSI bypass, execution-policy changes (-ExecutionPolicy Bypass, -ep
+    bypass), and PowerShell downgrade to v2 which lacks logging. Finding these shortly before a
+    spaceless-flag cmd execution strengthens the case that the obfuscated layout was deliberate.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in the hour before the alert?
+  context: >-
+    Tampering typically precedes payload execution. The query surfaces direct attempts to disable
+    AV/EDR services, flip Defender flags, add broad exclusions, clear logs, or patch AMSI/ETW.
+    Zero rows is a useful "protection looks healthy" signal; kernel-level driver tampering and
+    in-memory patches will not appear here. Populated rows shift the disposition toward operator
+    preparation, which fits an obfuscated execution layout; review the parent process and signing
+    chain to identify the writer.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired this spaceless-flag pattern, what parents and users drove it, and does the current alert fit?
+  context: >-
+    The query mirrors the rule's selection structure scoped to this host, so the resulting
+    parent/user distribution reflects how this specific spaceless-flag pattern has historically
+    run here rather than generic cmd.exe usage. A new parent process, an unexpected user account,
+    or a first-ever appearance of the pattern on this host is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection1:
+        CommandLine|contains:
+        - cmd.exe/c
+        - \cmd/c
+        - '"cmd/c'
+        - cmd.exe/k
+        - \cmd/k
+        - '"cmd/k'
+        - cmd.exe/r
+        - \cmd/r
+        - '"cmd/r'
+      selection2:
+        CommandLine|contains:
+        - /cwhoami
+        - /cpowershell
+        - /cschtasks
+        - /cbitsadmin
+        - /ccertutil
+        - /kwhoami
+        - /kpowershell
+        - /kschtasks
+        - /kbitsadmin
+        - /kcertutil
+      selection3:
+        CommandLine|contains:
+        - cmd.exe /c
+        - cmd /c
+        - cmd.exe /k
+        - cmd /k
+        - cmd.exe /r
+        - cmd /r
+      filter_generic:
+        CommandLine|contains:
+        - 'cmd.exe /c '
+        - 'cmd /c '
+        - 'cmd.exe /k '
+        - 'cmd /k '
+        - 'cmd.exe /r '
+        - 'cmd /r '
+      filter_fp:
+      - CommandLine|contains: AppData\Local\Programs\Microsoft VS Code\resources\app\node_modules
+      - CommandLine|endswith: cmd.exe/c .
+      - CommandLine: cmd.exe /c
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (1 of selection* and not 1 of filter_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_user_actor.baseline
+  always_include: true
+  question: Does this user normally run cmd.exe with this spaceless flag layout?
+  context: >-
+    Compare this user's current action against their historical pattern. A user who has never
+    produced a spaceless-flag cmd execution is more suspicious than one who does so regularly,
+    for example through a particular automation or build tool. The query is scoped to the rule's
+    pattern across all hosts so the count reflects this specific layout, not generic cmd.exe use,
+    and should be read against the user's role and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_user:
+        User|expand: '%User%'
+      selection1:
+        CommandLine|contains:
+        - cmd.exe/c
+        - \cmd/c
+        - '"cmd/c'
+        - cmd.exe/k
+        - \cmd/k
+        - '"cmd/k'
+        - cmd.exe/r
+        - \cmd/r
+        - '"cmd/r'
+      selection2:
+        CommandLine|contains:
+        - /cwhoami
+        - /cpowershell
+        - /cschtasks
+        - /cbitsadmin
+        - /ccertutil
+        - /kwhoami
+        - /kpowershell
+        - /kschtasks
+        - /kbitsadmin
+        - /kcertutil
+      selection3:
+        CommandLine|contains:
+        - cmd.exe /c
+        - cmd /c
+        - cmd.exe /k
+        - cmd /k
+        - cmd.exe /r
+        - cmd /r
+      condition: selection_user and 1 of selection*
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  always_include: true
+  question: Is this parent-and-cmd.exe combination historically routine on this host or across the environment, or is the parent unusual?
+  context: >-
+    When the alert fires under a service principal, user identity does not attribute behavior, so
+    the meaningful pivot is the launch mechanism. A parent that already accounts for thousands of
+    prior spaceless-flag cmd executions is vendor or OS automation; a new or rare parent for this
+    pattern on this host or environment-wide is the deviation worth chasing.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith: cmd.exe
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  always_include: true
+  question: What else did this user do across the network around this time?
+  context: >-
+    Tracking the user's activity across all hosts reveals lateral movement or activity spanning
+    multiple endpoints. If the same user triggered similar command-shell activity on several
+    hosts in this window, the scope of the activity may be larger than the single alerting host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  always_include: true
+  question: Did this same parent-and-cmd.exe combination fire on other hosts in the same window, or is it isolated to this host?
+  context: >-
+    Under a service principal, asking what else the user did network-wide returns agent-telemetry
+    noise. The meaningful question is whether the same launch mechanism, the parent process plus
+    cmd.exe, fired on other hosts in the alert window. Multiple hosts in the same window points to
+    scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith: cmd.exe
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: >-
+    Alerts rarely occur in isolation. Examining activity around the alert reveals what led to this
+    event and what followed: reconnaissance, privilege escalation, or persistence. Aggregating by
+    Image and ParentImage collapses repetitive agent telemetry into high-count rows while novel
+    parent-child pairs stand out at low counts.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired this spaceless-flag pattern in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: >-
+    The query mirrors the rule's selection structure with no host scope, so the result is a
+    fleet-wide count of this spaceless-flag pattern rather than generic cmd.exe usage. Many hosts
+    firing the same pattern points to scripted deployment or vendor automation; one host or a small
+    unrelated set points to manual operator activity. Use the host distribution and parent
+    consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection1:
+        CommandLine|contains:
+        - cmd.exe/c
+        - \cmd/c
+        - '"cmd/c'
+        - cmd.exe/k
+        - \cmd/k
+        - '"cmd/k'
+        - cmd.exe/r
+        - \cmd/r
+        - '"cmd/r'
+      selection2:
+        CommandLine|contains:
+        - /cwhoami
+        - /cpowershell
+        - /cschtasks
+        - /cbitsadmin
+        - /ccertutil
+        - /kwhoami
+        - /kpowershell
+        - /kschtasks
+        - /kbitsadmin
+        - /kcertutil
+      selection3:
+        CommandLine|contains:
+        - cmd.exe /c
+        - cmd /c
+        - cmd.exe /k
+        - cmd /k
+        - cmd.exe /r
+        - cmd /r
+      filter_generic:
+        CommandLine|contains:
+        - 'cmd.exe /c '
+        - 'cmd /c '
+        - 'cmd.exe /k '
+        - 'cmd /k '
+        - 'cmd.exe /r '
+        - 'cmd /r '
+      filter_fp:
+      - CommandLine|contains: AppData\Local\Programs\Microsoft VS Code\resources\app\node_modules
+      - CommandLine|endswith: cmd.exe/c .
+      - CommandLine: cmd.exe /c
+      condition: 1 of selection* and not 1 of filter_*
+    fields:
+    - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Alerts rarely happen in isolation. Earlier detections on the same host, such as defense
+    tampering, reconnaissance, or credential access, may reveal the attack stages that preceded
+    this event and help reconstruct the full timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1059.001
+      name: PowerShell
+      role: primary
+    - id: T1059
+      name: Command and Scripting Interpreter
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: interpreter_invocation
+      description: "cmd.exe is launched with a spaceless /c, /k, or /r flag layout"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: command_decode
+      description: "The command following the spaceless flag is decoded to its real operation"
+      mapped_to: Q3
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 3
+      label: encoded_downstream
+      description: "If cmd spawned PowerShell, its encoded/obfuscated arguments are decoded"
+      mapped_to: Q4
+      source: template:powershell.encoded_command_decode
+    - stage: 4
+      label: child_execution
+      description: "Child processes spawned by the cmd.exe (secondary execution events)"
+      mapped_to: Q6
+      source: template:cue_process_tool.follow_on
+  dimension_coverage:
+    - dimension: command_analysis
+      technique: T1059.001
+      covered_by: Q3
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1059.001
+      covered_by: Q5
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1059.001
+      covered_by: Q15
+      source: template:cue_host_context.clustering
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1059.001
+      covered_by: Q10
+      source: template:cue_process_tool.baseline_deviation
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1059
+      covered_by: Q2
+      source: template:universal.host_user_context
+      coverage_type: direct
+  mutable_dispositions:
+    - element: CommandLinePattern
+      dimension: command_analysis
+      specific_values: "-enc, -nop (encoded/obfuscated PowerShell args)"
+      disposition: context
+      target_question: Q4
+      notes: "Rule's own pattern is the spaceless cmd flag; PowerShell encoding values surface in the encoded_command_decode question when cmd launched PowerShell"
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "Excel, WinWord, mshta (abnormal parents)"
+      disposition: context
+      target_question: Q5
+      notes: "Abnormal-parent rationale folded into process_chain context (Office apps, mshta, wscript)"
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only (off-hours / non-maintenance)"
+      disposition: context
+      target_question: Q15
+      notes: "Tuning rationale, no concrete values to inject; clustering window carries temporal context"
+    - element: LoadedModuleList
+      dimension: tuning_parameter
+      specific_values: "rationale only (rare .NET assemblies)"
+      disposition: context
+      target_question: Q10
+      notes: "image_load logsource declined for this cmd.exe rule (see hint_dispositions); baseline_deviation covers tuning via the rule's own pattern"
+    - element: ScriptBlockLengthThreshold
+      dimension: tuning_parameter
+      specific_values: "rationale only (4104 length threshold)"
+      disposition: context
+      target_question: Q7
+      notes: "Threshold not directly queryable; script_block_logging question surfaces 4104 content when PowerShell ran"
+  dedup_decisions:
+    - dropped: cue_process_tool.baseline
+      reason: "generic host+binary count over cmd.exe is pure noise; cue_process_tool.baseline_deviation (REFLECTED, rule-pattern scoped) provides the host historical baseline with precision"
+      kept: cue_process_tool.baseline_deviation
+    - dropped: cue_process_tool.clustering
+      reason: "overlaps cue_host_context.clustering (same +/-15m host window); host_context version is kept"
+      kept: cue_host_context.clustering
+    - dropped: cue_user_actor.baseline pairing
+      reason: "user_actor pair — non-deduplicable; both user-pivot and service-principal substitute emitted"
+      kept: cue_user_actor.baseline + cue_user_actor.baseline_svc
+    - dropped: cue_user_actor.clustering pairing
+      reason: "user_actor pair — non-deduplicable; both user-pivot and service-principal substitute emitted"
+      kept: cue_user_actor.clustering + cue_user_actor.clustering_svc
+  skipped_templates: []
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "logsource 'image_load' (recommended by techniques: T1059.001) is not covered — pull in cue_image_load.* or author a custom question with `category: image_load`"
+      disposition: declined
+      reason: >-
+        The rule fires exclusively on cmd.exe CommandLine spaceless-flag patterns and never
+        touches a PowerShell process or .NET host directly. image_load coverage of rare .NET
+        assemblies is meaningful for direct/indirect PowerShell invocation, which is not what
+        this rule detects. The downstream PowerShell path (only when cmd uses /cpowershell or
+        /kpowershell) is covered by the encoded_command_decode and script_block_logging
+        questions via process_creation and 4104 evidence, which is sufficient for triage. No
+        compensating attack:T1059.001.image_load question authored.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - powershell
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 17
+      attack: 0
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 2
+      context: 13
+    logsource_diversity:
+      process_creation: 15
+      powershell_script_block: 1
+      sigma_alert: 1

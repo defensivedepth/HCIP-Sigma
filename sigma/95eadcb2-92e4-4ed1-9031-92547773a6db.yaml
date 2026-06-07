@@ -1,0 +1,535 @@
+name: Suspicious PowerShell Invocation From Script Engines
+id: c6b856ba-2525-4ed0-aec3-74f16a31dae7
+description: |
+  Detects the Windows Script Host engines wscript.exe or cscript.exe spawning powershell.exe or pwsh.exe,
+  excluding the benign Microsoft Operations Manager Health Service State working directory. Script engines
+  launching PowerShell is a common second-stage handoff: a document macro or dropped script runs under
+  wscript/cscript and then invokes PowerShell to fetch, decode, and execute a payload in memory.
+  Legitimate management tooling occasionally chains the two, so the investigation should determine what
+  script the engine ran, what the PowerShell child actually did, and whether the parent-child pairing and
+  user are routine for this host.
+type: detection
+detection_id: 95eadcb2-92e4-4ed1-9031-92547773a6db
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Did wscript.exe or cscript.exe spawn powershell.exe or pwsh.exe as detected?
+  context: Confirm the alert is a true positive by reviewing the exact parent and child images against the
+    rule criteria. The rule fires when a Windows Script Host engine (wscript.exe or cscript.exe) launches
+    powershell.exe or pwsh.exe, and the working directory is not the Health Service State path. Verify both
+    the parent and child binaries before investing further analysis time.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run PowerShell launched from a script engine?
+  context: Legitimate management tooling and login scripts occasionally chain a Windows Script Host engine
+    into PowerShell. Knowing whether the user role and host function are consistent with script-driven
+    PowerShell execution is often the fastest way to separate routine automation from a macro or dropper
+    handoff.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:parent_child.parent_process_legitimacy
+  question: What started the script engine, and what script did it run?
+  context: The parent-child relationship is the core signal for this detection. Tracing the script engine's
+    own origin reveals whether the chain is legitimate (a user double-clicked a .vbs or .js, or a login
+    script ran) or suspicious (a document macro or dropped file spawned wscript/cscript, which then launched
+    PowerShell). The parent command line typically names the script file the engine executed.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- source: template:parent_child.sibling_processes
+  question: What other child processes did the same script engine instance spawn?
+  context: A script that launched PowerShell often launches other tooling too. Examining the siblings of
+    the alerting process from the same parent instance reveals the full scope of activity the script drove
+    -- additional interpreters, reconnaissance binaries, or persistence helpers spawned from the same
+    wscript/cscript instance point to orchestrated execution rather than a one-off.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.mechanism_decode
+  question: What did the spawned PowerShell actually do? Decode its full command line.
+  context: The PowerShell command line reveals the specific action the script handed off. Decode any flags,
+    encoded blocks, concatenated strings, file paths, or download targets. Script engines commonly pass an
+    encoded or obfuscated one-liner so the readable .vbs/.js stays benign while the real payload lives in
+    the PowerShell argument. Scoping to the alerting parent instance keeps the result tied to this handoff
+    rather than every PowerShell execution on the host.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:powershell.encoded_command_decode
+  question: Was the PowerShell command encoded or obfuscated, and what does it decode to?
+  context: Script-engine handoffs frequently pass PowerShell an -EncodedCommand (-enc) base64 blob or use
+    concatenation, backtick escaping, and variable substitution to hide intent. Decoding reveals the actual
+    payload -- a download cradle, a reverse shell, or in-memory execution of a .NET assembly. A decoded
+    cradle that fetches and runs remote content is a strong pivot toward the second-stage source.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:powershell.script_block_logging
+  question: Did PowerShell script block logging capture the full deobfuscated script content?
+  context: PowerShell script block logging (Event ID 4104) records the deobfuscated script content that
+    PowerShell actually executes, even when the command line is encoded or obfuscated. This is ground truth
+    about what ran when the script engine passed an encoded one-liner. If PowerShell operational logs are
+    not ingested in this environment, treat zero results as a visibility gap rather than evidence nothing
+    ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- source: template:powershell.powershell_security_bypass
+  question: Were PowerShell security controls bypassed or weakened before this execution?
+  context: Attackers often disable or bypass PowerShell protections before running a payload. Common forms
+    include AMSI bypass (patching amsi.dll in memory), execution-policy changes (-ep bypass or
+    Set-ExecutionPolicy), constrained language mode escape, and downgrade to PowerShell v2 to evade logging.
+    Finding these precursor events on the host strengthens the case that the script-driven PowerShell was
+    malicious.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- source: attack:T1059.001.image_load
+  question: What modules or .NET assemblies did the spawned PowerShell load on this host?
+  context: PowerShell abuse frequently relies on in-memory execution -- reflectively loaded .NET assemblies
+    or rare modules pulled in to run a payload without writing a file. Image-load events for the PowerShell
+    process surface assemblies and DLLs that are uncommon for routine scripting. Rare or never-before-seen
+    .NET assemblies loaded shortly after a script-engine handoff point toward fileless execution. If
+    image-load telemetry is not ingested in this environment, treat zero results as a visibility gap.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+- source: template:cue_parent_process.baseline
+  question: Does this script engine normally spawn PowerShell on this host?
+  context: Some parent-child pairings are routine, while a Windows Script Host engine launching PowerShell
+    is inherently worth scrutiny. Historical frequency of this specific wscript/cscript-to-PowerShell
+    pairing on this host distinguishes an established management pattern from a novel spawning relationship.
+    Zero or very low counts indicate a first-time chain.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:cue_parent_process.clustering
+  question: Did the spawned PowerShell make outbound network connections around the time of the alert?
+  context: A script-engine handoff into PowerShell is a common precursor to command-and-control or
+    second-stage download. Outbound connections from the PowerShell process shortly after launch may reveal
+    the payload source or C2 destination. Connections to rare external addresses or non-standard ports
+    around the alert time are the pivot to follow.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+- source: template:cue_parent_process.scope
+  question: Is this script-engine-to-PowerShell pairing occurring on other hosts?
+  context: The same parent-child relationship appearing on multiple hosts may indicate a phishing wave or a
+    widely deployed script, while a single occurrence is more likely targeted or host-local. Enterprise-wide
+    comparison helps calibrate scope and identify whether the same handoff fired elsewhere.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+      - CommandLine
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run PowerShell launched from a script engine?
+  context: Compare this user's current action against their historical pattern. A user who has never had a
+    script engine spawn PowerShell for them is more suspicious than one for whom it is routine. User role
+    and typical toolset should align with script-driven PowerShell execution.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this script-engine-and-PowerShell pairing historically routine on this host or across the
+    environment, or is the parent unusual for this binary?
+  context: When the alert fires under a service principal, user identity does not attribute behavior. The
+    meaningful pivot is the launch mechanism -- which parent spawned PowerShell, and whether that pair is
+    historically common. A new or rare script-engine parent for PowerShell on this host or environment-wide
+    is the deviation worth chasing; a pair that already accounts for thousands of prior events is vendor or
+    OS automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning
+    multiple endpoints. If the same user triggered similar script-driven execution on multiple hosts, the
+    scope of compromise may be larger than a single alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same script-engine-and-PowerShell pairing fire on other hosts in the same window, or is
+    the activity isolated to this host?
+  context: Under a service principal, asking what else the user did across the network returns agent
+    telemetry noise. The meaningful question is whether the same launch mechanism -- script engine spawning
+    PowerShell -- fired on other hosts in the alert window. Multiple hosts in the same window points to
+    scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining activity around the alert reveals what led to this
+    event, what happened after, and whether it is part of a larger sequence. Look for reconnaissance,
+    privilege escalation, or persistence mechanisms appearing alongside the script-driven PowerShell.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host -- defense tampering, reconnaissance, credential access --
+    may reveal the attack stages that preceded this event and help reconstruct the timeline. A script-engine
+    handoff into PowerShell is often a mid-chain step rather than the first action.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1059.001
+      name: PowerShell
+      role: primary
+    - id: T1059
+      name: Command and Scripting Interpreter
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: script_engine_handoff
+      description: "A Windows Script Host engine (wscript/cscript) spawns PowerShell"
+      mapped_to: Q3
+      source: template:parent_child.parent_process_legitimacy
+    - stage: 2
+      label: encoded_obfuscated_args
+      description: "PowerShell launched with encoded, obfuscated, or hidden arguments"
+      mapped_to: Q6
+      source: template:powershell.encoded_command_decode
+    - stage: 3
+      label: module_assembly_load
+      description: "Rare modules or .NET assemblies loaded for in-memory execution"
+      mapped_to: Q9
+      source: attack:T1059.001.image_load
+    - stage: 4
+      label: network_or_child_spawn
+      description: "Network connections or secondary child processes follow the PowerShell launch"
+      mapped_to: Q11
+      source: template:cue_parent_process.clustering
+  dimension_coverage:
+    - dimension: command_analysis
+      technique: T1059.001
+      covered_by: Q5
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1059.001
+      covered_by: Q3
+      source: template:parent_child.parent_process_legitimacy
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1059.001
+      covered_by: Q17
+      source: template:cue_host_context.clustering
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1059.001
+      covered_by: Q9
+      source: attack:T1059.001.image_load
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1059
+      covered_by: Q13
+      source: template:cue_user_actor.baseline
+      coverage_type: direct
+  mutable_dispositions:
+    - element: CommandLinePattern
+      dimension: command_analysis
+      specific_values: "rationale only (e.g. '-enc', '-nop')"
+      disposition: context
+      target_question: Q6
+      notes: "Rule has empty commandline_values (field-only detection on parent/child Image).
+        Encoded/obfuscated-argument indicators carried as context and queried by the powershell_security_bypass
+        sweep; no concrete value list to inject into the mechanism_decode selection."
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "wscript.exe, cscript.exe"
+      disposition: query_injection
+      target_question: Q3
+      notes: "Parent images are the rule's selection; parent-process legitimacy, baseline, scope, and
+        service-principal substitutes all pivot on the wscript/cscript parent. Hint 'powershell.exe too
+        common for Image-based scoping' acted on here: mechanism_decode (Q5) scoped by ParentProcessGuid
+        (alerting script-engine instance) rather than host.name + Image|endswith powershell, so the result
+        stays tied to this handoff instead of every PowerShell on the host."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only (off-hours / non-maintenance windows)"
+      disposition: context
+      target_question: Q17
+      notes: "Time-of-day tuning is not directly queryable; host-context clustering and the -6h precursor
+        window carry temporal correlation."
+    - element: LoadedModuleList
+      dimension: tuning_parameter
+      specific_values: "rationale only (rare/never-before-seen .NET assemblies)"
+      disposition: new_question
+      target_question: Q9
+      notes: "Drove the new attack:T1059.001.image_load question (image_load logsource hint acted on)."
+    - element: ScriptBlockLengthThreshold
+      dimension: tuning_parameter
+      specific_values: "rationale only (4104 script block length)"
+      disposition: context
+      target_question: Q7
+      notes: "Threshold is a noise-filtering tuning knob, not a value to query; script block logging question
+        surfaces 4104 content directly."
+  dedup_decisions:
+    - dropped: cue_process_tool.process_chain
+      reason: "parent_process is primary cue and parent_child technique set active — parent_process_legitimacy
+        subsumes the generic process_chain lookup"
+      kept: parent_child.parent_process_legitimacy
+    - dropped: cue_parent_process.mechanism_decode
+      reason: "parent_child technique set active — parent_process_legitimacy is the more specific parent
+        question and covers what started the engine and what script it ran"
+      kept: parent_child.parent_process_legitimacy
+    - dropped: cue_parent_process.follow_on
+      reason: "sibling_processes (ParentProcessGuid-scoped) covers other children of the same parent instance
+        more precisely than the parent.name-scoped follow_on"
+      kept: parent_child.sibling_processes
+    - dropped: cue_process_tool.baseline
+      reason: "powershell.exe is too common for a host-frequency baseline to be meaningful — the parent-child
+        baseline (script engine spawning powershell) is the discriminating frequency question"
+      kept: cue_parent_process.baseline
+    - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc pair
+      reason: "user_actor pair — non-deduplicable; both emitted (user identity pivot + service-principal
+        launch-mechanism substitute)"
+      kept: both
+    - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc pair
+      reason: "user_actor pair — non-deduplicable; both emitted (user network-wide pivot + service-principal
+        launch-mechanism substitute)"
+      kept: both
+  skipped_templates:
+    - template: universal.endpoint_protection_health
+      reason: "powershell.powershell_security_bypass (Q8) already surfaces prior tamper/bypass activity on
+        the host within the same -1h window for this execution rule; the generic host-tamper sweep would
+        duplicate that coverage without adding specificity"
+  reflection_overrides: []
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - powershell
+    - parent_child
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 17
+      attack: 1
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 2
+      context: 14
+    logsource_diversity:
+      process_creation: 14
+      image_load: 1
+      network_connection: 1
+      powershell: 1
+      sigma_alert: 1

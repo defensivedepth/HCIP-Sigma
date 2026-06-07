@@ -1,0 +1,495 @@
+name: ImagingDevices Unusual Parent/Child Processes
+id: 695349a7-9426-405c-a411-fe54483061e9
+description: |
+  Detects ImagingDevices.exe (the Windows Contacts imaging helper) in an unusual parent-child relationship. The rule
+  fires when EITHER ImagingDevices.exe is spawned by WmiPrvSE.exe, svchost.exe, or dllhost.exe, OR ImagingDevices.exe
+  itself spawns a child process. Legitimately, ImagingDevices.exe is launched by user interaction with scanner or camera
+  hardware and rarely spawns children; the parent set above is associated with WMI/COM process injection that hollows a
+  benign signed binary to evade parent-child detection. Determine which branch fired, whether the parent-child pairing is
+  routine on this host, and what the involved process did after the alert.
+type: detection
+detection_id: f11f2808-adb4-46c0-802a-8660db50fa99
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-06
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the alerting event match either ImagingDevices.exe spawned by WmiPrvSE/svchost/dllhost, or ImagingDevices.exe spawning a child?
+  context: >-
+    The rule fires on one of two branches. The parent branch matches when ImagingDevices.exe (Image) has a parent of
+    WmiPrvSE.exe, svchost.exe, or dllhost.exe. The child branch matches when ImagingDevices.exe is the ParentImage of
+    another process. Read Image and ParentImage on the alerting event and note which branch fired, because that determines
+    which downstream questions carry weight — the parent branch points at injection into ImagingDevices.exe, while the
+    child branch points at code already running inside it reaching out to spawn tools.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+- source: template:universal.host_user_context
+  question: Is this user and host expected to interact with imaging or scanner hardware?
+  context: >-
+    ImagingDevices.exe is the Windows imaging helper launched when a user works with a scanner or camera. A workstation
+    with attached imaging hardware and a user who scans documents is a plausible benign source; a server or a host with no
+    imaging hardware running this binary, especially under the injection parent set, is harder to explain as routine use.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:parent_child.parent_process_legitimacy
+  question: Is this parent expected to spawn this child, and what started the parent itself?
+  context: >-
+    The parent-child relationship is the core signal. Trace the parent's own origin to see whether the chain is benign
+    (user launched imaging from a known application) or unusual (a service host or COM surrogate spawned ImagingDevices.exe,
+    consistent with WMI/COM injection into a signed binary). When ImagingDevices.exe is the parent, the grandparent shows
+    what started the injected process before it spawned the alerting child.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- source: template:parent_child.sibling_processes
+  question: What other child processes did the same parent spawn?
+  context: >-
+    If the parent in this alert spawned the detected process, it may have spawned others. Examining siblings reveals the
+    full scope of activity from that parent instance. Multiple tool-like children from the same parent — reconnaissance,
+    credential access, or transfer utilities — points to orchestrated activity rather than an isolated event.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_parent_process.mechanism_decode
+  question: What is the parent process instance and why did it spawn this binary?
+  context: >-
+    Retrieving the parent's own creation event shows what started it and what it was doing when it spawned the alerting
+    process. A WmiPrvSE.exe, svchost.exe, or dllhost.exe parent that spawned ImagingDevices.exe with no user-driven imaging
+    activity is consistent with COM/WMI-driven injection. When ImagingDevices.exe is the parent, this shows how the imaging
+    process was itself launched before it spawned a child.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+- source: template:cue_process_tool.mechanism_decode
+  question: What did ImagingDevices.exe do on this host, and did it spawn or connect to anything?
+  context: >-
+    ImagingDevices.exe normally performs imaging-device work and does not spawn additional processes. Reviewing every
+    ImagingDevices.exe execution on this host in a tight window around the alert surfaces whether the process behaved like a
+    benign imaging helper or like an injected host that launched other tools. Pair this view with the children of the
+    process to see what action followed.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:cue_parent_process.baseline
+  question: Has this parent-and-binary pairing been seen on this host before?
+  context: >-
+    Some parent-child pairings are routine; the ImagingDevices.exe pairings this rule targets are not. A pairing with zero
+    or very low historical count on this host is a novel relationship and more suspicious than one that recurs regularly as
+    part of normal imaging-hardware use.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith: \ImagingDevices.exe
+      condition: selection
+    fields:
+      - ParentImage
+- source: template:cue_parent_process.follow_on
+  question: What other processes spawned from ImagingDevices.exe on this host after the alert?
+  context: >-
+    When code is running inside ImagingDevices.exe, it may launch several tools in sequence — discovery, credential access,
+    or lateral movement utilities. Listing the children of the imaging process after the alert reveals the full scope of
+    activity initiated through it.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith: \ImagingDevices.exe
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_parent_process.clustering
+  question: What file or network activity surrounded the imaging process around the alert time?
+  context: >-
+    Beyond child processes, an injected host process may generate file writes or outbound connections. File events near the
+    alert can reveal a dropped payload, while outbound connections to external addresses can reveal command-and-control
+    traffic from the imaging process. Use the process identifier to tie this activity back to the alerting instance.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - DestinationIp
+      - DestinationPort
+      - Initiated
+- source: template:cue_parent_process.scope
+  question: Is this ImagingDevices.exe parent-child pattern occurring on other hosts?
+  context: >-
+    The same unusual ImagingDevices.exe pairing appearing across multiple hosts may indicate a phishing wave or lateral
+    movement, whereas a single occurrence is more likely targeted. An environment-wide comparison helps calibrate the scope
+    of the activity.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \ImagingDevices.exe
+      condition: selection
+    fields:
+      - host.name
+      - ParentImage
+- source: template:cue_user_actor.baseline
+  question: Does this user normally interact with imaging or scanner hardware?
+  context: >-
+    Compare this user's current activity against their history. A user who has never been associated with ImagingDevices.exe
+    activity is more anomalous than one who scans documents regularly. User role and typical hardware use should align with
+    imaging activity.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith: \ImagingDevices.exe
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent-and-ImagingDevices.exe pairing historically routine on this host or across the environment?
+  context: >-
+    When the alert fires under a service principal, user identity does not attribute the behavior; the meaningful pivot is
+    the launch mechanism. A new or rare parent for ImagingDevices.exe on this host or environment-wide is the deviation
+    worth chasing, while a pairing that already accounts for many prior events is more likely vendor or OS automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith: \ImagingDevices.exe
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: >-
+    Tracking the user's activity across all hosts can reveal lateral movement or activity spanning multiple endpoints. If
+    the same user triggered similar activity on several hosts, the scope of the activity may be larger than the single
+    alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent-and-ImagingDevices.exe pairing fire on other hosts in the same window?
+  context: >-
+    Under a service principal, asking what else the user did returns agent-telemetry noise. The meaningful question is
+    whether the same launch mechanism — parent process spawning ImagingDevices.exe — fired on other hosts in the alert
+    window. Multiple hosts in the same window points to scheduled or pushed automation; a single host points to a
+    host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith: \ImagingDevices.exe
+      condition: selection
+    fields:
+      - host.name
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in the hour before the alert?
+  context: >-
+    Tampering often precedes hands-on activity. This query surfaces direct attempts to disable AV/EDR services, flip
+    Defender flags, add broad exclusions, clear logs, or patch AMSI/ETW. Zero rows is a useful protection-looks-healthy
+    signal — kernel-level driver tampering and in-memory patches will not appear here. Populated rows shift the disposition
+    toward operator preparation; review the parent process and signing chain to identify the writer.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: >-
+    Alerts rarely occur in isolation. Examining activity around the alert reveals what led to this event and what happened
+    after. Aggregating by Image and ParentImage collapses repetitive agent telemetry into high-count rows while novel
+    parent-child pairs stand out at low counts — those are what to scan for.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Earlier detections on the same host — defense tampering, reconnaissance, credential access — may reveal the stages that
+    preceded this event and help reconstruct the timeline. Injection into a signed binary is often a mid-chain step, so a
+    preceding alert sequence can place this event in context.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: false
+  techniques: []
+  attack_chain_coverage: []
+  dimension_coverage: []
+  mutable_dispositions: []
+  dedup_decisions:
+    - dropped: cue_process_tool.process_chain
+      reason: "parent_process is primary cue (ParentImage in detection) and parent_child technique set is confirmed — parent_process_legitimacy and parent_process.mechanism_decode both look up the parent; process_chain is subsumed. Per hint."
+      kept: parent_child.parent_process_legitimacy
+    - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable; emitted both user-pivot baseline and service_principal_substitute baseline"
+      kept: both
+    - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable; emitted both user-pivot clustering and service_principal_substitute clustering"
+      kept: both
+  skipped_templates:
+    - template: cue_process_tool.baseline
+      reason: "binary-on-host historical frequency for ImagingDevices.exe is subsumed by cue_parent_process.baseline, which aggregates the same ImagingDevices.exe events grouped by ParentImage — the parent-child pairing is the discriminating dimension for this rule, not raw binary count"
+  reflection_overrides: []
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - parent_child
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 17
+      attack: 0
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 2
+      context: 13
+    logsource_diversity:
+      process_creation: 15
+      network_connection: 1
+      sigma_alert: 1

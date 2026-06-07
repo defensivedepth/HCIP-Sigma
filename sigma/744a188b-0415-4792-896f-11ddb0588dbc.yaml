@@ -1,0 +1,460 @@
+name: Potential Process Injection Via Msra.EXE
+id: b914e6c5-174c-4f50-b5b5-58eee42d6f0a
+description: |
+  Detects discovery and administrative binaries (arp.exe, cmd.exe, net.exe, netstat.exe, nslookup.exe, route.exe, schtasks.exe, whoami.exe) spawned by Microsoft Remote Assistance (msra.exe). The rule fires when msra.exe is both the parent image and its own command line, AND it spawns one of the listed binaries. Msra.exe legitimately runs only during interactive Remote Assistance sessions and rarely launches command-line tools; when an unrelated process injects into msra.exe, the discovery commands it runs appear as children of msra.exe. The investigation should determine whether msra.exe was driven by a real Remote Assistance session, confirm or rule out injection into the msra.exe process, and characterize the child command and any surrounding reconnaissance, persistence, or network activity.
+type: detection
+detection_id: 744a188b-0415-4792-896f-11ddb0588dbc
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Did msra.exe spawn the alerting child, and is the child one of the discovery or administrative binaries this rule watches for?
+  context: Confirm the alert is a true positive by reviewing the exact event. The rule requires msra.exe as both the parent image and parent command line, AND a child whose image ends in arp.exe, cmd.exe, net.exe, netstat.exe, nslookup.exe, route.exe, schtasks.exe, or whoami.exe. Verify the parent is genuinely msra.exe and read the child command line.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+      - Image
+- source: template:universal.host_user_context
+  question: Is this host running an interactive Remote Assistance session, and is the user expected to drive msra.exe to launch command-line tools?
+  context: Msra.exe normally runs only when a user starts a Remote Assistance session. If no session was active and the host or user is not associated with remote-support workflows, the parent context is unexplained. Check whether the user role and host function are consistent with interactive remote assistance.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What exactly did the child command do? Decode its full command-line arguments.
+  context: The child command line reveals the specific action taken inside the msra.exe context. Decode flags, parameters, target hosts, and any encoded or chained content. Discovery binaries such as arp, net, netstat, nslookup, route, and whoami map to network and system enumeration; cmd.exe may carry a longer chained command; schtasks.exe configures persistence. Identify what the operator was attempting to learn or establish.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:scheduled_task.task_configuration
+  question: If the alerting child was schtasks.exe, what task was created and what command does it execute?
+  context: When the child is schtasks.exe, the command line contains the task name, schedule, and the command or program to run. Identify the task name (/TN), the executed command (/TR), the schedule type (/SC, e.g. ONLOGON, MINUTE, DAILY), and the run-as account (/RU, where SYSTEM is high-risk). Injected msra.exe processes are documented to drop randomly-named persistence tasks, so the task payload often points to the staged binary or script. If the child was not schtasks.exe, this question does not apply.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:parent_child.parent_process_legitimacy
+  question: What started the msra.exe parent, and is that origin consistent with a real Remote Assistance session?
+  context: Legitimate msra.exe is started by user action through the Remote Assistance UI or a support workflow. Tracing the msra.exe process back to its own parent (grandparent) shows whether the chain is a genuine interactive session or whether msra.exe was launched and then hijacked. A loader such as regsvr32.exe or rundll32.exe in the ancestry, or msra.exe running from a non-interactive context, points away from a real session.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- source: template:parent_child.sibling_processes
+  question: What other child processes did this same msra.exe instance spawn?
+  context: An injected msra.exe typically runs a sequence of discovery and tooling commands, not a single one. Listing every child of this exact msra.exe instance reveals the full scope of activity driven through it. Multiple discovery binaries, a persistence tool, and network utilities spawned from one msra.exe strongly indicate scripted post-injection enumeration rather than an isolated command.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: attack:T1055.access_verification
+  question: Did another process open a handle to msra.exe with write or thread-creation access rights around the alert time?
+  context: Process injection requires the source process to open the target with rights such as PROCESS_VM_WRITE and PROCESS_CREATE_THREAD before writing code or starting a remote thread. Reviewing process-access events that target msra.exe, and the granted access mask on each, identifies whether and from which source process msra.exe was injected. A non-msra source process holding write or thread-creation rights to msra.exe is the direct evidence of the injection this rule infers from the child commands.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_access
+      product: windows
+    detection:
+      selection:
+        TargetImage|endswith: '\msra.exe'
+      condition: selection
+    fields:
+      - SourceImage
+      - SourceProcessGUID
+      - GrantedAccess
+      - CallTrace
+- source: attack:T1055.injection_indicators
+  question: Were unexpected modules loaded into msra.exe around the alert time?
+  context: After injection, attacker code in msra.exe frequently pulls in modules it would never load during a normal Remote Assistance session, and discovery commands run from the injected context. Reviewing image-load events for the msra.exe process surfaces unsigned or unusual DLLs and unexpected library loads that accompany injected execution. If image-load telemetry is not collected in this environment, treat zero results as a visibility gap rather than evidence nothing loaded, and rely on the process-access and child-command evidence instead.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        Image|endswith: '\msra.exe'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+- source: template:discovery_recon.discovery_burst_detection
+  question: Did other reconnaissance commands run on this host around the same time?
+  context: A single discovery command may be routine, but several reconnaissance binaries running in quick succession is a signature of post-compromise enumeration. Injected msra.exe is documented to run a burst of discovery commands (whoami, arp, net, netstat, nslookup, route) to map the host and network before the next stage. Three or more distinct discovery binaries within the window points to automated enumeration rather than ad-hoc troubleshooting.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_recon:
+        Image|endswith:
+          - '\whoami.exe'
+          - '\systeminfo.exe'
+          - '\ipconfig.exe'
+          - '\net.exe'
+          - '\net1.exe'
+          - '\nltest.exe'
+          - '\dsquery.exe'
+          - '\nbtstat.exe'
+          - '\arp.exe'
+          - '\netstat.exe'
+          - '\tasklist.exe'
+          - '\qprocess.exe'
+          - '\query.exe'
+          - '\quser.exe'
+          - '\hostname.exe'
+          - '\nslookup.exe'
+          - '\route.exe'
+      condition: selection and selection_recon
+    fields:
+      - Image
+      - User
+- source: template:cue_parent_process.clustering
+  question: What outbound network connections did msra.exe make around the alert time?
+  context: Msra.exe in a real Remote Assistance session connects to the peer endpoint, but an injected msra.exe is documented to carry command-and-control and to perform collection activity. Outbound connections from msra.exe to external hosts, especially on uncommon high ports, indicate the injected process is communicating rather than serving an interactive session. Correlate the destinations with the timing of the child discovery commands.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith: '\msra.exe'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+- source: template:cue_user_actor.baseline
+  question: Does this user normally drive Remote Assistance sessions that launch these command-line tools?
+  context: Compare this user's current activity against their historical behavior. A user who has never run discovery or administrative tools under msra.exe is more notable than one who routinely provides or receives remote support. User role and typical toolset should align with interactive Remote Assistance use.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is the msra.exe parent launching this binary historically routine on this host or across the environment, or is msra.exe an unusual parent for it?
+  context: When the alert fires under a service principal, user identity does not attribute the behavior; the meaningful pivot is the launch mechanism. Msra.exe is rarely a parent of discovery or administrative binaries in normal operation, so a near-zero historical count for the msra.exe-parent pairing is the deviation worth chasing. A pairing that already accounts for many prior events would point to an unusual but established local workflow.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints. If the same user triggered similar msra.exe-parented activity on other hosts, the scope is larger than a single endpoint.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did the same msra.exe-parented binary fire on other hosts in the same window, indicating coordinated automation rather than isolated activity?
+  context: Under a service principal, asking what else the user did returns agent-telemetry noise because every host runs system-owned agents constantly. The meaningful question is whether the same launch mechanism — msra.exe spawning this binary — fired on other hosts in the alert window. Multiple hosts in the same window point to a pushed or scheduled rollout; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_parent_process.scope
+  question: Is this msra.exe-to-discovery-binary spawning pattern occurring on other hosts?
+  context: The same parent-child relationship appearing on multiple hosts suggests a wave of injected msra.exe activity rather than a single targeted endpoint. Enterprise-wide comparison calibrates severity and identifies the scope of any compromise. A single occurrence is more likely targeted or a one-off.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+      - CommandLine
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — a loader execution, defense tampering, or a download cradle — may reveal the stages that preceded the injection and help reconstruct the timeline. Process injection into msra.exe is typically downstream of an initial loader, so a preceding regsvr32 or rundll32 alert is especially relevant.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: Examining activity around the alert reveals what led to this event, what happened after, and whether it is part of a larger sequence. Novel parent-child pairs stand out at low counts against the repetitive baseline of agent telemetry. Look for loader execution, additional persistence, or credential-access tooling near the alert time.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1055
+      name: Process Injection
+      role: primary
+  attack_chain_coverage:
+    - stage: 1
+      label: injection_into_msra
+      description: An unrelated process opens a handle to msra.exe and writes code / creates a remote thread, injecting into it.
+      mapped_to: Q7
+      source: attack:T1055.access_verification
+    - stage: 2
+      label: injected_module_load
+      description: Injected code in msra.exe loads modules / executes from the hijacked context.
+      mapped_to: Q8
+      source: attack:T1055.injection_indicators
+    - stage: 3
+      label: discovery_from_injected_context
+      description: The injected msra.exe spawns discovery / administrative binaries to enumerate host and network.
+      mapped_to: Q6
+      source: template:parent_child.sibling_processes
+  dimension_coverage:
+    - dimension: access_verification
+      technique: T1055
+      covered_by: Q7
+      source: attack:T1055.access_verification
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1055
+      covered_by: Q9
+      source: template:discovery_recon.discovery_burst_detection
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1055
+      covered_by: Q7
+      source: attack:T1055.access_verification
+      coverage_type: partial
+  mutable_dispositions:
+    - element: AccessMask
+      dimension: access_verification
+      specific_values: "PROCESS_VM_WRITE, PROCESS_CREATE_THREAD"
+      disposition: new_question
+      target_question: Q7
+      notes: "GrantedAccess projected and described in the process_access question; named rights enumerated in context."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q9
+      notes: "Correlation window between handle-open, thread-creation, and the discovery burst is enforced by the +/-15m ranges on Q7, Q8, Q9; no queryable threshold value supplied."
+    - element: InjectedProcessList
+      dimension: tuning_parameter
+      specific_values: "msra.exe (this rule's fixed target)"
+      disposition: context
+      target_question: Q7
+      notes: "Target is fixed to msra.exe by the rule; process_access and image_load questions are scoped to TargetImage/Image ending in \\msra.exe rather than a generic high-value list."
+  dedup_decisions:
+    - dropped: cue_parent_process.mechanism_decode
+      reason: "parent_child technique set active — parent_process_legitimacy (Q5) is the more specific parent-origin question."
+      kept: parent_child.parent_process_legitimacy
+    - dropped: cue_parent_process.follow_on
+      reason: "subsumed by parent_child.sibling_processes (Q6), which scopes to the exact ParentProcessGuid instance rather than all msra.exe instances."
+      kept: parent_child.sibling_processes
+    - dropped: cue_parent_process.baseline
+      reason: "parent-child frequency covered by cue_user_actor.baseline_svc (Q12, parent+binary pairing) and cue_parent_process.scope (Q15)."
+      kept: cue_user_actor.baseline_svc
+    - dropped: cue_process_tool.baseline
+      reason: "host-runs-this-tool frequency covered by cue_user_actor.baseline_svc (Q12) and cue_parent_process.scope (Q15) for the more meaningful parent+binary pairing."
+      kept: cue_user_actor.baseline_svc
+    - dropped: discovery_recon.discovery_parent_chain
+      reason: "parent-of-discovery question is parent_child.parent_process_legitimacy (Q5); both look up ParentProcessGuid origin — keep the technique-set-specific one."
+      kept: parent_child.parent_process_legitimacy
+    - dropped: discovery_recon.discovery_user_context
+      reason: "overlaps universal.host_user_context (Q2); template notes instruct preferring one — kept host_user_context which also frames the Remote Assistance session check."
+      kept: universal.host_user_context
+    - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc pairing kept
+      reason: "user_actor pair — non-deduplicable (Q11 subject-pivot + Q12 mechanism-pivot)."
+      kept: both
+    - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc pairing kept
+      reason: "user_actor pair — non-deduplicable (Q13 subject-pivot + Q14 mechanism-pivot)."
+      kept: both
+  skipped_templates:
+    - template: cue_process_tool.process_chain
+      reason: "hint: parent_process is primary — drop cue_process_tool.process_chain. Parent origin covered by parent_child.parent_process_legitimacy (Q5)."
+    - template: scheduled_task.task_trigger_and_timing
+      reason: "schtasks.exe is only 1 of 8 possible children; task-execution timing is branch-conditional and low-yield versus the injection-confirmation questions under the 18-question cap. task_configuration (Q4) retains the schtasks-branch decode."
+    - template: scheduled_task.task_still_present
+      reason: "schtasks.exe is only 1 of 8 possible children; task-persistence remediation is a follow-up action rather than a triage question. Held out under the cap."
+    - template: persistence_scope.process_based_persistence
+      reason: "schtasks is one branch of a discovery-focused rule; sibling_processes (Q6) and host clustering (Q17) already surface persistence tooling spawned by the same msra.exe / on the host."
+    - template: persistence_scope.file_based_persistence
+      reason: "file_event persistence-drop sweep is out of scope for a process-injection-into-msra rule whose evidence is process_access / image_load / process_creation; no file-drop signal is load-bearing for this disposition."
+    - template: universal.endpoint_protection_health
+      reason: "RECOMMENDED, not must_include. This rule fires on injection-driven discovery, not on a hands-on-keyboard execution/credential-access action whose disposition turns on prior tamper. cue_host_context.precursor (Q16) already surfaces prior tamper alerts on the host."
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "scheduled_task.task_configuration replaces cue_process_tool.mechanism_decode"
+      disposition: declined
+      reason: >-
+        Partial-act, recorded as declined for the full replacement only. task_configuration is
+        included as Q4 (the schtasks-branch decode) per the hint. It cannot fully replace
+        mechanism_decode because schtasks.exe is only 1 of 8 child binaries the rule fires on;
+        the other 7 (arp, cmd, net, netstat, nslookup, route, whoami) need a general child-command
+        decode, retained as Q3 (cue_process_tool.mechanism_decode, ProcessGuid-scoped). Both
+        analysis questions are present.
+    - hint: "parent_process is primary — drop cue_process_tool:process_chain"
+      disposition: declined
+      reason: >-
+        Acted on by dropping the template (see skipped_templates: cue_process_tool.process_chain).
+        Recorded here as the explicit decline outcome for the template itself; parent origin is
+        covered by parent_child.parent_process_legitimacy (Q5).
+    - hint: "logsource 'image_load' (recommended by techniques: T1055) is not covered — pull in cue_image_load.* or author a custom question with category: image_load"
+      disposition: acted-on
+      reason: >-
+        Authored Q8 (attack:T1055.injection_indicators) with category: image_load scoped to
+        Image ending in \\msra.exe to surface unexpected module loads into the injected process.
+    - hint: "logsource 'process_access' (recommended by techniques: T1055) is not covered and no template family exists — author a custom question with category: process_access"
+      disposition: acted-on
+      reason: >-
+        Authored Q7 (attack:T1055.access_verification) with category: process_access scoped to
+        TargetImage ending in \\msra.exe, projecting SourceImage and GrantedAccess to confirm the
+        injection the rule infers from child commands.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - discovery_recon
+    - scheduled_task
+    - parent_child
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 15
+      attack: 2
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 2
+      context: 13
+    logsource_diversity:
+      process_creation: 13
+      process_access: 1
+      image_load: 1
+      network_connection: 1
+      sigma_alert: 1

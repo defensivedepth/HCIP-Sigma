@@ -1,0 +1,589 @@
+name: Hiding User Account Via SpecialAccounts Registry Key - CommandLine
+id: 56cc68cd-eab8-43eb-9798-30355010c8e5
+description: |
+  Detects reg.exe adding a value of 0 under HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon\SpecialAccounts\UserList,
+  which hides the named user account from the Windows logon screen. The rule fires when reg.exe runs with a command line
+  that adds a UserList value, includes the add and /v switches, and sets the data to 0 — all conditions together. Legitimate
+  administrators occasionally hide service or kiosk accounts this way, but the pattern is also used after creating a local
+  account to keep it out of sight; the investigation should determine which account was hidden, who created it, and whether
+  the hiding accompanied account creation, defense tampering, or other operator activity on the host.
+type: detection
+detection_id: 9ec9fb1b-e059-4489-9642-f270c207923d
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Did reg.exe add a UserList value set to 0 under the SpecialAccounts key as this rule detects?
+  context: Before investing investigation time, confirm the alert is a true positive. Review the full command line and verify
+    that reg.exe wrote to ...\Winlogon\SpecialAccounts\UserList with the add and /v switches and a data value of 0, and note
+    which account name follows the /v switch — that is the account being hidden.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to hide local accounts from the logon screen?
+  context: Legitimate administrative activity can trigger this detection — kiosk, service, or built-in accounts are sometimes
+    hidden intentionally. Knowing whether this user routinely administers accounts and whether this host is one where such
+    changes are expected is often the fastest path to separating true positives from routine operations.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:registry.registry_key_context
+  question: Which account name was written to the UserList key, and does that account exist and appear privileged or recently created?
+  context: The value name written under SpecialAccounts\UserList is the account being hidden. Identify it, then determine whether
+    that account is a known administrative or service account or one that was recently created. An account hidden immediately
+    after creation, or one in a privileged group, shifts the disposition toward operator activity rather than routine maintenance.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+- source: attack:T1564.002.security
+  question: Was a local user account created on this host around the time the account was hidden?
+  context: Hiding an account from the logon screen is commonly paired with creating that account first. A nearby account-creation
+    event tying the same account name to the hiding action strongly indicates an operator establishing a concealed foothold.
+    If account-management logs are not collected in this environment, treat zero results as a visibility gap rather than evidence
+    no account was created.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: security
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4720
+      condition: selection
+    fields:
+      - TargetUserName
+      - SubjectUserName
+- source: template:registry.registry_related_modifications
+  question: Were other registry modifications made on this host in the same session?
+  context: An account-hiding registry edit often comes bundled with other reg.exe changes — enabling RDP, weakening UAC token
+    filtering, disabling Defender flags, or adding the account to a group. Finding a cluster of reg.exe writes from the same
+    host within a short window reveals the full scope of configuration changes and whether multiple objectives were pursued.
+  range: +/-30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_reg:
+        Image|endswith:
+          - '\reg.exe'
+          - '\regedit.exe'
+        CommandLine|contains:
+          - ' add '
+          - ' delete '
+          - ' import '
+          - '/s '
+      condition: selection and selection_reg
+    fields:
+      - CommandLine
+- source: template:cue_process_tool.process_chain
+  question: What process spawned reg.exe and is that parent chain expected?
+  context: The parent process reveals how reg.exe was invoked. An interactive administrator action usually descends from explorer.exe
+    or a console, while a batch toolkit, a remote-execution helper, or a script host (cmd.exe, powershell.exe, wscript.exe)
+    spawning reg.exe to hide an account points to scripted operator activity.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run reg.exe to modify account-visibility or Winlogon settings?
+  context: Compare this user's current action against their historical behavior. A user who has never modified Winlogon SpecialAccounts
+    keys is more suspicious than one who administers accounts regularly. The user's role and typical toolset should align with
+    hiding accounts from the logon screen.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent-plus-reg.exe launch combination historically routine on this host or across the environment?
+  context: When the alert fires under a service or computer account, user identity does not attribute the behavior; the meaningful
+    pivot is the launch mechanism. A new or rare parent process spawning reg.exe on this host is the deviation worth chasing,
+    while a parent that already accounts for many prior reg.exe runs is more likely automation or OS tooling.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or actions on multiple endpoints. If the same
+    user hid accounts or ran administrative tooling on several hosts in this window, the scope of the activity may be larger
+    than a single endpoint.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent-plus-reg.exe combination fire on other hosts in the same window?
+  context: Under a service or computer account, asking what the user did network-wide returns agent-telemetry noise. The meaningful
+    question is whether the same launch mechanism — parent process plus reg.exe — fired on other hosts in the alert window.
+    Multiple hosts point to scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: 'Alerts rarely occur in isolation. Examining activity around the alert reveals the immediate context: what led to
+    the account-hiding edit, what happened after, and whether it is part of a larger sequence. Look for account creation, group
+    additions, reconnaissance, or persistence installation nearby.'
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in the hour before the alert?
+  context: Account hiding is a defense-evasion action, and operators frequently weaken AV/EDR before or alongside it. This query
+    surfaces direct attempts to disable AV/EDR services, flip Defender flags, add broad exclusions, clear logs, or patch AMSI/ETW.
+    Zero rows is a useful "protection looks healthy" signal; populated rows shift the disposition toward operator preparation,
+    so review the parent process and signing chain to identify the writer.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Account hiding rarely happens in isolation. Earlier detections on the same host — credential access, reconnaissance,
+    privilege escalation, or defense tampering — may reveal the attack stages that preceded the account being hidden and help
+    reconstruct the full timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:persistence_scope.process_based_persistence
+  question: Were other process-based persistence mechanisms installed on this host?
+  context: A hidden local account is itself a persistence and re-entry mechanism, and operators rarely rely on a single one.
+    They commonly stack scheduled tasks, services, registry Run keys, BITS jobs, or WMI subscriptions. Multiple persistence
+    installations in the same timeframe indicate intentional stacking rather than isolated administrative action.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine
+- source: template:lolbin.technique_class_lateral
+  question: Were any other persistence or tamper LOLBins used on this host recently?
+  context: Operators who hide an account via reg.exe often pair it with other built-in tools for persistence and evasion —
+    schtasks for scheduled tasks, sc for services, netsh for firewall changes, wevtutil for log clearing, or bcdedit for boot
+    configuration. Finding several such tools used around the same time strengthens the case for hands-on operator activity.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_img:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\sc.exe'
+          - '\at.exe'
+          - '\netsh.exe'
+          - '\wevtutil.exe'
+          - '\bcdedit.exe'
+          - '\vssadmin.exe'
+          - '\diskshadow.exe'
+          - '\dnscmd.exe'
+      condition: selection and selection_img
+    fields:
+      - Image
+      - CommandLine
+- source: template:lolbin.renamed_binary_check
+  question: Was reg.exe executed from its expected System32 or SysWOW64 path?
+  context: reg.exe run from a non-standard path (a user's temp or download directory, AppData, or ProgramData) may indicate
+    the binary was copied or renamed to evade path-based allowlists. Compare the executed Image path and its OriginalFileName
+    against the expected Windows system locations.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- source: template:lolbin.historical_lolbin_baseline
+  question: How often has this host fired the UserList account-hiding pattern over the past 90 days, and what command-line shapes are typical?
+  context: An account-hiding edit with no prior history on a host is more suspicious than one seen repeatedly under stable parents.
+    The query mirrors the rule's selection structure scoped to this host, so the count reflects this specific firing pattern
+    rather than generic reg.exe usage. The command-line projection lets the analyst compare typical invocation shapes against
+    the alerting one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \reg.exe
+        CommandLine|contains|all:
+        - \SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon\SpecialAccounts\UserList
+        - add
+        - /v
+        - /d 0
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - CommandLine
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired the UserList account-hiding pattern in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of this
+    specific firing pattern rather than generic reg.exe usage. Many hosts firing the same pattern points to scripted deployment
+    or imaging; one host or a small unrelated set points to manual operator activity. Use the host distribution to calibrate
+    severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \reg.exe
+        CommandLine|contains|all:
+        - \SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon\SpecialAccounts\UserList
+        - add
+        - /v
+        - /d 0
+      condition: selection
+    fields:
+    - host.name
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1564.002
+      name: Hidden Users
+      role: primary
+    - id: T1564
+      name: Hide Artifacts
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: account_creation
+      description: "Actor creates a local user account to be concealed"
+      mapped_to: Q4
+      source: attack:T1564.002.security
+    - stage: 2
+      label: registry_hide
+      description: "Registry edit to SpecialAccounts\\UserList sets the account visibility to 0, hiding it from the logon screen"
+      mapped_to: Q3
+      source: template:registry.registry_key_context
+  dimension_coverage:
+    - dimension: tuning_parameter
+      technique: T1564.002
+      covered_by: Q3
+      source: template:registry.registry_key_context
+      coverage_type: direct
+  mutable_dispositions:
+    - element: AccountScope
+      dimension: tuning_parameter
+      specific_values: "rationale only (restrict monitoring to privileged or unexpected accounts)"
+      disposition: context
+      target_question: Q3
+      notes: "No queryable values; folded into registry_key_context context asking whether the hidden account is privileged or recently created."
+    - element: BaselineHiddenUsers
+      dimension: tuning_parameter
+      specific_values: "rationale only (whitelist intentionally-hidden admin accounts)"
+      disposition: context
+      target_question: Q2
+      notes: "No queryable values; folded into host_user_context — whether this user/host is expected to hide accounts (the whitelist judgment)."
+    - element: FileExtensions
+      dimension: tuning_parameter
+      specific_values: "rationale only (T1564 generic file-hiding tuning)"
+      disposition: context
+      target_question: Q11
+      notes: "Secondary technique T1564; not applicable to a registry-based account-hiding rule. No file-hiding query authored; host clustering covers nearby activity."
+    - element: ADSDetection
+      dimension: tuning_parameter
+      specific_values: "rationale only (T1564 ADS detection toggle)"
+      disposition: context
+      target_question: Q11
+      notes: "Secondary technique T1564; ADS detection not applicable to this registry rule. No ADS query authored."
+  dedup_decisions:
+    - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable; emit both (user-pivot baseline + parent+binary substitute)"
+      kept: both
+    - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable; emit both (user-pivot clustering + parent+binary substitute)"
+      kept: both
+    - dropped: cue_process_tool.baseline_deviation
+      reason: "host-scoped count of the rule's exact firing pattern overlaps lolbin.historical_lolbin_baseline (same reflected host_pattern query, same -host scope); dropped under the 18-question cap as the genuine redundancy"
+      kept: lolbin.historical_lolbin_baseline
+    - dropped: cue_process_tool.baseline
+      reason: "generic host baseline of reg.exe is subsumed by lolbin.historical_lolbin_baseline, which counts the rule's specific pattern on this host"
+      kept: lolbin.historical_lolbin_baseline
+    - dropped: cue_process_tool.clustering
+      reason: "host activity-around-the-alert overlaps cue_host_context.clustering (same host-scoped process_creation aggregation)"
+      kept: cue_host_context.clustering
+    - dropped: cue_process_tool.follow_on
+      reason: "reg.exe does not spawn children for account-hiding; nearby/follow-on activity covered by cue_host_context.clustering and process_based_persistence"
+      kept: cue_host_context.clustering
+    - dropped: persistence_scope.file_based_persistence
+      reason: "account-hiding is a registry/process behavior, not a file-drop; process_based_persistence covers the persistence-scope angle within the cap"
+      kept: persistence_scope.process_based_persistence
+  skipped_templates:
+    - template: cue_process_tool.mechanism_decode
+      reason: "replaced_by: registry.registry_key_context (more specific — surfaces TargetObject/Details for the registry write)"
+  reflection_overrides: []
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded:
+      - id: ransomware_impact
+        confidence: low
+        reason: "Keyword match on 'ransomware' in references is incidental — the rule detects a registry account-hiding action, not encryption/impact. No ransomware-specific question authored."
+      - id: network_scope
+        confidence: low
+        reason: "Keyword match on 'ransomware' in references is incidental — the rule has no network indicator and detects a local registry edit. No network-scope question authored."
+  technique_sets_applied:
+    - universal
+    - registry
+    - persistence_scope
+    - lolbin
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 17
+      attack: 1
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 15
+    logsource_diversity:
+      process_creation: 15
+      registry_set: 1
+      security: 1
+      sigma_alert: 1

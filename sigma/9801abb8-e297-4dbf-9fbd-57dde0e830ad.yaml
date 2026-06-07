@@ -1,0 +1,484 @@
+name: File Download And Execution Via IEExec.EXE
+id: a69ef46a-7915-4419-aa11-9df677a65007
+description: |
+  Detects execution of ieexec.exe with a command line containing an http or https URL. IEExec is an
+  undocumented .NET Framework 2.0 utility that fetches a managed .NET assembly from a remote URL and runs its
+  entry point in-process; because it is Microsoft-signed and lives in a fixed trusted path, it is used to
+  bypass application-control policies and proxy execution of arbitrary downloaded code. The rule fires when the
+  image ends in IEExec.exe (or its OriginalFileName is IEExec.exe) AND the command line contains a URL.
+  IEExec has no documented everyday use, so any such execution is a strong investigation lead; the goal is to
+  identify the remote destination, recover and characterize the fetched assembly, and determine what the
+  in-process payload then did on the host.
+type: detection
+detection_id: 9801abb8-e297-4dbf-9fbd-57dde0e830ad
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the alerting process run ieexec.exe with an http or https URL on its command line?
+  context: Before investing investigation time, confirm the alert is a true positive by reviewing the triggering
+    event. The rule requires both that the image is ieexec.exe (or its OriginalFileName is IEExec.exe) and that
+    the command line carries a URL. Read the full command line and confirm the remote URL is present and note
+    the destination it points to.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run ieexec.exe to fetch and execute remote .NET code?
+  context: IEExec is undocumented and has no routine administrative use, so legitimate execution is rare and
+    almost always tied to a known developer, build process, or custom automation. Knowing whether the user role
+    and host function could plausibly produce this is often the fastest path to distinguishing a true positive
+    from a sanctioned edge case.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What is the full ieexec.exe command line, and what remote URL does it fetch and execute?
+  context: The full command line reveals the exact remote resource. IEExec syntax is simply ieexec.exe followed
+    by a remote URL pointing at a .NET assembly, which it JIT-loads and runs in-process. Decode the URL, note
+    the scheme (http, https, file, or UNC), the host, and the path, and record whether the URL ends in an
+    assembly such as .exe or .dll.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:cue_network_endpoint.mechanism_decode
+  question: What is the remote destination ieexec.exe connected to, and what do DNS, WHOIS, and threat intel reveal about it?
+  context: IEExec fetches the assembly over the network, so the connection appears with ieexec.exe as the
+    process image and the payload host as the destination. Investigate the destination's DNS resolution
+    history, registration age, TLS certificate, and known threat intelligence. Recently registered domains,
+    raw external IP addresses, or known command-and-control infrastructure point to attacker-controlled
+    endpoints; an internal or vendor address shifts the picture toward sanctioned automation.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationHostname
+      - DestinationPort
+- source: template:cue_process_tool.process_chain
+  question: What process spawned ieexec.exe, and is that parent chain expected?
+  context: The parent process reveals how IEExec was invoked. Tune for known-good launchers, but treat script
+    hosts, Office applications, or shells (mshta.exe, wscript.exe, cmd.exe, powershell.exe, winword.exe) as
+    higher-concern parents that suggest macro or scripted delivery rather than a deliberate developer action.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:universal.evidence_preservation
+  question: Is the fetched .NET assembly or any payload it dropped still on disk for analysis?
+  context: IEExec loads the remote assembly in-process, so the downloaded code may never touch disk; however the
+    payload it runs frequently writes secondary files to staging directories such as C:\Users\Public, the user
+    temp path, or ProgramData. Checking whether artifacts remain on disk enables hash lookups, sandbox
+    submission, and content review.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: template:download_tool.download_success_verification
+  question: Did the fetch succeed? Check for file creation by ieexec.exe at the destination.
+  context: A download command does not guarantee the resource was retrieved. Network errors, blocked URLs, or
+    security controls may have prevented the transfer, and because IEExec runs the assembly in memory the most
+    reliable on-disk evidence is often a secondary file the payload writes. Confirming file creation establishes
+    whether the activity progressed past the delivery stage.
+  range: +15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: template:download_tool.payload_analysis
+  question: Can you retrieve and analyze the fetched assembly or dropped payload from a safe environment?
+  context: If the remote assembly or a file written by it is still on disk, submitting its hash to threat
+    intelligence services or detonating it in a sandbox reveals whether it is a known malicious payload, a
+    legitimate tool, or something novel that needs deeper analysis. Pair this with the remote URL recovered from
+    the command line to attempt retrieval of the assembly directly from the source.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Hashes
+- source: template:download_tool.directory_activity
+  question: What other file activity occurred in the staging directory around the download?
+  context: Operators often stage multiple files in the same directory, or the fetched assembly triggers further
+    writes such as extraction, decompression, or additional downloads. Common staging paths include C:\Users\Public,
+    the user temp directory, and ProgramData. Examining directory-level file activity reveals the broader scope of
+    the delivery.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains|expand: '%file_dirs%'
+      filter_self:
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection and not filter_self
+    fields:
+      - TargetFilename
+      - Image
+- source: template:cue_process_tool.follow_on
+  question: What child processes did ieexec.exe spawn afterward?
+  context: Because IEExec executes the .NET assembly in-process, the loaded payload runs under the ieexec.exe
+    image; any new processes it starts appear as children of ieexec.exe. Children such as cmd.exe, powershell.exe,
+    certutil.exe, or unsigned binaries from user-writable paths indicate post-exploitation activity following the
+    in-memory execution.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.baseline
+  question: Does this host normally run ieexec.exe at all?
+  context: IEExec has no documented everyday use, so even a small nonzero history is notable. A host that has
+    never run ieexec.exe is firing this for the first time; a host with a recurring count may have a known
+    developer or build workflow worth confirming against organizational knowledge.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired this rule's pattern, what parents and users normally drive it, and does the current alert fit?
+  context: Even a binary with a prior history can be abused. The query mirrors the rule's selection, scoped to
+    this host, so the resulting parent and user distribution reflects how ieexec.exe-with-a-URL has historically
+    run here rather than generic binary usage. A new parent process, an unexpected user account, or an unusual
+    command-line shape is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \IEExec.exe
+      - OriginalFileName: IEExec.exe
+      selection_cli:
+        CommandLine|contains:
+        - http://
+        - https://
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run ieexec.exe to fetch remote code?
+  context: Compare this user's current action against their historical behavior. A user who has never run
+    ieexec.exe with a URL is more concerning than one who does so regularly as part of a known developer or
+    build role. User role and typical toolset should align with fetching and executing remote .NET assemblies.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent and ieexec.exe combination historically routine on this host or across the environment, or is the parent unusual for this binary?
+  context: When the alert fires under a service principal, user identity does not attribute the behavior. The
+    meaningful pivot is the launch mechanism — which parent process spawned ieexec.exe, and whether that pair is
+    historically common. A new or rare parent for ieexec.exe is the deviation worth chasing; a pair that already
+    accounts for many prior events points to vendor or build automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple
+    endpoints. If the same user triggered similar fetch-and-execute activity on other hosts in the same window,
+    the scope of the operation may be larger than a single alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent and ieexec.exe combination fire on other hosts in the same window, or is the activity isolated to this host?
+  context: Under a service principal, asking what else the user did across the network returns agent-telemetry
+    noise because every host runs service-owned processes constantly. The meaningful question is whether the same
+    launch mechanism — parent process plus ieexec.exe — fired on other hosts in the alert window. Multiple hosts
+    point to scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired this rule's pattern in the past week, and does the cross-host distribution look like consistent automation or one-off activity?
+  context: The query mirrors the rule's selection with no host scope, giving a fleet-wide count of ieexec.exe
+    fetching a URL rather than generic binary usage. Many hosts firing the same pattern points to scripted
+    deployment or vendor automation; one host or a small unrelated set points to manual operator activity. Use
+    the host distribution and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \IEExec.exe
+      - OriginalFileName: IEExec.exe
+      selection_cli:
+        CommandLine|contains:
+        - http://
+        - https://
+      condition: all of selection_*
+    fields:
+    - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering,
+    reconnaissance, or credential access — may reveal the stages that preceded this fetch-and-execute event and
+    help reconstruct the full timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+  - id: T1105
+    name: Ingress Tool Transfer
+    role: primary
+  attack_chain_coverage:
+  - stage: 1
+    label: remote_fetch_execution
+    description: Process initiates a network connection to an external destination to fetch a payload (ieexec.exe loads a remote .NET assembly via URL)
+    mapped_to: Q4
+    source: template:cue_network_endpoint.mechanism_decode
+  - stage: 2
+    label: file_creation
+    description: File creation following the transfer (downloaded tool / payload written to disk)
+    mapped_to: Q7
+    source: template:download_tool.download_success_verification
+  dimension_coverage:
+  - dimension: file_path_analysis
+    technique: T1105
+    covered_by: Q9
+    source: template:download_tool.directory_activity
+    coverage_type: direct
+  - dimension: parent_process_analysis
+    technique: T1105
+    covered_by: Q5
+    source: template:cue_process_tool.process_chain
+    coverage_type: direct
+  - dimension: tuning_parameter
+    technique: T1105
+    covered_by: Q4
+    source: template:cue_network_endpoint.mechanism_decode
+    coverage_type: direct
+  mutable_dispositions:
+  - element: ParentProcessName
+    dimension: parent_process_analysis
+    specific_values: rationale only
+    disposition: context
+    target_question: Q5
+    notes: Parent-chain question carries the tune-for-known-good-updaters rationale; no specific parent values to inject.
+  - element: DestinationIPCategory
+    dimension: tuning_parameter
+    specific_values: internal vs external IP blocks
+    disposition: context
+    target_question: Q4
+    notes: Internal-vs-external framing carried in destination-investigation context; IEExec rule has no fixed destination to query.
+  - element: FilePathRegex
+    dimension: file_path_analysis
+    specific_values: 'C:\Users\Public, user temp, ProgramData'
+    disposition: context
+    target_question: Q6
+    notes: Example uncommon drop paths named in evidence-preservation and directory-activity context; queries scope via %file_paths%/%file_dirs% derived from the alert.
+  dedup_decisions:
+  - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc
+    reason: user_actor pair — non-deduplicable (subject vs. launch-mechanism identity pivots)
+    kept: both
+  - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc
+    reason: user_actor pair — non-deduplicable (subject vs. launch-mechanism identity pivots)
+    kept: both
+  - dropped: cue_process_tool.clustering
+    reason: overlaps cue_host_context.clustering and cross-host scope already covered by scope/clustering questions; dropped to stay within 18-question cap
+    kept: cue_host_context.precursor + cue_user_actor.clustering
+  - dropped: cue_host_context.clustering
+    reason: host-around-time context overlaps cue_process_tool.follow_on (post-execution) and precursor (prior alerts); dropped to stay within 18-question cap
+    kept: cue_process_tool.follow_on + cue_host_context.precursor
+  skipped_templates:
+  - template: cue_network_endpoint.baseline
+    reason: Destination IP is not a stable detection field on a process_creation alert; destination novelty is folded into the destination-investigation question (Q4) rather than a separate aggregation that would key on an unavailable %dst_ip%.
+  - template: universal.endpoint_protection_health
+    reason: Recommended (not must_include) generic tamper sweep; this is a download/proxy-execution lead, not a hands-on-keyboard impact/credential rule, and prior-tamper context is already surfaced by cue_host_context.precursor. Dropped to stay within the 18-question cap.
+  reflection_overrides: []
+  hint_dispositions:
+  - hint: 'File paths derived from CommandLine — use %file_paths% placeholder'
+    disposition: acted-on
+    reason: Evidence-preservation, download-success-verification, payload-analysis, and directory-activity questions all use %file_paths% / %file_dirs% placeholders for on-disk artifact scoping.
+  - hint: 'cue_network_endpoint: derived: https?:// in CommandLine'
+    disposition: acted-on
+    reason: cue_network_endpoint.mechanism_decode included as Q4 (destination investigation), pivoting from the URL in the command line to the network connection from ieexec.exe.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+  - universal
+  - download_tool
+  - cue_process_tool
+  - cue_network_endpoint
+  - cue_user_actor
+  - cue_host_context
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 18
+      attack: 0
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 2
+      context: 14
+    logsource_diversity:
+      process_creation: 12
+      network_connection: 1
+      file_event: 4
+      sigma_alert: 1

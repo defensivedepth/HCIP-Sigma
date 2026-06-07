@@ -1,0 +1,666 @@
+name: Enumeration for 3rd Party Creds From CLI
+id: 0f10f913-53a2-4cdc-9804-e88655047bdc
+description: |
+  Detects a process whose command line references the registry paths used by third-party
+  applications (mail clients, FTP/SFTP/SSH clients, VNC/RDP tools, OpenVPN, MobaXterm,
+  Radmin, and others) to store saved credentials. The rule fires when the command line
+  contains any of those credential-store registry paths AND the process is not reg.exe
+  performing an export/save (that case is handled by a separate rule). Legitimate hits are
+  rare — these keys have no benign reason to be enumerated by anything other than the
+  application that owns them — so the investigation should confirm what was queried, which
+  application's saved credentials were targeted, who and what launched the query, and
+  whether credential access was followed by lateral movement or exfiltration.
+type: detection
+detection_id: 87a476dc-0079-4583-a985-dee7a20a03de
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line reference one of the third-party credential-store registry paths this rule detects?
+  context: Confirm the alert is a true positive by reading the exact command line and checking
+    that it contains one of the watched registry paths (for example \Software\SimonTatham\PuTTY\Sessions,
+    \Software\Mobatek\MobaXterm\, \Software\Martin Prikryl\WinSCP 2\Sessions, or
+    \Software\FTPWare\COREFTP\Sites) and that the process is not reg.exe doing an export/save.
+    Note which application's credential store the matched path belongs to — that drives the rest of the investigation.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to enumerate third-party application credential stores from the command line?
+  context: Querying these registry paths is normal only for the owning application itself or for a
+    deliberate credential-migration/backup task. A general-purpose user or service account reading
+    saved-credential keys for SSH, FTP, VNC, or mail clients is unusual and is often the fastest way
+    to separate a true positive from routine activity.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:credential_access.credential_target_identification
+  question: Which application's saved credentials were targeted, and were multiple credential stores queried together?
+  context: Decode the command line to identify which third-party store was read — MobaXterm
+    (\Software\Mobatek\MobaXterm\ holds base64 SSH/SFTP/RDP secrets), PuTTY sessions and host keys,
+    WinSCP sessions, CoreFTP/FFFTP sites, OpenVPN configs, Radmin/VNC passwords, or a mail client
+    (Foxmail, IncrediMail, Eudora, Becky!). A single process referencing several of these paths in
+    quick succession is a strong credential-harvesting fingerprint and tells you which application
+    accounts may be exposed.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: attack:T1552.002.credential_path_enumeration
+  question: How many distinct third-party credential registry paths were referenced on this host in a short window, and by which processes?
+  context: A single legitimate read touches one application's key; a stealer sweeps many. Counting how
+    many of the watched credential paths were queried across the host's processes in a tight window
+    distinguishes a one-off lookup from an automated enumeration of every saved-credential store. Review
+    the Image and command line of each matching process to see whether one tool drove the whole sweep.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains:
+        - \Software\Aerofox\Foxmail\V3.1
+        - \Software\Aerofox\FoxmailPreview
+        - \Software\DownloadManager\Passwords
+        - \Software\FTPWare\COREFTP\Sites
+        - \Software\IncrediMail\Identities
+        - \Software\Martin Prikryl\WinSCP 2\Sessions
+        - \Software\Mobatek\MobaXterm\
+        - \Software\OpenSSH\Agent\Keys
+        - \Software\OpenVPN-GUI\configs
+        - \Software\ORL\WinVNC3\Password
+        - \Software\Qualcomm\Eudora\CommandLine
+        - \Software\RealVNC\WinVNC4
+        - \Software\RimArts\B2\Settings
+        - \Software\SimonTatham\PuTTY\Sessions
+        - \Software\SimonTatham\PuTTY\SshHostKeys\
+        - \Software\Sota\FFFTP
+        - \Software\TightVNC\Server
+        - \Software\WOW6432Node\Radmin\v3.0\Server\Parameters\Radmin
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.process_chain
+  question: What process spawned the process that queried these credential keys, and is that parent chain expected?
+  context: The parent reveals how the enumeration was launched. A query of saved-credential keys spawned
+    from explorer.exe during interactive admin work reads differently than one spawned from a script host
+    (wscript.exe, cscript.exe, powershell.exe), an Office application, or an unexpected downloader.
+    An unusual parent points toward post-exploitation rather than legitimate use.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired this credential-enumeration pattern, what parents and users normally drove it, and does the current alert fit?
+  context: The query mirrors the rule's selection scoped to this host, so the resulting parent/user
+    distribution reflects how this specific pattern has historically run here — not generic process usage.
+    A new parent process, an unexpected user account, or a first-ever appearance of the pattern on this
+    host is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains:
+        - \Software\Aerofox\Foxmail\V3.1
+        - \Software\Aerofox\FoxmailPreview
+        - \Software\DownloadManager\Passwords
+        - \Software\FTPWare\COREFTP\Sites
+        - \Software\IncrediMail\Identities
+        - \Software\Martin Prikryl\WinSCP 2\Sessions
+        - \Software\Mobatek\MobaXterm\
+        - \Software\OpenSSH\Agent\Keys
+        - \Software\OpenVPN-GUI\configs
+        - \Software\ORL\WinVNC3\Password
+        - \Software\Qualcomm\Eudora\CommandLine
+        - \Software\RealVNC\WinVNC4
+        - \Software\RimArts\B2\Settings
+        - \Software\SimonTatham\PuTTY\Sessions
+        - \Software\SimonTatham\PuTTY\SshHostKeys\
+        - \Software\Sota\FFFTP
+        - \Software\TightVNC\Server
+        - \Software\WOW6432Node\Radmin\v3.0\Server\Parameters\Radmin
+      filter_main_other_rule:
+        Image|endswith: reg.exe
+        CommandLine|contains:
+        - export
+        - save
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection and not 1 of filter_main_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired this credential-enumeration pattern in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: The query mirrors the rule's selection with no host scope, giving a fleet-wide count of this
+    specific pattern. Many hosts firing the same pattern points to scripted deployment or a credential
+    backup/migration tool; one host or a small unrelated set points to manual operator activity. Use the
+    host distribution to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains:
+        - \Software\Aerofox\Foxmail\V3.1
+        - \Software\Aerofox\FoxmailPreview
+        - \Software\DownloadManager\Passwords
+        - \Software\FTPWare\COREFTP\Sites
+        - \Software\IncrediMail\Identities
+        - \Software\Martin Prikryl\WinSCP 2\Sessions
+        - \Software\Mobatek\MobaXterm\
+        - \Software\OpenSSH\Agent\Keys
+        - \Software\OpenVPN-GUI\configs
+        - \Software\ORL\WinVNC3\Password
+        - \Software\Qualcomm\Eudora\CommandLine
+        - \Software\RealVNC\WinVNC4
+        - \Software\RimArts\B2\Settings
+        - \Software\SimonTatham\PuTTY\Sessions
+        - \Software\SimonTatham\PuTTY\SshHostKeys\
+        - \Software\Sota\FFFTP
+        - \Software\TightVNC\Server
+        - \Software\WOW6432Node\Radmin\v3.0\Server\Parameters\Radmin
+      filter_main_other_rule:
+        Image|endswith: reg.exe
+        CommandLine|contains:
+        - export
+        - save
+      condition: selection and not 1 of filter_main_*
+    fields:
+    - host.name
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run the process that performed this credential enumeration?
+  context: Compare the acting user against their own history. A user who has never run this binary, or
+    never reached into third-party credential stores, is more suspicious than one who does so as part of
+    a known administrative or migration workflow. The user's role should align with reading saved SSH,
+    FTP, VNC, and mail-client credentials.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent-and-binary combination historically routine on this host or across the environment, or is the parent unusual for this binary?
+  context: When the alert fires under a service principal, user identity does not attribute the behavior.
+    The meaningful pivot is the launch mechanism — which parent spawned this binary, and whether that pair
+    is historically common. A new or rare parent for this binary is the deviation worth chasing; a pair
+    already accounting for thousands of prior events is vendor or OS automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or parallel activity on
+    multiple endpoints. If the same user enumerated credentials or ran related tooling on several hosts in
+    this window, the scope of compromise may be larger than one machine.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent-and-binary combination fire on other hosts in the same window — a coordinated rollout, or isolated to this host?
+  context: Under a service principal, asking what else the user did across the network returns
+    agent-telemetry noise, since every host runs SYSTEM-owned agents constantly. The meaningful question
+    is whether the same launch mechanism — parent process plus spawned binary — fired on other hosts in
+    the alert window. Multiple hosts points to scheduled or pushed automation; a single host points to a
+    host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: Credential enumeration rarely occurs in isolation. Activity surrounding the alert reveals what
+    led to it and what followed — reconnaissance, privilege escalation, staging, or exfiltration. Novel
+    parent-child process pairs at low counts are what to scan for amid the high-count agent telemetry.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host — defense tampering, reconnaissance, initial execution — may
+    reveal the attack stages that preceded this credential enumeration and help reconstruct the timeline.
+    Credential access typically sits in the middle of an intrusion, so prior alerts often explain how the
+    actor reached this point.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in the hour before the alert?
+  context: Tampering often precedes hands-on credential harvesting. The query surfaces direct attempts to
+    disable AV/EDR services, flip Defender flags, add broad exclusions, clear logs, or patch AMSI/ETW. Zero
+    rows is a useful "protection looks healthy" signal — kernel-level driver tampering and in-memory patches
+    will not appear here. Populated rows shift the disposition toward operator preparation; review the parent
+    process and signing chain to identify the writer.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+- source: template:credential_access.post_access_lateral_movement
+  question: Were any new logon sessions or remote connections initiated on this host after the enumeration?
+  context: Credential theft is typically followed by use of those credentials — the saved SSH, FTP, VNC,
+    or RDP secrets these keys hold are exactly what enables remote access. Look for follow-on alerts
+    involving RDP, SMB, WinRM, or new outbound connections in the hours after the enumeration as evidence
+    the harvested credentials were exercised.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - rule.name
+      - rule.uuid
+      - event.severity_label
+- source: template:credential_access.credential_exposure_assessment
+  question: Which application accounts may be exposed, and do any provide access to sensitive systems?
+  context: The impact depends on what the targeted credential stores unlock. Saved WinSCP/CoreFTP/FFFTP
+    sites, PuTTY/OpenSSH/MobaXterm sessions, OpenVPN configs, and VNC/Radmin passwords often grant access
+    to servers, network devices, or third-party services. Cross-reference the acting user and the targeted
+    applications against what those saved sessions reach to scope remediation and credential rotation.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:registry.registry_related_modifications
+  question: Were other registry add, delete, or import operations performed on this host in the same session?
+  context: Credential harvesting is frequently paired with configuration changes — staging persistence,
+    disabling protections, or writing back modified keys. Finding reg.exe or regedit.exe write operations
+    from the same host within a short window reveals whether the activity went beyond reading credentials
+    into modifying system state.
+  range: +/-30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_reg:
+        Image|endswith:
+          - '\reg.exe'
+          - '\regedit.exe'
+        CommandLine|contains:
+          - ' add '
+          - ' delete '
+          - ' import '
+          - '/s '
+      condition: selection and selection_reg
+    fields:
+      - CommandLine
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1552.002
+      name: Credentials in Registry
+      role: primary
+    - id: T1552
+      name: Unsecured Credentials
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: registry_credential_read
+      description: "Process queries third-party credential-store registry paths via command line"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: target_store_identification
+      description: "Decode which application's saved-credential store was targeted"
+      mapped_to: Q3
+      source: template:credential_access.credential_target_identification
+    - stage: 3
+      label: enumeration_breadth
+      description: "Multiple credential stores swept in a short window (automated harvest)"
+      mapped_to: Q4
+      source: attack:T1552.002.credential_path_enumeration
+    - stage: 4
+      label: credential_use_lateral_movement
+      description: "Harvested credentials exercised for remote access / lateral movement"
+      mapped_to: Q15
+      source: template:credential_access.post_access_lateral_movement
+  dimension_coverage:
+    - dimension: parent_process_analysis
+      technique: T1552.002
+      covered_by: Q5
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1552.002
+      covered_by: Q12
+      source: template:cue_host_context.clustering
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1552.002
+      covered_by: Q4
+      source: attack:T1552.002.credential_path_enumeration
+      coverage_type: direct
+    - dimension: command_analysis
+      technique: T1552
+      covered_by: Q3
+      source: template:credential_access.credential_target_identification
+      coverage_type: direct
+    - dimension: process_identification
+      technique: T1552
+      covered_by: Q5
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1552
+      covered_by: Q8
+      source: template:cue_user_actor.baseline
+      coverage_type: direct
+  mutable_dispositions:
+    - element: KeywordMatch
+      dimension: tuning_parameter
+      specific_values: "18 third-party credential registry paths (PuTTY, WinSCP, MobaXterm, CoreFTP, FFFTP, OpenVPN, OpenSSH, VNC/Radmin, Foxmail, IncrediMail, Eudora, Becky!, DownloadManager)"
+      disposition: query_injection
+      target_question: Q4
+      notes: "Rule's full path list embedded in the credential_path_enumeration breadth query; also surfaced in Q1/Q3 context with named applications"
+    - element: ParentProcessFilter
+      dimension: parent_process_analysis
+      specific_values: "rationale only (cmd.exe > reg.exe vs services.exe > reg.exe ancestry)"
+      disposition: context
+      target_question: Q5
+      notes: "Parent-chain legitimacy assessed in process_chain question and baseline_deviation parent distribution"
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only (chained activity between reads and credential use)"
+      disposition: context
+      target_question: Q15
+      notes: "Time correlation between read and credential use carried by post_access_lateral_movement (+4h) and host clustering windows"
+    - element: RegistryHiveScope
+      dimension: tuning_parameter
+      specific_values: "rationale only (HKLM vs HKCU). Rule's paths are all HKCU/HKLM Software subkeys; not separately tunable here"
+      disposition: context
+      target_question: Q3
+      notes: "Hive scope is fixed by the rule's literal paths; target_store_identification context names the per-application HKCU stores"
+    - element: SuspiciousProcessList
+      dimension: tuning_parameter
+      specific_values: "reg.exe, cmd.exe, powershell.exe (T1552 analytic)"
+      disposition: context
+      target_question: Q5
+      notes: "Rule is CommandLine-only (no Image constraint), so process identity is investigated via parent chain and Image surfaced in breadth/baseline queries rather than a fixed Image filter"
+  dedup_decisions:
+    - dropped: cue_process_tool.baseline
+      reason: "host-binary frequency subsumed by cue_user_actor.baseline (user+binary, 90d) and cue_process_tool.baseline_deviation (rule-pattern host distribution, 14d); a plain Image baseline is misleading for a CommandLine-only rule where Image is unconstrained"
+      kept: cue_process_tool.baseline_deviation
+    - dropped: cue_process_tool.follow_on
+      reason: "child-process spawn coverage subsumed by cue_host_context.clustering (host activity +/-15m) and post_access_lateral_movement; follow_on keys on ParentImage|endswith %Image% which is meaningless when the rule does not constrain Image"
+      kept: cue_host_context.clustering
+    - dropped: cue_process_tool.clustering
+      reason: "generic host process clustering overlaps cue_host_context.clustering which provides the same +/-15m aggregated host view with Image+ParentImage"
+      kept: cue_host_context.clustering
+    - dropped: cue_user_actor.clustering (user-pivot) vs clustering_svc pairing
+      reason: "user_actor pair — non-deduplicable; both user-pivot and parent+binary substitute emitted"
+      kept: both
+    - dropped: cue_user_actor.baseline (user-pivot) vs baseline_svc pairing
+      reason: "user_actor pair — non-deduplicable; both user-pivot and parent+binary substitute emitted"
+      kept: both
+  skipped_templates:
+    - template: cue_process_tool.mechanism_decode
+      reason: "replaced_by: credential_access.credential_target_identification (also flagged by two brief hints) — the technique-set decode question is more specific to credential targeting"
+    - template: registry.registry_key_context
+      reason: "query keys registry_set (write events 13/14) via ProcessGuid; this rule detects a command-line registry READ (reg query / Get-ItemProperty), which produces no registry_set write event, so the linked-event lookup returns nothing. registry_related_modifications (reg write sweep) retained instead for registry-write context"
+    - template: universal.evidence_preservation
+      reason: "applicability flag has_file_reference fired on the registry-path strings, but the rule references registry KEYS not on-disk files; %file_paths% would be empty and a file_event lookup is not meaningful for a registry-read detection"
+  hint_dispositions:
+    - hint: "File paths derived from CommandLine — use %file_paths% placeholder"
+      disposition: declined
+      reason: >-
+        The command-line strings this rule matches are registry key paths
+        (\Software\...), not filesystem paths. There is no on-disk file
+        artifact to preserve or hash, so %file_paths% would resolve empty and
+        a file_event query is not meaningful. universal.evidence_preservation
+        was skipped for the same reason; Q3 (credential_target_identification)
+        decodes the registry-key command line directly instead.
+  contextual_sets:
+    included: []
+    excluded:
+      - id: data_staging_exfil
+        confidence: low
+        reason: "The 'exfiltration' mention is downstream context in the references (stealer C2 after harvest), not behavior this rule detects. The rule fires on the registry-read step only; staging/exfil would be a separate detection. post_access_lateral_movement already covers the follow-on-use angle without importing staging questions whose queries (file write / network egress) don't align with a registry-read trigger."
+  technique_sets_applied:
+    - universal
+    - credential_access
+    - registry
+  reflection_overrides: []
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 16
+      attack: 1
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 14
+    logsource_diversity:
+      process_creation: 15
+      sigma_alert: 2

@@ -1,0 +1,594 @@
+name: PUA - RunXCmd Execution
+id: 073a177d-6b80-43d0-8b37-1089935089ba
+description: |
+  Detects the RunXcmd console tool launching a target executable under the NT AUTHORITY\SYSTEM
+  or NT SERVICE\TrustedInstaller account, identified by a command line that contains both an
+  account selector (/account=system or /account=ti) and an /exec= target. The rule fires when
+  all of those conditions match. RunXcmd is a signed, portable dual-use utility: administrators
+  occasionally use it to run maintenance tasks that require SYSTEM or TrustedInstaller rights,
+  while operators abuse the same primitive to bypass file and registry ACLs owned by those
+  principals during privilege escalation or hands-on-keyboard intrusion. Investigation should
+  confirm the exact target and account, identify who and what launched the tool, and determine
+  whether the elevated child process performed any further service, registry, or impact actions.
+type: detection
+detection_id: 93199800-b52a-4dec-b762-75212c196542
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line contain both an account selector (/account=system or /account=ti) and an /exec= target?
+  context: Confirm the alert is a true positive by reviewing the exact command line. The rule fires only when both an
+    account selector and an /exec= target are present, so verify both are there and read the full /exec= path and any /args=
+    payload before investing further time.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run programs under the SYSTEM or TrustedInstaller account?
+  context: Running an arbitrary executable as SYSTEM or TrustedInstaller is an administrative action that grants ownership of
+    ACL-protected files and registry keys. Knowing whether this user role and host function routinely require that level of
+    elevation is often the fastest way to separate sanctioned maintenance from operator activity.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What did this invocation actually run? Decode the /exec= target, the /account= selector, and any /args= payload.
+  context: The full command line reveals the elevated action. Read the /exec= path to see which executable was launched, the
+    /account= value (system or TrustedInstaller; TrustedInstaller is the implicit default if omitted), and the trailing /args=
+    payload, which is passed unquoted to the child. A target under a user-writable staging path, or an internal PE FileDescription
+    that still reports RunX/RunXcmd on a renamed binary, points away from routine administration.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+      - Image
+- source: template:remote_access_tool.tool_authorization
+  question: Is RunXcmd on the organization's approved software list for this host?
+  context: RunXcmd is a free, portable, dual-use elevation utility with no install footprint, which makes it easy to drop into
+    a toolkit. Many organizations do not sanction SYSTEM/TrustedInstaller launchers at all, or restrict them to a small set of
+    administrative hosts. A copy on a host where it is not approved represents shadow IT or an attacker-staged tool regardless
+    of the binary being signed.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+- source: template:cue_process_tool.process_chain
+  question: What process spawned this tool, and is that parent chain expected?
+  context: The parent process reveals how the elevation tool was invoked. Interactive launches from explorer.exe or a console
+    are consistent with an administrator at the keyboard; launches from script hosts, Office applications, or remote-execution
+    parents suggest the tool was driven by a payload or a hands-on-keyboard operator.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.follow_on
+  question: What process did the elevated launch spawn, and what did that child do?
+  context: The point of this tool is to run a target executable under SYSTEM or TrustedInstaller, so the spawned child is the
+    actual impact. The /exec= target inherits the elevated token; a child such as cmd.exe, powershell.exe, regedit.exe, or a
+    service-control binary running as SYSTEM is where ACL bypass, registry edits, or further execution would occur.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - User
+- source: attack:T1569.002.service_creation
+  question: Were any Windows service registry keys created or modified on this host around the time of the alert?
+  context: Service execution often leaves registry changes under the service control keys (HKLM\SYSTEM\CurrentControlSet\Services)
+    that precede or accompany the launch of a non-standard service binary. An elevated child running as SYSTEM can install or
+    reconfigure a service for execution or persistence; correlating service-key writes with this elevated activity helps
+    distinguish a one-off maintenance task from service abuse. Build an allowlist of installers and management agents that
+    routinely touch service keys so expected churn does not mask the relevant change.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|contains: '\Services\'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+      - User
+- source: attack:T1569.002.service_install
+  question: Was a new Windows service installed on this host around the time of the alert?
+  context: A service-installed record names the service, its image path, and the account it runs under, and is a direct signal
+    that execution was set up to run through the service control manager rather than as a transient process. Correlate the
+    install time and the named binary against the elevated activity; an unexpected service whose image path points at a
+    user-writable directory or an unsigned binary is the change worth chasing. If service-install audit records are not
+    collected in this environment, treat zero results as a visibility gap rather than evidence nothing was installed.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: security
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4697
+      condition: selection
+    fields:
+      - ServiceName
+      - ServiceFileName
+      - ServiceAccount
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired this SYSTEM/TrustedInstaller elevation pattern, what parents and users normally
+    drive it, and does the current alert fit?
+  context: Even a sanctioned admin tool runs in a recognizable way on a given host. The query mirrors the rule's selection
+    structure scoped to this host, so the resulting parent and user distribution reflects how this specific elevation pattern
+    has actually run here. A new parent process, an unexpected user account, or an unusual command-line shape against that
+    history is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_account:
+        CommandLine|contains:
+        - ' /account=system '
+        - ' /account=ti '
+      selection_exec:
+        CommandLine|contains: /exec=
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run SYSTEM/TrustedInstaller elevation tools?
+  context: Compare this user's current action against their historical behavior. A user who has never run this elevation tool
+    is more notable than one who does so as part of a routine administrative role. User role and typical toolset should align
+    with launching programs under SYSTEM or TrustedInstaller.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent and binary combination historically routine on this host or across the environment, or is the parent unusual for this binary?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior. The meaningful pivot is
+    the launch mechanism: which parent process spawned this binary, and whether that pair is historically common. A new or rare
+    parent for this binary is the deviation worth chasing; a pair that already accounts for many prior events is vendor or OS
+    automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or coordinated activity on multiple endpoints.
+    If the same user drove similar elevated activity on several hosts in the alert window, the scope of the operation may be
+    larger than this single host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent and binary combination fire on other hosts in the same window, or is the activity isolated to this host?
+  context: Under a service principal, asking what else the user did across the network returns agent-telemetry noise. The
+    meaningful question is whether the same launch mechanism — parent process plus spawned binary — fired on other hosts in
+    the alert window. Multiple hosts in the same window points to scheduled or pushed automation; a single host points to a
+    host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_process_tool.clustering
+  question: What other tools ran on this host around the same time?
+  context: Privilege escalation rarely occurs in isolation. Activity surrounding the elevated launch may reveal reconnaissance,
+    credential access, persistence installation, or data staging that provides broader context. Novel parent-child pairs at low
+    counts are what to scan for; high-count rows are usually routine agent and OS telemetry.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host — defense tampering, reconnaissance, or credential access — may reveal the
+    attack stages that preceded an elevation to SYSTEM or TrustedInstaller and help reconstruct the timeline. Tampering or
+    recon followed by privilege elevation is a common ordering.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in the hour before the alert?
+  context: Tampering typically precedes elevated execution. The query surfaces direct attempts to disable AV/EDR services, flip
+    Defender flags, add broad exclusions, clear logs, or patch AMSI/ETW. Zero rows is a useful protection-looks-healthy signal;
+    kernel-level driver tampering and in-memory patches will not appear here. Populated rows shift the disposition toward
+    operator preparation, so review the parent process and signing chain to identify the writer.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired this SYSTEM/TrustedInstaller elevation pattern in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of this
+    elevation pattern rather than generic binary usage. Many hosts firing the same pattern points to scripted deployment or
+    vendor automation; one host or a small unrelated set points to manual operator activity. Use the host distribution and
+    parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_account:
+        CommandLine|contains:
+        - ' /account=system '
+        - ' /account=ti '
+      selection_exec:
+        CommandLine|contains: /exec=
+      condition: all of selection_*
+    fields:
+    - host.name
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1569.002
+      name: Service Execution
+      role: primary
+    - id: T1569
+      name: System Services
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: elevated_tool_invocation
+      description: "RunXcmd launches a target executable under SYSTEM or TrustedInstaller via /account= and /exec= flags"
+      mapped_to: Q3
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 2
+      label: elevated_child_execution
+      description: "The /exec= target runs under the elevated token (service-control binary, shell, registry editor)"
+      mapped_to: Q6
+      source: template:cue_process_tool.follow_on
+    - stage: 3
+      label: service_key_registry_change
+      description: "Service execution leaves registry changes under the service control keys preceding/accompanying a service binary launch"
+      mapped_to: Q7
+      source: attack:T1569.002.service_creation
+    - stage: 4
+      label: service_installation
+      description: "A new service is installed via the service control manager (security audit 4697)"
+      mapped_to: Q8
+      source: attack:T1569.002.service_install
+  dimension_coverage:
+    - dimension: tuning_parameter
+      technique: T1569.002
+      covered_by: Q3
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: direct
+    - dimension: obfuscation_check
+      technique: T1569
+      covered_by: Q3
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1569
+      covered_by: Q7
+      source: attack:T1569.002.service_creation
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1569
+      covered_by: Q2
+      source: template:universal.host_user_context
+      coverage_type: direct
+  mutable_dispositions:
+    - element: ServiceBinaryAllowlist
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q7
+      notes: "No specific values in brief; service-key allowlisting guidance folded into service-creation question context"
+    - element: ParentProcessCorrelationWindow
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q7
+      notes: "Correlation-window rationale realized as the +/-15m range on the service-key question"
+    - element: RemoteExecutionHosts
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q14
+      notes: "Approved-remote-host rationale covered by cross-host distribution framing"
+    - element: ServiceAllowlist
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q8
+      notes: "Known-good service allowlisting folded into service-install question context"
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q8
+      notes: "Correlation threshold realized as the +/-1h range on the service-install question"
+  dedup_decisions:
+    - dropped: cue_host_context.clustering
+      reason: "host-scoped +/-15m process_creation aggregation duplicates cue_process_tool.clustering (same scope/range/intent)"
+      kept: cue_process_tool.clustering
+    - dropped: null
+      reason: "user_actor pair — non-deduplicable: cue_user_actor.baseline + baseline_svc both emitted (subject vs. launch-mechanism identity)"
+      kept: cue_user_actor.baseline + cue_user_actor.baseline_svc
+    - dropped: null
+      reason: "user_actor pair — non-deduplicable: cue_user_actor.clustering + clustering_svc both emitted (subject vs. launch-mechanism identity)"
+      kept: cue_user_actor.clustering + cue_user_actor.clustering_svc
+  skipped_templates:
+    - template: remote_access_tool.active_session_context
+      reason: "Template assumes an interactive remote-support session (helpdesk ticket / RMM session). RunXcmd is a local SYSTEM/TrustedInstaller elevation utility with no remote session concept; authorization is already covered by remote_access_tool.tool_authorization (Q4) and human-context by host_user_context (Q2)."
+    - template: remote_access_tool.connection_destination
+      reason: "Template queries network_connection for the tool's outbound relay/C2 endpoint. RunXcmd performs local token elevation and does not establish its own outbound session; there is no relevant external endpoint to enumerate for this binary."
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "CommandLine-only detection — no Image field in rule. Use CommandLine pattern matching for scoping, not Image-based queries"
+      disposition: acted-on
+      reason: >-
+        The two fleet/host baseline questions that scope on the rule's firing
+        pattern (cue_process_tool.scope and cue_process_tool.baseline_deviation,
+        both REFLECTED) use the rule's /account= and /exec= CommandLine|contains
+        selections rather than Image, so the rule-pattern scoping is CommandLine-based
+        as the hint directs. Image-based queries remain only in the user-actor
+        baseline/substitute pivots, where %Image% is resolved from the alert event
+        (RunXcmd.exe) at hydration, not from a rule-level binary constraint.
+    - hint: "logsource 'registry_set' (recommended by techniques: T1569.002) is not covered — pull in cue_registry_key.* or author a custom question with `category: registry_set`"
+      disposition: acted-on
+      reason: >-
+        Authored attack:T1569.002.service_creation (Q7) with category: registry_set,
+        scoping host.name and TargetObject|contains '\Services\' to surface
+        service-control-key writes that accompany service execution, covering the
+        registry stage of the T1569.002 chain.
+    - hint: "logsource 'security' (recommended by techniques: T1569.002) is not covered and no template family exists — author a custom question with `category: security`"
+      disposition: acted-on
+      reason: >-
+        Authored attack:T1569.002.service_install (Q8) with service: security and
+        EventID 4697 (service installed), scoping host.name to surface SCM service
+        installation around the alert, covering the security-log stage of the
+        T1569.002 chain.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - remote_access_tool
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 15
+      attack: 2
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 14
+    logsource_diversity:
+      process_creation: 14
+      registry_set: 1
+      security: 1
+      sigma_alert: 1

@@ -1,0 +1,586 @@
+name: Suspicious XOR Encoded PowerShell Command
+id: 128a1d75-a95a-454e-912a-de3dd1d07cb4
+description: |
+  Detects PowerShell (powershell.exe or pwsh.exe) launched with a command line that contains the -bxor operator together with character-array, join, or loop constructs ([char], -join, ForEach, for(, ::Join). This combination is the in-memory XOR-decode pattern used to reconstruct an obfuscated payload at runtime so the readable script never appears on the command line. Legitimate scripting almost never combines a raw -bxor with character reassembly; when it fires, decode the reconstructed payload, identify what it executes (download cradle, reflective .NET assembly load, or follow-on process), and determine whether the user, host, and parent process are expected to run obfuscated PowerShell.
+type: detection
+detection_id: bb780e0c-16cf-4383-8383-1e5471db6cf9
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-06
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line match what this rule detects — PowerShell run with -bxor plus a char/join reassembly construct?
+  context: >-
+    Before investing investigation time, confirm the alert is a true positive. The rule fires only when all three conditions hold together: the image is powershell.exe or pwsh.exe (or the PowerShell OriginalFileName/Description/Product), the command line contains bxor, AND it contains at least one of [char], -join, ForEach, for(, or ::Join. Review the exact command line and process metadata to confirm the XOR-decode shape is present rather than an incidental substring.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+      - Description
+      - Product
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run obfuscated, XOR-decoded PowerShell?
+  context: >-
+    Legitimate administrative scripting rarely reconstructs a payload from a -bxor character loop. Knowing whether the user role and host function involve developer tooling, security testing, or known automation that emits obfuscated PowerShell is often the fastest path to separating a true positive from a sanctioned activity.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:powershell.encoded_command_decode
+  question: What does the XOR-decoded command reconstruct to, and what operation does the decoded script perform?
+  context: >-
+    The -bxor loop combined with [char]/-join reassembles a hidden payload at runtime so the readable script never appears in plaintext. Manually reproduce the XOR (the byte array and key are both in the command line) to recover the actual script. Decoded content commonly resolves to a download cradle, a reverse shell, in-memory execution of a .NET assembly, or a second-stage loader. Identify the payload source and what ultimately gets executed.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:cue_process_tool.mechanism_decode
+  question: Across nearby PowerShell invocations on this host, what is the full XOR-decode operation — does the decode chain across more than one command?
+  context: >-
+    The triggering event shows one command, but a XOR loader is sometimes split across sequential PowerShell invocations (read encoded file, decode, then invoke). Scoping to PowerShell runs on this host that carry the bxor operator within a few minutes surfaces whether the decode is a single self-contained command or one step in a multi-invocation chain. The bxor and char/join filters keep this from returning every PowerShell process on a busy host.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      selection_cli_xor:
+        CommandLine|contains: bxor
+      selection_cli_other:
+        CommandLine|contains:
+          - ForEach
+          - for(
+          - 'for '
+          - '-join '
+          - -join'
+          - -join"
+          - -join`
+          - ::Join
+          - '[char]'
+      condition: all of selection_*
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:powershell.script_block_logging
+  question: Did PowerShell script block logging capture the deobfuscated script content?
+  context: >-
+    Script block logging (Event ID 4104) records the script PowerShell actually executes after deobfuscation, so it reveals the post-XOR payload even when the command line is unreadable. This is the ground-truth source for what ran. If PowerShell operational logs are not ingested in this environment, treat zero results as a visibility gap rather than evidence that nothing executed.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- source: template:powershell.powershell_security_bypass
+  question: Were PowerShell security controls bypassed or weakened on this host before this execution?
+  context: >-
+    Operators frequently disable protections before running an obfuscated payload. Common precursors include AMSI bypass (patching amsi.dll in memory), execution-policy changes (-ExecutionPolicy Bypass or -ep bypass), and PowerShell downgrade to v2 which lacks logging. Finding these in the hour before the XOR-decode execution strengthens the case for malicious activity and explains gaps in script block logging.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- source: template:cue_process_tool.process_chain
+  question: What process spawned this PowerShell instance, and is that parent chain expected?
+  context: >-
+    The parent process reveals how PowerShell was invoked. Interactive use spawns from explorer.exe or a terminal; scheduled automation spawns from services.exe or taskeng.exe. Office applications (winword.exe, excel.exe), mshta.exe, wscript.exe, rundll32.exe, or a browser spawning PowerShell that immediately runs a XOR-decode loop points to macro-borne or download-delivered execution rather than a console session.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: attack:T1059.001.image_load
+  question: Did this PowerShell process load unusual or rarely seen .NET assemblies consistent with in-memory code loading?
+  context: >-
+    XOR-decoded PowerShell loaders often end in reflective .NET assembly loading ([Reflection.Assembly]::Load against a decoded byte array) so the payload runs from memory with no file on disk. Image-load events for this process surface the managed and native modules pulled in. A never-before-seen or oddly named assembly, or .NET runtime modules loaded into a PowerShell process that otherwise does only simple work, is the artifact that confirms in-memory execution. Compare loaded modules against what routine PowerShell on this host loads.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+- source: template:cue_process_tool.follow_on
+  question: What child processes did this PowerShell instance spawn afterward?
+  context: >-
+    The processes a decoded payload launches reveal its real impact. A XOR loader that resolves to a download cradle or reverse shell typically spawns cmd.exe, additional powershell.exe, certutil.exe, or an unfamiliar binary dropped to a user-writable path. Benign obfuscated scripts usually terminate without spawning post-exploitation children.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:universal.evidence_preservation
+  question: Are any files the decoded command references still on disk for analysis?
+  context: >-
+    A XOR loader frequently reads an encoded payload from a file or writes a decoded artifact (a .txt, .dat, .ps1, or .dll under a user profile or temp path) before executing it. If the referenced files are still present, they enable hash lookups, content review, and sandbox submission. Pull the file paths from the decoded command line into the scope of this query.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host previously fired this XOR-decode pattern, what parents and users drove it, and does the current alert fit that history?
+  context: >-
+    The query mirrors the rule's full selection structure scoped to this host, so the resulting parent and user distribution reflects how this specific XOR-decode pattern has run here historically — not generic PowerShell usage. A new parent process, an unexpected user account, or a first-ever appearance of the pattern on this host is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+      - OriginalFileName:
+        - PowerShell.EXE
+        - pwsh.dll
+      - Description: Windows PowerShell
+      - Product: PowerShell Core 6
+      selection_cli_xor:
+        CommandLine|contains: bxor
+      selection_cli_other:
+        CommandLine|contains:
+        - ForEach
+        - for(
+        - 'for '
+        - '-join '
+        - -join'
+        - -join"
+        - -join`
+        - ::Join
+        - '[char]'
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run PowerShell with obfuscated, XOR-style commands?
+  context: >-
+    Compare this user's current action against their historical behavior across all hosts. A user who has never run PowerShell in this way is more suspicious than one who does so routinely. User role and typical toolset should align — developers and security staff may legitimately produce obfuscated scripts; most accounts will not.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent+PowerShell launch combination historically routine on this host or environment-wide, or is the parent unusual for PowerShell?
+  context: >-
+    When the alert fires under a service principal (SYSTEM, LOCAL SERVICE, NETWORK SERVICE, or a computer account), user identity does not attribute behavior. The meaningful pivot is the launch mechanism — which parent spawned PowerShell, and whether that pair is historically common. A new or rare parent for PowerShell on this host or environment-wide is the deviation; a pair already accounting for thousands of prior events is OS or vendor automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: >-
+    Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints. If the same user triggered similar obfuscated-PowerShell activity on other hosts in the same window, the scope of the incident may be larger than a single endpoint.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent+PowerShell combination fire on other hosts in the same window — a coordinated automation rollout, or isolated to this host?
+  context: >-
+    Under a service principal, asking what else the user did network-wide returns agent-telemetry noise. The meaningful question is whether the same launch mechanism — parent process plus spawned PowerShell — fired on other hosts in the alert window. Multiple hosts in the same window points to scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired this XOR-decode pattern in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: >-
+    The query mirrors the rule's full selection structure with no host scope, so the result is a fleet-wide count of this XOR-decode pattern rather than generic PowerShell usage. Many hosts firing the same pattern points to scripted deployment or a sanctioned tool that emits obfuscated PowerShell; one host or a small unrelated set points to manual operator activity. Use the host distribution and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+      - OriginalFileName:
+        - PowerShell.EXE
+        - pwsh.dll
+      - Description: Windows PowerShell
+      - Product: PowerShell Core 6
+      selection_cli_xor:
+        CommandLine|contains: bxor
+      selection_cli_other:
+        CommandLine|contains:
+        - ForEach
+        - for(
+        - 'for '
+        - '-join '
+        - -join'
+        - -join"
+        - -join`
+        - ::Join
+        - '[char]'
+      condition: all of selection_*
+    fields:
+    - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: >-
+    Alerts rarely occur in isolation. Examining the surrounding activity reveals what led to this event and what followed — reconnaissance, privilege escalation, persistence installation, or data staging. Novel parent-child pairs at low counts stand out against high-count agent-telemetry noise and are what to scan for.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Earlier detections on the same host — defense tampering, reconnaissance, credential access — may reveal the attack stages that preceded the XOR-decode execution and help reconstruct the timeline. Defense tampering followed by execution, or reconnaissance followed by exploitation, are the sequences to look for.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1059.001
+      name: PowerShell
+      role: primary
+    - id: T1140
+      name: Deobfuscate/Decode Files or Information
+      role: secondary
+    - id: T1027
+      name: Obfuscated Files or Information
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: powershell_launch
+      description: PowerShell launched with an obfuscated command line (XOR + char/join reassembly)
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: deobfuscation
+      description: The -bxor loop reconstructs a hidden payload at runtime (deobfuscation step)
+      mapped_to: Q3
+      source: template:powershell.encoded_command_decode
+    - stage: 3
+      label: in_memory_load
+      description: Decoded payload commonly resolves to reflective .NET assembly load / in-memory execution
+      mapped_to: Q8
+      source: attack:T1059.001.image_load
+    - stage: 4
+      label: follow_on_execution
+      description: Decoded payload spawns child processes or network/file activity (download cradle, reverse shell)
+      mapped_to: Q9
+      source: template:cue_process_tool.follow_on
+  dimension_coverage:
+    - dimension: command_analysis
+      technique: T1059.001
+      covered_by: Q3
+      source: template:powershell.encoded_command_decode
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1059.001
+      covered_by: Q7
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1059.001
+      covered_by: Q17
+      source: template:cue_host_context.clustering
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1059.001
+      covered_by: Q8
+      source: attack:T1059.001.image_load
+      coverage_type: direct
+    - dimension: command_analysis
+      technique: T1140
+      covered_by: Q3
+      source: template:powershell.encoded_command_decode
+      coverage_type: direct
+    - dimension: execution_context
+      technique: T1140
+      covered_by: Q2
+      source: template:universal.host_user_context
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1140
+      covered_by: Q7
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1140
+      covered_by: Q9
+      source: template:cue_process_tool.follow_on
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1140
+      covered_by: Q5
+      source: template:powershell.script_block_logging
+      coverage_type: partial
+    - dimension: user_context
+      technique: T1140
+      covered_by: Q12
+      source: template:cue_user_actor.baseline
+      coverage_type: direct
+    - dimension: obfuscation_check
+      technique: T1027
+      covered_by: Q4
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1027
+      covered_by: Q11
+      source: template:cue_process_tool.baseline_deviation
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1027
+      covered_by: Q16
+      source: template:cue_process_tool.scope
+      coverage_type: partial
+    - dimension: user_context
+      technique: T1027
+      covered_by: Q12
+      source: template:cue_user_actor.baseline
+      coverage_type: direct
+  mutable_dispositions:
+    - element: CommandLinePattern
+      dimension: command_analysis
+      specific_values: "bxor; [char]; -join; ForEach; for(; ::Join"
+      disposition: query_injection
+      target_question: Q4
+      notes: "Rule's selection_cli_xor + selection_cli_other values injected into mechanism_decode CommandLine|contains so the host-scoped decode query enforces the rule's XOR-decode pattern (hint 1)."
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "rationale only (Excel, WinWord, mshta as abnormal parents)"
+      disposition: context
+      target_question: Q7
+      notes: "No parent in rule detection; abnormal-parent rationale carried in process_chain context."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q11
+      notes: "Off-hours / non-maintenance framing carried in baseline_deviation and clustering context."
+    - element: LoadedModuleList
+      dimension: tuning_parameter
+      specific_values: "rationale only (rare/never-before-seen .NET assemblies)"
+      disposition: new_question
+      target_question: Q8
+      notes: "Drove the attack:T1059.001.image_load question on the image_load logsource."
+    - element: ScriptBlockLengthThreshold
+      dimension: tuning_parameter
+      specific_values: "rationale only (EID 4104 block length)"
+      disposition: context
+      target_question: Q5
+      notes: "4104 length-threshold tuning carried in script_block_logging context."
+    - element: PayloadEntropyThreshold
+      dimension: obfuscation_check
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q4
+      notes: "Entropy/obfuscation rationale carried in mechanism_decode context; rule already encodes the XOR signature directly."
+  dedup_decisions:
+    - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable"
+      kept: both emitted (Q12, Q13)
+    - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable"
+      kept: both emitted (Q14, Q15)
+    - dropped: cue_process_tool.baseline
+      reason: "powershell.exe runs on essentially every host, so a generic Image-only -90d host baseline is non-discriminating; cue_process_tool.baseline_deviation (rule-pattern-scoped) is the meaningful host-frequency question and supersedes it"
+      kept: cue_process_tool.baseline_deviation
+  skipped_templates:
+    - template: obfuscation.encoded_payload_decode
+      reason: "replaced_by: powershell.encoded_command_decode — parent is powershell.exe/pwsh.exe so the PowerShell-specific decode question is more specific (hint 2)"
+    - template: cue_process_tool.clustering
+      reason: "near-identical host-scoped aggregation to cue_host_context.clustering (both group nearby process_creation on the host); cue_host_context.clustering kept because it projects ParentImage as well as Image"
+    - template: universal.endpoint_protection_health
+      reason: "generic host tamper sweep is subsumed for this execution rule by powershell.powershell_security_bypass (Q6), which surfaces AMSI/Defender/exec-policy tamper in the -1h pre-execution window with PowerShell-relevant indicators; no separate generic sweep needed"
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "logsource 'process_access' (recommended by techniques: T1140) is not covered and no template family exists — author a custom question with category: process_access"
+      disposition: declined
+      reason: >-
+        process_access (Sysmon EID 10) for T1140 targets cross-process memory
+        reads, which this rule does not detect: the rule fires on a self-contained
+        in-process XOR-decode command line, not on one process opening a handle to
+        another. The deobfuscation-then-execution chain for this rule resolves to
+        in-memory .NET assembly loading, which is covered by the
+        attack:T1059.001.image_load question (Q8) on the image_load logsource.
+        No compensating process_access question authored.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - powershell
+    - obfuscation
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 17
+      attack: 1
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 2
+      context: 14
+    logsource_diversity:
+      process_creation: 14
+      image_load: 1
+      file_event: 1
+      powershell_script_block: 1
+      sigma_alert: 1

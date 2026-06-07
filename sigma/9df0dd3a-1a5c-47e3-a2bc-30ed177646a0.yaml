@@ -1,0 +1,558 @@
+name: Remote Code Execute via Winrm.vbs
+id: e1b294b1-56f0-474e-9a95-7929841a7988
+description: |
+  Detects cscript.exe invoking the Windows-signed winrm.vbs script to create a remote
+  service or process over WinRM (WS-Management) — the command line carries 'winrm',
+  'invoke Create wmicimv2/Win32_', and a '-r:http' remote-host switch, which together
+  form a signed-script proxy primitive for remote code or service execution. The rule
+  fires when both the script-host selection (cscript.exe / cscript OriginalFileName) and
+  the command-line selection match. Legitimate WinRM administration uses subcommands like
+  'get config' or 'quickconfig'; the invoke-Create-over-HTTP pattern is the lateral-movement
+  shape. Note that the spawned process appears on the target as a child of wmiprvse.exe, not
+  of cscript.exe, so investigation should follow both the local launch chain and any remote
+  service/process creation it drives.
+type: detection
+detection_id: 9df0dd3a-1a5c-47e3-a2bc-30ed177646a0
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line show cscript running winrm.vbs with an invoke-Create against a Win32_ class over a -r:http remote host?
+  context: Confirm the alert is a true positive by reviewing the exact command line and process details. The rule fires only when the script host is cscript.exe (or carries the cscript OriginalFileName) AND the command line contains all of 'winrm', 'invoke Create wmicimv2/Win32_', and '-r:http'. Verify all three command-line tokens are present and note whether the targeted class is Win32_Process (runs at user privilege) or Win32_Service (requires admin and creates a remote service).
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to drive remote WinRM service or process creation from the command line?
+  context: Remote WinRM management from a scripting host is normal for a small set of admin or automation accounts and jump hosts; on a general workstation or a user without a remote-management role it is unexpected. Knowing whether the user role and host function fit remote WS-Management administration is often the fastest path to separating a true positive from sanctioned operations.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: Decode the full winrm.vbs command line — which Win32_ class and method, what payload, and which remote host and port?
+  context: The full command line reveals the operation. Identify the WMI class and method (Win32_Process Create runs a command at user privilege; Win32_Service Create defines and can then start a remote service), the embedded payload such as the @{CommandLine=...} or @{PathName=...} value, and the -r:host:port target (default WinRM listeners are 5985 for HTTP and 5986 for HTTPS). Auth switches -a:certificate and -c:<thumbprint> indicate certificate-based authentication to the remote host.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+        CommandLine|contains|all:
+          - 'winrm'
+          - 'invoke Create wmicimv2/Win32_'
+          - '-r:http'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:cue_process_tool.process_chain
+  question: What process spawned cscript.exe, and is that parent chain expected for remote WinRM administration?
+  context: The parent reveals how the script host was launched. A management console, a scheduled-task host, or an interactive admin shell is consistent with sanctioned remote administration; an Office application, a browser child, a script interpreter like wscript.exe or mshta.exe, or a freshly written binary points to operator-driven or macro-driven execution. Walk one level higher if needed to see what spawned the parent.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.follow_on
+  question: What child processes did cscript.exe spawn on this host after the alert?
+  context: When winrm.vbs drives a remote Win32_Process or Win32_Service Create, the resulting process runs on the target as a child of wmiprvse.exe, not of cscript.exe — so the local cscript.exe host often has no children. Children on this host therefore indicate either local execution rather than a clean remote invoke, or follow-on operator tooling. Unexpected children such as cmd.exe, powershell.exe, or certutil.exe are post-exploitation candidates.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: attack:T1216.unsigned_payload
+  question: Did cscript.exe write any files to user-writable or non-standard locations around the time of the alert?
+  context: System-script proxy abuse pairs a Microsoft-signed parent (cscript.exe via winrm.vbs) with an untrusted or unsigned payload. One bypass variant drops an attacker-controlled WsmPty.xsl or WsmTxt.xsl alongside a copied cscript.exe so a -format:pretty/text transform executes arbitrary unsigned script. Files written by the script host — especially .xsl transforms or staged executables outside System32/SysWOW64 — mark the signed-to-unsigned transition worth chasing. Zero file events with a clean remote invoke is consistent with a transport-only lateral move.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - User
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run remote WinRM administration via scripting hosts?
+  context: Compare this user's current action against their historical behavior. A user who has never driven winrm.vbs invoke-Create activity is more suspicious than one who does so as part of a remote-management role. User role and typical toolset should align with WS-Management administration.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent-plus-cscript launch combination historically routine on this host or across the environment, or is the parent unusual for cscript.exe?
+  context: When the alert fires under a service principal (SYSTEM, LOCAL SERVICE, NETWORK SERVICE, or a computer account), user identity does not attribute behavior. The meaningful pivot is the launch mechanism — which parent spawned cscript.exe and whether that pair is historically common. A new or rare parent for cscript.exe is the deviation worth chasing; a pair already accounting for thousands of prior events is automation or OS behavior.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints. WinRM invoke-Create is itself a remote-execution primitive, so if the same user drove similar activity on several hosts in this window the scope of the operation may be larger than the alerting host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent-plus-cscript combination fire on other hosts in the same window — a coordinated rollout, or activity isolated to this host?
+  context: Under a service principal, asking what else the user did returns agent-telemetry noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same launch mechanism — parent process plus cscript.exe — fired on other hosts in the alert window. Multiple hosts in the same window points to scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: 'Alerts rarely occur in isolation. Examining activity around the alert reveals the immediate context: what led to this remote-execution attempt, what happened after, and whether it is part of a larger sequence. Look for reconnaissance, credential access, or staging of the payload that winrm.vbs carried.'
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host — defense tampering, reconnaissance, or credential access — may reveal the stages that preceded this remote-execution attempt. WinRM lateral movement is typically preceded by credential acquisition, so prior alerts help reconstruct how the operator reached this host and account.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in the hour before the alert?
+  context: Tampering typically precedes hands-on-keyboard execution. The query surfaces direct attempts to disable AV/EDR services, flip Defender flags, add broad exclusions, clear logs, or patch AMSI/ETW. Zero rows is a useful "protection looks healthy" signal — kernel-level driver tampering and in-memory patches will not appear here. Populated rows shift the disposition toward operator preparation; review the parent process and signing chain to identify the writer.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+- source: template:lolbin.technique_class_lateral
+  question: Were any other proxy-execution or lateral-movement LOLBins used on this host recently?
+  context: Operators who reach for one signed-binary proxy often use several. If winrm.vbs invoke-Create was used for remote execution, check whether wmic, rundll32, regsvr32, mshta, msbuild, installutil, or msiexec were also used for proxy execution in the same window. Multiple LOLBins driving the same objective strengthens the case for malicious activity over a one-off admin action.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_img:
+        Image|endswith:
+          - '\wmic.exe'
+          - '\rundll32.exe'
+          - '\regsvr32.exe'
+          - '\mshta.exe'
+          - '\msbuild.exe'
+          - '\cmstp.exe'
+          - '\msiexec.exe'
+          - '\installutil.exe'
+          - '\forfiles.exe'
+          - '\pcalua.exe'
+          - '\presentationhost.exe'
+          - '\control.exe'
+          - '\infdefaultinstall.exe'
+          - '\msdt.exe'
+          - '\mavinject.exe'
+          - '\xwizard.exe'
+          - '\ie4uinit.exe'
+      condition: selection and selection_img
+    fields:
+      - Image
+      - CommandLine
+- source: template:lolbin.renamed_binary_check
+  question: Was cscript.exe executed from its expected System32 or SysWOW64 path?
+  context: cscript.exe run from outside System32 or SysWOW64 may indicate it was copied to an attacker-controlled directory — a known winrm.vbs AppLocker-bypass variant copies cscript.exe alongside a malicious WsmPty.xsl so a -format transform executes unsigned script. A cscript.exe under a user temp, AppData, or other writable directory is more suspicious than one in the standard system paths.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- source: template:lolbin.historical_lolbin_baseline
+  question: How often has this host fired the winrm.vbs invoke-Create pattern over the past 90 days, and what command-line shapes are typical?
+  context: A LOLBin pattern with no prior history on a host is more suspicious than one used regularly under stable parents. The query mirrors the rule's selection structure scoped to this host, so the count reflects the rule's specific firing pattern — cscript.exe driving winrm invoke-Create over -r:http — not generic cscript usage. The CommandLine projection lets the analyst compare the historical target classes and remote hosts against the alerting invocation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \cscript.exe
+      - OriginalFileName: cscript.exe
+      selection_cli:
+        CommandLine|contains|all:
+        - winrm
+        - invoke Create wmicimv2/Win32_
+        - -r:http
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection*) and _pb_scope
+    fields:
+    - CommandLine
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired the winrm.vbs invoke-Create pattern in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of the invoke-Create-over-HTTP pattern, not generic cscript usage. Many hosts firing the same pattern points to scripted deployment or sanctioned remote-management automation; one host or a small unrelated set points to manual operator activity. Use the host distribution and the remote-target consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \cscript.exe
+      - OriginalFileName: cscript.exe
+      selection_cli:
+        CommandLine|contains|all:
+        - winrm
+        - invoke Create wmicimv2/Win32_
+        - -r:http
+      condition: all of selection*
+    fields:
+    - host.name
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1216
+      name: System Script Proxy Execution
+      role: primary
+  attack_chain_coverage:
+    - stage: 1
+      label: signed_script_proxy_invocation
+      description: "Microsoft-signed cscript.exe invokes winrm.vbs to proxy a remote Win32_Process/Win32_Service Create over WinRM"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: command_line_lineage
+      description: "Parent chain leading to the signed script host establishes how the proxy was launched"
+      mapped_to: Q4
+      source: template:cue_process_tool.process_chain
+    - stage: 3
+      label: unsigned_payload_from_signed_parent
+      description: "Signed-to-unsigned transition: child process spawning and/or unsigned payload (e.g. WsmPty.xsl) executed from the signed parent"
+      mapped_to: Q6
+      source: attack:T1216.unsigned_payload
+  dimension_coverage:
+    - dimension: parent_process_analysis
+      technique: T1216
+      covered_by: Q4
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1216
+      covered_by: Q16
+      source: template:lolbin.historical_lolbin_baseline
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1216
+      covered_by: Q3
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: direct
+  mutable_dispositions:
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "rationale only (env-specific paths to wscript.exe/cscript.exe/pubprn.vbs/installutil.exe)"
+      disposition: context
+      target_question: Q4
+      notes: "process_chain question evaluates whether the parent of cscript.exe is expected; no fixed value to inject"
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only (delta between signed-script execution and suspicious child creation)"
+      disposition: context
+      target_question: Q5
+      notes: "follow_on Q5 (+4h) and historical_lolbin_baseline Q16 (-90d) bound the correlation window; threshold not directly queryable"
+    - element: ChildCommandLineRegex
+      dimension: tuning_parameter
+      specific_values: "rationale only (regex for download cradle / PowerShell decode in child)"
+      disposition: context
+      target_question: Q5
+      notes: "follow_on surfaces child CommandLine; no concrete regex value supplied to inject"
+    - element: SignedToUnsignedTransition
+      dimension: tuning_parameter
+      specific_values: "WsmPty.xsl / WsmTxt.xsl transform drop; cscript.exe relocated outside System32/SysWOW64"
+      disposition: new_question
+      target_question: Q6
+      notes: "Authored attack:T1216.unsigned_payload (file_event) for the .xsl/staged-payload drop; renamed_binary_check (Q15) covers the relocated-cscript transition"
+  dedup_decisions:
+    - dropped: cue_process_tool.baseline_deviation
+      reason: "REFLECTED host_pattern query is identical in intent and selection to lolbin.historical_lolbin_baseline (Q15), which is must_include; emitting both would duplicate the rule-pattern host baseline"
+      kept: lolbin.historical_lolbin_baseline
+    - dropped: cue_process_tool.baseline
+      reason: "generic Image|endswith host baseline of cscript.exe is broader and less precise than the rule-pattern host baseline kept at Q15 (historical_lolbin_baseline)"
+      kept: lolbin.historical_lolbin_baseline
+    - dropped: cue_process_tool.clustering
+      reason: "host-scoped 'what else ran on this host' is covered by cue_host_context.clustering (Q11); the two queries are the same shape (host.name aggregation over process_creation)"
+      kept: cue_host_context.clustering
+    - dropped: cue_user_actor.baseline
+      reason: "user_actor pair — non-deduplicable"
+      kept: cue_user_actor.baseline_svc
+    - dropped: cue_user_actor.clustering
+      reason: "user_actor pair — non-deduplicable"
+      kept: cue_user_actor.clustering_svc
+  skipped_templates: []
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "logsource 'image_load' (recommended by techniques: T1216) is not covered — pull in cue_image_load.* or author a custom question with `category: image_load`"
+      disposition: declined
+      reason: >-
+        The rule's detection is the cscript.exe command-line proxy invocation
+        (winrm invoke Create over -r:http); per the reference material the
+        executed payload runs on the REMOTE target as a child of wmiprvse.exe,
+        not as a local .NET/DLL load on the cscript host. The signed-script
+        proxy and any unsigned transition are observable through
+        process_creation (Q4 process_chain, Q5 follow_on, Q14 renamed_binary)
+        and file_event (Q6 unsigned_payload). Local image_load on cscript.exe
+        would return host-wide module-load volume without precision for this
+        cross-host primitive. No compensating attack:T1216.image_load question
+        authored.
+    - hint: "logsource 'process_access' (recommended by techniques: T1216) is not covered and no template family exists — author a custom question with `category: process_access`"
+      disposition: declined
+      reason: >-
+        process_access (handle/memory access between processes) is not the
+        mechanism this rule fires on — winrm.vbs proxies execution over the
+        WinRM transport, it does not open a handle into another process. The
+        relevant cross-process pivot for this technique is the wmiprvse.exe
+        parentage of the spawned process on the target, an analyst-side
+        process_creation pivot reflected in Q5 (follow_on) context, not a
+        local process_access edge. No compensating attack:T1216.process_access
+        question authored.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - lolbin
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 16
+      attack: 1
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 14
+    logsource_diversity:
+      process_creation: 15
+      file_event: 1
+      sigma_alert: 1

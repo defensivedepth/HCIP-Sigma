@@ -1,0 +1,483 @@
+name: Use of W32tm as Timer
+id: 12802fcd-2a18-444a-bc36-d61f7f2bf504
+description: |
+  Detects w32tm.exe (or a renamed binary with OriginalFileName w32time.dll) invoked with the
+  /stripchart, /computer:, /period:, /dataonly, and /samples: arguments all present. While w32tm
+  is a legitimate Windows time service utility, this specific argument combination produces a
+  fixed-duration measurement loop that can be used as a delay or sleep mechanism rather than for
+  genuine time synchronization. The rule fires only when both the binary/OriginalFileName check
+  AND the full stripchart argument set match. Investigation should confirm the exact command line,
+  identify what process launched it, and determine whether the surrounding activity points to a
+  benign timing task or to a process using the loop to pace or gate follow-on execution.
+type: detection
+detection_id: 6da2c9f5-7c53-401b-aacb-92c040ce1215
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line match what this rule detects, with w32tm running /stripchart together with /computer:, /period:, /dataonly, and /samples:?
+  context: Before investing investigation time, confirm the alert is a true positive by reviewing the exact command line and process details. The rule fires only when the binary resolves to w32tm.exe or carries OriginalFileName w32time.dll AND the command line contains all five stripchart arguments. Confirm every argument is present and note the period and samples values, since their product sets the loop duration.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run w32tm with stripchart timing arguments?
+  context: Legitimate time-service troubleshooting can use w32tm, but the full stripchart measurement loop is uncommon in routine operations. Knowing whether the user role and host function include time-synchronization diagnostics is often the fastest path to distinguishing a true positive from an administrator measuring clock offset.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: 'What were the exact /period: and /samples: values, and what loop duration do they produce?'
+  context: 'The stripchart loop runs one iteration per sample, spaced by the period in seconds, so the sample count times the period approximates the wall-clock delay the command imposes. Decode the full argument set to determine how long the process pauses and whether the /computer: target is localhost (self-timing) or a remote host. A round delay value reached through this loop suggests the command is being used to pace execution rather than to measure a real time source.'
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+        CommandLine|contains: '/stripchart'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:cue_process_tool.process_chain
+  question: What process spawned this w32tm invocation and is that parent chain expected?
+  context: The parent process reveals how the timer was invoked. Interactive troubleshooting typically shows explorer.exe or a console shell as the lineage, while a scripting host, an Office application, or an unfamiliar binary in the parent chain points to automated execution that is gating its own activity behind the delay loop.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: attack:T1124.follow_on_scheduling
+  question: Did scheduled-task creation or other timing or conditional-execution commands run on this host shortly after the timer fired?
+  context: Time discovery and delay loops are often a prelude to scheduling or conditional execution. A w32tm stripchart delay followed closely by schtasks or at.exe task registration, or by additional sleep loops, suggests the actor is pacing or gating later stages. This query surfaces scheduling and timing binaries on the host in the window after the alert.
+  range: +30m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_timing:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\timeout.exe'
+          - '\ping.exe'
+          - '\w32tm.exe'
+      condition: selection and selection_timing
+    fields:
+      - Image
+      - CommandLine
+      - User
+- source: attack:T1124.scheduled_task_registration
+  question: Were any scheduled tasks registered on this host in the window after the timer ran?
+  context: A delay loop that immediately precedes task registration points to an actor establishing timed or conditional execution rather than performing one-off time troubleshooting. Task-scheduler operational events record task creation independently of the process_creation view and confirm whether a persistent timing trigger was installed.
+  range: +30m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: taskscheduler
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - TaskName
+      - EventID
+- source: template:cue_process_tool.follow_on
+  question: What child processes did this w32tm invocation spawn afterward?
+  context: w32tm itself does not normally launch other processes. Any child of this invocation -- a command interpreter, a script host, or a downloaded binary -- would indicate the timer is embedded in a larger automation sequence rather than running as a standalone diagnostic.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:discovery_recon.discovery_burst_detection
+  question: Did other reconnaissance commands run on this host around the same time?
+  context: A single timing command may be benign, but several discovery commands in rapid succession -- whoami, ipconfig, net user, systeminfo -- is a signature of post-compromise enumeration. An actor pacing execution with a delay loop while also profiling the host points to hands-on activity rather than a maintenance task.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_recon:
+        Image|endswith:
+          - '\whoami.exe'
+          - '\systeminfo.exe'
+          - '\ipconfig.exe'
+          - '\net.exe'
+          - '\net1.exe'
+          - '\nltest.exe'
+          - '\dsquery.exe'
+          - '\nbtstat.exe'
+          - '\arp.exe'
+          - '\netstat.exe'
+          - '\tasklist.exe'
+          - '\qprocess.exe'
+          - '\query.exe'
+          - '\quser.exe'
+          - '\hostname.exe'
+          - '\nslookup.exe'
+          - '\adfind.exe'
+          - '\csvde.exe'
+          - '\ldifde.exe'
+          - '\dnscmd.exe'
+          - '\cmdkey.exe'
+          - '\setspn.exe'
+      condition: selection and selection_recon
+    fields:
+      - Image
+      - User
+- source: template:discovery_recon.discovery_parent_chain
+  question: What process spawned the timing command, and is this a normal pattern for this host?
+  context: Legitimate timing or discovery commands are typically run from a console spawned by explorer.exe or from a known automation script. The same command spawned by an Office application, a script interpreter, wmiprvse.exe, or wsmprovhost.exe indicates automated or remotely driven execution.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+- source: template:discovery_recon.discovery_user_context
+  question: Is this user expected to run system time-service diagnostics?
+  context: Network administrators and IT staff legitimately run time-synchronization diagnostics during clock-skew troubleshooting. Standard users rarely run w32tm stripchart loops. The user's role and typical behavior baseline determine whether this timing activity is routine or anomalous.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - User
+- source: template:cue_process_tool.baseline
+  question: Does this host normally run w32tm?
+  context: A binary that has rarely or never run on a host is more suspicious than one that runs regularly. Low historical counts for w32tm indicate first-time or unusual execution and weigh against routine time-service maintenance.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired the rule's pattern, what parents and users normally drive that activity, and does the current alert fit that pattern?
+  context: Even legitimate utilities can be abused. This query mirrors the rule's selection structure scoped to this host, so the resulting parent and user distribution reflects how the stripchart timing pattern -- not generic w32tm usage -- has historically run here. A new parent process, an unexpected user account, or an unusual command-line shape is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_w32tm:
+      - Image|endswith: \w32tm.exe
+      - OriginalFileName: w32time.dll
+      selection_cmd:
+        CommandLine|contains|all:
+        - /stripchart
+        - '/computer:'
+        - '/period:'
+        - /dataonly
+        - '/samples:'
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run time-service diagnostics like this?
+  context: Compare this user's current action against their historical behavior. A user who has never run w32tm timing loops is more notable than one who does so regularly as part of their role. User role and typical toolset should align with running clock diagnostics.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent and w32tm combination historically routine on this host or across the environment, or is the parent unusual for this binary?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior. The meaningful pivot is the launch mechanism: which parent process spawned w32tm, and whether that pair is historically common. A new or rare parent for w32tm on this host or environment-wide is the deviation worth chasing; a pair that already accounts for many prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints. If the same user triggered similar timing or discovery activity on several hosts, the scope of the activity may be larger than a single endpoint.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent and w32tm combination fire on other hosts in the same window, or is the activity isolated to this host?
+  context: Under a service principal, asking what else the user did across the network returns agent-telemetry noise. The meaningful question is whether the same launch mechanism -- parent process plus spawned w32tm -- fired on other hosts in the alert window. Multiple hosts in the same window points to scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host -- defense tampering, reconnaissance, or credential access -- may reveal the stages that preceded this timing activity and help reconstruct the full timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1124
+      name: System Time Discovery
+      role: primary
+  attack_chain_coverage:
+    - stage: 1
+      label: time_query_or_delay
+      description: "A process queries system time or runs a fixed-duration w32tm stripchart loop used as a delay mechanism"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: decode_loop_duration
+      description: "Decode the period/samples values to determine the delay imposed and whether the loop paces execution"
+      mapped_to: Q3
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 3
+      label: follow_on_scheduling
+      description: "Time discovery/delay is optionally followed within a short window by time-based scheduling or conditional execution (schtasks, at.exe, additional sleeps)"
+      mapped_to: Q5
+      source: attack:T1124.follow_on_scheduling
+  dimension_coverage:
+    - dimension: time_correlation
+      technique: T1124
+      covered_by: Q5
+      source: attack:T1124.follow_on_scheduling
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1124
+      covered_by: Q3
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1124
+      covered_by: Q10
+      source: template:discovery_recon.discovery_user_context
+      coverage_type: direct
+  mutable_dispositions:
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "5-15 minutes correlation window between discovery and follow-on scheduling"
+      disposition: new_question
+      target_question: Q5
+      notes: "Follow-on scheduling/timing question uses a +30m window to capture schtasks/at.exe/timeout/ping/w32tm after the timer"
+    - element: AllowedParents
+      dimension: tuning_parameter
+      specific_values: "rationale only (corporate scripts, management agents)"
+      disposition: context
+      target_question: Q12
+      notes: "baseline_deviation surfaces the historical parent/user distribution for the rule's firing pattern; analyst calibrates allowed parents from it"
+    - element: CommandlineKeywordList
+      dimension: tuning_parameter
+      specific_values: "/stripchart, /computer:, /period:, /dataonly, /samples: (rule's own keyword set)"
+      disposition: query_injection
+      target_question: Q3
+      notes: "mechanism_decode scoped with CommandLine|contains '/stripchart' to align with the period/samples decode framing"
+    - element: UserContextScope
+      dimension: user_context
+      specific_values: "rationale only (non-service, non-administrative, rare users)"
+      disposition: context
+      target_question: Q10
+      notes: "discovery_user_context asks whether the user is expected to run time-service diagnostics"
+    - element: ProcessPrevalenceThreshold
+      dimension: tuning_parameter
+      specific_values: "rationale only (frequency threshold to exclude benign estate-wide usage)"
+      disposition: context
+      target_question: Q11
+      notes: "host baseline aggregation surfaces prevalence; low counts indicate first-time/rare execution"
+  dedup_decisions:
+    - dropped: cue_process_tool.clustering
+      reason: "host-wide clustering (+/-15m) overlaps cue_host_context.clustering and discovery_burst_detection; the discovery burst question is more specific to this discovery rule and the precursor question carries cross-time host context"
+      kept: discovery_recon.discovery_burst_detection
+    - dropped: cue_host_context.clustering
+      reason: "generic host-activity aggregation overlaps the discovery burst question (recon-scoped) and the discovery_parent_chain question; dropped to stay within the 18-question cap while keeping the discovery-specific views"
+      kept: discovery_recon.discovery_burst_detection
+    - dropped: null
+      reason: "user_actor pair (cue_user_actor.baseline + cue_user_actor.baseline_svc) — non-deduplicable; both emitted"
+      kept: cue_user_actor.baseline, cue_user_actor.baseline_svc
+    - dropped: null
+      reason: "user_actor pair (cue_user_actor.clustering + cue_user_actor.clustering_svc) — non-deduplicable; both emitted"
+      kept: cue_user_actor.clustering, cue_user_actor.clustering_svc
+  skipped_templates:
+    - template: universal.endpoint_protection_health
+      reason: "Recommended, not must_include. This rule fires on a discovery/delay utility, not on payload execution or credential access where tamper-as-precursor is the live question. The cue_host_context.precursor question already surfaces prior tamper alerts on the host, and the host is not the locus of a hands-on payload action that an operator would precede by disabling AV/EDR. Dropped to keep the discovery-specific chain within the 18-question cap."
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "logsource 'file_event' (recommended by techniques: T1124) is not covered — pull in cue_artifact.* or author a custom question with `category: file_event`"
+      disposition: declined
+      reason: >-
+        The rule fires on w32tm used as an in-process delay loop, not on a
+        file-dropping artifact; w32tm /stripchart writes no payload to disk.
+        T1124 file_event coverage exists for techniques that drop a timing
+        script or marker file, which this rule's detection logic does not
+        implicate. The follow-on scheduling question (Q5) and the
+        scheduled-task registration question (Q6) carry the load-bearing
+        follow-on coverage for this delay-as-timer rule. No compensating
+        attack:T1124.file_event question authored.
+    - hint: "logsource 'image_load' (recommended by techniques: T1124) is not covered — pull in cue_image_load.* or author a custom question with `category: image_load`"
+      disposition: declined
+      reason: >-
+        image_load on w32tm.exe (or w32time.dll) returns module-load volume
+        without precision for the stripchart-loop behavior this rule detects;
+        the rule already constrains Image and the full CommandLine argument
+        set, so the triggering event is fully characterized at
+        process_creation. The OriginalFileName w32time.dll branch is already
+        verified in Q1's projection. No compensating attack:T1124.image_load
+        question authored.
+    - hint: "logsource 'process_access' (recommended by techniques: T1124) is not covered and no template family exists — author a custom question with `category: process_access`"
+      disposition: declined
+      reason: >-
+        process_access covers cross-process time-API handle access (e.g.
+        QueryPerformanceCounter/GetTickCount probing via a remote handle),
+        which is a different T1124 sub-pattern than the self-contained w32tm
+        stripchart delay this rule fires on. The rule's binary runs its own
+        timing loop with no inter-process access component, so a
+        process_access question would not align with the detection. No
+        compensating question authored.
+    - hint: "logsource 'taskscheduler' (recommended by techniques: T1124) is not covered and no template family exists — author a custom question with `category: taskscheduler`"
+      disposition: acted_on
+      reason: >-
+        Acted on — authored Q6 (attack:T1124.scheduled_task_registration)
+        with `service: taskscheduler` to surface task registration after the
+        timer, since follow-on time-based scheduling is the load-bearing
+        T1124 chain stage for a delay-as-timer rule.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - discovery_recon
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 15
+      attack: 2
+      llm_generated: 0
+    phase_distribution:
+      triage: 1
+      analysis: 1
+      context: 15
+    logsource_diversity:
+      process_creation: 15
+      taskscheduler: 1
+      sigma_alert: 1

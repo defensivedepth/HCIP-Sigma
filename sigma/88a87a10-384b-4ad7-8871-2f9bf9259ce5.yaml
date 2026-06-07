@@ -1,0 +1,503 @@
+name: Suspicious Regsvr32 Execution From Remote Share
+id: 28814c03-2a87-4da6-9cff-464ce4594242
+description: |
+  Detects regsvr32.exe (or a binary whose OriginalFileName is REGSVR32.EXE) executing with a command line that
+  references a UNC path (a backslash-backslash sequence), indicating registration or execution of a DLL or scriptlet
+  hosted on a remote share. The rule fires when both conditions match: the image is regsvr32.exe AND the command line
+  contains a remote-share reference. regsvr32.exe is a Microsoft-signed binary that legitimate installers and COM
+  registration occasionally drive, but loading code directly from a network location is a proxy-execution pattern used
+  to run externally hosted payloads while blending in with a trusted process. Investigation should confirm the exact
+  command line and remote path, identify what spawned regsvr32.exe, determine what the loaded module did, and check
+  whether the remote share and downstream activity are expected for this host and user.
+type: detection
+detection_id: 88a87a10-384b-4ad7-8871-2f9bf9259ce5
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line show regsvr32.exe loading a DLL or scriptlet from a remote share?
+  context: Confirm the alert is a true positive by reviewing the exact command line and process details. The rule fires
+    only when the image is regsvr32.exe (or its OriginalFileName is REGSVR32.EXE) AND the command line contains a UNC
+    remote-share reference (a backslash-backslash sequence). Verify the referenced path points to a network location and
+    note the exact remote host and file so downstream questions can follow it.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to register or execute COM components from a network location?
+  context: Legitimate COM registration is normally driven by local installers and runs against local files; loading a
+    module from a remote share is unusual for most endpoints. Knowing whether the user role and host function involve
+    software deployment or developer workflows that legitimately pull components from a file server is often the fastest
+    path to distinguishing routine activity from proxy execution.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What exactly did regsvr32.exe do? Decode the command-line arguments and identify the remote path and entrypoint.
+  context: The full command line reveals the specific action. Identify the UNC path that was referenced, the file name
+    and extension of the module (.dll, .ocx, .sct scriptlet, or a renamed file), and any /i, /u, /s, or /n switches that
+    control registration, unregistration, silent mode, or a custom entrypoint. A /u or /i flag with a scriptlet or a
+    file from a temporary or remote path is a stronger proxy-execution signal than a plain DLL registration.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:cue_process_tool.process_chain
+  question: What process spawned regsvr32.exe and is that parent chain expected?
+  context: The parent process reveals how regsvr32.exe was invoked. Legitimate COM registration is typically launched by
+    explorer.exe, an installer, or services.exe. Parents such as office applications, script hosts, msdt.exe,
+    sdiagnhost.exe, or a command shell suggest the invocation came from a document, macro, or operator activity rather
+    than routine software installation.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: attack:T1218.010.image_load
+  question: What modules did regsvr32.exe load right after it started, and were any unsigned or loaded from an unusual path?
+  context: The proxy-execution payload arrives as a module that regsvr32.exe loads shortly after process creation.
+    Correlating the load events for this process surfaces the DLL or scriptlet actually executed, its on-disk location,
+    and its signature state. An unsigned module, or one loaded from a temporary, user-writable, or remote-mapped path,
+    is the artifact that distinguishes proxy execution from legitimate COM registration. If image-load telemetry is not
+    collected in this environment, treat the absence of results as a visibility gap rather than evidence nothing loaded.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - CommandLine
+- source: attack:T1218.010.network_connection
+  question: Did regsvr32.exe make any outbound network connections around the time of the alert?
+  context: When a remote-share or remote-URL path is referenced, regsvr32.exe may reach across the network to retrieve
+    the module before executing it. An outbound connection from regsvr32.exe to a file server, an internal host, or an
+    external address corroborates remote payload retrieval and gives a destination to scope. regsvr32.exe rarely
+    initiates network traffic during legitimate local COM registration, so any connection here is worth examining.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+- source: template:lolbin.renamed_binary_check
+  question: Was regsvr32.exe executed from its expected System32 or SysWOW64 path?
+  context: regsvr32.exe executed from a non-standard path (outside System32 or SysWOW64) may indicate the binary was
+    copied or renamed to evade path-based allowlists. Compare the Image path against OriginalFileName — a file whose
+    OriginalFileName is REGSVR32.EXE but whose path or name differs from the expected system location points to a
+    relocated or renamed copy.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- source: template:cue_process_tool.follow_on
+  question: What child processes did regsvr32.exe spawn afterward?
+  context: The processes spawned after regsvr32.exe loads its module reveal the payload's actual impact. Legitimate COM
+    registration spawns nothing; proxy execution frequently leads to a command shell, a script host, or additional
+    binaries that carry out discovery, persistence, or further download activity.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired this remote-share regsvr32 pattern, what parents and users normally drive
+    it, and does the current alert fit?
+  context: Even common tools can be abused. The query mirrors the rule's selection structure scoped to this host — the
+    resulting parent and user distribution reflects how the rule's specific firing pattern (not generic regsvr32 usage)
+    has historically run here. A new parent process, an unexpected user account, or an unusual command-line shape is the
+    deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \regsvr32.exe
+      - OriginalFileName: \REGSVR32.EXE
+      selection_cli:
+        CommandLine|contains: ' \\\\'
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:lolbin.historical_lolbin_baseline
+  question: How often has this host fired the remote-share regsvr32 pattern over the past 90 days, and what command-line
+    shapes are typical?
+  context: A LOLBin pattern with no prior history on a host is more suspicious than one used daily under stable parents.
+    The query mirrors the rule's selection structure scoped to this host, so the count reflects the rule's specific
+    firing pattern rather than generic regsvr32 usage. The command-line projection lets the analyst compare typical
+    invocation shapes against the alerting one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \regsvr32.exe
+      - OriginalFileName: \REGSVR32.EXE
+      selection_cli:
+        CommandLine|contains: ' \\\\'
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - CommandLine
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run regsvr32.exe against remote paths?
+  context: Compare this user's current action against their historical behavior. A user who has never driven regsvr32.exe
+    against a network path is more suspicious than one who does so as part of a known deployment or development workflow.
+    User role and typical toolset should align with registering components from a remote share.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent and regsvr32.exe combination historically routine on this host or across the environment, or is
+    the parent unusual for this binary?
+  context: When the alert fires under a service principal, user identity does not attribute behavior. The meaningful pivot
+    is the launch mechanism — which parent process spawned regsvr32.exe, and is that pair historically common. A new or
+    rare parent for regsvr32.exe on this host or environment-wide is the deviation worth chasing; a pair that already
+    accounts for many prior events is vendor or OS automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple
+    endpoints. If the same user triggered similar activity on more than one host, the scope may be larger than a single
+    endpoint.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent and regsvr32.exe combination fire on other hosts in the same window, or is the activity
+    isolated to this host?
+  context: Under a service principal, asking what else the user did across the network returns agent-telemetry noise. The
+    meaningful question is whether the same launch mechanism — parent process plus spawned regsvr32.exe — fired on other
+    hosts in the alert window. Multiple hosts in the same window points to scheduled or pushed automation; a single host
+    points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — reconnaissance, exploitation of a
+    document or browser, or credential access — may reveal the stages that preceded this event and help reconstruct the
+    full timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:lolbin.technique_class_lateral
+  question: Were any other proxy-execution LOLBins used on this host recently?
+  context: Attackers who use one proxy-execution LOLBin often use several. If regsvr32.exe was used to run a remote
+    module, check whether rundll32, mshta, msiexec, installutil, or similar binaries were also used to execute code on
+    the same host. Finding multiple proxy-execution LOLBins performing the same objective strengthens the case for
+    malicious activity.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_img:
+        Image|endswith:
+          - '\rundll32.exe'
+          - '\mshta.exe'
+          - '\msbuild.exe'
+          - '\cmstp.exe'
+          - '\msiexec.exe'
+          - '\forfiles.exe'
+          - '\pcalua.exe'
+          - '\presentationhost.exe'
+          - '\control.exe'
+          - '\installutil.exe'
+          - '\msdt.exe'
+          - '\mavinject.exe'
+          - '\wmic.exe'
+          - '\xwizard.exe'
+          - '\ie4uinit.exe'
+      condition: selection and selection_img
+    fields:
+      - Image
+      - CommandLine
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+  - id: T1218.010
+    name: Regsvr32
+    role: primary
+  - id: T1218
+    name: System Binary Proxy Execution
+    role: secondary
+  attack_chain_coverage:
+  - stage: 1
+    label: regsvr32_process_creation
+    description: regsvr32.exe process creation with suspicious command-line arguments referencing a remote path
+    mapped_to: Q1
+    source: template:universal.verify_trigger_match
+  - stage: 2
+    label: module_load
+    description: regsvr32.exe loads a DLL or scriptlet from an unusual/remote path shortly after process creation
+    mapped_to: Q5
+    source: attack:T1218.010.image_load
+  - stage: 3
+    label: network_connection
+    description: Optional outbound network connection initiated by regsvr32.exe to retrieve the remote module
+    mapped_to: Q6
+    source: attack:T1218.010.network_connection
+  dimension_coverage:
+  - dimension: time_correlation
+    technique: T1218.010
+    covered_by: Q5
+    source: attack:T1218.010.image_load
+    coverage_type: direct
+  - dimension: tuning_parameter
+    technique: T1218.010
+    covered_by: Q7
+    source: template:lolbin.renamed_binary_check
+    coverage_type: direct
+  - dimension: command_analysis
+    technique: T1218
+    covered_by: Q3
+    source: template:cue_process_tool.mechanism_decode
+    coverage_type: direct
+  - dimension: parent_process_analysis
+    technique: T1218
+    covered_by: Q4
+    source: template:cue_process_tool.process_chain
+    coverage_type: direct
+  mutable_dispositions:
+  - element: AllowedDLLPaths
+    dimension: tuning_parameter
+    specific_values: 'rationale only (e.g., C:\Windows\System32)'
+    disposition: context
+    target_question: Q5
+    notes: Expected-path framing folded into the image-load question context and the renamed-binary path check; no fixed
+      allowlist queryable.
+  - element: ScriptletExtensions
+    dimension: tuning_parameter
+    specific_values: .sct, .ocx
+    disposition: context
+    target_question: Q3
+    notes: Suspicious extensions (.sct scriptlet, .ocx) called out in the mechanism_decode context for the analyst to
+      match against the decoded path.
+  - element: TimeWindow
+    dimension: time_correlation
+    specific_values: rationale only
+    disposition: context
+    target_question: Q5
+    notes: Correlation window between process creation, module load, and network connection realized via +/-5m image-load
+      and +/-15m network-connection ranges.
+  - element: ParentProcessWhitelist
+    dimension: tuning_parameter
+    specific_values: 'rationale only (e.g., explorer.exe)'
+    disposition: context
+    target_question: Q4
+    notes: Expected-parent framing (explorer.exe for legitimate COM registration) folded into the process_chain context.
+  - element: ParentProcessName
+    dimension: parent_process_analysis
+    specific_values: rationale only
+    disposition: context
+    target_question: Q4
+    notes: Unexpected parent-child profiling covered by the process_chain question.
+  - element: SignedBinaryList
+    dimension: tuning_parameter
+    specific_values: 'rationale only (e.g., regsvr32.exe, msiexec.exe)'
+    disposition: context
+    target_question: Q16
+    notes: Signed-binary proxy-execution set realized as the lolbin.technique_class_lateral cross-LOLBin sweep.
+  - element: CommandLineRegex
+    dimension: command_analysis
+    specific_values: 'rationale only (URLs, script paths, DLL entrypoints)'
+    disposition: context
+    target_question: Q3
+    notes: Suspicious-argument analysis (remote path, entrypoint, /i /u /s switches) folded into mechanism_decode.
+  - element: RemoteDomainAllowlist
+    dimension: tuning_parameter
+    specific_values: rationale only
+    disposition: context
+    target_question: Q6
+    notes: Legitimate-vs-suspicious destination triage folded into the network_connection question context.
+  dedup_decisions:
+  - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc pairing
+    reason: user_actor pair — non-deduplicable
+    kept: both emitted (user-pivot Q11 + service-principal substitute Q12)
+  - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc pairing
+    reason: user_actor pair — non-deduplicable
+    kept: both emitted (user-pivot Q13 + service-principal substitute Q14)
+  skipped_templates:
+  - template: cue_process_tool.baseline
+    reason: superseded by lolbin.historical_lolbin_baseline (reflected host-pattern baseline is more specific — counts the
+      rule's remote-share pattern, not all regsvr32 usage)
+  - template: cue_process_tool.clustering
+    reason: superseded by cue_host_context.clustering intent and cue_user_actor.clustering; same-window host activity
+      covered without a third broad same-time aggregation
+  - template: cue_process_tool.scope
+    reason: superseded by lolbin.historical_lolbin_baseline and cue_user_actor.clustering_svc — fleet-pattern cross-host
+      count and same-window parent+binary rollout check already cover cross-host distribution
+  - template: cue_host_context.clustering
+    reason: superseded by cue_user_actor.clustering (network-wide same-window activity) and cue_host_context.precursor
+      (prior on-host detections); avoids a redundant broad host aggregation
+  - template: universal.endpoint_protection_health
+    reason: recommended-not-must; this is an initial-access/proxy-execution rule, not a credential-access or hands-on
+      impact rule, and cue_host_context.precursor already surfaces prior tamper alerts on the host. Dropped to stay within
+      the 18-question cap while keeping the two image_load/network_connection chain-stage questions the hints call for.
+  reflection_overrides: []
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+  - universal
+  - lolbin
+  generation_stats:
+    total_questions: 16
+    source_counts:
+      template: 14
+      attack: 2
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 13
+    logsource_diversity:
+      process_creation: 13
+      image_load: 1
+      network_connection: 1
+      sigma_alert: 1

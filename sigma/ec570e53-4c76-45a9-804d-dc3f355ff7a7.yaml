@@ -1,0 +1,530 @@
+name: 7Zip Compressing Dump Files
+id: a183c8ec-681b-44bc-9d19-b9e77a327613
+description: |
+  Detects 7-Zip being used to compress a file whose name contains a memory-dump extension (.dmp, .dump, .hdmp). The rule
+  fires when all of two conditions match — the process is identified as 7-Zip (by Description, by an Image ending in 7z.exe /
+  7zr.exe / 7za.exe, or by an OriginalFileName of 7z.exe / 7za.exe) AND the command line references a dump-file extension.
+  Compressing dump files is a routine troubleshooting step (Windows Error Reporting crash dumps), but it is also a common
+  staging step before exfiltrating a credential dump such as an LSASS memory image. Determine which files were archived,
+  whether the archive was password-protected, where it was written next, and whether the 7-Zip binary and its parent chain
+  are consistent with legitimate use on this host and by this user.
+type: detection
+detection_id: ec570e53-4c76-45a9-804d-dc3f355ff7a7
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-06
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line show 7-Zip compressing a file with a .dmp, .dump, or .hdmp extension?
+  context: Confirm the alert is a true positive before investing analysis time. The rule fires only when the process is
+    identified as 7-Zip (Description, Image name, or OriginalFileName) and the command line contains one of the dump-file
+    extensions. Read the full command line and process identity from the triggering event and verify both conditions are
+    actually present.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+      - Description
+- source: template:universal.host_user_context
+  question: Is this user and host expected to compress dump files with 7-Zip?
+  context: Legitimate archiving of crash dumps for troubleshooting is common on workstations and on hosts running developer
+    or support tooling. Knowing whether this user role and host function routinely package .dmp files helps separate routine
+    support activity from staging of a captured memory dump.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What exactly did this 7-Zip command do? Decode the archive operation, source files, and output path.
+  context: The full command line reveals the archive subcommand (a for add), the output archive path, the source file paths
+    and wildcards, the archive format and compression switches, and any password flags. A command that targets a single
+    crash dump in a support directory reads differently from one that pulls a credential dump out of a staging path into a
+    portable archive. Multiple sequential 7-Zip invocations on this host within the window may together form one logical
+    archive operation.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:data_staging_exfil.data_scope
+  question: What files or directories were written to the archive?
+  context: The command line names the source paths, and file events from the same tool show what was actually read and the
+    archive that was produced. Look for which dump files were targeted, whether the source was a system crash-dump location
+    or a staging directory, and whether additional sensitive files were swept in alongside the dump.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - TargetFilename
+- source: template:data_staging_exfil.encryption_password
+  question: Was a password or header encryption applied to the archive?
+  context: A password (-p) or header encryption (-mhe=on) on the archive prevents inspection of the contents and even the
+    filenames in transit. An encrypted archive of a dump file points more toward deliberate staging for exfiltration than a
+    plain troubleshooting compression. Some passwords are passed via stdin or a config file and will not appear in the
+    command line, so absence of a flag is not proof encryption was not used.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:data_staging_exfil.archive_destination
+  question: Where was the resulting archive written or moved after creation?
+  context: Staging usually creates the archive locally, then moves it to a staging path or pushes it out over the network.
+    File events from the same tool reveal the output archive location; pair this with outbound network connections from the
+    host in the same window to see whether the archive left the host. An archive written to a removable drive, a shared
+    folder, or a temporary path that is then transferred outbound is the exfiltration path worth tracing.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: attack:T1560.001.process_identification
+  question: Is the binary genuinely 7-Zip, or a renamed copy of it placed in a user-writable location?
+  context: The rule identifies 7-Zip by Description, by an Image ending in 7z.exe / 7zr.exe / 7za.exe, or by an OriginalFileName
+    of 7z.exe / 7za.exe — so it also fires on a 7-Zip executable that has been renamed and dropped elsewhere, where
+    OriginalFileName still reveals the true identity while the on-disk name does not. Compare the Image path and name against
+    OriginalFileName and Description. A 7-Zip binary running from a temp, profile, or staging directory under a name that does
+    not match its OriginalFileName indicates the tool was staged rather than installed.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - Description
+      - CurrentDirectory
+- source: attack:T1560.001.image_load
+  question: Did the 7-Zip process load crypt32.dll, indicating an encryption operation?
+  context: Archiving utilities that apply encryption to their output load crypt32.dll for the cryptographic operations. An
+    image-load event for crypt32.dll under the alerting 7-Zip process is corroborating evidence that the archive was
+    encrypted, which strengthens a staging-for-exfiltration interpretation. If image-load events are not collected in this
+    environment, treat zero results as a visibility gap rather than evidence no encryption occurred.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+        ImageLoaded|endswith: \crypt32.dll
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Image
+      - ProcessGuid
+- source: template:cue_process_tool.process_chain
+  question: What process spawned 7-Zip, and is that parent chain expected for this activity?
+  context: The parent process shows how 7-Zip was invoked. Interactive use launched from explorer.exe or a console reads
+    differently from invocation by a remote-administration tool, a service, or a scripting host. A parent such as cmd.exe or
+    powershell.exe driven by a remote session, or an unexpected service parent, fits an operator staging a dump rather than a
+    user troubleshooting a crash.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.follow_on
+  question: What child processes did 7-Zip spawn afterward?
+  context: The processes spawned after the archive operation reveal the next step. Follow-on copy, move, or upload commands,
+    or a scripting host invoked right after, may show the archive being relocated or transferred. Legitimate troubleshooting
+    typically ends with the archive and no further process activity.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.baseline
+  question: Does this host normally run 7-Zip?
+  context: A 7-Zip binary that has never been seen on this host is more suspicious than one that runs regularly as part of
+    installed tooling or scheduled jobs. Zero or very low historical counts indicate first-time or rare execution and raise
+    the weight of the dump-compression activity.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously matched the rule's pattern, what parents and users drove it, and does the current
+    alert fit that pattern?
+  context: The query mirrors the rule's selection structure scoped to this host, so the resulting parent and user
+    distribution reflects how this specific 7-Zip-compressing-dump pattern has historically run here — not generic 7-Zip
+    usage. A new parent process, an unexpected user account, or an unusual command-line shape is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Description|contains: 7-Zip
+      - Image|endswith:
+        - \7z.exe
+        - \7zr.exe
+        - \7za.exe
+      - OriginalFileName:
+        - 7z.exe
+        - 7za.exe
+      selection_extension:
+        CommandLine|contains:
+        - .dmp
+        - .dump
+        - .hdmp
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.scope
+  question: Have other hosts matched the rule's pattern in the past week, and does the cross-host distribution look like
+    automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of this
+    specific dump-compression pattern rather than generic 7-Zip usage. Many hosts matching the same pattern points to a
+    scripted backup or troubleshooting job; one host or a small unrelated set points to manual operator activity. Use the
+    host distribution and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Description|contains: 7-Zip
+      - Image|endswith:
+        - \7z.exe
+        - \7zr.exe
+        - \7za.exe
+      - OriginalFileName:
+        - 7z.exe
+        - 7za.exe
+      selection_extension:
+        CommandLine|contains:
+        - .dmp
+        - .dump
+        - .hdmp
+      condition: all of selection_*
+    fields:
+    - host.name
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run 7-Zip against dump files?
+  context: Compare this user's current action against their historical pattern across all hosts. A user who has never run
+    7-Zip, or who has never targeted dump files with it, is more notable than one who packages crash dumps as part of a
+    support or development role. Align the result with what is known about the user's responsibilities.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent and 7-Zip combination historically routine on this host or across the environment, or is the
+    parent unusual for this binary?
+  context: When the alert fires under a service or computer account, user identity does not attribute the behavior. The
+    meaningful pivot is the launch mechanism — which parent spawned 7-Zip, and whether that pair is historically common. A
+    new or rare parent for this binary is the deviation worth chasing; a pair that already accounts for thousands of prior
+    events is backup or maintenance automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts in a tight window reveals whether the dump compression is isolated
+    or part of broader hands-on activity such as collection from multiple endpoints. The same user driving similar archiving
+    on several hosts widens the potential scope.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent and 7-Zip combination fire on other hosts in the same window — a coordinated automation
+    rollout, or activity isolated to this host?
+  context: Under a service principal, asking what else the user did network-wide returns agent-telemetry noise because every
+    host runs service-owned processes constantly. The meaningful question is whether the same launch mechanism — parent
+    process plus 7-Zip — fired on other hosts in the alert window. Multiple hosts points to scheduled or pushed automation; a
+    single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining activity around the archive operation reveals what led to it and what
+    followed — credential-access tooling that produced the dump, reconnaissance, or a subsequent transfer step. Aggregating
+    by parent and child collapses repetitive agent telemetry while novel process pairs stand out at low counts.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1560.001
+      name: Archive via Utility
+      role: primary
+    - id: T1560
+      name: Archive Collected Data
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: archive_utility_execution
+      description: "Execution of a compression utility (7-Zip) with command-line arguments referencing dump-file extensions"
+      mapped_to: Q3
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 2
+      label: source_data_selection
+      description: "Identification of the files/directories targeted for compression (the dump files read into the archive)"
+      mapped_to: Q4
+      source: template:data_staging_exfil.data_scope
+    - stage: 3
+      label: encryption_operation
+      description: "Optional encryption of the archive — password/header-encryption flags and crypt32.dll load for crypto ops"
+      mapped_to: Q5
+      source: template:data_staging_exfil.encryption_password
+    - stage: 4
+      label: archive_creation_and_move
+      description: "Creation of the compressed/encrypted archive and its subsequent move to a staging or exfil path"
+      mapped_to: Q6
+      source: template:data_staging_exfil.archive_destination
+  dimension_coverage:
+    - dimension: file_path_analysis
+      technique: T1560.001
+      covered_by: Q4
+      source: template:data_staging_exfil.data_scope
+      coverage_type: direct
+    - dimension: obfuscation_check
+      technique: T1560.001
+      covered_by: Q5
+      source: template:data_staging_exfil.encryption_password
+      coverage_type: direct
+    - dimension: process_identification
+      technique: T1560.001
+      covered_by: Q7
+      source: attack:T1560.001.process_identification
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1560.001
+      covered_by: Q18
+      source: template:cue_host_context.clustering
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1560.001
+      covered_by: Q5
+      source: template:data_staging_exfil.encryption_password
+      coverage_type: partial
+    - dimension: user_context
+      technique: T1560.001
+      covered_by: Q15
+      source: template:cue_user_actor.baseline
+      coverage_type: direct
+  mutable_dispositions:
+    - element: SuspiciousExtensions
+      dimension: tuning_parameter
+      specific_values: ".dmp, .dump, .hdmp (rule); .cab, .zip, .7z, .rar (analytic)"
+      disposition: query_injection
+      target_question: Q13
+      notes: "The rule's own dump-file extensions (.dmp/.dump/.hdmp) are embedded verbatim in the reflected baseline_deviation
+        (Q12) and scope (Q13) queries' selection_extension block. Analytic archive-output extensions inform the
+        archive_destination context (Q6) rather than a query — the rule fires on the source extension, not the output format."
+    - element: ProcessAllowlist
+      dimension: process_identification
+      specific_values: "rationale only (known business archiving utilities)"
+      disposition: context
+      target_question: Q7
+      notes: "No concrete allowlist values in the brief; addressed as the renamed/true-identity check (Q7) and the
+        host/user/fleet baselines (Q11, Q12, Q13, Q15) that surface whether this is established business automation."
+    - element: FileSizeThresholdMB
+      dimension: tuning_parameter
+      specific_values: "rationale only (minimum archive size threshold)"
+      disposition: context
+      target_question: Q4
+      notes: "Threshold is a tuning rationale with no specific value; archive size is not directly queryable here. The
+        data-scope question (Q4) directs the analyst to assess the volume/breadth of files swept into the archive."
+    - element: ArchiveExtensions
+      dimension: tuning_parameter
+      specific_values: "rationale only (T1560 secondary — extensions suspicious outside expected paths)"
+      disposition: context
+      target_question: Q6
+      notes: "Secondary technique tuning rationale; the output-archive path/extension judgment is folded into the
+        archive_destination question (Q6)."
+  dedup_decisions:
+    - dropped: cue_process_tool.clustering
+      reason: "Host-wide what-else-ran coverage provided by cue_host_context.clustering (Q18, same +/-15m window and same
+        host.name aggregation); user-wide coverage provided by cue_user_actor.clustering (Q16). The process_tool clustering
+        variant adds no distinct scope."
+      kept: cue_host_context.clustering
+    - dropped: cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable. The user-pivot baseline (Q15) and its service_principal_substitute (Q16)
+        are emitted as separate questions because user.name pivots degenerate under service/computer accounts. Recorded here
+        for the audit trail; both are kept."
+      kept: cue_user_actor.baseline
+    - dropped: cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable. The user-pivot clustering (Q16) and its service_principal_substitute (Q17)
+        are emitted as separate questions; both are kept."
+      kept: cue_user_actor.clustering
+  skipped_templates:
+    - template: universal.endpoint_protection_health
+      reason: "Recommended, not must_include. This is a collection/archiving rule, not an execution or credential-access rule
+        where the disposition turns on whether protection was disabled first. The 18-question budget is fully consumed by the
+        ATT&CK chain, both hint-driven questions, and the non-deduplicable user_actor pairs. Prior-host context is carried by
+        cue_host_context.clustering (Q18)."
+    - template: cue_host_context.precursor
+      reason: "Dropped to stay within the 18-question cap. The host's surrounding activity is covered by
+        cue_host_context.clustering (Q18); the higher-value slots went to the ATT&CK chain (data_scope, encryption,
+        destination), the process_identification and image_load hint questions, and the non-deduplicable user_actor pairs."
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - data_staging_exfil
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 16
+      attack: 2
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 15
+    logsource_diversity:
+      process_creation: 15
+      file_event: 2
+      image_load: 1

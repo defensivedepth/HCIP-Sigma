@@ -1,0 +1,621 @@
+name: Uncommon  Assistive Technology Applications Execution Via AtBroker.EXE
+id: fd1f5929-9b1b-45b2-9991-b76857335fd8
+description: |
+  Detects AtBroker.exe launching a non built-in assistive technology (AT) application. The rule fires when
+  AtBroker.exe (by Image name or OriginalFileName) runs with a CommandLine containing "start" AND the AT name
+  is not one of the known built-in accessibility features (Narrator, osk, magnifier, sticky keys, etc.) and is
+  not the Java Access Bridge. AtBroker.exe is a signed Windows binary that proxies execution of ATs registered
+  under the Accessibility registry keys, so an attacker can register a malicious binary as an AT and launch it
+  through AtBroker to make the activity appear to originate from a legitimate signed OS process. Because
+  AtBroker is normally spawned by winlogon.exe, the proxied payload inherits winlogon.exe in its lineage,
+  defeating parent-process heuristics that expect user-launched processes to descend from explorer.exe.
+  Determine which AT name was launched, whether it maps to a registered legitimate AT, and what the proxied
+  process did next.
+type: detection
+detection_id: f24bcaea-0cd1-11eb-adc1-0242ac120002
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: '2026-06-06'
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the AtBroker.exe command line start a non built-in assistive technology application?
+  context: Confirm the alert is a true positive by reviewing the exact command line and process details.
+    The rule fires only when AtBroker.exe (or a binary whose OriginalFileName is AtBroker.exe) runs with "start"
+    in the command line AND the named AT is not one of the well-known built-in accessibility features and is not
+    the Java Access Bridge. Read the AT name that follows "start" and confirm it is not an expected built-in.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to launch custom assistive technology applications via AtBroker.exe?
+  context: Legitimate, non-default AT software (accessibility vendors, third-party magnifiers or readers) can
+    trigger this rule on machines where users genuinely rely on those tools. Knowing whether the user role and
+    host function are consistent with custom accessibility software is often the fastest way to separate routine
+    use from a registered malicious AT.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: Which assistive technology name did AtBroker.exe start, and does it map to a registered legitimate AT?
+  context: The AT name following "start" is the key indicator. AtBroker resolves that name against the
+    Accessibility registry (the ATs key and the per-user Configuration value) and launches whatever executable
+    path is registered for it. Decode the full command line, identify the AT name, then determine whether that
+    name corresponds to a known legitimate accessibility product or to an attacker-registered entry pointing at
+    an arbitrary binary. Scoping to all AtBroker.exe executions on this host within the window surfaces any
+    related invocations that form one logical action.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:cue_process_tool.process_chain
+  question: What process spawned AtBroker.exe, and is that parent chain expected?
+  context: AtBroker.exe is normally launched by winlogon.exe at logon, desktop switch, or via the Ease of
+    Access entry points. A winlogon.exe parent is expected; an unusual parent such as a script host, Office
+    application, or a generic command interpreter points to AtBroker being invoked as a proxy rather than by
+    the normal accessibility path. Note that when AtBroker proxies a payload, the payload inherits winlogon.exe
+    in its lineage, so a winlogon parent alone does not clear the activity.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.follow_on
+  question: What child processes did AtBroker.exe spawn afterward?
+  context: AtBroker proxies execution of the registered AT, so the process it spawns is the actual payload of
+    interest. A registered legitimate AT launches a known accessibility executable; an abused registration
+    launches an arbitrary binary, and that child may in turn spawn command interpreters or downloaders. Review
+    each child process and its command line to identify what the proxied AT actually ran.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.baseline
+  question: Does this host normally run AtBroker.exe to start non built-in assistive technologies?
+  context: AtBroker.exe itself runs routinely at logon on most workstations, but launches of non-default AT
+    names are far less common. A host with zero or very low historical counts of this binary indicates rare
+    execution worth scrutiny; a host where it runs constantly suggests an installed accessibility product.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously matched this rule's pattern, what parents and users normally drive it,
+    and does the current alert fit?
+  context: The query mirrors the rule's full selection structure (AtBroker.exe with "start" and a non built-in,
+    non-Java AT name) scoped to this host, so the resulting parent and user distribution reflects how this
+    specific firing pattern has historically run here rather than generic AtBroker usage. A new parent process,
+    an unexpected user account, or a first-ever appearance of this pattern is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \AtBroker.exe
+      - OriginalFileName: AtBroker.exe
+      selection_cli:
+        CommandLine|contains: start
+      filter_main_builtin:
+        CommandLine|contains:
+        - animations
+        - audiodescription
+        - caretbrowsing
+        - caretwidth
+        - colorfiltering
+        - cursorindicator
+        - cursorscheme
+        - filterkeys
+        - focusborderheight
+        - focusborderwidth
+        - highcontrast
+        - keyboardcues
+        - keyboardpref
+        - livecaptions
+        - magnifierpane
+        - messageduration
+        - minimumhitradius
+        - mousekeys
+        - Narrator
+        - osk
+        - overlappedcontent
+        - showsounds
+        - soundsentry
+        - speechreco
+        - stickykeys
+        - togglekeys
+        - voiceaccess
+        - windowarranging
+        - windowtracking
+        - windowtrackingtimeout
+        - windowtrackingzorder
+      filter_optional_java:
+        CommandLine|contains: Oracle_JavaAccessBridge
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_* and not 1 of filter_main_* and not 1 of filter_optional_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.scope
+  question: Have other hosts matched this rule's pattern in the past week, and does the cross-host distribution
+    look like consistent automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide
+    count of this firing pattern rather than generic AtBroker usage. Many hosts launching the same non built-in
+    AT pattern points to a deployed accessibility product or scripted rollout; a single host or a small
+    unrelated set points to manual or host-local activity. Use the host distribution and parent consistency to
+    calibrate the response.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \AtBroker.exe
+      - OriginalFileName: AtBroker.exe
+      selection_cli:
+        CommandLine|contains: start
+      filter_main_builtin:
+        CommandLine|contains:
+        - animations
+        - audiodescription
+        - caretbrowsing
+        - caretwidth
+        - colorfiltering
+        - cursorindicator
+        - cursorscheme
+        - filterkeys
+        - focusborderheight
+        - focusborderwidth
+        - highcontrast
+        - keyboardcues
+        - keyboardpref
+        - livecaptions
+        - magnifierpane
+        - messageduration
+        - minimumhitradius
+        - mousekeys
+        - Narrator
+        - osk
+        - overlappedcontent
+        - showsounds
+        - soundsentry
+        - speechreco
+        - stickykeys
+        - togglekeys
+        - voiceaccess
+        - windowarranging
+        - windowtracking
+        - windowtrackingtimeout
+        - windowtrackingzorder
+      filter_optional_java:
+        CommandLine|contains: Oracle_JavaAccessBridge
+      condition: all of selection_* and not 1 of filter_main_* and not 1 of filter_optional_*
+    fields:
+    - host.name
+- source: template:cue_user_actor.baseline
+  question: Does this user normally launch assistive technology applications via AtBroker.exe?
+  context: Compare this user's current action against their historical behavior. A user who has never started
+    a custom AT through AtBroker is more notable than one who does so regularly because they depend on
+    accessibility software. User role and typical toolset should align with non-default AT usage.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent-plus-AtBroker.exe combination historically routine on this host or across the
+    environment, or is the parent unusual for this binary?
+  context: When the alert fires under a service principal, user identity does not attribute behavior. The
+    meaningful pivot is the launch mechanism — which parent process spawned AtBroker.exe, and whether that pair
+    is historically common. A new or rare parent for AtBroker.exe is the deviation worth chasing; a pair that
+    already accounts for many prior events is OS or vendor automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple
+    endpoints. If the same user triggered similar activity on more than one host, the scope of the activity may
+    be larger than this single alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent-plus-AtBroker.exe combination fire on other hosts in the same window — a
+    coordinated automation rollout, or activity isolated to this host?
+  context: Under a service principal, asking what else the user did across the network returns agent-telemetry
+    noise because every host runs system-owned agents constantly. The meaningful question is whether the same
+    launch mechanism — parent process plus spawned binary — fired on other hosts in the alert window. Multiple
+    hosts in the same window points to scheduled or pushed automation; a single host points to a host-local
+    trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining activity around the alert reveals what led to this
+    event, what happened after, and whether it is part of a larger sequence. Look for reconnaissance, privilege
+    escalation, or persistence mechanisms, and for registry changes to the Accessibility keys that would
+    register or modify an AT.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host — defense tampering, reconnaissance, credential access, or
+    registry modifications — may reveal the stages that preceded this event. Registering or modifying an AT
+    requires elevated privileges, so prior privilege-escalation or registry-write alerts are especially
+    relevant to reconstructing the timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in the hour before the alert?
+  context: Proxy execution through a signed binary is often used to run a payload while evading controls, so
+    tampering may precede it. The query surfaces direct attempts to disable AV/EDR services, flip Defender
+    flags, add broad exclusions, clear logs, or patch AMSI/ETW. Zero rows is a useful protection-looks-healthy
+    signal; kernel-level driver tampering and in-memory patches will not appear here. Populated rows shift the
+    disposition toward operator preparation — review the parent process and signing chain to identify the writer.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1218
+      name: System Binary Proxy Execution
+      role: primary
+  attack_chain_coverage:
+    - stage: 1
+      label: proxy_invocation
+      description: AtBroker.exe (a trusted signed binary) is invoked with "start" and a non built-in AT name,
+        proxying execution of whatever binary that AT is registered to.
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: command_decode
+      description: The AT name argument resolves against the Accessibility registry to the executable the proxy
+        will launch; decode it to learn what is being executed.
+      mapped_to: Q3
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 3
+      label: parent_lineage
+      description: AtBroker is normally spawned by winlogon.exe; the proxied payload inherits winlogon in its
+        lineage, so parent-chain analysis is needed to spot abuse.
+      mapped_to: Q4
+      source: template:cue_process_tool.process_chain
+    - stage: 4
+      label: payload_execution
+      description: The proxied AT executes; its child processes reveal the actual payload behavior.
+      mapped_to: Q5
+      source: template:cue_process_tool.follow_on
+  dimension_coverage:
+    - dimension: command_analysis
+      technique: T1218
+      covered_by: Q3
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1218
+      covered_by: Q4
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1218
+      covered_by: Q7
+      source: template:cue_process_tool.baseline_deviation
+      coverage_type: partial
+  mutable_dispositions:
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: rationale only (winlogon.exe is the expected normal parent)
+      disposition: context
+      target_question: Q4
+      notes: Parent-chain question describes the winlogon.exe expected parent and the lineage-inheritance caveat
+        in context; no fixed parent list to inject since abuse can come from any parent.
+    - element: CommandLineRegex
+      dimension: command_analysis
+      specific_values: rationale only (suspicious-argument regex; rule already encodes the concrete pattern as
+        CommandLine|contains start plus built-in-AT-name filters)
+      disposition: context
+      target_question: Q3
+      notes: The rule's own selection_cli/filter blocks are the concrete command pattern; mechanism_decode
+        context directs the analyst to decode the AT name. Reflected baseline_deviation/scope queries carry the
+        exact filter values verbatim.
+    - element: SignedBinaryList
+      dimension: tuning_parameter
+      specific_values: rationale only (msiexec.exe, regsvr32.exe — generic T1218 proxy-binary allowlist, not
+        AtBroker-specific)
+      disposition: context
+      target_question: Q1
+      notes: Generic to the cross-binary T1218 strategy; this rule is constrained to AtBroker.exe so the
+        allowlist concept is not directly queryable. AtBroker is the trusted signed binary here.
+    - element: RemoteDomainAllowlist
+      dimension: tuning_parameter
+      specific_values: rationale only (network-allowlist for the generic proxy-then-download strategy)
+      disposition: context
+      target_question: Q7
+      notes: Applies to the network_connection arm of the generic T1218 strategy; AtBroker /start does not
+        perform network retrieval itself, so no network selection is injected. See declined network_connection
+        hint.
+  dedup_decisions:
+    - dropped: cue_process_tool.clustering
+      reason: near-identical +/-15m host-scoped activity query; cue_host_context.clustering covers the same
+        window and adds ParentImage to the projection, so it subsumes the process_tool variant.
+      kept: cue_host_context.clustering
+    - dropped: none
+      reason: cue_user_actor.baseline and cue_user_actor.baseline_svc kept as a non-deduplicable pair
+        (user-pivot vs. launch-mechanism); cue_user_actor.clustering and cue_user_actor.clustering_svc kept as a
+        non-deduplicable pair. user_actor pair — non-deduplicable.
+      kept: cue_user_actor.baseline + cue_user_actor.baseline_svc + cue_user_actor.clustering + cue_user_actor.clustering_svc
+  skipped_templates: []
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: 'logsource ''image_load'' (recommended by techniques: T1218) is not covered — pull in cue_image_load.* or author a custom
+        question with `category: image_load`'
+      disposition: declined
+      reason: >-
+        The image_load arm belongs to the generic T1218 strategy for DLL-loading proxies
+        (rundll32.exe/regsvr32.exe loading an unsigned module). This rule fires on AtBroker.exe /start, which
+        proxies execution of a separately-registered AT executable, not an in-process DLL load — the proxied
+        payload appears as a child process, not a module load on AtBroker. Q5 (follow_on child processes) is the
+        correct evidence for what AtBroker launched. No compensating attack:T1218.image_load question authored.
+    - hint: 'logsource ''network_connection'' (recommended by techniques: T1218) is not covered — pull in cue_network_endpoint.* or
+        author a custom question with `category: network_connection`'
+      disposition: declined
+      reason: >-
+        The network_connection arm covers proxy binaries that retrieve a remote payload (e.g.,
+        regsvr32 /i:http URL). AtBroker.exe /start does not perform network retrieval; it launches a locally
+        registered AT executable. Any network activity originates from the proxied child process, whose
+        execution is captured by Q5 (follow_on) and can be pivoted to network telemetry by ProcessGuid from
+        there. No network selection is injected because AtBroker itself contacts no endpoint. No compensating
+        attack:T1218.network_connection question authored.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+  generation_stats:
+    total_questions: 15
+    source_counts:
+      template: 15
+      attack: 0
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 12
+    logsource_diversity:
+      process_creation: 14
+      sigma_alert: 1

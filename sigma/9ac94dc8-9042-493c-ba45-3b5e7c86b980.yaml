@@ -1,0 +1,625 @@
+name: Disable Important Scheduled Task
+id: aca31a73-43fe-4d70-acfa-f64d7c11e9e5
+description: |
+  Detects schtasks.exe disabling built-in protective scheduled tasks — the rule fires when an
+  schtasks invocation (Image ends in schtasks.exe or OriginalFileName schtasks.exe) carries a /disable
+  switch AND references a sensitive task path such as BitLocker, Windows Defender, Exploit Guard,
+  System Restore, Update Orchestrator, Windows Update, or Windows Backup. Legitimately this is rare:
+  administrators occasionally disable update or backup tasks during maintenance windows, but disabling
+  Defender or BitLocker tasks is almost never routine. Maliciously, turning off these tasks weakens
+  recovery and protection ahead of destructive activity, and frequently appears alongside shadow-copy
+  deletion, service stops, and log clearing as a ransomware precursor. Determine which protective task
+  was targeted, who and what launched the command, whether protection or recovery state actually
+  changed, and whether other recovery-inhibiting or destructive actions ran on the host or fleet.
+type: detection
+detection_id: 9ac94dc8-9042-493c-ba45-3b5e7c86b980
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Did schtasks run with /disable against a protected task path such as BitLocker, Defender, Exploit Guard, System Restore, or a backup/update task?
+  context: Confirm the alert is a true positive before investing time. The rule fires only when the command line both carries a /disable switch and names one of the protected task paths, so read the exact command line and verify both halves are present rather than a benign schtasks query or an unrelated task.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to disable protective scheduled tasks?
+  context: Disabling Defender, BitLocker, or Exploit Guard tasks is almost never routine; disabling update or backup tasks can be legitimate during maintenance. Knowing whether the account and host function fit this action is often the fastest path to separating a sanctioned maintenance window from operator preparation for destruction.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:scheduled_task.task_configuration
+  question: Which protective task was disabled, and what were the exact /tn target and switches?
+  context: The schtasks command line carries the targeted task name (/tn) and the change action (/change /disable, or /disable). Decode it to identify precisely which protective task was turned off — BitLocker, Defender, Exploit Guard, System Restore (SR), Update Orchestrator, Windows Update, or Windows Backup — since the specific target determines which protection or recovery capability was weakened.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: attack:T1489.service_identification
+  question: Did the protective service or feature behind the disabled task actually change state on this host?
+  context: Disabling a scheduled task does not by itself stop a running service, but the targeted tasks back protection and recovery features (Defender, BitLocker, System Restore, backup). Service Control Manager state-change records show whether the corresponding service was also stopped or set to disabled around the same time, which distinguishes a single task tweak from a deliberate teardown of the protection stack.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: system
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID:
+          - 7036
+          - 7040
+      condition: selection
+    fields:
+      - ServiceName
+      - StartType
+      - EventID
+- source: template:universal.endpoint_protection_health
+  question: Were other tamper attempts against endpoint protection seen on this host in the hour before the alert?
+  context: Disabling protective tasks is itself a tamper action, so check whether OTHER weakening occurred in the same window — Defender flag flips, broad exclusions, AV/EDR service stops, log clearing, or AMSI/ETW patching. Zero rows is a useful "no other tampering visible" signal; populated rows point to a broader operator preparation phase. Review the parent process and signing chain to identify the writer.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+- source: template:ransomware_impact.recovery_options_assessment
+  question: What recovery-inhibiting commands were executed on this host?
+  context: Disabling System Restore, backup, and update tasks is often one step in a wider recovery-destruction sequence such as deleting shadow copies (vssadmin, wmic), disabling boot recovery (bcdedit), deleting backups (wbadmin), or disabling the Recovery Environment (reagentc). This query surfaces all recovery-inhibiting commands on the host so the full scope is visible. Verify whether each action succeeded by checking system state with vssadmin list shadows, bcdedit /enum, and reagentc /info.
+  range: +24h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_recovery:
+        Image|endswith:
+          - '\vssadmin.exe'
+          - '\wmic.exe'
+          - '\bcdedit.exe'
+          - '\wbadmin.exe'
+          - '\reagentc.exe'
+          - '\diskshadow.exe'
+      selection_cmdline:
+        CommandLine|contains:
+          - 'delete shadows'
+          - 'shadowcopy delete'
+          - 'recoveryenabled'
+          - 'bootstatuspolicy'
+          - 'delete catalog'
+          - 'delete systemstatebackup'
+          - 'boot.ini'
+          - 'winre.wim'
+          - '/disable'
+      condition: selection and (selection_recovery or selection_cmdline)
+    fields:
+      - Image
+      - CommandLine
+- source: template:ransomware_impact.destruction_scope_on_host
+  question: What other destructive or recovery-inhibiting actions occurred on this host?
+  context: Operators preparing for impact typically chain multiple destructive actions — disabling protection AND deleting shadow copies AND stopping security services AND clearing logs. Finding the complete set of destructive commands around this event reveals whether this is an isolated administrative tweak or part of a destruction playbook.
+  range: +/-30m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_destructive:
+        Image|endswith:
+          - '\vssadmin.exe'
+          - '\wmic.exe'
+          - '\bcdedit.exe'
+          - '\wbadmin.exe'
+          - '\cipher.exe'
+          - '\fsutil.exe'
+          - '\icacls.exe'
+          - '\takeown.exe'
+          - '\attrib.exe'
+          - '\sc.exe'
+          - '\net.exe'
+          - '\net1.exe'
+          - '\powershell.exe'
+          - '\taskkill.exe'
+      condition: selection and selection_destructive
+    fields:
+      - Image
+      - User
+- source: template:ransomware_impact.encryption_or_ransom_indicators
+  question: Are there signs of file encryption, ransom notes, or unknown binary execution on this host after the disable?
+  context: Recovery-inhibiting actions typically precede file encryption by minutes. Checking for execution of unknown or suspicious binaries shortly after the protective task was disabled determines whether an encryption or destruction payload has already started. Also check for ransom notes (README.txt, HOW_TO_DECRYPT, unusual extensions) via file events or the endpoint console.
+  range: +30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      filter_known:
+        Image|startswith:
+          - 'C:\Program Files'
+          - 'C:\Windows\System32\svchost'
+          - 'C:\Windows\System32\wbem'
+      condition: selection and not filter_known
+    fields:
+      - Image
+      - CommandLine
+      - CurrentDirectory
+- source: template:ransomware_impact.network_wide_impact
+  question: Is this same task-disable activity firing on other hosts in the environment?
+  context: Destructive preparation is often pushed across many hosts at once or in rapid succession. Finding this same alert on multiple hosts indicates network-wide execution and sets the scope for containment and incident response.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        rule.uuid|expand: '%rule.uuid%'
+      condition: selection
+    fields:
+      - host.name
+      - rule.name
+      - event.severity_label
+- source: template:cue_process_tool.process_chain
+  question: What process spawned this schtasks command, and is that parent chain expected?
+  context: The parent process reveals how schtasks was invoked. A logon shell or management agent driving routine maintenance looks different from cmd.exe or powershell.exe running a batch script, or an Office or scripting-host parent, which point to scripted or operator-driven disabling. Walk up the tree to see what spawned the parent and what else it spawned.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run schtasks on this fleet?
+  context: Compare this user's current action against their historical behavior. An account that has never run schtasks, or never disabled protective tasks, is more suspicious than one that does so regularly as part of a sanctioned role. User role and typical toolset should align.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent and schtasks combination historically routine on this host or across the environment, or is the parent unusual?
+  context: When the alert fires under a service or computer account, user identity does not attribute behavior; the meaningful pivot is the launch mechanism. A parent process that already accounts for many prior schtasks executions is OS or management automation; a new or rare parent for schtasks is the deviation worth chasing.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or coordinated action across endpoints. If the same account disabled protective tasks or ran destructive tools on multiple hosts, the scope of compromise may be larger than the alerting host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent and schtasks combination fire on other hosts in the same window — a coordinated rollout, or isolated to this host?
+  context: Under a service or computer account, network-wide user activity is mostly agent-telemetry noise. The meaningful question is whether the same launch mechanism — parent process plus schtasks — fired on other hosts in the alert window. Multiple hosts points to scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Disabling protective tasks rarely happens in isolation. Earlier detections on the same host — reconnaissance, credential access, other defense tampering — may reveal the stages that preceded this event and help reconstruct the timeline leading to it.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:lolbin.technique_class_lateral
+  question: Were other native persistence or defense-evasion tools used on this host recently?
+  context: Operators who disable one protective task usually reach for several native tools — sc, net, reg, bcdedit, vssadmin — to stop services, change configuration, or destroy recovery. Finding multiple such tools running in the same timeframe strengthens the case that this is a deliberate teardown rather than a one-off task tweak.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_img:
+        Image|endswith:
+          - '\sc.exe'
+          - '\net.exe'
+          - '\net1.exe'
+          - '\reg.exe'
+          - '\at.exe'
+          - '\netsh.exe'
+          - '\wevtutil.exe'
+          - '\bcdedit.exe'
+          - '\vssadmin.exe'
+          - '\diskshadow.exe'
+          - '\wbadmin.exe'
+          - '\reagentc.exe'
+          - '\wmic.exe'
+      condition: selection and selection_img
+    fields:
+      - Image
+      - CommandLine
+- source: template:lolbin.renamed_binary_check
+  question: Was schtasks executed from its expected System32 path, or from an unusual location?
+  context: schtasks run from outside System32 or SysWOW64 may be a copied or renamed binary used to evade path-based allowlists. Compare the Image path and OriginalFileName from the alert — an OriginalFileName of schtasks.exe under a non-standard Image path is more suspicious than the in-box binary.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- source: template:lolbin.historical_lolbin_baseline
+  question: How often has this host fired this schtasks-disable pattern over the past 90 days, and what command-line shapes are typical?
+  context: A disable-protective-task pattern with no prior history on a host is more suspicious than one that recurs under stable parents (for example, a managed maintenance job). The query mirrors the rule's selection structure scoped to this host, so the count reflects the rule's specific firing pattern, not generic schtasks usage. The CommandLine projection lets you compare typical invocation shapes against the alerting one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \schtasks.exe
+      - OriginalFileName: schtasks.exe
+      selection_cli_disable:
+        CommandLine|contains|windash: /disable
+      selection_cli_task:
+        CommandLine|contains:
+        - \Windows\BitLocker
+        - \Windows\ExploitGuard
+        - \Windows\ExploitGuard\ExploitGuard MDM policy Refresh
+        - \Windows\SystemRestore\SR
+        - \Windows\UpdateOrchestrator\
+        - \Windows\Windows Defender\
+        - \Windows\WindowsBackup\
+        - \Windows\WindowsUpdate\
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - CommandLine
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1489
+      name: Service Stop
+      role: primary
+  attack_chain_coverage:
+    - stage: 1
+      label: elevated_execution_context
+      description: "Adversary disables/stops a protective capability from an elevated context (schtasks /disable on a protective task)"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: target_protective_capability
+      description: "Which protective service/feature was the disabled task tied to, and did it change state"
+      mapped_to: Q4
+      source: attack:T1489.service_identification
+    - stage: 3
+      label: follow_up_destruction
+      description: "Possible follow-up destructive/recovery-inhibiting actions (T1485/T1486)"
+      mapped_to: Q6
+      source: template:ransomware_impact.recovery_options_assessment
+  dimension_coverage:
+    - dimension: parent_process_analysis
+      technique: T1489
+      covered_by: Q10
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: service_identification
+      technique: T1489
+      covered_by: Q4
+      source: attack:T1489.service_identification
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1489
+      covered_by: Q15
+      source: template:cue_host_context.precursor
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1489
+      covered_by: Q3
+      source: template:scheduled_task.task_configuration
+      coverage_type: direct
+  mutable_dispositions:
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q15
+      notes: "No numeric threshold given; time-correlation handled by the -6h precursor sweep and +/-30m destruction-scope window."
+    - element: ServiceName
+      dimension: service_identification
+      specific_values: "MSExchangeIS, SQLSERVERAGENT (examples only; this rule targets BitLocker/Defender/ExploitGuard/SR/Update/Backup task paths)"
+      disposition: new_question
+      target_question: Q4
+      notes: "Rule's own protective task paths drive the analysis; service-state check authored as attack:T1489.service_identification over system EventID 7036/7040."
+    - element: ParentProcess
+      dimension: parent_process_analysis
+      specific_values: "rationale only"
+      disposition: query_injection
+      target_question: Q10
+      notes: "Upstream lineage covered by process_chain (ParentProcessGuid lookup)."
+  dedup_decisions:
+    - dropped: cue_process_tool.baseline_deviation
+      reason: "Reflected host_pattern query is the same rule-detection block scoped to host as lolbin.historical_lolbin_baseline (kept); overlapping host-firing-pattern question dropped to stay under the 18-question cap."
+      kept: lolbin.historical_lolbin_baseline
+    - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable; both emitted (Q11, Q12)."
+      kept: both
+    - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable; both emitted (Q13, Q14)."
+      kept: both
+  skipped_templates:
+    - template: cue_process_tool.mechanism_decode
+      reason: "replaced_by: scheduled_task.task_configuration (Q3 carries the decode of the disable command)."
+    - template: cue_process_tool.baseline
+      reason: "Generic host binary-frequency superseded by lolbin.historical_lolbin_baseline (Q18), which counts the rule's specific disable pattern rather than all schtasks usage."
+    - template: cue_process_tool.follow_on
+      reason: "schtasks /disable spawns no payload child; follow-on impact is covered by the ransomware_impact destruction/encryption questions (Q6-Q8)."
+    - template: cue_process_tool.clustering
+      reason: "Host-wide concurrent activity covered by ransomware_impact.destruction_scope_on_host (Q7) and cue_host_context.precursor (Q15)."
+    - template: cue_process_tool.scope
+      reason: "Reflected fleet_pattern cross-host count is covered by ransomware_impact.network_wide_impact (Q9), which pivots on the same rule firing network-wide."
+    - template: cue_host_context.clustering
+      reason: "Concurrent host activity covered by ransomware_impact.destruction_scope_on_host (Q7); avoided a second broad host sweep under the cap."
+    - template: scheduled_task.task_trigger_and_timing
+      reason: "Template assumes a newly CREATED persistence task that will later execute; this rule disables EXISTING protective tasks, so trigger/next-run timing of a created payload does not apply."
+    - template: scheduled_task.task_still_present
+      reason: "Same mismatch — the rule disables a task rather than creating one; 'is the created task still registered' is not the relevant question. Whether the protective task is still disabled is covered by the service-state check (Q4) and manual schtasks /query."
+    - template: persistence_scope.process_based_persistence
+      reason: "Rule is impact/defense-evasion, not persistence; applicability is_persistence_rule=false. Tool-stacking on the host is already covered by lolbin.technique_class_lateral (Q16)."
+    - template: persistence_scope.file_based_persistence
+      reason: "Rule is not a persistence rule; no file drop is involved. file_event coverage of Startup/Run drops adds no signal for a task-disable command and would not reach the 18-cap priorities."
+    - template: network_scope.same_action_other_hosts
+      reason: "Cross-host spread of this action covered by ransomware_impact.network_wide_impact (Q9, same rule fleet-wide)."
+    - template: network_scope.actor_activity_network_wide
+      reason: "User network-wide activity covered by cue_user_actor.clustering (Q13)."
+    - template: network_scope.actor_authentication_trail
+      reason: "Authentication-trail pivot is secondary for an impact/defense-evasion command; dropped under the 18-cap in favor of service-state and destruction-scope questions more decisive for this rule."
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "logsource 'security' (recommended by techniques: T1489) is not covered and no template family exists — author a custom question with `category: security`"
+      disposition: declined
+      reason: >-
+        The T1489 security channel is EventCode 4672 (special-privileges-assigned
+        at logon), which is a generic elevation marker, not evidence of this
+        action. Disabling a scheduled task is a pure process_creation event and
+        does not generate a Security service-control record. Q4
+        (attack:T1489.service_identification) instead queries the System log
+        (EventID 7036/7040) for actual service state changes of the protective
+        services behind the disabled tasks — the relevant cross-logsource pivot
+        for Service Stop here. No 4672 question authored.
+    - hint: "logsource 'sysmon_status' (recommended by techniques: T1489) is not covered and no template family exists — author a custom question with `category: sysmon_status`"
+      disposition: declined
+      reason: >-
+        sysmon_status (Sysmon EventCode 4) reports the Sysmon service's own
+        start/stop state, not the target service. A schtasks /disable does not
+        stop the Sysmon service, so this channel adds no triage signal for this
+        rule. Service-state confirmation for the protective services is covered
+        by Q4 (System EventID 7036/7040). No sysmon_status question authored.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - scheduled_task
+    - ransomware_impact
+    - lolbin
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 17
+      attack: 1
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 15
+    logsource_diversity:
+      process_creation: 15
+      system: 1
+      sigma_alert: 2

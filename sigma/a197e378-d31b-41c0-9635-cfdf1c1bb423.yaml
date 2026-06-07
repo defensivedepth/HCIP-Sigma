@@ -1,0 +1,469 @@
+name: HackTool - WinRM Access Via Evil-WinRM
+id: bfc908e6-8c03-449e-ba6f-ca4acd281658
+description: |
+  Detects ruby.exe running with the command-line flags -i, -u, and -p together, the signature invocation pattern of Evil-WinRM, a Ruby-based interactive WinRM/PSRP client used for remote access and post-exploitation. The flags map to a target host (-i), a username (-u), and a password (-p), so a match means an operator on this host is opening an authenticated remote management session to another system. Ruby is rarely present on Windows endpoints, and the tool supports pass-the-hash, Kerberos, in-memory .NET/DLL loading, Donut shellcode injection, and AMSI/ETW bypass, so the investigation should determine the target and credentials used, whether the session is authorized, and what was done over it.
+type: detection
+detection_id: a197e378-d31b-41c0-9635-cfdf1c1bb423
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line show ruby.exe running with the -i, -u, and -p flags together?
+  context: Confirm the alert is a true positive by reviewing the exact command line and process details. The rule fires when the Image ends in ruby.exe and the command line contains all three of -i (target host or IP), -u (username), and -p (password). Read the full argument list to recover the target, the account, and any additional flags such as -S (SSL), -H (NTLM hash for pass-the-hash), -r (Kerberos realm), or -s/-e (script and executable load directories).
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to open remote WinRM management sessions with a Ruby-based client?
+  context: Ruby is not part of a default Windows install and a Ruby WinRM client is not a standard administrative tool; native remote management uses PowerShell Remoting or winrs. A user with no administrative or red-team role, or a host that is not an operator workstation or jump box, running this is harder to explain as routine work. Knowing the expected role is often the fastest way to separate an authorized engagement from intrusion activity.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:hacking_tool.authorized_engagement
+  question: Is this Evil-WinRM execution part of an authorized penetration test or red team engagement?
+  context: Evil-WinRM is a standard offensive toolkit component used in authorized security assessments. Before investing further analysis, check whether a penetration test or red team exercise is currently active on this host or network segment. An authorized engagement whose scope, source host, and timing match this activity resolves the alert without deeper investigation.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:cue_process_tool.mechanism_decode
+  question: What target, account, and authentication material did this Evil-WinRM invocation use?
+  context: The full command line reveals the operation. Decode -i to the target host or IP, -u to the username, and -p to the password; then check for the higher-risk flags -H (NTLM hash, indicating pass-the-hash), -r and --spn (Kerberos), -S/-c/-k (SSL with client certificate), and -s/-e (directories of PowerShell scripts and .NET binaries staged for in-memory loading). The presence of -H or -s/-e shifts the session from a simple login toward credential reuse and in-memory tooling.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:hacking_tool.tool_capability_used
+  question: Which Evil-WinRM capability was invoked -- a plain remote shell, pass-the-hash, Kerberos auth, or in-memory loading?
+  context: Evil-WinRM is multi-purpose. The flags distinguish a simple password login (-p) from pass-the-hash (-H), Kerberos ticket use (-r/--spn), and staging of in-memory payloads via the script (-s) and executable (-e) load directories that feed Invoke-Binary, Dll-Loader, Donut-Loader, and Bypass-4MSI. Which capability was used determines the scope of potential compromise and the required response.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:hacking_tool.tool_specific_artifacts
+  question: Did this ruby.exe process write Evil-WinRM artifacts such as downloaded files, log files, or staged payloads to disk?
+  context: Evil-WinRM leaves characteristic artifacts on the operator host. Logging via -l writes session log files under the user profile, the upload/download commands move files between local and remote, and the -s/-e directories hold PowerShell scripts and .NET binaries staged for in-memory loading. Files written by this process confirm what was transferred or staged even after the process exits.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: attack:T1021.006.user_context
+  question: What remote logon to the target host accompanied this session, and is the account a non-admin or service account that should not be using WinRM?
+  context: An Evil-WinRM session authenticates to the target over WinRM/PSRP, which generates remote logon events (4624 network logon, often with 4648 explicit-credential logon) on the target. Correlate the account and source against the connection to confirm the session reached the target and to scope the user. A non-administrator, a service account, or an account not on the list of identities expected to use WinRM is a stronger signal than a known administrator from a known jump box. If Security logon events are not collected in this environment, treat absent results as a visibility gap rather than evidence the session failed.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: security
+    detection:
+      selection:
+        EventID:
+          - 4624
+          - 4648
+        LogonType: 3
+      condition: selection
+    fields:
+      - TargetUserName
+      - IpAddress
+      - LogonType
+      - host.name
+- source: template:lateral_movement.source_host_identification
+  question: What host initiated this WinRM connection, and is it an expected administrative source?
+  context: Lateral movement requires a source and a destination. Identifying the originating host shows whether the WinRM session came from a known admin jump box, a routine operator workstation, or an unexpected system that may itself be compromised and used as a pivot. Connections on the WinRM ports (5985/5986) from an unrecognized source are the ones worth chasing.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        DestinationPort:
+          - 5985
+          - 5986
+      condition: selection
+    fields:
+      - SourceIp
+      - DestinationPort
+- source: template:lateral_movement.authentication_method
+  question: What authentication method did this session use -- a password, an NTLM hash for pass-the-hash, or a Kerberos ticket?
+  context: The authentication method reveals how access was obtained. Evil-WinRM supports a plain password (-p), an NTLM hash for pass-the-hash (-H), and Kerberos via an imported ccache (-r/--spn). Pass-the-hash and pass-the-ticket bypass the need for a cleartext password and point to prior credential theft; legitimate credential use suggests the operator already holds valid passwords. The command line and the matching remote logon type together identify which path was used.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - User
+      - CommandLine
+- source: template:lateral_movement.target_activity_after_access
+  question: What processes were spawned on the target host shortly after this WinRM session was established?
+  context: Lateral movement is a means to an end. Over WinRM/PSRP, remote commands run as children of wsmprovhost.exe on the target, so processes appearing under that parent shortly after the session opened reveal the operator's objectives -- reconnaissance, tool deployment, credential access, or data collection. The tight window after access keeps the focus on activity attributable to this session.
+  range: +30m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - User
+      - Image
+- source: template:lateral_movement.lateral_movement_scope
+  question: Has this user account connected to other hosts using remote-access tooling?
+  context: Operators rarely stop at one target. If the same account is running remote-access and lateral-movement tooling against multiple systems, the scope of compromise is larger. A single account reaching many hosts within a short window indicates active lateral movement rather than an isolated administrative task.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      selection_lateral:
+        Image|endswith:
+          - '\psexec.exe'
+          - '\psexec64.exe'
+          - '\mstsc.exe'
+          - '\ssh.exe'
+          - '\plink.exe'
+          - '\wmic.exe'
+          - '\ruby.exe'
+          - '\winrs.exe'
+      condition: selection and selection_lateral
+    fields:
+      - host.name
+      - Image
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired this Evil-WinRM pattern, what parents and users normally drive it, and does the current alert fit?
+  context: Even a rare tool can have an established niche use such as a sanctioned operator workstation. This query mirrors the rule's selection scoped to this host, so the resulting parent and user distribution reflects how the rule's specific firing pattern has historically run here. A new parent process, an unexpected account, or a first-ever appearance is the deviation worth chasing, and an empty history makes this a first-time event on the host.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \ruby.exe
+        CommandLine|contains|all:
+        - '-i '
+        - '-u '
+        - '-p '
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired this Evil-WinRM pattern in the past week, and does the cross-host distribution look like consistent automation or one-off operator activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of this specific firing pattern rather than generic ruby.exe usage. Many hosts firing the same pattern can point to a sanctioned testing tool or scripted deployment; one host or a small unrelated set points to manual operator activity. Use the host distribution to calibrate how isolated this is.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \ruby.exe
+        CommandLine|contains|all:
+        - '-i '
+        - '-u '
+        - '-p '
+      condition: selection
+    fields:
+    - host.name
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run remote-access or offensive tooling like a Ruby WinRM client?
+  context: Compare the current action against this user's historical behavior. A user who has never run ruby.exe in this form across the environment is more suspicious than one who does so regularly, and the user's role should align with running remote-management tooling. Zero or very low counts indicate this is outside their normal toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent and ruby.exe combination historically routine on this host or across the environment, or is the parent unusual for this binary?
+  context: When the alert fires under a service principal, user identity does not attribute the behavior, so the meaningful pivot is the launch mechanism. A parent process that already accounts for many prior ruby.exe executions is automation; a new or rare parent for this binary on this host or environment-wide is the deviation worth chasing.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints. If the same user drove remote-access or post-exploitation activity on other hosts in the same window, the scope of the operation may be larger than this single alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent and ruby.exe combination fire on other hosts in the same window, indicating a coordinated rollout rather than isolated activity?
+  context: Under a service principal, asking what else the user did across the network returns agent-telemetry noise. The meaningful question is whether the same launch mechanism, parent process plus spawned binary, fired on other hosts in the alert window. Multiple hosts in the same window points to scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host, such as credential access, defense tampering, or reconnaissance, may reveal the stages that preceded this remote session and help reconstruct the timeline. Lateral movement typically follows credential theft, so a preceding credential-access alert strengthens the case that this session is part of an intrusion.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+  - id: T1021.006
+    name: Windows Remote Management
+    role: primary
+  - id: T1021
+    name: Remote Services
+    role: secondary
+  attack_chain_coverage:
+  - stage: 1
+    label: winrm_client_invocation
+    description: ruby.exe (Evil-WinRM) launches with -i/-u/-p, opening an authenticated WinRM/PSRP session to a target host
+    mapped_to: Q1
+    source: template:universal.verify_trigger_match
+  - stage: 2
+    label: credential_and_capability_decode
+    description: Command-line flags decoded to recover target, account, auth material (password/hash/Kerberos) and any in-memory loading capability
+    mapped_to: Q4
+    source: template:cue_process_tool.mechanism_decode
+  - stage: 3
+    label: remote_session_logon
+    description: WinRM session produces a network logon (4624/4648) on the target; correlate account and source
+    mapped_to: Q7
+    source: attack:T1021.006.user_context
+  - stage: 4
+    label: post_access_execution
+    description: Remote commands run as children of wsmprovhost.exe on the target after the session is established
+    mapped_to: Q10
+    source: template:lateral_movement.target_activity_after_access
+  dimension_coverage:
+  - dimension: time_correlation
+    technique: T1021.006
+    covered_by: Q10
+    source: template:lateral_movement.target_activity_after_access
+    coverage_type: direct
+  - dimension: tuning_parameter
+    technique: T1021.006
+    covered_by: Q12
+    source: template:cue_process_tool.baseline_deviation
+    coverage_type: direct
+  - dimension: user_context
+    technique: T1021.006
+    covered_by: Q7
+    source: attack:T1021.006.user_context
+    coverage_type: direct
+  - dimension: command_analysis
+    technique: T1021
+    covered_by: Q4
+    source: template:cue_process_tool.mechanism_decode
+    coverage_type: direct
+  mutable_dispositions:
+  - element: TimeWindow
+    dimension: time_correlation
+    specific_values: "rationale only — max time between remote shell creation and child process execution (e.g., 60s)"
+    disposition: new_question
+    target_question: Q10
+    notes: "No fixed value to inject; drove the +30m forward window on the post-access target-activity question that ties wsmprovhost.exe children to the session."
+  - element: UserContext
+    dimension: user_context
+    specific_values: "rationale only — scope to unexpected remote user logons (non-admins, service accounts)"
+    disposition: new_question
+    target_question: Q7
+    notes: "Drove the custom security-logsource remote-logon question scoping the 4624/4648 account against expected WinRM users."
+  - element: CommandLineAnomalyScore
+    dimension: tuning_parameter
+    specific_values: "rationale only — score for suspicious WinRM command usage (e.g., encoded PowerShell)"
+    disposition: context
+    target_question: Q5
+    notes: "No fixed values; tool_capability_used context enumerates the -H/-r/-s/-e flags that constitute the anomalous-capability signal an analyst would score."
+  - element: KnownAdminHosts
+    dimension: tuning_parameter
+    specific_values: "rationale only — list of trusted systems allowed to use WinRM legitimately"
+    disposition: context
+    target_question: Q8
+    notes: "Allowlist rationale, no fixed values; source_host_identification surfaces the originating host so the analyst can compare it against known admin sources."
+  - element: LogonUser
+    dimension: tuning_parameter
+    specific_values: "rationale only — limit to service accounts or privileged users (T1021)"
+    disposition: context
+    target_question: Q7
+    notes: "Folded into the remote-logon question's account-scoping context; no fixed list to inject."
+  - element: RemoteHostList
+    dimension: tuning_parameter
+    specific_values: "rationale only — allowlist known admin jumpboxes / deployment tools (T1021)"
+    disposition: context
+    target_question: Q8
+    notes: "Same allowlist intent as KnownAdminHosts; covered by the source-host identification question."
+  dedup_decisions:
+  - dropped: cue_user_actor.baseline + cue_user_actor.baseline_svc
+    reason: "user_actor pair — non-deduplicable"
+    kept: both emitted (Q14 user-pivot, Q15 parent+binary substitute)
+  - dropped: cue_user_actor.clustering + cue_user_actor.clustering_svc
+    reason: "user_actor pair — non-deduplicable"
+    kept: both emitted (Q16 user-pivot, Q17 parent+binary substitute)
+  - dropped: cue_process_tool.process_chain
+    reason: "At the 18-question hard cap. Parent-chain attribution is already carried by the baseline_deviation (Q12) and baseline_svc (Q15) questions, which both project ParentImage / parent.name scoped to this host and binary; a standalone ParentProcessGuid lookup adds little for a single-invocation tool."
+    kept: cue_process_tool.baseline_deviation
+  - dropped: cue_process_tool.clustering
+    reason: "Host-wide what-else-ran clustering overlaps the network-wide user clustering (Q16) and the post-access target-activity sweep (Q10); dropped to stay within the 18-question cap."
+    kept: cue_user_actor.clustering
+  skipped_templates:
+  - template: cue_process_tool.baseline
+    reason: "At the 18-question cap. The -90d host-frequency count is subsumed by baseline_deviation (Q12), which scopes the same host to the rule's actual firing pattern rather than generic ruby.exe volume, and by scope (Q13) for the fleet view."
+  - template: cue_process_tool.follow_on
+    reason: "At the 18-question cap. On the alerting (source) host the tool's children are the operator's local console, not the impact; the load-bearing follow-on activity is on the TARGET host and is covered by target_activity_after_access (Q10)."
+  - template: cue_host_context.clustering
+    reason: "At the 18-question cap. Host-wide activity-around-the-alert is covered by cue_host_context.precursor (Q18) for prior alerts and by the network-wide user clustering (Q16); a third host-scoped sweep would duplicate."
+  - template: universal.endpoint_protection_health
+    reason: "RECOMMENDED, not must_include. cue_host_context.precursor (Q18) is present and surfaces prior tamper alerts on the host; this rule fires on lateral-movement session establishment rather than a local payload-execution or credential-access action whose disposition turns on whether AV/EDR was disabled first. Dropped to stay within the 18-question cap."
+  - template: network_scope.same_action_other_hosts
+    reason: "RECOMMENDED. Cross-host occurrence of the same Evil-WinRM pattern is covered by cue_process_tool.scope (Q13), which mirrors the rule's full selection (binary + -i/-u/-p) rather than ruby.exe alone."
+  - template: network_scope.actor_activity_network_wide
+    reason: "RECOMMENDED. Network-wide user activity is covered by cue_user_actor.clustering (Q16), which uses the identical User-scoped aggregation shape."
+  - template: network_scope.actor_authentication_trail
+    reason: "RECOMMENDED. The user's authentication trail is covered by the custom security-logsource remote-logon question (Q7), which queries 4624/4648 for the account; a second security-log authentication question would duplicate it within the 18-question cap."
+  reflection_overrides: []
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+  - universal
+  - lateral_movement
+  - hacking_tool
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 17
+      attack: 1
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 15
+    logsource_diversity:
+      process_creation: 14
+      security: 1
+      network_connection: 1
+      file_event: 1
+      sigma_alert: 1

@@ -1,0 +1,609 @@
+name: Renamed AdFind Execution
+id: 42ca5b75-3332-4668-9820-31d8d373ed97
+description: |
+  Detects execution of AdFind under a non-AdFind.exe filename. The rule fires when EITHER the command line carries AdFind reconnaissance syntax (trustdmp, objectcategory=, -subnets -f, computers_pwdnotreqd, and similar shortcut queries), OR the import hash matches a known AdFind build, OR the PE OriginalFileName is AdFind.exe — while the on-disk filename is NOT AdFind.exe. AdFind is a legitimate dual-use Active Directory query utility, but renaming it is a common evasion against tools that block the canonical binary by name, and AdFind-driven domain recon is a recurring pre-ransomware and lateral-movement staging step. Investigation should confirm the rename/metadata mismatch, decode what AD data was enumerated, establish whether the user, host, and parent process make this routine administration, and map any follow-on activity.
+type: detection
+detection_id: df55196f-f105-44d3-a675-e9dfb6cc2f2b
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-06
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does this process match the renamed-AdFind pattern — either AdFind recon command-line syntax, a known AdFind import hash, or an AdFind OriginalFileName while the filename on disk is not AdFind.exe?
+  context: >-
+    Confirm the alert before investing time. The rule fires on any one of three independent branches, so note which one matched: AdFind shortcut syntax in the command line (trustdmp, objectcategory=, -subnets -f, computers_pwdnotreqd, and similar), a matching import hash, or an embedded OriginalFileName of AdFind.exe — combined with an on-disk name that is not AdFind.exe. Which branch fired determines what follow-up matters most. A command-line-branch fire makes decoding the enumeration arguments load-bearing; a hash-only or OriginalFileName-only fire (no recon syntax visible) means the arguments may be off-screen and the identity-of-binary evidence carries the disposition.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - OriginalFileName
+      - CommandLine
+      - Hashes
+- source: template:masquerading.true_identity
+  question: What is the actual identity of this binary based on its metadata and hash?
+  context: >-
+    The file is named something other than AdFind.exe on disk, but the PE metadata and import hash still reflect the original tool. Compare the Image path (name on disk) against OriginalFileName (embedded metadata) to confirm the rename, and submit the hash for reputation lookup to establish whether this is a known AdFind build, a known malware sample, or a novel binary. The signing chain indicates whether this is a third-party-signed utility, a system binary, or unsigned.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - Hashes
+- source: template:masquerading.binary_origin
+  question: How did this renamed binary arrive on the host?
+  context: >-
+    A renamed AdFind binary does not appear spontaneously — it was copied, downloaded, or dropped by another process. Tracing the file-creation event for this filename over a long window reveals the delivery mechanism: a download tool, an archive extraction, a manual copy via remote access, or lateral movement from another host. The process that created the file (Image in the file event) identifies the dropper. A user-writable landing path (Desktop, Downloads, Temp, AppData) points to download or extraction; a staging share points to operator placement.
+  range: -30d
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains|expand: '%file_name%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: template:masquerading.renamed_binary_activity
+  question: What did this renamed binary spawn after execution, and is the same renamed binary present on other hosts?
+  context: >-
+    The purpose of renaming AdFind is to keep running the tool while evading name-based blocking. Child processes, command shells, and output redirection spawned by the renamed binary reveal what it actually did and whether enumeration output was written to disk for collection. The same renamed binary appearing on multiple hosts suggests deliberate distribution rather than an isolated execution. Pair the local child-process view with the metadata/hash identity to confirm scope.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.mechanism_decode
+  question: What exactly did this AdFind execution enumerate? Decode the command-line arguments.
+  context: >-
+    The full command line reveals which Active Directory data was queried. Decode the shortcut syntax — trustdmp dumps trust objects, objectcategory= enumerates persons/computers/subnets, computers_pwdnotreqd and users_noexpire hunt weak accounts, dclist and dcmodes map domain controllers, -subnets -f maps the network, name="Domain Admins" targets privileged groups. Output piping (-csv, -list) and redirection to a file indicate the operator intended to collect the results. This host+binary scope over a short window also surfaces multiple sequential invocations that together form one enumeration sweep.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:discovery_recon.discovery_parent_chain
+  question: What process spawned this discovery command, and is that parent chain expected?
+  context: >-
+    Legitimate administrative discovery typically runs from cmd.exe spawned by explorer.exe (an interactive admin session) or from a known automation engine. AdFind reconnaissance spawned by Office applications, script interpreters (wscript.exe, cscript.exe, mshta.exe), wmiprvse.exe (WMI remote execution), or wsmprovhost.exe (WinRM remote execution) points to automated post-exploitation rather than hands-on administration. Examine the immediate parent and its command line to judge how the enumeration was initiated.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+- source: template:discovery_recon.discovery_user_context
+  question: Is this user expected to run administrative domain-discovery commands?
+  context: >-
+    Network administrators and IT staff legitimately query Active Directory for troubleshooting and inventory. Standard users and most service accounts rarely run AD enumeration tools. The user's role and typical behavior baseline determine whether this AdFind execution is routine administration or anomalous reconnaissance — a non-admin or unexpected account performing domain trust and account enumeration is the case worth chasing.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - User
+- source: template:discovery_recon.discovery_burst_detection
+  question: Did other reconnaissance commands run on this host around the same time?
+  context: >-
+    A single AD query may be legitimate, but multiple reconnaissance commands in rapid succession — net.exe, nltest.exe, dsquery.exe, nslookup.exe, csvde.exe, setspn.exe, whoami — is a signature of post-compromise enumeration. Operators run these to map the domain before moving to the next stage. Three or more distinct recon binaries within fifteen minutes typically indicates automated reconnaissance rather than ad-hoc troubleshooting.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_recon:
+        Image|endswith:
+          - '\whoami.exe'
+          - '\systeminfo.exe'
+          - '\ipconfig.exe'
+          - '\net.exe'
+          - '\net1.exe'
+          - '\nltest.exe'
+          - '\dsquery.exe'
+          - '\nbtstat.exe'
+          - '\arp.exe'
+          - '\netstat.exe'
+          - '\tasklist.exe'
+          - '\qprocess.exe'
+          - '\query.exe'
+          - '\quser.exe'
+          - '\hostname.exe'
+          - '\nslookup.exe'
+          - '\adfind.exe'
+          - '\csvde.exe'
+          - '\ldifde.exe'
+          - '\dnscmd.exe'
+          - '\cmdkey.exe'
+          - '\setspn.exe'
+      condition: selection and selection_recon
+    fields:
+      - Image
+      - User
+- source: attack:T1018.network_connection
+  question: Did this renamed binary make LDAP or directory-service connections to a domain controller?
+  context: >-
+    AdFind enumerates Active Directory by binding to a domain controller over LDAP (389/636) or the global catalog (3268/3269) — discovery that crosses into network telemetry, not just process arguments. Correlating outbound connections from this process to directory-service ports confirms the enumeration actually reached a DC and identifies which controller was queried, which the command line alone does not show. A host that does not normally talk LDAP to a DC making these connections under a renamed binary is the deviation to chase. If directory-service network telemetry is not collected in this environment, treat zero results as a visibility gap rather than evidence nothing happened, and fall back to the decoded command line for intent.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        DestinationPort:
+          - 389
+          - 636
+          - 3268
+          - 3269
+      condition: selection
+    fields:
+      - Image
+      - DestinationIp
+      - DestinationPort
+- source: template:cue_process_tool.baseline
+  question: Does this host normally run this AdFind binary?
+  context: >-
+    A binary that has never been seen on this host is more suspicious than one that runs regularly. A zero or very low ninety-day count for this renamed binary indicates first-time or rare execution, consistent with operator-introduced tooling rather than an installed administrative utility.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired this rule's pattern, what parents and users normally drive it, and does the current alert fit?
+  context: >-
+    Even legitimate AD administration leaves a baseline. The query mirrors the rule's full selection structure scoped to this host, so the parent/user distribution reflects how this specific firing pattern — not generic binary usage — has historically run here. A new parent process, an unexpected user account, or an unusual command-line shape against an otherwise stable baseline is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_1:
+        CommandLine|contains:
+        - domainlist
+        - trustdmp
+        - dcmodes
+        - adinfo
+        - ' dclist '
+        - computer_pwdnotreqd
+        - objectcategory=
+        - -subnets -f
+        - name="Domain Admins"
+        - '-sc u:'
+        - domainncs
+        - dompol
+        - ' oudmp '
+        - subnetdmp
+        - gpodmp
+        - fspdmp
+        - users_noexpire
+        - computers_active
+        - computers_pwdnotreqd
+      selection_2:
+        Hashes|contains:
+        - IMPHASH=BCA5675746D13A1F246E2DA3C2217492
+        - IMPHASH=53E117A96057EAF19C41380D0E87F1C2
+        - IMPHASH=d144de8117df2beceaba2201ad304764
+        - IMPHASH=12ce1c0f3f5837ecc18a3782408fa975
+        - IMPHASH=4fbf3f084fbbb2470b80b2013134df35
+        - IMPHASH=49b639b4acbecc49d72a01f357aa4930
+        - IMPHASH=680dad9e300346e05a85023965867201
+        - IMPHASH=21aa085d54992511b9f115355e468782
+      selection_3:
+        OriginalFileName: AdFind.exe
+      filter:
+        Image|endswith: \AdFind.exe
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (1 of selection* and not filter) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.clustering
+  question: What other tools ran on this host around the same time?
+  context: >-
+    Reconnaissance rarely happens alone. Activity surrounding the AdFind execution may reveal credential access, privilege escalation, persistence installation, or data staging that frames the enumeration as one stage of a multi-step operation. Scan the surrounding process activity for tools that do not fit routine host operation.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired this rule's pattern in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: >-
+    The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of this firing pattern, not generic usage of the binary. Many hosts firing the same pattern points to scripted deployment or vendor automation; one host or a small unrelated set points to manual operator activity. Use the host distribution and parent/binary consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_1:
+        CommandLine|contains:
+        - domainlist
+        - trustdmp
+        - dcmodes
+        - adinfo
+        - ' dclist '
+        - computer_pwdnotreqd
+        - objectcategory=
+        - -subnets -f
+        - name="Domain Admins"
+        - '-sc u:'
+        - domainncs
+        - dompol
+        - ' oudmp '
+        - subnetdmp
+        - gpodmp
+        - fspdmp
+        - users_noexpire
+        - computers_active
+        - computers_pwdnotreqd
+      selection_2:
+        Hashes|contains:
+        - IMPHASH=BCA5675746D13A1F246E2DA3C2217492
+        - IMPHASH=53E117A96057EAF19C41380D0E87F1C2
+        - IMPHASH=d144de8117df2beceaba2201ad304764
+        - IMPHASH=12ce1c0f3f5837ecc18a3782408fa975
+        - IMPHASH=4fbf3f084fbbb2470b80b2013134df35
+        - IMPHASH=49b639b4acbecc49d72a01f357aa4930
+        - IMPHASH=680dad9e300346e05a85023965867201
+        - IMPHASH=21aa085d54992511b9f115355e468782
+      selection_3:
+        OriginalFileName: AdFind.exe
+      filter:
+        Image|endswith: \AdFind.exe
+      condition: 1 of selection* and not filter
+    fields:
+    - host.name
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run this tool?
+  context: >-
+    Compare this user's current action against their historical behavior. A user who has never run an AD enumeration tool is more suspicious than one who does so regularly, and the user's role should align with domain-administration tooling. Combine the ninety-day cross-host count with organizational knowledge of what this account is expected to do.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent+binary combination historically routine on this host or across the environment, or is the parent unusual for this binary?
+  context: >-
+    When the alert fires under a service principal (SYSTEM, LOCAL SERVICE, NETWORK SERVICE, or a computer account), user identity does not attribute the behavior. The meaningful pivot is the launch mechanism — which parent process spawned this binary, and whether that pair is historically common. A new or rare parent for this binary on this host, or environment-wide, is the deviation; a pair that already accounts for thousands of prior events is vendor or OS automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: >-
+    Tracking the user's activity across all hosts reveals lateral movement or coordinated activity on multiple endpoints. If the same account triggered similar enumeration on several hosts in this window, the scope of the operation is larger than a single endpoint.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent+binary combination fire on other hosts in the same window — a coordinated automation rollout, or activity isolated to this host?
+  context: >-
+    Under a service principal, asking what else the user did across the network returns agent-telemetry noise, because every host runs SYSTEM-owned agents constantly. The meaningful question is whether the same launch mechanism — parent process plus spawned binary — fired on other hosts in the alert window. Multiple hosts in the same window points to scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Enumeration rarely happens in isolation. Earlier detections on the same host — defense tampering, initial access, credential access — may reveal the attack stages that preceded this reconnaissance and help reconstruct the timeline. Discovery activity following a prior execution or access alert shifts the disposition toward an active operation.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1018
+      name: Remote System Discovery
+      role: primary
+    - id: T1087.002
+      name: 'Account Discovery: Domain Account'
+      role: secondary
+    - id: T1482
+      name: Domain Trust Discovery
+      role: secondary
+    - id: T1069.002
+      name: 'Permission Groups Discovery: Domain Groups'
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: renamed_binary_identity
+      description: "Adversary runs AdFind under a non-AdFind.exe name to evade name-based blocking"
+      mapped_to: Q2
+      source: template:masquerading.true_identity
+    - stage: 2
+      label: ad_enumeration_execution
+      description: "Renamed binary issues AdFind shortcut queries enumerating accounts, groups, trusts, subnets, and DCs"
+      mapped_to: Q5
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 3
+      label: directory_service_query
+      description: "Enumeration binds to a domain controller over LDAP/global-catalog ports"
+      mapped_to: Q9
+      source: attack:T1018.network_connection
+    - stage: 4
+      label: follow_on_staging
+      description: "Output collection and follow-on tooling staged after recon"
+      mapped_to: Q4
+      source: template:masquerading.renamed_binary_activity
+  dimension_coverage:
+    - dimension: command_analysis
+      technique: T1018
+      covered_by: Q5
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1018
+      covered_by: Q6
+      source: template:discovery_recon.discovery_parent_chain
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1018
+      covered_by: Q8
+      source: template:discovery_recon.discovery_burst_detection
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1018
+      covered_by: Q11
+      source: template:cue_process_tool.baseline_deviation
+      coverage_type: direct
+    - dimension: process_identification
+      technique: T1087.002
+      covered_by: Q2
+      source: template:masquerading.true_identity
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1087.002
+      covered_by: Q7
+      source: template:discovery_recon.discovery_user_context
+      coverage_type: direct
+    - dimension: execution_context
+      technique: T1087
+      covered_by: Q9
+      source: attack:T1018.network_connection
+      coverage_type: indirect
+    - dimension: network_indicators
+      technique: T1087
+      covered_by: Q9
+      source: attack:T1018.network_connection
+      coverage_type: direct
+  mutable_dispositions:
+    - element: CommandLinePattern
+      dimension: command_analysis
+      specific_values: "trustdmp, objectcategory=, -subnets -f, computers_pwdnotreqd, ' dclist ', dcmodes, name=\"Domain Admins\", -sc u:"
+      disposition: query_injection
+      target_question: Q11
+      notes: "Rule's full CommandLine|contains list embedded verbatim in the REFLECTED baseline_deviation and scope queries; also decoded in Q5 context"
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "bursty enumeration <30s to 15m"
+      disposition: query_injection
+      target_question: Q8
+      notes: "discovery_burst_detection scopes recon binaries to +/-15m window"
+    - element: ParentProcess
+      dimension: parent_process_analysis
+      specific_values: "rationale only (suspicious ancestry)"
+      disposition: new_question
+      target_question: Q6
+      notes: "discovery_parent_chain surfaces ParentImage/ParentCommandLine for ancestry judgment"
+    - element: ParentImage
+      dimension: tuning_parameter
+      specific_values: "rationale only (expected script hosts/admins)"
+      disposition: query_injection
+      target_question: Q11
+      notes: "baseline_deviation projects ParentImage distribution scoped to rule pattern on this host"
+    - element: SourceHost
+      dimension: tuning_parameter
+      specific_values: "rationale only (non-DC/non-admin systems)"
+      disposition: context
+      target_question: Q7
+      notes: "host/user-expectation framing carries the non-admin-context restriction"
+    - element: UserContext
+      dimension: user_context
+      specific_values: "rationale only (non-admin/unexpected user)"
+      disposition: new_question
+      target_question: Q7
+      notes: "discovery_user_context asks whether the user is expected to run AD discovery"
+    - element: API_Name
+      dimension: tuning_parameter
+      specific_values: "DSEnumerateDomainTrusts (rationale only)"
+      disposition: context
+      target_question: Q9
+      notes: "API-level trust enumeration is not visible in process_creation; network-connection question covers the observable LDAP/DC bind instead"
+    - element: ProcessLineageDepth
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q6
+      notes: "parent-chain depth handled by discovery_parent_chain ancestry walk"
+    - element: CommandLineRegex
+      dimension: command_analysis
+      specific_values: "net group / Get-ADGroupMember (rationale only)"
+      disposition: context
+      target_question: Q8
+      notes: "group-enumeration variants surfaced via the recon-binary burst query and decoded in Q5"
+  dedup_decisions:
+    - dropped: cue_process_tool.process_chain
+      reason: "near-identical parent question; discovery_recon.discovery_parent_chain (technique set, more specific to discovery ancestry) supersedes it for parent_process_analysis"
+      kept: discovery_recon.discovery_parent_chain
+    - dropped: universal.host_user_context
+      reason: "discovery_recon.discovery_user_context notes_to_llm directs preferring the discovery-specific version and dropping host_user_context"
+      kept: discovery_recon.discovery_user_context
+    - dropped: cue_process_tool.follow_on
+      reason: "identical query intent (host.name + ParentImage|endswith %Image% -> Image, CommandLine) to masquerading.renamed_binary_activity; technique-set version kept"
+      kept: masquerading.renamed_binary_activity
+    - dropped: cue_host_context.clustering
+      reason: "same time-window host-activity sweep as cue_process_tool.clustering; kept the process_tool version to avoid duplicate +/-15m host aggregation"
+      kept: cue_process_tool.clustering
+    - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable; both emitted (Q14, Q15)"
+      kept: cue_user_actor.baseline + cue_user_actor.baseline_svc
+    - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable; both emitted (Q16, Q17)"
+      kept: cue_user_actor.clustering + cue_user_actor.clustering_svc
+  skipped_templates:
+    - template: universal.endpoint_protection_health
+      reason: "RECOMMENDED, not must_include. This is a discovery/recon rule, not an execution or credential-access rule whose disposition turns on prior tamper; the defense_tampering set is not confirmed and cue_host_context.precursor (Q18) already surfaces any prior tamper alerts on the host."
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "logsource 'image_load' (recommended by techniques: T1482) is not covered — pull in cue_image_load.* or author a custom question with `category: image_load`"
+      disposition: declined
+      reason: >-
+        The rule fires purely on process_creation evidence (CommandLine recon syntax, import hash, OriginalFileName) for a standalone AdFind binary that performs LDAP queries over the network. image_load EID7 telemetry would catch in-process .NET/Win32 trust-API loading, but renamed AdFind is a self-contained C++ binary that does not host the trust enumeration in a victim process; loaded-module volume on it returns noise without precision. The observable cross-logsource pivot for this rule is the LDAP/DC network bind, covered by the directory-service connection question (Q9).
+    - hint: "logsource 'process_access' (recommended by techniques: T1482) is not covered and no template family exists — author a custom question with `category: process_access`"
+      disposition: declined
+      reason: >-
+        process_access EID10 telemetry targets handle/memory access (e.g., LSASS reads) by API-based trust enumeration. AdFind enumerates AD remotely over LDAP and does not open cross-process handles to perform trust discovery, so a process_access query scoped to this binary returns nothing relevant. The rule's detection is process_creation-constrained; the genuine cross-logsource observable is the network bind covered by Q9.
+    - hint: "logsource 'security' (recommended by techniques: T1482) is not covered and no template family exists — author a custom question with `category: security`"
+      disposition: declined
+      reason: >-
+        Security EID 4662 (directory-service object access) would record the LDAP reads server-side, but it requires SACL auditing on the queried AD objects that is rarely enabled, and it is collected on domain controllers, not on the alerting endpoint this playbook scopes to. The endpoint-observable equivalent — the outbound LDAP/global-catalog connection from the renamed binary — is covered by Q9.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - discovery_recon
+    - masquerading
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 17
+      attack: 1
+      llm_generated: 0
+    phase_distribution:
+      triage: 1
+      analysis: 1
+      context: 16
+    logsource_diversity:
+      process_creation: 15
+      file_event: 1
+      network_connection: 1
+      sigma_alert: 1

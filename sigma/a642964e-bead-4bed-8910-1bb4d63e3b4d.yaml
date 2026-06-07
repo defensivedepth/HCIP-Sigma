@@ -1,0 +1,811 @@
+name: HackTool - Mimikatz Execution
+id: 255790b8-1f10-4224-934d-58c62de1ee9a
+description: |
+  Detects command lines containing well-known Mimikatz arguments — either a tool name (DumpCreds, mimikatz),
+  a Mimikatz function name (::skeleton, ::memssp, ::multirdp, and similar), or a Mimikatz module prefix
+  (sekurlsa::, lsadump::, kerberos::, dpapi::, crypto::, token::, privilege::, process::, rpc::, vault::).
+  The rule fires when ANY one of those three pattern groups appears, so a single matching string is enough.
+  Mimikatz and its derivatives dump credentials from LSASS memory, the SAM/SECURITY hives, LSA secrets, cached
+  domain credentials, and Active Directory via DCSync, and also forge Kerberos tickets and tamper with
+  authentication. Legitimate sightings are almost always authorized penetration tests or red-team exercises;
+  outside those, treat it as hands-on credential theft. The investigation should confirm which capability was
+  invoked, which credential store was targeted, which accounts may now be exposed, and whether stolen
+  credentials were already used for lateral movement.
+type: detection
+detection_id: a642964e-bead-4bed-8910-1bb4d63e3b4d
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line contain a Mimikatz tool name, function name, or module prefix?
+  context: >-
+    Confirm the alert is a true positive by reading the exact command line. The rule fires when the command
+    line contains EITHER a tool name (DumpCreds, mimikatz) OR a Mimikatz function name (for example ::skeleton,
+    ::memssp, ::multirdp, ::printnightmare) OR a module prefix (sekurlsa::, lsadump::, kerberos::, dpapi::,
+    crypto::, token::, privilege::, process::, rpc::, vault::). Note which of the three branches matched —
+    a module prefix points to live credential dumping, a function name points to a specific tampering or
+    persistence module, and the bare tool names may also appear in unrelated text. The matched branch shapes
+    which downstream questions carry the most weight.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:hacking_tool.authorized_engagement
+  question: Is this Mimikatz execution part of an authorized penetration test or red team engagement?
+  context: >-
+    Mimikatz is a standard tool in authorized security assessments. Before investing investigation time, check
+    whether a pentest or red-team exercise is active on this host or network segment. An authorized engagement
+    with matching tool usage, operator, and timing resolves the alert without further analysis.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run credential-dumping tooling?
+  context: >-
+    Credential dumping is almost never part of normal user or service activity. Knowing whether the user role
+    (security tester, sysadmin) and host function (admin jump box, DC) plausibly involve this tooling is often
+    the fastest way to separate an authorized assessment from genuine theft.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:hacking_tool.tool_capability_used
+  question: Which Mimikatz module or capability was invoked?
+  context: >-
+    Mimikatz is multi-purpose. The module prefix or function name in the command line reveals the capability:
+    sekurlsa:: dumps LSASS memory, lsadump:: covers SAM / LSA secrets / cached creds / DCSync, kerberos::
+    forges or injects tickets, dpapi:: unprotects DPAPI blobs, token::/privilege:: handle impersonation and
+    privilege requests, and function names like ::skeleton (Skeleton Key), ::memssp (malicious SSP), or
+    ::multirdp (concurrent RDP) indicate authentication tampering or persistence. The specific module
+    determines the scope of compromise and the required response.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:credential_access.credential_target_identification
+  question: Which credential stores were targeted by the invoked modules?
+  context: >-
+    Different Mimikatz modules target different stores, and each implies a different blast radius. sekurlsa::
+    targets LSASS memory (interactive and service logon secrets); lsadump::sam / lsadump::secrets / lsadump::cache
+    target the local SAM, LSA secrets, and cached domain credentials; lsadump::dcsync replicates domain account
+    hashes from a DC (krbtgt replication enables Golden Tickets); vault:: targets the Windows Vault. Identify
+    every store named in the command line to determine which accounts may be compromised and what remediation
+    is needed.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: attack:T1003.001.access_verification
+  question: Did a process open a full-access handle to lsass.exe around the time of this alert?
+  context: >-
+    The sekurlsa:: family reads LSASS memory, which requires opening a handle with broad access rights
+    (commonly the full-access mask 0x1F0FFF) to lsass.exe. This process_access view confirms whether the
+    in-memory read actually occurred and which process performed it, separating a credential-dump attempt
+    from a command line that merely referenced a module. Allowlisted security tooling (AV/EDR) also opens
+    LSASS handles, so correlate the source process and timing against the alerting command. Zero rows when
+    process_access telemetry is not collected is a visibility gap, not proof nothing ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_access
+      product: windows
+    detection:
+      selection:
+        TargetImage|endswith: '\lsass.exe'
+        host.name|expand: '%hostname%'
+      filter_mask:
+        GrantedAccess|contains:
+          - '0x1F0FFF'
+          - '0x1010'
+          - '0x1410'
+      condition: selection and filter_mask
+    fields:
+      - SourceImage
+      - GrantedAccess
+      - CallTrace
+- source: attack:T1003.002.tuning_parameter
+  question: Were SAM, SYSTEM, or SECURITY hives saved to disk, or memory dump files written, on this host?
+  context: >-
+    Module-based dumping (lsadump::sam) and offline workflows leave file artifacts: reg save of HKLM\SAM,
+    HKLM\SYSTEM, and HKLM\SECURITY (all three are needed to extract hashes offline), or LSASS memory dumps
+    written to staging paths such as %TEMP%, C:\Windows\Temp, or C:\Users\Public. The presence of these files
+    — especially all three hives together or a .dmp alongside the alert — confirms credential-theft intent and
+    identifies what was staged for exfiltration.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains:
+          - '\SAM'
+          - '\SYSTEM'
+          - '\SECURITY'
+          - '.dmp'
+          - '.save'
+          - 'lsass'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: attack:T1003.006.user_context
+  question: Did directory replication (DCSync) activity occur from an account or host that is not a domain controller?
+  context: >-
+    The lsadump::dcsync module abuses the directory replication service to pull account hashes from a DC
+    without touching LSASS. Legitimate replication comes only from domain controllers and from accounts that
+    hold replication rights, so a replication request sourced from a workstation or a normal user account is
+    the anomaly. Tune the expected accounts to those that legitimately replicate. If directory-service auditing
+    is not collected, treat zero results as a visibility gap rather than evidence DCSync did not happen.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: security
+    detection:
+      selection:
+        EventID: 4662
+        Properties|contains:
+          - '1131f6aa-9c07-11d1-f79f-00c04fc2dcd2'
+          - '1131f6ad-9c07-11d1-f79f-00c04fc2dcd2'
+          - '89e95b76-444d-4c62-991a-0facbeda640c'
+      condition: selection
+    fields:
+      - SubjectUserName
+      - SubjectLogonId
+      - host.name
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in the hour before the alert?
+  context: >-
+    Operators frequently weaken protection before dumping credentials, and Mimikatz itself can load a driver
+    to bypass LSA protection (PPL). The query surfaces direct attempts to disable AV/EDR services, flip
+    Defender flags, add broad exclusions, clear logs, or patch AMSI/ETW. Zero rows is a useful "protection
+    looks healthy" signal — kernel-level driver tampering and in-memory patches will not appear here.
+    Populated rows shift the disposition toward operator preparation; review the parent process and signing
+    chain to identify the writer.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+- source: template:cue_user_actor.baseline
+  question: Has this user run the Mimikatz command-line pattern before?
+  context: >-
+    Compare this user's current action against their history. A user who has never run a credential-dumping
+    command line is far more suspicious than a security tester who does so regularly. The query looks for the
+    same Mimikatz pattern under this user across all hosts; zero or very low counts indicate first-time use.
+    If the alert fired under a service or machine account, this pivot is unreliable — read the parent+binary
+    baseline instead.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        CommandLine|contains:
+          - DumpCreds
+          - mimikatz
+          - '::'
+          - 'sekurlsa::'
+          - 'lsadump::'
+          - 'kerberos::'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is the parent process that launched this credential-dumping pattern historically routine in the environment?
+  context: >-
+    When the alert fires under a service or machine account, user identity does not attribute the behavior;
+    the meaningful pivot is the launch mechanism. This query mirrors the rule's pattern across the environment
+    and groups by the parent process so the analyst can see whether a known automation or operator shell
+    normally drives this activity. A new or rare parent for this pattern is the deviation worth chasing; a
+    parent already accounting for many prior events is more likely vendor or OS automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_tools_name:
+        CommandLine|contains:
+        - DumpCreds
+        - mimikatz
+      selection_function_names:
+        CommandLine|contains:
+        - ::aadcookie
+        - ::detours
+        - ::memssp
+        - ::mflt
+        - ::ncroutemon
+        - ::ngcsign
+        - ::printnightmare
+        - ::skeleton
+        - ::preshutdown
+        - ::mstsc
+        - ::multirdp
+      selection_module_names:
+        CommandLine|contains:
+        - 'rpc::'
+        - 'token::'
+        - 'crypto::'
+        - 'dpapi::'
+        - 'sekurlsa::'
+        - 'kerberos::'
+        - 'lsadump::'
+        - 'privilege::'
+        - 'process::'
+        - 'vault::'
+      condition: 1 of selection_*
+    fields:
+      - ParentImage
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around the time of this alert?
+  context: >-
+    Tracking the user's activity across all hosts in the alert window reveals lateral movement or staging on
+    other endpoints. If the same user triggered process activity on multiple hosts, the scope of compromise
+    may be larger than the alerting host. If the alert fired under a service or machine account, this pivot
+    returns agent-telemetry noise — read the parent+binary cross-host view instead.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did the same Mimikatz pattern fire on other hosts in the same window — a coordinated rollout, or isolated to this host?
+  context: >-
+    Under a service or machine account, "what else did this user do" returns noise from constantly running
+    agents. The meaningful question is whether the same credential-dumping pattern appeared on other hosts in
+    the alert window. Multiple hosts in the same window points to scripted or pushed deployment of the tool;
+    a single host points to a host-local, hands-on-keyboard trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_tools_name:
+        CommandLine|contains:
+        - DumpCreds
+        - mimikatz
+      selection_function_names:
+        CommandLine|contains:
+        - ::aadcookie
+        - ::detours
+        - ::memssp
+        - ::mflt
+        - ::ncroutemon
+        - ::ngcsign
+        - ::printnightmare
+        - ::skeleton
+        - ::preshutdown
+        - ::mstsc
+        - ::multirdp
+      selection_module_names:
+        CommandLine|contains:
+        - 'rpc::'
+        - 'token::'
+        - 'crypto::'
+        - 'dpapi::'
+        - 'sekurlsa::'
+        - 'kerberos::'
+        - 'lsadump::'
+        - 'privilege::'
+        - 'process::'
+        - 'vault::'
+      condition: 1 of selection_*
+    fields:
+      - host.name
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired this Mimikatz pattern, what parents and users normally drive it, and does the current alert fit?
+  context: >-
+    Even on a host where credential tooling is occasionally legitimate, the parent process and user that drive
+    it tend to be consistent. The query mirrors the rule's selection scoped to this host, so the resulting
+    parent/user distribution reflects how this specific pattern has historically run here. A new parent
+    process, an unexpected user account, or a first-ever appearance is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_tools_name:
+        CommandLine|contains:
+        - DumpCreds
+        - mimikatz
+      selection_function_names:
+        CommandLine|contains:
+        - ::aadcookie
+        - ::detours
+        - ::memssp
+        - ::mflt
+        - ::ncroutemon
+        - ::ngcsign
+        - ::printnightmare
+        - ::skeleton
+        - ::preshutdown
+        - ::mstsc
+        - ::multirdp
+      selection_module_names:
+        CommandLine|contains:
+        - 'rpc::'
+        - 'token::'
+        - 'crypto::'
+        - 'dpapi::'
+        - 'sekurlsa::'
+        - 'kerberos::'
+        - 'lsadump::'
+        - 'privilege::'
+        - 'process::'
+        - 'vault::'
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (1 of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:hacking_tool.tool_specific_artifacts
+  question: Are known Mimikatz file artifacts present on this host after the alert?
+  context: >-
+    Mimikatz leaves characteristic on-disk artifacts even after the process exits: LSASS dump files (.dmp),
+    exported Kerberos tickets (.kirbi), and saved registry hive copies (SAM/SYSTEM/SECURITY .save files).
+    Their presence confirms execution and reveals what was staged for offline extraction. Pair this with the
+    hive/dump-file question to build the full picture of what was written.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains:
+          - '.dmp'
+          - '.kirbi'
+          - '.save'
+          - 'lsass'
+          - 'mimi'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: template:credential_access.post_access_lateral_movement
+  question: Were any new logon sessions or remote connections initiated on this host after the alert?
+  context: >-
+    Credential theft is typically followed by use of the stolen credentials. Follow-on alerts for RDP, SMB,
+    WinRM, PsExec, or new authentication events shortly after the dump indicate the credentials are already
+    being exercised. DCSync may enable immediate lateral movement, while offline cracking of SAM hashes takes
+    longer, so weight the timing against the module that was used.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - rule.name
+      - rule.uuid
+      - event.severity_label
+- source: template:credential_access.credential_exposure_assessment
+  question: Which accounts may be compromised, and do any have elevated privileges?
+  context: >-
+    The severity of this event depends on the privilege level of the exposed accounts. If LSASS was dumped,
+    every account with an active logon session on this host is potentially exposed; if DCSync ran, the
+    replicated domain accounts (especially Domain Admin, Enterprise Admin, krbtgt, and service accounts) are
+    exposed. Cross-reference the affected accounts with directory group memberships — domain admin or krbtgt
+    exposure requires incident escalation and credential rotation.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired this Mimikatz pattern in the past week, and does the spread look like automation or isolated activity?
+  context: >-
+    The query mirrors the rule's selection with no host scope, returning a fleet-wide count of this
+    credential-dumping pattern rather than generic binary usage. Many hosts firing the same pattern points to
+    scripted deployment or a sanctioned assessment sweep; one host or a small unrelated set points to manual
+    operator activity. Use the host distribution to calibrate how broadly to respond.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_tools_name:
+        CommandLine|contains:
+        - DumpCreds
+        - mimikatz
+      selection_function_names:
+        CommandLine|contains:
+        - ::aadcookie
+        - ::detours
+        - ::memssp
+        - ::mflt
+        - ::ncroutemon
+        - ::ngcsign
+        - ::printnightmare
+        - ::skeleton
+        - ::preshutdown
+        - ::mstsc
+        - ::multirdp
+      selection_module_names:
+        CommandLine|contains:
+        - 'rpc::'
+        - 'token::'
+        - 'crypto::'
+        - 'dpapi::'
+        - 'sekurlsa::'
+        - 'kerberos::'
+        - 'lsadump::'
+        - 'privilege::'
+        - 'process::'
+        - 'vault::'
+      condition: 1 of selection_*
+    fields:
+    - host.name
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1003.001
+      name: LSASS Memory
+      role: primary
+    - id: T1003.002
+      name: Security Account Manager
+      role: secondary
+    - id: T1003.004
+      name: LSA Secrets
+      role: secondary
+    - id: T1003.005
+      name: Cached Domain Credentials
+      role: secondary
+    - id: T1003.006
+      name: DCSync
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: capability_selection
+      description: "Operator invokes a specific Mimikatz module / capability via the command line"
+      mapped_to: Q4
+      source: template:hacking_tool.tool_capability_used
+    - stage: 2
+      label: credential_store_access
+      description: "Module reads the targeted store — LSASS memory handle, SAM/SECURITY/SYSTEM hives, LSA secrets, cached creds, or DCSync replication"
+      mapped_to: Q6
+      source: attack:T1003.001.access_verification
+    - stage: 3
+      label: artifact_staging
+      description: "Dumped material is written to disk (hive .save, LSASS .dmp, .kirbi tickets)"
+      mapped_to: Q7
+      source: attack:T1003.002.tuning_parameter
+    - stage: 4
+      label: credential_reuse
+      description: "Stolen credentials used for lateral movement / new logon sessions"
+      mapped_to: Q16
+      source: template:credential_access.post_access_lateral_movement
+  dimension_coverage:
+    - dimension: access_verification
+      technique: T1003.001
+      covered_by: Q6
+      source: attack:T1003.001.access_verification
+      coverage_type: direct
+    - dimension: command_analysis
+      technique: T1003.001
+      covered_by: Q4
+      source: template:hacking_tool.tool_capability_used
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1003.001
+      covered_by: Q15
+      source: template:cue_process_tool.baseline_deviation
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1003.001
+      covered_by: Q6
+      source: attack:T1003.001.access_verification
+      coverage_type: partial
+    - dimension: tuning_parameter
+      technique: T1003.001
+      covered_by: Q7
+      source: attack:T1003.002.tuning_parameter
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1003.006
+      covered_by: Q8
+      source: attack:T1003.006.user_context
+      coverage_type: direct
+  mutable_dispositions:
+    - element: AccessMask
+      dimension: access_verification
+      specific_values: "0x1F0FFF (full access), 0x1010, 0x1410"
+      disposition: query_injection
+      target_question: Q6
+      notes: "Injected into process_access GrantedAccess|contains filter for the LSASS-handle question"
+    - element: DumpFilePath / TargetFilePath
+      dimension: tuning_parameter
+      specific_values: "%TEMP%, C:\\Windows\\Temp, C:\\Users\\Public, *.dmp, *.save"
+      disposition: query_injection
+      target_question: Q7
+      notes: "Hive names (\\SAM \\SYSTEM \\SECURITY) and dump suffixes injected into TargetFilename|contains"
+    - element: RegistryPath
+      dimension: tuning_parameter
+      specific_values: "HKLM\\SAM, HKLM\\SYSTEM, HKLM\\SECURITY"
+      disposition: context
+      target_question: Q7
+      notes: "Hive theft surfaced via the .save file-event artifacts rather than a separate registry_set query; see hint_dispositions registry_set decline"
+    - element: CommandLinePattern
+      dimension: command_analysis
+      specific_values: "rundll32, procdump, comsvcs.dll MiniDump, Invoke-Mimikatz, reg save"
+      disposition: context
+      target_question: Q5
+      notes: "Dumping syntax described in credential_target_identification context; the rule already keys on Mimikatz CLI strings"
+    - element: Properties (DCSync replication GUIDs)
+      dimension: user_context
+      specific_values: "1131f6aa-/1131f6ad-/89e95b76- DS-Replication-Get-Changes* control access rights"
+      disposition: query_injection
+      target_question: Q8
+      notes: "Injected into EventID 4662 Properties|contains for the DCSync security question (numbered Q8 in list)"
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "5 min (access->dump), 3 min (SAM->SYSTEM)"
+      disposition: context
+      target_question: Q6
+      notes: "Thresholds expressed as query ranges (+/-5m, +/-15m) rather than queryable fields"
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "rationale only (allowlist AV/EDR parents)"
+      disposition: context
+      target_question: Q15
+      notes: "Parent distribution surfaced by baseline_deviation; allowlisting guidance in context"
+  dedup_decisions:
+    - dropped: cue_process_tool.process_chain
+      reason: "Rule has no Image/parent in detection (CommandLine-only); the parent dimension is covered by cue_process_tool.baseline_deviation (ParentImage distribution) and the user_actor baseline_svc/clustering_svc parent pivots. A ProcessGuid->parent lookup adds no unique field beyond those."
+      kept: cue_process_tool.baseline_deviation
+    - dropped: cue_process_tool.baseline
+      reason: "Image-scoped frequency baseline is meaningless for a CommandLine-only rule with no %Image%; cue_process_tool.baseline_deviation provides the host-scoped historical view via the reflected detection pattern."
+      kept: cue_process_tool.baseline_deviation
+    - dropped: cue_process_tool.follow_on
+      reason: "ParentImage|endswith %Image% has no value (CommandLine-only rule). Follow-on impact is covered by credential_access.post_access_lateral_movement (alert correlation) and hacking_tool.tool_specific_artifacts (file artifacts)."
+      kept: template:credential_access.post_access_lateral_movement
+    - dropped: cue_process_tool.clustering
+      reason: "Host-wide tool co-occurrence overlaps cue_host_context.clustering and the user_actor clustering pivots; dropped under the 18-question cap as a generic, lower-signal sweep for a credential-access rule."
+      kept: template:cue_user_actor.clustering
+    - dropped: cue_host_context.clustering
+      reason: "Same host-wide co-occurrence intent as cue_process_tool.clustering; both are generic and lower-signal than the credential-specific chain questions. Dropped under the 18-question cap."
+      kept: template:cue_process_tool.baseline_deviation
+    - dropped: cue_host_context.precursor
+      reason: "Prior-alert timeline is partly covered by universal.endpoint_protection_health (tamper precursor, -1h) and credential_access.post_access_lateral_movement (follow-on alert correlation). Dropped under the 18-question cap to keep the chain-specific and user_actor questions; endpoint_protection_health is retained as the more specific precursor signal for a credential-access rule."
+      kept: template:universal.endpoint_protection_health
+    - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable; both emitted (user pivot + parent+binary substitute)"
+      kept: both
+    - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable; both emitted (user pivot + parent+binary substitute)"
+      kept: both
+  skipped_templates:
+    - template: cue_process_tool.mechanism_decode
+      reason: "replaced_by: credential_access.credential_target_identification (more specific Phase 2 question for a credential-access rule)"
+  hint_dispositions:
+    - hint: "logsource 'image_load' (recommended by techniques: T1003.004) is not covered — pull in cue_image_load.* or author a custom question with `category: image_load`"
+      disposition: declined
+      reason: >-
+        The LSA-secrets / LSASS image_load signal (unsigned DLL or lsasrv.dll
+        loaded into a credential-reading process) is a proxy for the same
+        in-memory access that the attack:T1003.001.access_verification
+        process_access question (LSASS full-access handle) measures directly.
+        The process_access view is more precise for this Mimikatz rule, which
+        operates via direct memory reads rather than DLL injection into LSASS.
+        No compensating attack:T1003.004.image_load question authored.
+    - hint: "logsource 'registry_set' (recommended by techniques: T1003.001,T1003.002) is not covered — pull in cue_registry_key.* or author a custom question with `category: registry_set`"
+      disposition: declined
+      reason: >-
+        The rule keys on Mimikatz module strings, not on reg.exe / registry
+        hive access. SAM/SYSTEM/SECURITY hive theft and dump staging are
+        surfaced as their file-event artifacts (.save files and HKLM hive
+        names) by attack:T1003.002.tuning_parameter, which is the durable
+        on-disk evidence of the same activity. A registry_set query would chase
+        a different tool (reg.exe) than the one this rule detects.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - credential_access
+    - hacking_tool
+    - cue_process_tool
+    - cue_user_actor
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 15
+      attack: 3
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 15
+    logsource_diversity:
+      process_creation: 13
+      process_access: 1
+      file_event: 2
+      security: 1
+      sigma_alert: 1

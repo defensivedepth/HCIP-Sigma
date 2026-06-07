@@ -1,0 +1,572 @@
+name: New DLL Registered Via Odbcconf.EXE
+id: 54349550-1895-41e9-9e8c-ebf2dd27a3aa
+description: |
+  Detects execution of odbcconf.exe with a REGSVR action and a .dll argument, which invokes DllRegisterServer on an arbitrary DLL — the same primitive as regsvr32.exe, but routed through a signed Microsoft ODBC utility to proxy a DLL load past application controls that only watch the usual suspects. The rule fires when the process image is odbcconf.exe (by name or OriginalFileName) AND the command line contains both 'REGSVR ' and '.dll'. Legitimate ODBC driver registration can produce this pattern, so the investigation should determine the path and provenance of the DLL being registered, what process invoked odbcconf.exe, and whether the registered module loads, spawns children, or makes outbound connections.
+type: detection
+detection_id: 9f0a8bf3-a65b-440a-8c1e-5cb1547c8e70
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line match a REGSVR action against a .dll through odbcconf.exe?
+  context: Before investing investigation time, confirm the alert is a true positive. The rule requires both that the image
+    is odbcconf.exe (by name or OriginalFileName) and that the command line contains a 'REGSVR ' action together with a '.dll'
+    argument. Read the full command line and note the exact DLL path being registered and whether a silent switch (/S) is present.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to register ODBC drivers or DLLs via odbcconf.exe?
+  context: Legitimate ODBC driver installation can trigger this detection, typically during software setup or by an installer
+    service. Knowing whether the user role and host function involve ODBC/database driver management is often the fastest way
+    to separate routine setup from proxy-execution abuse.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What is the full odbcconf.exe command line, and which DLL path and switches were passed to the REGSVR action?
+  context: The full command line reveals the specific DLL being registered and how. Decode the path that follows the REGSVR
+    action — a DLL under a user-writable or temporary directory (AppData, Temp, Public, the Installer cache) is far more concerning
+    than one under a vendor program-files path. Note whether the silent switch (/S) or a response-file switch (/F or -f) is
+    present, since those forms are the canonical abuse invocations.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: attack:T1218.008.image_load
+  question: Did odbcconf.exe load the registered DLL, and is that module signed and from an expected path?
+  context: After REGSVR registration, odbcconf.exe loads the target DLL to invoke its DllRegisterServer entry point. A module
+    loaded from a user-writable or temporary directory, or one that is unsigned, is the proxied payload rather than a legitimate
+    ODBC driver. If module-load telemetry is not collected in this environment, treat zero results as a visibility gap and
+    fall back to inspecting the DLL path on disk for signature and reputation.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith: \odbcconf.exe
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+- source: attack:T1218.008.network_connection
+  question: Did odbcconf.exe or a process it launched make outbound network connections shortly after the DLL was registered?
+  context: A proxied DLL frequently beacons or pulls a follow-on stage after it loads. Outbound connections from odbcconf.exe
+    itself, or from a child process it spawned, in the minutes after registration point to command-and-control or tool-transfer
+    activity rather than routine driver setup. Correlate the connection time against the odbcconf.exe execution time.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith: \odbcconf.exe
+      condition: selection
+    fields:
+      - Image
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+- source: template:cue_process_tool.follow_on
+  question: What child processes did odbcconf.exe spawn after registering the DLL?
+  context: The processes spawned after registration reveal the DLL's actual impact. A registered ODBC driver does not normally
+    spawn interpreters or network tools; child processes such as cmd.exe, powershell.exe, rundll32.exe, regsvr32.exe, or dllhost.exe
+    point to post-registration execution of the proxied payload.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.process_chain
+  question: What process spawned odbcconf.exe, and is that parent chain expected?
+  context: The parent process reveals how odbcconf.exe was invoked. Legitimate registration usually descends from an installer
+    or a setup process. Parents such as mshta.exe, wscript.exe, rundll32.exe, fodhelper.exe, an Office application, or a shell
+    reading from removable media indicate the binary was driven by a delivery chain rather than a driver install.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired the REGSVR-via-odbcconf pattern, what parents and users normally drove it, and
+    does the current alert fit that pattern?
+  context: Even a deprecated utility can have a legitimate registration footprint on a given host. The query mirrors the rule's
+    selection structure scoped to this host, so the resulting parent/user distribution reflects how this specific REGSVR-through-odbcconf
+    pattern has historically run here. A new parent process, an unexpected user account, or a DLL path unlike the prior baseline
+    is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \odbcconf.exe
+      - OriginalFileName: odbcconf.exe
+      selection_cli:
+        CommandLine|contains|all:
+        - 'REGSVR '
+        - .dll
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired the REGSVR-via-odbcconf pattern in the past week, and does the cross-host distribution look
+    like consistent automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of this
+    specific REGSVR-through-odbcconf pattern. Many hosts firing the same pattern points to scripted deployment or vendor automation;
+    one host or a small unrelated set points to manual operator activity. Use the host distribution and parent consistency
+    to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \odbcconf.exe
+      - OriginalFileName: odbcconf.exe
+      selection_cli:
+        CommandLine|contains|all:
+        - 'REGSVR '
+        - .dll
+      condition: all of selection_*
+    fields:
+    - host.name
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run odbcconf.exe?
+  context: Compare this user's current action against their historical behavior. A user who has never registered DLLs via odbcconf.exe
+    is more suspicious than one who does so regularly as part of database or driver administration. User role and typical toolset
+    should align with ODBC management.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent+odbcconf.exe combination historically routine on this host or across the environment, or is the parent
+    unusual for this binary?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior. The meaningful pivot
+    is the launch mechanism: which parent process spawned odbcconf.exe, and is that pair historically common. A new or rare
+    parent for odbcconf.exe on this host or environment-wide is the deviation worth chasing; a pair that already accounts for
+    thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints.
+    If the same user triggered similar activity on other hosts, the scope of the operation may be larger than this single alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent+odbcconf.exe combination fire on other hosts in the same window — is this a coordinated rollout
+    or isolated to this host?
+  context: Under a service principal, asking what else the user did across the network returns agent-telemetry noise. The meaningful
+    question is whether the same launch mechanism — parent process plus odbcconf.exe — fired on other hosts in the alert window.
+    Multiple hosts in the same window points to scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: 'Alerts rarely occur in isolation. Examining the activity surrounding the alert reveals the immediate context: what
+    led to the odbcconf.exe execution and what happened after. Look for reconnaissance, UAC bypass helpers, removable-media
+    access, or follow-on proxy binaries (rundll32.exe, regsvr32.exe, dllhost.exe) that frame this event within a larger sequence.'
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host — defense tampering, application-control bypasses, reconnaissance, or credential
+    access — may reveal the attack stages that preceded this registration and help reconstruct the full timeline. Proxy execution
+    through a signed binary is often a mid-chain step rather than the start.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in the hour before the alert?
+  context: Proxying a DLL load through odbcconf.exe is a way to evade application control, and operators frequently weaken AV/EDR
+    before running a payload. The query surfaces direct attempts to disable protection services, flip Defender flags, add broad
+    exclusions, clear logs, or patch AMSI/ETW. Zero rows is a useful health signal; populated rows shift the disposition toward
+    operator preparation — review the parent process and signing chain to identify the writer.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1218.008
+      name: Odbcconf
+      role: primary
+    - id: T1218
+      name: System Binary Proxy Execution
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: odbcconf_regsvr_execution
+      description: "Process creation of odbcconf.exe with a REGSVR action and a .dll argument"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 1b
+      label: command_decode
+      description: "Decode the REGSVR DLL path and switches to identify the registered module"
+      mapped_to: Q3
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 2
+      label: dll_load
+      description: "DLL load by odbcconf.exe of a non-standard or unsigned module"
+      mapped_to: Q4
+      source: attack:T1218.008.image_load
+    - stage: 3
+      label: follow_on_network
+      description: "Optional follow-on network activity from the loaded DLL"
+      mapped_to: Q5
+      source: attack:T1218.008.network_connection
+    - stage: 3b
+      label: follow_on_process
+      description: "Optional follow-on process creation from the loaded DLL"
+      mapped_to: Q6
+      source: template:cue_process_tool.follow_on
+  dimension_coverage:
+    - dimension: parent_process_analysis
+      technique: T1218.008
+      covered_by: Q7
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1218.008
+      covered_by: Q5
+      source: attack:T1218.008.network_connection
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1218.008
+      covered_by: Q8
+      source: template:cue_process_tool.baseline_deviation
+      coverage_type: direct
+    - dimension: command_analysis
+      technique: T1218
+      covered_by: Q3
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1218
+      covered_by: Q7
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1218
+      covered_by: Q9
+      source: template:cue_process_tool.scope
+      coverage_type: direct
+  mutable_dispositions:
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "rationale only (approved processes that may invoke odbcconf.exe)"
+      disposition: context
+      target_question: Q7
+      notes: "No fixed allowlist values in brief; process_chain question profiles the parent chain and names unexpected parents in context."
+    - element: AllowedCommandPatterns
+      dimension: tuning_parameter
+      specific_values: "rationale only (known-good odbcconf.exe arguments)"
+      disposition: context
+      target_question: Q8
+      notes: "baseline_deviation (REFLECTED) mirrors the rule's REGSVR/.dll selection host-scoped; deviation from prior command shape is the tuning angle."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only (correlation window for module loads / network after execution)"
+      disposition: query_injection
+      target_question: Q5
+      notes: "Network follow-on question uses +/-15m to correlate connections against odbcconf.exe execution time."
+    - element: ApprovedModuleHashes
+      dimension: tuning_parameter
+      specific_values: "rationale only (baseline of legitimate DLLs loaded by odbcconf.exe)"
+      disposition: context
+      target_question: Q4
+      notes: "image_load question surfaces ImageLoaded + signature so the analyst compares against approved modules; no hash list in brief."
+    - element: SignedBinaryList
+      dimension: tuning_parameter
+      specific_values: "rationale only (known signed binaries allowed for execution)"
+      disposition: context
+      target_question: Q4
+      notes: "Signature of the loaded module is projected in the image_load query fields; rule already pins the proxy binary to odbcconf.exe."
+    - element: CommandLineRegex
+      dimension: command_analysis
+      specific_values: "REGSVR, .dll (from rule), plus /S, /F, -f abuse switches"
+      disposition: context
+      target_question: Q3
+      notes: "mechanism_decode is KEEP-intent for the host+binary scope; rule's REGSVR/.dll pattern and the silent/response-file switches are called out in context for the analyst to inspect."
+    - element: RemoteDomainAllowlist
+      dimension: tuning_parameter
+      specific_values: "rationale only (suppress legitimate enterprise domains)"
+      disposition: context
+      target_question: Q5
+      notes: "Network question projects DestinationHostname/Ip so the analyst can excuse known-good destinations; no allowlist values in brief."
+  dedup_decisions:
+    - dropped: cue_process_tool.baseline
+      reason: "Generic host+binary baseline is subsumed by baseline_deviation (REFLECTED), which scopes to the rule's REGSVR/.dll firing pattern rather than all odbcconf.exe usage — the more specific signal."
+      kept: cue_process_tool.baseline_deviation
+    - dropped: cue_process_tool.clustering
+      reason: "Host-scoped 'what other tools ran' aggregation is covered by cue_host_context.clustering with the same +/-15m window and Image projection; the two queries are near-identical."
+      kept: cue_host_context.clustering
+    - dropped: null
+      reason: "user_actor pair — non-deduplicable (cue_user_actor.baseline + cue_user_actor.baseline_svc): subject-pivot vs. launch-mechanism pivot, kept as Q10/Q11."
+      kept: cue_user_actor.baseline, cue_user_actor.baseline_svc
+    - dropped: null
+      reason: "user_actor pair — non-deduplicable (cue_user_actor.clustering + cue_user_actor.clustering_svc): user network-wide pivot vs. parent+binary rollout pivot, kept as Q12/Q13."
+      kept: cue_user_actor.clustering, cue_user_actor.clustering_svc
+  skipped_templates: []
+  reflection_overrides: []
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+  generation_stats:
+    total_questions: 16
+    source_counts:
+      template: 14
+      attack: 2
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 13
+    logsource_diversity:
+      process_creation: 13
+      image_load: 1
+      network_connection: 1
+      sigma_alert: 1

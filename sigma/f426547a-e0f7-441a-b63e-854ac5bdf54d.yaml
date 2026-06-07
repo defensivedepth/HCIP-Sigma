@@ -1,0 +1,544 @@
+name: Perl Inline Command Execution
+id: e868645c-e93c-4779-9fc4-8f154431df30
+description: |
+  Detects perl.exe (matched by Image name or OriginalFileName) running with an inline-code flag in the form ' -e' on its
+  command line. The rule fires only when both conditions hold: the process is perl, and the command line contains a ' -e'
+  argument. Inline perl code is legitimate in development, build automation, and some packaged tooling, but the same flag
+  lets an operator run arbitrary code directly from the command line without a script file on disk — a common way to launch
+  reverse shells or stage follow-on activity. Investigation should decode the inline code, confirm the parent and user are
+  expected to run perl this way, and look for network connections or child processes that the inline code spawned.
+type: detection
+detection_id: f426547a-e0f7-441a-b63e-854ac5bdf54d
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-06
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line show perl running inline code via a ' -e' flag?
+  context: Confirm the alert is a true positive by reviewing the exact command line and binary identity. The rule fires when
+    the process is perl (by Image ending in perl.exe or by OriginalFileName perl.exe) AND the command line contains a ' -e'
+    argument, which tells perl to execute code supplied directly on the command line. Verify both the perl identity and the
+    inline-code flag are present in the alerting event.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run perl with inline code?
+  context: Legitimate inline perl is common on developer workstations, build agents, and hosts running packaged tools that
+    embed perl. Knowing whether the user role and host function involve perl development or automation is often the fastest
+    way to separate routine use from operator activity.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What does the inline perl code actually do? Decode the ' -e' argument and any chained commands.
+  context: The string passed after ' -e' is the operation. Read it for socket setup, file or process redirection, and execution
+    of a secondary shell — the canonical perl reverse shell opens a PF_INET/SOCK_STREAM socket to a remote host, dups STDIN,
+    STDOUT and STDERR onto it, and execs an interactive shell. Decode any encoded blobs, embedded IP addresses or ports, and
+    follow-on commands. This query scopes to all perl executions on this host in the surrounding window, since a single logical
+    operation may span more than one invocation.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+        CommandLine|contains: ' -e'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:cue_process_tool.process_chain
+  question: What process spawned this perl instance, and is that parent chain expected?
+  context: The parent process reveals how perl was invoked. A build system, package manager, or interactive shell launched
+    by explorer.exe is a routine parent for development use. Parents like a web server, an Office application, mshta.exe, or
+    wscript.exe point to exploitation or a malicious launcher rather than hands-on development.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.baseline
+  question: Does this host normally run perl?
+  context: A perl process that has never run on a host is more notable than one that runs regularly as part of builds or packaged
+    tooling. Zero or very low historical counts over the lookback window indicate first-time or rare execution and raise the
+    weight of the inline-code finding.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously run perl with inline code, what parents and users normally drive that activity, and
+    does the current alert fit that pattern?
+  context: Even routine tools get abused. This query mirrors the rule's selection — perl identity AND a ' -e' command line —
+    scoped to this host, so the resulting parent and user distribution reflects how the rule's specific firing pattern has
+    historically run here rather than generic perl usage. A new parent process, an unexpected user account, or an unusual
+    command-line shape is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \perl.exe
+      - OriginalFileName: perl.exe
+      selection_cli:
+        CommandLine|contains: ' -e'
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.follow_on
+  question: What child processes did this perl instance spawn afterward?
+  context: The processes spawned by inline perl reveal its actual impact. A reverse shell or stager typically execs a command
+    interpreter such as cmd.exe or powershell.exe, or pulls down additional tooling. Children that look like an interactive
+    shell or download utility shift the disposition toward operator activity.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: attack:T1059.command_and_control
+  question: Did this perl instance open any network connections, and to where?
+  context: The most common malicious use of inline perl is a reverse shell, which connects outbound to an operator-controlled
+    host over a raw TCP socket. Correlate the perl process by its ProcessGuid to outbound connections in the surrounding window
+    and check the destination address and port against expected build or update endpoints. An outbound connection to an unfamiliar
+    external address shortly after the inline-code execution is the network half of a reverse-shell pattern.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - DestinationIp
+      - DestinationPort
+      - Initiated
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run perl with inline code?
+  context: Compare this user's current action against their historical behavior. A user who has never run perl, or never run
+    it with a ' -e' inline-code flag, is more notable than a developer who does so routinely. The user's role and typical
+    toolset should align with command-line perl use.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent-and-perl combination historically routine on this host or across the environment, or is the parent
+    unusual for perl?
+  context: When the alert fires under a service principal, user identity does not attribute the behavior; the meaningful pivot
+    is the launch mechanism. Check which parent process spawned perl and whether that pair is historically common. A new or
+    rare parent for perl on this host or environment-wide is the deviation worth chasing, while a pair that already accounts
+    for thousands of prior events is build or packaging automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or parallel activity on multiple endpoints.
+    If the same user triggered similar perl or other interpreter activity on more than one host in the window, the scope is
+    larger than a single endpoint.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent-and-perl combination fire on other hosts in the same window, or is the activity isolated to
+    this host?
+  context: Under a service principal, asking what else the user did across the network returns agent-telemetry noise, because
+    every host runs service-owned processes constantly. The meaningful question is whether the same launch mechanism — the
+    parent process spawning perl — fired on other hosts in the alert window. Multiple hosts in the same window points to scheduled
+    or pushed automation, while a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining process activity around the alert reveals what led to this event and
+    what happened after, and whether the perl execution is part of a larger sequence such as reconnaissance, privilege escalation,
+    or persistence installation.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: attack:T1059.time_correlation
+  question: Did this perl execution occur inside expected administrative or build windows, or at an unusual hour for this host?
+  context: Interpreter abuse often runs outside normal administrative or scheduled-build windows. Compare the alert timestamp
+    against this host's historical perl activity by hour and against known maintenance windows. Inline perl that runs at an
+    hour when this host has no prior interpreter activity, and outside any documented automation schedule, is a deviation that
+    raises the weight of the finding.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \perl.exe
+      - OriginalFileName: perl.exe
+      selection_cli:
+        CommandLine|contains: ' -e'
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - CommandLine
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host — defense tampering, reconnaissance, or credential access — may reveal the stages
+    that preceded the perl execution and help reconstruct the timeline. The order in which detections fired often tells the
+    story of how the host reached this point.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in the hour before the alert?
+  context: Tampering typically precedes payload execution. The query surfaces direct attempts to disable AV/EDR services, flip
+    Defender flags, add broad exclusions, clear logs, or patch AMSI/ETW. Zero rows is a useful signal that protection looks
+    healthy — kernel-level driver tampering and in-memory patches will not appear here. Populated rows shift the disposition
+    toward operator preparation; review the parent process and signing chain to identify the writer.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1059
+      name: Command and Scripting Interpreter
+      role: primary
+  attack_chain_coverage:
+    - stage: 1
+      label: interpreter_invocation
+      description: "perl is invoked with an inline-code flag, executing code supplied on the command line rather than from a script file"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: inline_code_action
+      description: "The inline code performs its action — socket setup, redirection, or execution of a secondary shell"
+      mapped_to: Q3
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 3
+      label: secondary_execution
+      description: "Inline code execs follow-on processes or opens outbound connections (reverse-shell / stager pattern)"
+      mapped_to: Q7
+      source: template:cue_process_tool.follow_on
+    - stage: 4
+      label: command_and_control
+      description: "Outbound raw-TCP connection to operator host completes the reverse-shell pattern"
+      mapped_to: Q8
+      source: attack:T1059.command_and_control
+  dimension_coverage:
+    - dimension: command_analysis
+      technique: T1059
+      covered_by: Q3
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1059
+      covered_by: Q4
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1059
+      covered_by: Q14
+      source: attack:T1059.time_correlation
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1059
+      covered_by: Q6
+      source: template:cue_process_tool.baseline_deviation
+      coverage_type: indirect
+    - dimension: user_context
+      technique: T1059
+      covered_by: Q9
+      source: template:cue_user_actor.baseline
+      coverage_type: direct
+  mutable_dispositions:
+    - element: CommandLinePattern
+      dimension: command_analysis
+      specific_values: "rationale only (rule's concrete pattern is ' -e', already enforced)"
+      disposition: query_injection
+      target_question: Q3
+      notes: "Rule's ' -e' inline-code pattern injected into mechanism_decode CommandLine|contains so the decode question
+        scopes to inline-code invocations, not all perl runs. The mutable element itself carries no extra concrete values
+        beyond the rule's flag."
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q4
+      notes: "No specific parent values given by the analytic; parent legitimacy is investigated via process_chain and the
+        parent-pivot baseline/clustering questions."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only (work hours / maintenance windows)"
+      disposition: new_question
+      target_question: Q14
+      notes: "No concrete hour values supplied; authored a dedicated time-correlation question comparing the alert hour to
+        this host's historical inline-perl activity and known maintenance windows."
+  dedup_decisions:
+    - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable; emitted BOTH user-pivot and service-principal substitute"
+      kept: both (Q9 user-pivot, Q10 parent+binary substitute)
+    - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable; emitted BOTH user-pivot and service-principal substitute"
+      kept: both (Q11 user-pivot, Q12 parent+binary substitute)
+  skipped_templates:
+    - template: cue_process_tool.clustering
+      reason: "Subsumed by cue_host_context.clustering (Q13), which provides the same around-the-alert host activity view
+        with the Image+ParentImage aggregation; process_tool.clustering would produce a near-identical Image-only aggregation
+        on the same host scope."
+    - template: cue_process_tool.scope
+      reason: "Cross-host fleet count of the rule's firing pattern. Dropped to stay within the 18-question cap; the
+        cross-host coordination angle is already covered for the service-principal case by cue_user_actor.clustering_svc (Q12),
+        and host-level baseline/deviation (Q5, Q6) carry the recurrence signal. REFLECTED template left unmodified, not used."
+  reflection_overrides: []
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+  generation_stats:
+    total_questions: 16
+    source_counts:
+      template: 14
+      attack: 2
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 13
+    logsource_diversity:
+      process_creation: 14
+      network_connection: 1
+      sigma_alert: 1

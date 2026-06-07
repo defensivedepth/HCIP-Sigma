@@ -1,0 +1,566 @@
+name: Suspicious Microsoft OneNote Child Process
+id: a4359b3d-0737-4851-b010-68ead0614dbc
+description: |
+  Detects when Microsoft OneNote (onenote.exe) spawns a suspicious child process, which commonly indicates execution of a malicious embedded object inside a .one file. The rule fires when onenote.exe is the parent AND at least one of three conditions holds - the child is a known living-off-the-land binary by name or OriginalFileName, OR explorer.exe runs with a scriptable extension on its command line, OR the child runs from a user-writable staging path (AppData, ProgramData, Public, Windows Temp/Tasks) - and the activity is not a known Teams or OneDrive embedding launch. OneNote attachments became a phishing delivery vector where a victim is socially engineered into double-clicking an embedded file icon that launches a script host or interpreter; investigate whether the child execution is attacker-driven delivery versus a benign add-in or user action.
+type: detection
+detection_id: c27515df-97a9-4162-8a60-dc0eeb51b775
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-06
+questions:
+- source: template:universal.verify_trigger_match
+  question: Did onenote.exe spawn a child that matches any one of the rule's trigger branches?
+  context: >-
+    Confirm the alert is a true positive by reviewing the triggering event. The rule fires
+    when onenote.exe is the parent AND EITHER the child is a listed living-off-the-land binary
+    by Image name or OriginalFileName, OR it is explorer.exe carrying a scriptable extension
+    (.hta, .vb, .wsh, .js, .ps, .scr, .pif, .bat, .cmd) on its command line, OR the child runs
+    from a user-writable staging path (AppData, Public, ProgramData, Windows Tasks, Windows Temp).
+    Note which branch fired - the branch determines which downstream questions carry weight. A
+    name-branch fire points at the binary identity; a path-branch fire points at where the binary
+    was staged.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - OriginalFileName
+      - CommandLine
+  answer_sources:
+  - alert
+  - process_creation
+- source: template:universal.host_user_context
+  question: Is this user and host expected to open OneNote documents that launch interpreters or scripts?
+  context: >-
+    Legitimate OneNote use rarely spawns command interpreters, script hosts, or other living-off-the-land
+    binaries. Knowing whether the user routinely receives .one files and whether the host runs OneNote
+    add-ins or automation that legitimately invokes child tools is often the fastest way to separate a
+    benign add-in from socially engineered execution of an embedded object.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+  answer_sources:
+  - asset_inventory
+  - organizational_knowledge
+- source: template:initial_access.delivery_vector
+  question: What .one file or email attachment led OneNote to launch this child process?
+  context: >-
+    OneNote-based execution typically begins with a .one file delivered as an email attachment or
+    download that the victim opens, then double-clicks an embedded object icon. Identifying the source
+    file and how it arrived (mail attachment, web download, shared link) enables perimeter blocking and
+    a search for other recipients. The parent command line and recently opened .one files on the host
+    point to the originating document.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+  answer_sources:
+  - manual_review
+  - edr_console
+- source: template:parent_child.parent_process_legitimacy
+  question: Is onenote.exe expected to spawn this child, and what started OneNote itself?
+  context: >-
+    The onenote.exe-to-child relationship is the core signal. Tracing OneNote's own origin reveals
+    whether the chain is user-driven (a person opened a .one file from mail or a share) or part of an
+    automated launch. A scriptable child of OneNote is the embedded-object execution pattern; a benign
+    add-in launch usually has a predictable, signed helper as the child.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+  answer_sources:
+  - process_creation
+- source: template:masquerading.true_identity
+  question: What is the true identity of the child binary based on its metadata and hash?
+  context: >-
+    The rule matches both on-disk name (Image) and embedded metadata (OriginalFileName) because
+    delivered payloads are often renamed - a copied powershell.exe seen on disk as system32.bat.exe
+    still carries OriginalFileName PowerShell.exe. Comparing the Image path against OriginalFileName
+    exposes the renamed-tool pattern, and the signing chain plus hash distinguish a Microsoft-signed
+    system binary from an unsigned or tampered drop. Submit the hash for reputation checking.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - Hashes
+  answer_sources:
+  - process_creation
+  - external_threat_intel
+- source: template:cue_process_tool.mechanism_decode
+  question: What exactly did the spawned child binary do? Decode its full command line.
+  context: >-
+    The full command line reveals the operation. Decode any encoded or obfuscated content, flags,
+    file paths, and URLs. OneNote-delivered chains commonly fetch a remote payload via a script host
+    or interpreter, then stage a follow-on binary. Scoping to all executions of this binary on the
+    host within a few minutes captures multi-step invocations that together form one logical operation.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+  answer_sources:
+  - process_creation
+  - manual_review
+- source: template:powershell.encoded_command_decode
+  question: If the child is PowerShell, was the command encoded or obfuscated, and what does it decode to?
+  context: >-
+    When the spawned child is powershell.exe or pwsh.exe, OneNote-delivered chains frequently pass an
+    -EncodedCommand (-enc) base64 payload or use concatenation, backtick escaping, and variable
+    substitution to hide intent. Decoding reveals the actual payload - a download cradle, reverse shell,
+    or in-memory .NET assembly load. If the child is not a PowerShell process, this query returns the
+    triggering event for reference and the decode applies to the relevant interpreter instead.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - process_creation
+  - manual_review
+- source: attack:T1566.001.outbound_network
+  question: Did the spawned child make outbound network connections to fetch a payload or reach a remote host?
+  context: >-
+    Spearphishing-attachment chains continue with outbound activity - the script host or interpreter
+    reaches a file-transfer service or compromised site to download a follow-on payload, and a decoy
+    document is sometimes fetched in parallel to reassure the victim. Outbound connections from the
+    spawned child, especially to file-sharing or transfer services, corroborate active delivery rather
+    than a benign add-in launch.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+      - Initiated
+  answer_sources:
+  - network_connection
+- source: template:parent_child.sibling_processes
+  question: What other child processes did this same OneNote instance spawn?
+  context: >-
+    A single embedded-object launch often kicks off multiple processes - an interpreter that downloads,
+    a shell that stages, and a follow-on binary that runs the payload. Examining the siblings spawned by
+    the exact OneNote instance shows the full scope of activity initiated through this document.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+  answer_sources:
+  - process_creation
+- source: template:cue_parent_process.baseline
+  question: Has this OneNote-to-child binary pairing been seen on this host before?
+  context: >-
+    OneNote spawning a command interpreter or script host is rarely routine. Historical frequency of
+    this specific parent-child pairing on the host distinguishes a recurring benign add-in from a novel
+    spawning relationship. Zero or very low counts indicate first-time execution worth chasing.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+  answer_sources:
+  - process_creation
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run this child binary?
+  context: >-
+    Compare the user's current action against their historical behavior. A user who has never launched
+    this interpreter or tool is more suspicious than one who does so regularly. User role and typical
+    toolset should align with the spawned binary.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+  answer_sources:
+  - process_creation
+  - organizational_knowledge
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent and child binary pairing historically routine on this host or across the environment?
+  context: >-
+    When the alert fires under a service principal, user identity does not attribute behavior. The
+    meaningful pivot is the launch mechanism - which parent spawned this binary and whether that pair is
+    historically common. A new or rare parent for this binary is the deviation worth chasing; a pair that
+    already accounts for thousands of prior events is vendor or OS automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+  answer_sources:
+  - process_creation
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: >-
+    Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple
+    endpoints. If the same user triggered similar activity elsewhere, the scope of compromise may be
+    larger than this single host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+  answer_sources:
+  - process_creation
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent and child binary pairing fire on other hosts in the same window?
+  context: >-
+    Under a service principal, the user pivot returns agent-telemetry noise. The meaningful question is
+    whether the same launch mechanism - parent process plus spawned binary - fired on other hosts in the
+    alert window. Multiple hosts in the same window points to a phishing wave or pushed automation; a
+    single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+  answer_sources:
+  - process_creation
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: >-
+    Embedded-object execution rarely occurs in isolation. Examining activity in the minutes around the
+    alert reveals what led to the document opening, what the child staged afterward, and the timing
+    between document open, file creation, and process execution that characterizes a delivery chain.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+  answer_sources:
+  - process_creation
+  - file_event
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Earlier detections on the same host - reconnaissance, defense tampering, or other execution alerts -
+    may reveal the stages that preceded this event and help reconstruct the delivery timeline. The alert
+    sequence on a host often tells the order of the operation.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+  answer_sources:
+  - alert
+- source: template:initial_access.campaign_scope
+  question: Were other users or systems hit by the same OneNote child-process delivery?
+  context: >-
+    Phishing campaigns rarely target a single user. If one recipient opened a malicious .one file and it
+    spawned a suspicious child, others likely received the same attachment. Correlating this detection
+    across hosts reveals campaign breadth and identifies additional systems that need investigation.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        rule.uuid|expand: '%rule.uuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+  answer_sources:
+  - alert
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1566.001
+      name: Spearphishing Attachment
+      role: primary
+    - id: T1566
+      name: Phishing
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: attachment_delivery
+      description: "Inbound .one attachment delivered and opened in OneNote.exe"
+      mapped_to: Q3
+      source: template:initial_access.delivery_vector
+    - stage: 2
+      label: embedded_object_execution
+      description: "Victim double-clicks embedded object; OneNote spawns a script host / interpreter / LOLBin child"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 3
+      label: payload_decode
+      description: "Child interpreter decodes / executes the embedded or fetched payload"
+      mapped_to: Q6
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 4
+      label: outbound_network
+      description: "Child reaches a transfer service or compromised host to fetch the follow-on payload"
+      mapped_to: Q8
+      source: attack:T1566.001.outbound_network
+  dimension_coverage:
+    - dimension: tuning_parameter
+      technique: T1566
+      covered_by: Q1
+      source: template:universal.verify_trigger_match
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1566.001
+      covered_by: Q15
+      source: template:cue_host_context.clustering
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1566.001
+      covered_by: Q4
+      source: template:parent_child.parent_process_legitimacy
+      coverage_type: direct
+  mutable_dispositions:
+    - element: SuspiciousFileTypes
+      dimension: tuning_parameter
+      specific_values: "rationale only (.exe, .js, .vbs, .scr, macro-enabled docs)"
+      disposition: context
+      target_question: Q1
+      notes: "Rule already enumerates the scriptable extensions (.hta/.vb/.wsh/.js/.ps/.scr/.pif/.bat/.cmd) and the LOLBin list in its own detection; verify_trigger_match context surfaces them. No query injection needed - the rule's own selection is the filter."
+    - element: AllowedSenders
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q3
+      notes: "Sender allow-listing is mail-side tuning; surfaced as delivery-vector context (who sent the .one). Not queryable from process_creation."
+    - element: AttachmentExtensions
+      dimension: tuning_parameter
+      specific_values: "rationale only (.exe, .js, .vbs, .docm, .xlsm)"
+      disposition: context
+      target_question: Q1
+      notes: "Covered by the rule's own extension/binary list; verify_trigger_match context names the scriptable extensions."
+    - element: SuspiciousParentChildPairs
+      dimension: tuning_parameter
+      specific_values: "rationale only (e.g., office.exe -> powershell.exe)"
+      disposition: context
+      target_question: Q4
+      notes: "The onenote.exe -> child pairing IS the rule's parent-child signal; parent_process_legitimacy investigates it directly."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only (correlation window email->file->process)"
+      disposition: context
+      target_question: Q15
+      notes: "host_context.clustering at +/-15m provides the correlation window between document open, child spawn, and follow-on activity."
+  dedup_decisions:
+    - dropped: cue_process_tool.process_chain
+      reason: "parent_process is the primary cue (ParentImage onenote.exe in detection) - per hint, cue_process_tool:process_chain is subsumed by the parent-process questions"
+      kept: parent_child.parent_process_legitimacy
+    - dropped: cue_parent_process.mechanism_decode
+      reason: "parent_child technique set active - parent_child.parent_process_legitimacy is the more specific parent-origin question"
+      kept: parent_child.parent_process_legitimacy
+    - dropped: cue_parent_process.follow_on
+      reason: "duplicate of parent_child.sibling_processes (children of the same parent); sibling_processes scopes by exact ParentProcessGuid (more precise)"
+      kept: parent_child.sibling_processes
+    - dropped: cue_parent_process.clustering
+      reason: "duplicate of cue_host_context.clustering and parent_child.sibling_processes for around-the-alert parent activity"
+      kept: cue_host_context.clustering
+    - dropped: cue_parent_process.scope
+      reason: "duplicate of initial_access.campaign_scope (cross-host spread of the same detection); campaign_scope pivots on rule.uuid which is the precise phishing-wave signal"
+      kept: initial_access.campaign_scope
+    - dropped: cue_process_tool.baseline
+      reason: "duplicate of cue_parent_process.baseline / cue_user_actor.baseline_svc which already aggregate parent+binary frequency"
+      kept: cue_parent_process.baseline
+    - dropped: cue_user_actor pair (baseline + baseline_svc, clustering + clustering_svc)
+      reason: "user_actor pair - non-deduplicable; both user-pivot and service-principal-substitute variants emitted per AGENTS.md"
+      kept: all four emitted (Q11-Q14)
+  skipped_templates:
+    - template: obfuscation.encoded_payload_decode
+      reason: "replaced_by: powershell.encoded_command_decode (acted on the hint - PS decode question Q7 supersedes the generic obfuscation decode)"
+    - template: scheduled_task.task_configuration
+      reason: "Confirmed set fired only because schtasks.exe is one of ~40 binaries in the rule's option list. The rule detects ANY suspicious OneNote child, not scheduled-task creation specifically. task_configuration is ProcessGuid re-display scoped to schtasks; it would be dead weight when the child is mshta/wscript/regasm/etc. cue_process_tool.mechanism_decode (Q6) decodes whatever child fired, including schtasks args."
+    - template: scheduled_task.task_trigger_and_timing
+      reason: "Same as task_configuration - schtasks is incidental to the option list, not the rule's behavior. No scheduled-task persistence is the detected action."
+    - template: scheduled_task.task_still_present
+      reason: "Same - scheduled-task persistence is not what this rule detects; the rule fires on initial-access execution from OneNote."
+    - template: powershell.script_block_logging
+      reason: "Applies only to the powershell-child branch (1 of ~40 possible children). For mshta/wscript/regasm/curl fires it returns nothing relevant. One PowerShell decode question (Q7) is retained for the common PS payload branch; a second PS-only question over-fits a multi-binary rule."
+    - template: powershell.powershell_security_bypass
+      reason: "Same as script_block_logging - powershell.exe is one branch of the option list. AMSI/execution-policy bypass is not part of this rule's detection logic; keeping it would add a PS-only question to a rule that fires on many non-PS binaries."
+    - template: download_tool (set)
+      reason: "Confirmed only because bitsadmin.exe/curl.exe are in the option list. Download behavior is covered behaviorally by the outbound-network question (Q8) and mechanism_decode (Q6) without binding the playbook to bitsadmin-specific download questions for a multi-binary rule."
+    - template: persistence_scope.process_based_persistence
+      reason: "Confirmed only because bitsadmin/schtasks appear in the option list. This rule detects initial-access execution from OneNote, not persistence installation; process-persistence questions are off-axis for the detected behavior."
+    - template: persistence_scope.file_based_persistence
+      reason: "Same - persistence is not the detected behavior. The file_event slot is better spent on the network/delivery axis (Q8) that matches the spearphishing chain."
+    - template: initial_access.application_patch_status
+      reason: "OneNote child-process execution is social-engineering driven (victim double-clicks an embedded object), not exploitation of an unpatched CVE. Patch status of OneNote is not the disposition lever here; slot reserved for delivery/scope questions that match the technique."
+    - template: masquerading.binary_origin
+      reason: "true_identity (Q5) already establishes the OriginalFileName/Image mismatch and hash. binary_origin (-30d file_event by basename) targets a renamed-tool-staged-long-ago scenario; for OneNote delivery the binary arrives at execution time, covered by delivery_vector (Q3) and the around-alert host context."
+    - template: masquerading.renamed_binary_activity
+      reason: "Local post-execution activity is covered by sibling_processes (Q9) and mechanism_decode (Q6); cross-host scope is covered by campaign_scope (Q17). The dedicated renamed-binary scope question would duplicate those."
+    - template: universal.endpoint_protection_health
+      reason: "RECOMMENDED, not must_include. This rule fires at initial-access/execution from a document open, not on a hands-on-keyboard payload that an operator would precede by disabling AV/EDR. cue_host_context.precursor (Q16) already surfaces any prior tamper alerts on the host, so the generic tamper sweep adds no disposition value here."
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "scheduled_task.task_configuration replaces cue_process_tool.mechanism_decode"
+      disposition: declined
+      reason: >-
+        Declined the replacement. scheduled_task fired only because schtasks.exe is one of ~40 binaries
+        in the rule's option list; the rule detects ANY suspicious OneNote child, not scheduled-task
+        creation. Using task_configuration (schtasks-scoped ProcessGuid re-display) as the Phase 2 decode
+        would be dead weight when the child is mshta/wscript/regasm/curl/etc. cue_process_tool.mechanism_decode
+        (Q6) is retained as the Phase 2 decode because it adapts to whatever child binary actually fired,
+        including schtasks command-line arguments.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - initial_access
+    - parent_child
+    - masquerading
+    - powershell
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 16
+      attack: 1
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 2
+      context: 13
+    logsource_diversity:
+      process_creation: 14
+      network_connection: 1
+      sigma_alert: 2

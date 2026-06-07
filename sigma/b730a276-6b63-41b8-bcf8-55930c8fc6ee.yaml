@@ -1,0 +1,743 @@
+name: Csc.EXE Execution Form Potentially Suspicious Parent
+id: 2369c69e-1900-48af-89bf-f6d6da47396a
+description: |
+  Detects csc.exe (the .NET C# command-line compiler) spawned by a parent that is unusual for legitimate development:
+  an Office application or script host (cscript, wscript, mshta, winword, excel, outlook, powerpnt, onenote), a
+  powershell.exe/pwsh.exe parent whose command line carries -Encoded or FromBase64String, OR a parent command line that
+  references a user-writable staging path (ProgramData, AppData, Public, Windows\Temp, Favorites, Contacts, Pictures).
+  Compile-after-delivery uses csc.exe to turn a dropped source file into a DLL or EXE on the endpoint, evading signature
+  and reputation controls that would catch a pre-built binary; the same pattern fires for benign in-app compilation, so
+  the investigation centers on what the parent is, what source was compiled, and where the output went.
+type: detection
+detection_id: b730a276-6b63-41b8-bcf8-55930c8fc6ee
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-06
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does this event match the rule — csc.exe whose parent is EITHER a script host or Office app, OR an encoded
+    PowerShell, OR a process launched from a user-writable path?
+  context: Confirm the alert is a true positive before investing analysis time. The rule fires on csc.exe (Image ends in
+    \csc.exe or OriginalFileName csc.exe) when at least one of three parent branches matches, and none of the legitimate
+    filters (Program Files parents, sdiagnhost, w3wp, chocolatey, Defender ATP, Ansible) apply. Note which branch fired —
+    a known script-host parent, an encoded PowerShell parent, or a parent command line pointing at a user-writable
+    location — because that branch determines which downstream questions carry the most weight.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+      - Image
+      - OriginalFileName
+- source: template:universal.host_user_context
+  question: Is this user and host expected to compile C# source with csc.exe?
+  context: Legitimate csc.exe use comes from developer workstations, build agents, and a handful of system maintenance
+    paths. On a general-purpose endpoint or a user with no development role, on-the-fly compilation driven by a script
+    host or Office parent is anomalous and is often the fastest way to separate a real detection from routine build
+    activity.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:parent_child.parent_process_legitimacy
+  question: Is this parent expected to spawn csc.exe, and what started the parent itself?
+  context: The parent-child relationship is the core signal here. csc.exe launched by a developer IDE or build tool is
+    routine; csc.exe launched by cscript, wscript, mshta, or an Office application is not. Tracing the parent's own origin
+    (grandparent process) shows whether the chain began with a user opening a document or with an automated script,
+    distinguishing a benign build from a delivery chain that compiled a payload after landing.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- source: template:cue_parent_process.mechanism_decode
+  question: What script, macro, or document did the parent process execute that led to this compile?
+  context: The parent's own command line reveals how the chain was initiated. A script-host parent (cscript/wscript/mshta)
+    shows the script file it ran; an Office parent points to the document and embedded macro or object; an encoded
+    PowerShell parent carries the -Encoded or FromBase64String payload that produced the compile step. Reading the
+    parent's command line and its grandparent identifies the entry point.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+- source: template:cue_process_tool.mechanism_decode
+  question: What did csc.exe actually compile — which source file was the input, and what output binary did it produce?
+  context: Parse the full csc.exe command line to identify the source file (a dropped .cs read from a user-writable path)
+    and the output (the /out target, typically a .dll or .exe written to a user-writable path). Compile-after-delivery
+    turns delivered source into a binary on the endpoint; the input and output paths are the artifacts to recover and
+    hash. This shows every csc.exe invocation on the host in the surrounding window, which may include multiple
+    sequential compiles that form one operation.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:obfuscation.encoded_payload_decode
+  question: If the parent is PowerShell, what does its -Encoded or FromBase64String payload decode to, and what operation
+    does the decoded content perform?
+  context: The PowerShell parent branch fires specifically on -Encoded or FromBase64String in the parent command line —
+    base64-wrapped script that hides the operation from casual inspection. Decode the payload to reveal the actual intent —
+    a download cradle, a reflective in-memory loader, or the routine that writes the source file csc.exe then compiles.
+    For multi-layer encoding, iterate decoding until the script is readable. If the parent is a script host instead,
+    reconstruct any Chr() or fromCharCode string-building in the script it ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:parent_child.sibling_processes
+  question: What other child processes did the same parent spawn?
+  context: A parent that spawned csc.exe to compile a payload often spawned other processes too — the script host that
+    wrote the source, a follow-on loader that runs the compiled DLL, or reconnaissance tools. Examining siblings of the
+    same parent instance reveals the full scope of activity launched through this chain; multiple suspicious children
+    from one parent points to orchestrated execution rather than an isolated compile.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:initial_access.delivery_vector
+  question: What email, document, or web request triggered this execution?
+  context: When the parent is an Office application or a script host, the chain usually begins with a phishing document or
+    a downloaded script. Identifying the delivery vector — the sender, the document or script filename in the parent
+    command line, or the originating link — enables perimeter blocking and a search for other recipients who received the
+    same lure. For an Office parent, the ParentCommandLine often carries the document path.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+- source: template:initial_access.campaign_scope
+  question: Did this same detection fire on other hosts or for other users recently?
+  context: Phishing and delivery campaigns rarely hit a single user. If one endpoint compiled a payload after opening a
+    document, others may have received the same lure. Correlating this rule across all hosts reveals campaign breadth and
+    surfaces additional endpoints that need the same investigation.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        rule.uuid|expand: '%rule.uuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:universal.evidence_preservation
+  question: Are the compiled output binary and the source file still on disk for analysis?
+  context: csc.exe reads a source file and writes a compiled DLL or EXE, both typically under user-writable paths derived
+    from the command line. Checking whether those files still exist enables hashing, reputation lookups, and content
+    review. Recovering the source shows exactly what was compiled; recovering the output gives the binary to detonate or
+    submit. File paths come from the csc.exe command line surfaced earlier.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: attack:T1027.004.network_connection
+  question: Did the compiled output binary or its parent chain make outbound network connections shortly after the compile?
+  context: Compile-after-delivery commonly precedes execution of the new binary, which then reaches out to retrieve a
+    follow-on stage or to establish command and control. Outbound connections from the host in the window after the
+    compile — excluding routine system processes — help confirm the compiled artifact ran and identify the endpoints it
+    contacted for blocking. Correlate the connection time against the compile time to establish the compile-then-C2
+    sequence.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      filter_system:
+        Image|startswith:
+          - C:\Windows\System32\
+          - C:\Windows\SysWOW64\
+      condition: selection and not filter_system
+    fields:
+      - Image
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+- source: template:lolbin.renamed_binary_check
+  question: Was csc.exe executed from its expected .NET Framework path?
+  context: csc.exe normally lives under %windir%\Microsoft.NET\Framework[64]\<version>\. A csc.exe running from a user
+    temp directory, a download folder, or another non-standard path may have been copied or renamed to evade path-based
+    allowlists, which raises suspicion independent of the parent. Compare the Image path against OriginalFileName.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- source: template:lolbin.technique_class_lateral
+  question: Were any other compiler or proxy-execution LOLBins used on this host recently?
+  context: Operators who compile after delivery often pair csc.exe with other living-off-the-land binaries that build or
+    proxy-execute code — ilasm, msbuild, installutil, regasm, rundll32, regsvr32, mshta. Finding several of these on the
+    same host in the same window strengthens the case that the compile was part of a payload-staging chain rather than an
+    isolated build action.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_img:
+        Image|endswith:
+          - '\ilasm.exe'
+          - '\msbuild.exe'
+          - '\installutil.exe'
+          - '\regasm.exe'
+          - '\regsvcs.exe'
+          - '\rundll32.exe'
+          - '\regsvr32.exe'
+          - '\mshta.exe'
+          - '\cmstp.exe'
+          - '\msiexec.exe'
+      condition: selection and selection_img
+    fields:
+      - Image
+      - CommandLine
+- source: template:lolbin.historical_lolbin_baseline
+  question: How often has this host fired the csc.exe suspicious-parent pattern over the past 90 days, and what
+    command-line shapes are typical?
+  context: A csc.exe-from-suspicious-parent pattern with no prior history on a host is more suspicious than one that
+    recurs under stable conditions. The query mirrors the rule's full selection structure scoped to this host, so the
+    count reflects the rule's specific firing pattern rather than generic csc.exe usage. The CommandLine projection lets
+    the analyst compare the typical invocation shapes against the alerting one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \csc.exe
+      - OriginalFileName: csc.exe
+      selection_parent_generic:
+        ParentImage|endswith:
+        - \cscript.exe
+        - \excel.exe
+        - \mshta.exe
+        - \onenote.exe
+        - \outlook.exe
+        - \powerpnt.exe
+        - \winword.exe
+        - \wscript.exe
+      selection_parent_powershell:
+        ParentImage|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+        ParentCommandLine|contains:
+        - '-Encoded '
+        - FromBase64String
+      selection_parent_susp_location:
+      - ParentCommandLine|re: (?:[Pp]rogram[Dd]ata|%(?:[Ll]ocal)?[Aa]pp[Dd]ata%|\\[Aa]pp[Dd]ata\\(?:[Ll]ocal(?:[Ll]ow)?|[Rr]oaming))\\[^\\]{1,256}$
+      - ParentCommandLine|contains:
+        - :\PerfLogs\
+        - :\Users\Public\
+        - :\Windows\Temp\
+        - \Temporary Internet
+      - ParentCommandLine|contains|all:
+        - :\Users\
+        - \Favorites\
+      - ParentCommandLine|contains|all:
+        - :\Users\
+        - \Favourites\
+      - ParentCommandLine|contains|all:
+        - :\Users\
+        - \Contacts\
+      - ParentCommandLine|contains|all:
+        - :\Users\
+        - \Pictures\
+      filter_main_programfiles:
+        ParentImage|startswith:
+        - C:\Program Files (x86)\
+        - C:\Program Files\
+      filter_main_sdiagnhost:
+        ParentImage: C:\Windows\System32\sdiagnhost.exe
+      filter_main_w3p:
+        ParentImage: C:\Windows\System32\inetsrv\w3wp.exe
+      filter_optional_chocolatey:
+        ParentImage: C:\ProgramData\chocolatey\choco.exe
+      filter_optional_defender:
+        ParentCommandLine|contains: \ProgramData\Microsoft\Windows Defender Advanced Threat Protection
+      filter_optional_ansible:
+        ParentCommandLine|contains:
+        - JwB7ACIAZgBhAGkAbABlAGQAIgA6AHQAcgB1AGUALAAiAG0AcwBnACIAOgAiAEEAbgBzAGkAYgBsAGUAIAByAGUAcQB1AGkAcgBlAHMAIABQAG8AdwBlAHIAUwBoAGUAbABsACAAdgAzAC4AMAAgAG8AcgAgAG4AZQB3AGUAcgAiAH0AJw
+        - cAewAiAGYAYQBpAGwAZQBkACIAOgB0AHIAdQBlACwAIgBtAHMAZwAiADoAIgBBAG4AcwBpAGIAbABlACAAcgBlAHEAdQBpAHIAZQBzACAAUABvAHcAZQByAFMAaABlAGwAbAAgAHYAMwAuADAAIABvAHIAIABuAGUAdwBlAHIAIgB9ACcA
+        - nAHsAIgBmAGEAaQBsAGUAZAAiADoAdAByAHUAZQAsACIAbQBzAGcAIgA6ACIAQQBuAHMAaQBiAGwAZQAgAHIAZQBxAHUAaQByAGUAcwAgAFAAbwB3AGUAcgBTAGgAZQBsAGwAIAB2ADMALgAwACAAbwByACAAbgBlAHcAZQByACIAfQAnA
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection_img and 1 of selection_parent_* and not 1 of filter_main_* and not 1 of filter_optional_*) and _pb_scope
+    fields:
+    - CommandLine
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run csc.exe?
+  context: Compare this user's current action against their historical behavior. A user who has never invoked csc.exe — or
+    only under a developer toolchain — running it from a script-host or Office parent is a stronger signal than a
+    developer for whom compilation is routine. User role and typical toolset should align.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent+csc.exe combination historically routine on this host or across the environment, or is the
+    parent unusual for csc.exe?
+  context: When the alert fires under a service principal, user identity does not attribute behavior. The meaningful pivot
+    is the launch mechanism — which parent process spawned csc.exe, and whether that pair is historically common. A new or
+    rare parent for csc.exe on this host or environment-wide is the deviation worth chasing; a pair that already accounts
+    for thousands of prior events is build automation or OS tooling.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints.
+    If the same user triggered related activity on other hosts in the alert window, the scope of compromise may be larger
+    than the single detection.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent+csc.exe combination fire on other hosts in the same window — a coordinated rollout, or
+    activity isolated to this host?
+  context: Under a service principal, asking what else the user did across the network returns agent-telemetry noise. The
+    meaningful question is whether the same launch mechanism — parent process plus csc.exe — fired on other hosts in the
+    alert window. Multiple hosts in the same window points to scheduled or pushed automation; a single host points to a
+    host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1027.004
+      name: Compile After Delivery
+      role: primary
+    - id: T1059.005
+      name: Visual Basic
+      role: secondary
+    - id: T1059.007
+      name: JavaScript
+      role: secondary
+    - id: T1218.005
+      name: Mshta
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: delivery_and_parent_initiation
+      description: "An Office app or script host (or an encoded PowerShell, or a process run from a user-writable path) is the parent that initiates the chain"
+      mapped_to: Q3
+      source: template:parent_child.parent_process_legitimacy
+    - stage: 2
+      label: source_written_and_compiled
+      description: "csc.exe compiles a delivered source file into a DLL/EXE on the endpoint (compile after delivery)"
+      mapped_to: Q5
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 3
+      label: encoded_payload_in_parent
+      description: "The initiating script/PowerShell carries encoded content that writes the source and drives the compile"
+      mapped_to: Q6
+      source: template:obfuscation.encoded_payload_decode
+    - stage: 4
+      label: compiled_output_execution_and_c2
+      description: "The newly compiled binary executes and reaches out for a follow-on stage or C2"
+      mapped_to: Q11
+      source: attack:T1027.004.network_connection
+  dimension_coverage:
+    - dimension: obfuscation_check
+      technique: T1059.005
+      covered_by: Q6
+      source: template:obfuscation.encoded_payload_decode
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1059.005
+      covered_by: Q3
+      source: template:parent_child.parent_process_legitimacy
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1059.005
+      covered_by: Q11
+      source: attack:T1027.004.network_connection
+      coverage_type: indirect
+    - dimension: tuning_parameter
+      technique: T1059.005
+      covered_by: Q14
+      source: template:lolbin.historical_lolbin_baseline
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1059.005
+      covered_by: Q15
+      source: template:cue_user_actor.baseline
+      coverage_type: direct
+    - dimension: command_analysis
+      technique: T1059
+      covered_by: Q5
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1059
+      covered_by: Q4
+      source: template:cue_parent_process.mechanism_decode
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1059
+      covered_by: Q14
+      source: template:lolbin.historical_lolbin_baseline
+      coverage_type: indirect
+    - dimension: tuning_parameter
+      technique: T1059
+      covered_by: Q14
+      source: template:lolbin.historical_lolbin_baseline
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1059
+      covered_by: Q2
+      source: template:universal.host_user_context
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1059.007
+      covered_by: Q3
+      source: template:parent_child.parent_process_legitimacy
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1059.007
+      covered_by: Q11
+      source: attack:T1027.004.network_connection
+      coverage_type: indirect
+    - dimension: tuning_parameter
+      technique: T1059.007
+      covered_by: Q12
+      source: template:lolbin.renamed_binary_check
+      coverage_type: partial
+    - dimension: user_context
+      technique: T1059.007
+      covered_by: Q15
+      source: template:cue_user_actor.baseline
+      coverage_type: direct
+    - dimension: command_analysis
+      technique: T1218.005
+      covered_by: Q4
+      source: template:cue_parent_process.mechanism_decode
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1218.005
+      covered_by: Q11
+      source: attack:T1027.004.network_connection
+      coverage_type: indirect
+    - dimension: tuning_parameter
+      technique: T1218.005
+      covered_by: Q14
+      source: template:lolbin.historical_lolbin_baseline
+      coverage_type: direct
+    - dimension: command_analysis
+      technique: T1218
+      covered_by: Q5
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1218
+      covered_by: Q3
+      source: template:parent_child.parent_process_legitimacy
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1218
+      covered_by: Q13
+      source: template:lolbin.technique_class_lateral
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1027.004
+      covered_by: Q3
+      source: template:parent_child.parent_process_legitimacy
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1027.004
+      covered_by: Q11
+      source: attack:T1027.004.network_connection
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1027.004
+      covered_by: Q10
+      source: template:universal.evidence_preservation
+      coverage_type: partial
+    - dimension: obfuscation_check
+      technique: T1027
+      covered_by: Q6
+      source: template:obfuscation.encoded_payload_decode
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1027
+      covered_by: Q11
+      source: attack:T1027.004.network_connection
+      coverage_type: indirect
+    - dimension: tuning_parameter
+      technique: T1027
+      covered_by: Q14
+      source: template:lolbin.historical_lolbin_baseline
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1027
+      covered_by: Q15
+      source: template:cue_user_actor.baseline
+      coverage_type: direct
+  mutable_dispositions:
+    - element: ParentProcess
+      dimension: parent_process_analysis
+      specific_values: "Office apps (winword/excel/outlook/powerpnt/onenote), script hosts (cscript/wscript/mshta), powershell/pwsh"
+      disposition: query_injection
+      target_question: Q14
+      notes: "Parent list is the rule's selection_parent_* blocks, embedded verbatim in the reflected historical baseline query"
+    - element: OutputDirectoryPath
+      dimension: tuning_parameter
+      specific_values: "C:\\Users\\Public, %TEMP%, AppData, ProgramData (user-writable output zones)"
+      disposition: context
+      target_question: Q10
+      notes: "Surfaced in evidence_preservation context and via %file_paths% scoping; csc output/source paths come from the command line"
+    - element: ScriptPath
+      dimension: tuning_parameter
+      specific_values: "%TEMP%, user download folder, UNC/web path"
+      disposition: context
+      target_question: Q4
+      notes: "Parent script/source path read from ParentCommandLine in mechanism_decode"
+    - element: CommandLinePattern
+      dimension: command_analysis
+      specific_values: "-Encoded , FromBase64String (PowerShell parent branch)"
+      disposition: query_injection
+      target_question: Q14
+      notes: "Encoded-PowerShell parent values embedded in reflected baseline query; decoded in Q6"
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q11
+      notes: "Compile-then-C2 correlation window expressed as +1h network query range"
+    - element: PayloadEntropyThreshold
+      dimension: obfuscation_check
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q6
+      notes: "High-entropy/encoded-content rationale informs the decode question; no queryable threshold"
+    - element: ModuleName
+      dimension: tuning_parameter
+      specific_values: "vbscript.dll, scrrun.dll, jscript modules"
+      disposition: context
+      target_question: Q4
+      notes: "Script-engine module context folded into parent mechanism_decode; image_load logsource declined (see hint_dispositions)"
+    - element: AllowedHTASources
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q8
+      notes: "Allowlist tuning rationale for mshta parents; informs delivery_vector context"
+    - element: SignedBinaryList
+      dimension: tuning_parameter
+      specific_values: "ilasm, msbuild, installutil, regasm, rundll32, regsvr32, mshta, cmstp, msiexec"
+      disposition: query_injection
+      target_question: Q13
+      notes: "Compiler/proxy-execute LOLBin list injected into technique_class_lateral selection_img"
+  dedup_decisions:
+    - dropped: cue_process_tool.process_chain
+      reason: "parent_process is primary cue and parent_child technique set active — parent_process_legitimacy subsumes process_chain (hint 1)"
+      kept: parent_child.parent_process_legitimacy
+    - dropped: cue_user_actor pair
+      reason: "user_actor pair — non-deduplicable; baseline+baseline_svc and clustering+clustering_svc all emitted (Q15-Q18)"
+      kept: cue_user_actor.baseline, cue_user_actor.baseline_svc, cue_user_actor.clustering, cue_user_actor.clustering_svc
+    - dropped: cue_parent_process.baseline
+      reason: "parent_child.parent_process_legitimacy + cue_user_actor.baseline_svc cover parent-child historical frequency; avoids a third overlapping baseline"
+      kept: cue_user_actor.baseline_svc
+    - dropped: cue_parent_process.follow_on
+      reason: "parent_child.sibling_processes covers children of the same parent instance with tighter ParentProcessGuid scope"
+      kept: parent_child.sibling_processes
+    - dropped: cue_parent_process.clustering
+      reason: "cue_host_context activity-around-alert intent overlaps; under 18-cap, sibling_processes + network correlation carry the around-alert context"
+      kept: parent_child.sibling_processes
+    - dropped: cue_parent_process.scope
+      reason: "initial_access.campaign_scope (rule.uuid fleet correlation) covers cross-host scope more precisely for a delivery-chain rule"
+      kept: initial_access.campaign_scope
+    - dropped: cue_process_tool.baseline
+      reason: "lolbin.historical_lolbin_baseline (reflected, rule-pattern-specific) supersedes generic per-binary host baseline"
+      kept: lolbin.historical_lolbin_baseline
+    - dropped: cue_host_context.clustering
+      reason: "around-alert host context covered by sibling_processes (same-parent children) and the +1h network correlation; dropped under 18-cap"
+      kept: parent_child.sibling_processes
+  skipped_templates:
+    - template: initial_access.application_patch_status
+      reason: "Rule fires on compile-after-delivery, not on exploitation of an unpatched Office/server CVE; patch status is not load-bearing for this disposition and the slot is needed for the user_actor pair and cross-logsource coverage under the 18-cap"
+    - template: universal.endpoint_protection_health
+      reason: "Generic host-tamper sweep; lolbin/parent-chain questions and the +1h network correlation carry the precursor signal, and no tamper-as-precursor question is load-bearing for a compile-after-delivery disposition. Dropped under 18-cap; defense_tampering set not confirmed"
+    - template: cue_host_context.precursor
+      reason: "initial_access.campaign_scope already correlates sigma alerts across the fleet by rule.uuid; prior-alert-on-this-host context dropped under 18-cap to preserve the non-deduplicable user_actor pair"
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "logsource 'image_load' (recommended by techniques: T1059.005,T1059.007) is not covered — pull in cue_image_load.* or author a custom question with `category: image_load`"
+      disposition: declined
+      reason: >-
+        The rule's detection is the csc.exe compile spawned by a suspicious
+        parent (T1027.004), expressed entirely in process_creation. T1059.005
+        and T1059.007 are tagged only because cscript/wscript/mshta appear in
+        the parent list; the rule does not fire on script-engine module loads.
+        Confirmation that the parent script host actually executed VB/JS is
+        reached through Q4 (parent mechanism_decode, which reads the parent's
+        script/command line) and Q6 (decode of encoded parent payloads). An
+        image_load query of vbscript.dll/scrrun.dll on the parent would return
+        volume without precision for the parent-of-csc compile pattern the rule
+        detects. No compensating attack:T1059.005.image_load question authored.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - initial_access
+    - obfuscation
+    - parent_child
+    - lolbin
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 17
+      attack: 1
+      llm_generated: 0
+    phase_distribution:
+      triage: 1
+      analysis: 2
+      context: 15
+    logsource_diversity:
+      process_creation: 14
+      sigma_alert: 1
+      file_event: 1
+      network_connection: 1

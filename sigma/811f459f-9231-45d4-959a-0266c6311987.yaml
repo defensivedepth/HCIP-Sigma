@@ -1,0 +1,603 @@
+name: Suspicious Child Process Of BgInfo.EXE
+id: 36bd6906-7400-4857-b8b9-ec351fac78fc
+description: |
+  Detects bginfo.exe or bginfo64.exe spawning a child process whose Image either ends in a known interpreter or GUI binary
+  (calc.exe, cmd.exe, cscript.exe, mshta.exe, notepad.exe, powershell.exe, pwsh.exe, wscript.exe) or runs from a user-writable
+  directory (AppData\Local, AppData\Roaming, Users\Public, Temp, Windows\Temp, PerfLogs). bginfo.exe is a Microsoft-signed
+  SysInternals utility that can be abused to proxy execution of attacker-controlled VBScript embedded in a .bgi configuration
+  file, allowing an application-allowlisting bypass under caller-level privileges; a child interpreter or a child launched
+  from a writable path is a sign the binary was driven to run external script content rather than display desktop information.
+  Investigation should confirm which branch fired, reconstruct what the bginfo invocation and its child actually executed,
+  and determine whether the parent chain and the .bgi source are legitimate.
+type: detection
+detection_id: 811f459f-9231-45d4-959a-0266c6311987
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the alerting event show bginfo.exe or bginfo64.exe spawning a child that is a known interpreter or that runs from a user-writable directory?
+  context: >-
+    Confirm the alert is a true positive before investing time. The rule fires when the parent Image ends in bginfo.exe or
+    bginfo64.exe AND the child either ends in one of the named binaries (calc.exe, cmd.exe, cscript.exe, mshta.exe, notepad.exe,
+    powershell.exe, pwsh.exe, wscript.exe) or its Image path contains a user-writable directory (AppData\Local, AppData\Roaming,
+    Users\Public, Temp, Windows\Temp, PerfLogs). Note which branch fired: a named-interpreter child points at script-host
+    proxying, while a writable-path child points at a binary dropped and launched from an operator-controlled location.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run bginfo.exe at all, and to have it spawn child processes?
+  context: >-
+    bginfo.exe has no default install path and is not present on stock Windows; it must be deployed deliberately, often as
+    part of a desktop-information policy that runs at logon. Knowing whether this host is supposed to run bginfo at all, and
+    whether its normal use ever spawns child processes, is often the fastest way to separate a sanctioned deployment from
+    abuse of the binary to proxy script execution.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:parent_child.parent_process_legitimacy
+  question: Is bginfo.exe expected to spawn this child, and what started bginfo.exe itself?
+  context: >-
+    The parent-child relationship is the core signal here. Tracing bginfo's own origin (the grandparent) reveals whether the
+    chain is a legitimate logon-time desktop policy run from a logon script or scheduled task, or whether bginfo was launched
+    interactively or from an unexpected parent to drive a malicious .bgi. A bginfo instance started from a script host, a
+    shell, or a writable path is far more concerning than one started by the logon/policy infrastructure.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- source: template:parent_child.sibling_processes
+  question: What other child processes did this same bginfo.exe instance spawn?
+  context: >-
+    If bginfo was driven to proxy execution, the embedded VBScript can launch additional processes beyond the one that fired
+    the alert. Examining all children of the exact parent instance reveals the full scope of activity initiated through this
+    bginfo run -- multiple interpreters or tools from the same bginfo parent strongly suggests the .bgi carried an active
+    payload rather than benign display logic.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_parent_process.mechanism_decode
+  question: What did the bginfo.exe parent invocation reference, and was a .bgi configuration file involved?
+  context: >-
+    The bginfo command line shows whether it was pointed at a .bgi configuration file, and from where. A .bgi argument that
+    resolves to a user-writable directory, a UNC path, or a WebDAV share is the classic abuse pattern, since bginfo evaluates
+    VBScript embedded in that .bgi inline without spawning a separate script host. Reading the parent's own event shows what
+    drove the detected child to run.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+- source: template:cue_process_tool.mechanism_decode
+  question: What exactly did the child process do? Decode its full command line and working directory.
+  context: >-
+    The child's full command line reveals the action taken once bginfo proxied execution. Decode any flags, script paths,
+    encoded content, URLs, or output files. For a named interpreter child this shows whether it ran a script, fetched a remote
+    payload, or executed an in-memory loader; for a writable-path child it shows what the dropped binary was told to do.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:powershell.encoded_command_decode
+  question: If the child is powershell.exe or pwsh.exe, was its command encoded or obfuscated, and what does it decode to?
+  context: >-
+    When the child is PowerShell, attackers frequently use the -EncodedCommand (-enc) parameter or string concatenation,
+    backtick escaping, and variable substitution to hide intent. Base64-encoded commands are the most common form. Decoding
+    reveals the actual payload -- download cradles, reverse shells, or in-memory execution of .NET assemblies handed off from
+    the bginfo-proxied VBScript.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: attack:T1059.005.obfuscation_check
+  question: Does the VBScript or script content reached through bginfo show signs of obfuscation or encoding?
+  context: >-
+    bginfo evaluates VBScript embedded in the .bgi inline. High-entropy strings, Chr() concatenation chains, base64 blobs,
+    or character-code reconstruction in the child command line or referenced script are signs the payload was obfuscated to
+    evade casual inspection. Reconstruct any such chains to recover the real command the script forms before assessing intent.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:powershell.script_block_logging
+  question: If the child is PowerShell, did script block logging capture the full deobfuscated script content?
+  context: >-
+    Script block logging records the deobfuscated script content PowerShell actually executes, even when the command line
+    is encoded or obfuscated, providing ground truth about what ran. If PowerShell operational logs are not ingested in this
+    environment, treat zero results as a visibility gap rather than evidence that nothing ran, and fall back to decoding the
+    child command line directly.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- source: template:powershell.powershell_security_bypass
+  question: Were PowerShell or endpoint security controls bypassed or weakened on this host before the bginfo activity?
+  context: >-
+    Abuse of a signed binary to proxy script execution is itself an allowlisting bypass; operators frequently pair it with
+    disabling AMSI, flipping Defender preferences, or invoking an execution-policy bypass before running a payload. Finding
+    these precursor events on the host strengthens the case that the bginfo child is malicious rather than a benign display run.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- source: attack:T1202.file_access
+  question: Did bginfo or its child read or write a .bgi, .vbs, or other script file from a user-writable or network path around this time?
+  context: >-
+    The .bgi configuration that bginfo proxies, and any .vbs it references, are the artifacts that carry the payload. A .bgi
+    or script file created or accessed in a writable directory, on a UNC share, or over WebDAV just before the alert points
+    at attacker-staged content rather than a managed desktop policy. Correlating these file events with the process chain
+    helps locate the actual payload source.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains:
+          - '.bgi'
+          - '.vbs'
+          - '.vbe'
+          - '.wsf'
+          - '.bgi64'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - User
+- source: attack:T1218.network_retrieval
+  question: Did bginfo.exe or the child process make outbound network connections, especially to a UNC, WebDAV, or external host?
+  context: >-
+    The .bgi can be served from a remote WebDAV or UNC path, and the proxied script can itself fetch a follow-on payload or
+    contact command-and-control. Outbound connections from bginfo.exe or its child -- particularly to an external address or
+    a non-enterprise share -- indicate remote payload retrieval or callback rather than local desktop display.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+      - Initiated
+- source: template:cue_parent_process.baseline
+  question: Does bginfo.exe normally spawn this child binary on this host?
+  context: >-
+    Some parent-child pairings are routine while others are inherently abnormal. A bginfo parent spawning an interpreter or
+    a binary from a writable path has rarely or never been seen before is a strong novelty signal; a pairing that already
+    accounts for many prior events on this host is more likely a quirk of a sanctioned deployment.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run this binary or trigger bginfo child-process activity?
+  context: >-
+    Compare this user's current action against their historical behavior. A user who has never run this child binary, or who
+    is not associated with desktop-information deployment, is more suspicious than one who does so regularly. User role and
+    typical toolset should align with running a signed SysInternals utility that spawns interpreters.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this bginfo parent and child-binary combination historically routine on this host or across the environment, or is the launch mechanism unusual?
+  context: >-
+    When the alert fires under a service principal, user identity does not attribute behavior; the meaningful pivot is the
+    launch mechanism. A bginfo-to-child pairing that already accounts for many prior events is OS or vendor automation, while
+    a new or rare bginfo parent for this child binary on this host or environment-wide is the deviation worth chasing.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: >-
+    Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints. If the
+    same user triggered similar bginfo-driven or interpreter activity on multiple hosts, the scope may extend beyond this
+    single alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same bginfo parent and child-binary combination fire on other hosts in the same window, indicating a coordinated rollout rather than isolated activity?
+  context: >-
+    Under a service principal, asking what else the user did returns agent-telemetry noise. The meaningful question is whether
+    the same launch mechanism -- bginfo spawning this child binary -- fired on other hosts in the alert window. Multiple hosts
+    in the same window points to scheduled or pushed automation, such as a domain-wide .bgi policy; a single host points to
+    a host-local trigger that warrants closer review.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Alerts rarely happen in isolation. Earlier detections on the same host -- defense tampering, reconnaissance, or other
+    proxy-execution activity -- may reveal the stages that preceded this event and help reconstruct the timeline of how the
+    bginfo abuse came about.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1218
+      name: System Binary Proxy Execution
+      role: primary
+    - id: T1059.005
+      name: Visual Basic
+      role: secondary
+    - id: T1202
+      name: Indirect Command Execution
+      role: secondary
+    - id: T1059
+      name: Command and Scripting Interpreter
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: signed_binary_invocation
+      description: "bginfo.exe (signed SysInternals binary) is launched, optionally pointed at a .bgi config from a writable/UNC/WebDAV path"
+      mapped_to: Q5
+      source: template:cue_parent_process.mechanism_decode
+    - stage: 2
+      label: proxied_script_execution
+      description: "bginfo evaluates embedded VBScript inline and/or spawns a child interpreter or writable-path binary"
+      mapped_to: Q6
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 3
+      label: payload_staging_retrieval
+      description: ".bgi/.vbs payload staged on disk or fetched over the network; child may retrieve follow-on payload or call out"
+      mapped_to: Q11
+      source: attack:T1202.file_access
+    - stage: 4
+      label: network_callout
+      description: "bginfo or its child opens outbound connections (WebDAV/UNC fetch or C2 callback)"
+      mapped_to: Q12
+      source: attack:T1218.network_retrieval
+  dimension_coverage:
+    - dimension: parent_process_analysis
+      technique: T1218
+      covered_by: Q3
+      source: template:parent_child.parent_process_legitimacy
+      coverage_type: direct
+    - dimension: command_analysis
+      technique: T1218
+      covered_by: Q6
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1218
+      covered_by: Q5
+      source: template:cue_parent_process.mechanism_decode
+      coverage_type: direct
+    - dimension: obfuscation_check
+      technique: T1059.005
+      covered_by: Q8
+      source: attack:T1059.005.obfuscation_check
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1059.005
+      covered_by: Q18
+      source: template:cue_host_context.precursor
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1059.005
+      covered_by: Q14
+      source: template:cue_user_actor.baseline
+      coverage_type: direct
+    - dimension: command_analysis
+      technique: T1059
+      covered_by: Q7
+      source: template:powershell.encoded_command_decode
+      coverage_type: direct
+  mutable_dispositions:
+    - element: ParentProcess
+      dimension: parent_process_analysis
+      specific_values: "rationale only (Office/mshta spawning script host)"
+      disposition: context
+      target_question: Q3
+      notes: "Rule's parent is fixed to bginfo.exe/bginfo64.exe; example parents from the analytic do not apply. Parent-legitimacy question covers the dimension."
+    - element: UserContext
+      dimension: user_context
+      specific_values: "rationale only (non-admin / service accounts)"
+      disposition: context
+      target_question: Q14
+      notes: "Covered by user_actor baseline and host_user_context (Q2)."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only (outside business hours; 10-30m correlation)"
+      disposition: context
+      target_question: Q11
+      notes: "Correlation windows expressed via question range fields (+/-15m file/network, -6h precursor)."
+    - element: PayloadEntropyThreshold
+      dimension: obfuscation_check
+      specific_values: "rationale only (high entropy)"
+      disposition: new_question
+      target_question: Q8
+      notes: "Drove dedicated obfuscation-check question; no numeric threshold queryable, so framed as context-directed analysis."
+    - element: ModuleName
+      dimension: tuning_parameter
+      specific_values: "vbscript.dll, scrrun.dll"
+      disposition: context
+      target_question: Q8
+      notes: "image_load logsource not selected (see hint disposition); scripting-engine module names noted as context for obfuscation question."
+    - element: CommandLinePattern
+      dimension: command_analysis
+      specific_values: "rationale only (encoded/uncommon patterns)"
+      disposition: context
+      target_question: Q6
+      notes: "Covered by child mechanism_decode and powershell encoded-command decode."
+    - element: SignedBinaryList
+      dimension: tuning_parameter
+      specific_values: "msiexec.exe, regsvr32.exe (T1218 examples)"
+      disposition: context
+      target_question: Q5
+      notes: "Rule's signed binary is bginfo.exe specifically; generic signed-binary list does not apply. Parent invocation question covers it."
+    - element: CommandLineRegex
+      dimension: command_analysis
+      specific_values: "rationale only (URLs, script paths, DLL entrypoints)"
+      disposition: context
+      target_question: Q6
+      notes: "Child command-line decode surfaces URLs/script paths."
+    - element: RemoteDomainAllowlist
+      dimension: tuning_parameter
+      specific_values: "rationale only (enterprise domain suppression)"
+      disposition: context
+      target_question: Q12
+      notes: "Network-retrieval question directs analyst to external/non-enterprise destinations."
+    - element: HighRiskChildren
+      dimension: tuning_parameter
+      specific_values: "powershell.exe, cmd.exe, rundll32.exe, regsvr32.exe, mshta.exe, msiexec.exe, curl.exe, bitsadmin.exe"
+      disposition: context
+      target_question: Q1
+      notes: "Rule already enumerates its own high-risk child set; verify_trigger_match lists the rule's named binaries."
+    - element: AllowedUtilities
+      dimension: tuning_parameter
+      specific_values: "rationale only (forfiles, wsl, ssh on jumphosts)"
+      disposition: context
+      target_question: Q2
+      notes: "host_user_context covers whether bginfo use is sanctioned on this host."
+    - element: DestCIDRs
+      dimension: tuning_parameter
+      specific_values: "rationale only (known-good egress)"
+      disposition: context
+      target_question: Q12
+      notes: "Network question directs analyst to non-enterprise egress; no specific CIDRs in rule."
+  dedup_decisions:
+    - dropped: cue_process_tool.process_chain
+      reason: "parent_process is primary cue and parent_child technique set active — parent_process_legitimacy (Q3) subsumes it"
+      kept: parent_child.parent_process_legitimacy
+    - dropped: cue_parent_process.follow_on
+      reason: "parent_child.sibling_processes (Q4) is more specific (scopes to exact ParentProcessGuid instance, not all parent-binary instances)"
+      kept: parent_child.sibling_processes
+    - dropped: cue_parent_process.clustering
+      reason: "near-duplicate of host_context and sibling coverage; +/-15m parent activity already surfaced by sibling_processes (Q4) and host precursor context"
+      kept: parent_child.sibling_processes
+    - dropped: cue_process_tool.baseline
+      reason: "cue_parent_process.baseline (Q13) is more specific for this parent-driven rule (pivots on the bginfo parent + child pair, not the child binary alone)"
+      kept: cue_parent_process.baseline
+    - dropped: cue_host_context.clustering
+      reason: "host-wide +/-15m activity overlaps sibling_processes (Q4) and precursor (Q18); dropped to stay within 18-question cap"
+      kept: cue_host_context.precursor
+    - dropped: cue_parent_process.scope
+      reason: "cross-host parent+child distribution already covered by cue_user_actor.clustering_svc (Q17, same parent+binary pivot env-wide in the alert window); dropped to stay within 18-question cap"
+      kept: cue_user_actor.clustering_svc
+    - dropped: universal.endpoint_protection_health
+      reason: "powershell.powershell_security_bypass (Q10) covers the precursor-tamper question more specifically for this execution rule (AMSI/exec-policy/Defender bypass on the host)"
+      kept: powershell.powershell_security_bypass
+  skipped_templates:
+    - template: obfuscation.encoded_payload_decode
+      reason: "replaced_by: powershell.encoded_command_decode (Q7) — parent set includes powershell.exe/pwsh.exe children"
+  hint_dispositions:
+    - hint: "logsource 'image_load' (recommended by techniques: T1059.005,T1218) is not covered — pull in cue_image_load.* or author a custom question with `category: image_load`"
+      disposition: declined
+      reason: >-
+        The rule constrains the alert to a child process_creation event of bginfo.exe; the load of scripting-engine modules
+        (vbscript.dll, scrrun.dll) occurs inside the bginfo or child process and is one logsource removed from the analyst's
+        triage pivot, which is "what did the spawned child do." The obfuscation-check question (Q8) and child mechanism_decode
+        (Q6) recover the proxied VBScript/script behavior from process_creation evidence sufficiently for triage, and the
+        scripting-engine module names are recorded as context on Q8. No compensating attack:image_load question authored.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - parent_child
+    - powershell
+    - obfuscation
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 15
+      attack: 3
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 3
+      context: 13
+    logsource_diversity:
+      process_creation: 14
+      powershell_script_block: 1
+      file_event: 1
+      network_connection: 1
+      sigma_alert: 1

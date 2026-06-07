@@ -1,0 +1,487 @@
+name: Potential Remote Desktop Tunneling
+id: cd397122-dd99-49b3-9bab-d526bfeadc51
+description: |
+  Detects command-line invocations that combine the RDP port reference :3389 with an SSH tunneling flag
+  (-L, -P, -R, -pw, or -ssh). This pattern is consistent with an SSH utility forwarding Remote Desktop
+  traffic through an encrypted tunnel, which lets RDP reach a destination that direct connections cannot
+  — for example, bypassing a firewall that blocks inbound RDP but permits outbound SSH. The rule fires
+  only when both the :3389 reference and at least one tunneling flag appear in the same command line.
+  Legitimate use is uncommon; investigation should determine which utility ran, what the forward mapping
+  was, which user and source host drove it, and whether the tunnel reached an internal or external endpoint.
+type: detection
+detection_id: 8a3038e8-9c9d-46f8-b184-66234a160f6f
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line contain :3389 together with an SSH tunneling flag (-L, -P, -R, -pw, or -ssh)?
+  context: Before investing investigation time, confirm the alert is a true positive by reading the exact
+    command line. The rule fires only when the :3389 reference and at least one tunneling flag both appear,
+    so verify that both elements are present and note which tool ran (plink.exe, ssh.exe, or similar) and
+    what the port-forward mapping looks like.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run SSH tunneling utilities that forward RDP?
+  context: Legitimate administrative remote access usually goes through sanctioned jump boxes and management
+    tooling, not ad-hoc SSH port forwards to port 3389. Knowing whether this user's role and this host's
+    function involve SSH tunneling is often the fastest way to separate a sanctioned admin action from
+    operator activity establishing covert reach.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What was the full tunnel command? Decode the forward mapping, the SSH server, and any embedded credentials.
+  context: The full command line reveals what the tunnel actually does. Read the forward specifier to see
+    the mapping — for example -R 3389:127.0.0.1:3389 (reverse forward exposing local RDP to the remote
+    SSH server) or -L 13389:127.0.0.1:3389 (local forward). Identify the SSH server hostname or IP, the
+    -P port, and whether -pw passed a plaintext password. These details determine whether the tunnel reaches
+    an internal pivot or an external destination.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+      - Image
+- source: template:cue_process_tool.process_chain
+  question: What process spawned this tunneling command, and is that parent chain expected?
+  context: The parent process reveals how the tunnel was launched. An interactive shell or remote-access
+    parent suggests hands-on-keyboard activity, while a script host, Office application, or unusual service
+    parent points to scripted or exploitation-driven invocation. Note what spawned the parent and what
+    else the parent launched.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.follow_on
+  question: What child processes did this tunneling command spawn afterward?
+  context: Processes spawned by the tunnel command reveal its operational impact. A tunnel utility that
+    spawns command interpreters, credential tools, or additional network clients shortly after launch
+    indicates the forward was used as a staging step for further hands-on activity rather than a one-off
+    connection.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired the tunneling pattern, what parents and users normally drive
+    it, and does the current alert fit that pattern?
+  context: Even sanctioned tunneling can recur on a host. The query mirrors the rule's :3389-plus-flag
+    selection scoped to this host, so the resulting parent and user distribution reflects how this specific
+    pattern has run here before. A new parent process, an unexpected user account, or an unusual command
+    shape is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains: :3389
+      selection_opt:
+        CommandLine|contains:
+        - ' -L '
+        - ' -P '
+        - ' -R '
+        - ' -pw '
+        - ' -ssh '
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired the tunneling pattern in the past week, and does the cross-host distribution
+    look like consistent automation or one-off activity?
+  context: The query mirrors the rule's :3389-plus-flag selection with no host scope, giving a fleet-wide
+    count of the tunneling pattern rather than generic SSH-client usage. Many hosts firing the same pattern
+    points to scripted deployment or a management tool; one host or a small unrelated set points to manual
+    operator activity. Use the host distribution to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains: :3389
+      selection_opt:
+        CommandLine|contains:
+        - ' -L '
+        - ' -P '
+        - ' -R '
+        - ' -pw '
+        - ' -ssh '
+      condition: all of selection*
+    fields:
+    - host.name
+- source: template:cue_user_actor.baseline
+  question: Has this user run the RDP tunneling pattern before on any host?
+  context: Compare this user's current action against their history. A user who has never established an
+    SSH tunnel to port 3389 is more notable than one who does so as part of a known administrative routine.
+    The query scopes to this user and the rule's :3389-plus-flag pattern across all hosts over 90 days;
+    zero or very low counts indicate first-time use.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        CommandLine|contains: :3389
+      selection_opt:
+        CommandLine|contains:
+        - ' -L '
+        - ' -P '
+        - ' -R '
+        - ' -pw '
+        - ' -ssh '
+      condition: all of selection*
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts in the alert window reveals whether the tunnel
+    is isolated or part of broader movement. If the same user triggered similar activity or touched multiple
+    endpoints, the scope of compromise may be larger than the single alerting host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: 'Alerts rarely occur in isolation. Examining activity around the alert reveals the immediate
+    context: what led to the tunnel command, what happened after, and whether it is part of a larger sequence.
+    Look for reconnaissance, credential access, or staging that surrounds the tunnel setup.'
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host — reconnaissance, credential access, or defense tampering —
+    may reveal the attack stages that preceded the tunnel setup. A tunnel is usually a means to reach a
+    target, so prior alerts often explain how the operator got to the point of forwarding RDP.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:lateral_movement.source_host_identification
+  question: What inbound RDP or SSH connections reached this host, and are those sources expected administrative origins?
+  context: Lateral movement requires a source and destination. Inbound connections to the RDP (3389) and
+    SSH (22) ports reveal whether the tunneled access came from a known admin jump box, a compromised
+    workstation, or an unexpected origin. A tunnel that terminates RDP locally is often consumed by a
+    connection arriving on one of these ports.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        DestinationPort:
+          - 3389
+          - 22
+          - 445
+          - 5985
+          - 5986
+      condition: selection
+    fields:
+      - SourceIp
+      - DestinationPort
+- source: template:lateral_movement.authentication_method
+  question: What user and credential context launched the tunnel, and does the command pass a plaintext password?
+  context: The acting user and any embedded credentials reveal how access was obtained. A -pw flag passes
+    a plaintext SSH password on the command line, which is both an exposure and a sign of scripted operator
+    use. The user account driving the tunnel determines whether legitimate credentials, stolen credentials,
+    or a service account is in play.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - User
+      - CommandLine
+- source: template:lateral_movement.target_activity_after_access
+  question: What processes ran on this host after the tunnel was established?
+  context: A tunnel is a means to an end — once RDP is forwarded, the operator interacts with the desktop
+    or runs commands. Examining processes spawned shortly after the tunnel setup reveals the objective on
+    this host, such as remote desktop sessions, file access, or tool deployment.
+  range: +30m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - User
+      - Image
+- source: template:lateral_movement.lateral_movement_scope
+  question: Has this user account run remote-access or tunneling tools against other hosts?
+  context: Attackers rarely stop at one target. If this user account is invoking SSH clients, RDP clients,
+    or other remote-access tooling across multiple systems within a short window, the scope of compromise
+    is larger. Connections to many hosts from one account indicate active lateral movement.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      selection_lateral:
+        Image|endswith:
+          - '\plink.exe'
+          - '\ssh.exe'
+          - '\putty.exe'
+          - '\mstsc.exe'
+          - '\psexec.exe'
+          - '\psexec64.exe'
+      condition: selection and selection_lateral
+    fields:
+      - host.name
+      - Image
+- source: attack:T1021.logon_correlation
+  question: Where has this user authenticated recently, and do the logon events line up with the tunnel timing?
+  context: Remote service abuse pairs a logon with follow-on activity. Security logon events show which
+    systems the user reached before and after the tunnel command and which logon types were used (3 network,
+    10 RDP, 2 interactive). A burst of logons across systems around the tunnel timing, or an RDP logon that
+    immediately follows the forward, helps confirm the tunnel carried an actual session. If Security logs
+    are not ingested in this environment, treat zero results as a visibility gap rather than evidence nothing
+    occurred.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      service: security
+    detection:
+      selection:
+        EventID:
+          - 4624
+          - 4625
+          - 4648
+        TargetUserName|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - IpAddress
+      - EventID
+      - LogonType
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1021
+      name: Remote Services
+      role: primary
+  attack_chain_coverage:
+    - stage: 1
+      label: remote_logon
+      description: "Logon via RDP/WMI by a user account (the tunnel forwards RDP/3389 to reach the target)"
+      mapped_to: Q16
+      source: attack:T1021.logon_correlation
+    - stage: 2
+      label: post_access_activity
+      description: "Uncommon command execution, file manipulation, or lateral network connections following access"
+      mapped_to: Q14
+      source: template:lateral_movement.target_activity_after_access
+    - stage: 3
+      label: lateral_network_connection
+      description: "Lateral network connection to the remote service port"
+      mapped_to: Q12
+      source: template:lateral_movement.source_host_identification
+  dimension_coverage:
+    - dimension: command_analysis
+      technique: T1021
+      covered_by: Q3
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1021
+      covered_by: Q16
+      source: attack:T1021.logon_correlation
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1021
+      covered_by: Q12
+      source: template:lateral_movement.source_host_identification
+      coverage_type: partial
+  mutable_dispositions:
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only — correlation window between login and post-access activity"
+      disposition: context
+      target_question: Q16
+      notes: "No fixed threshold supplied; logon-correlation question frames timing alignment between Security logons and the tunnel command in context."
+    - element: LogonUser
+      dimension: tuning_parameter
+      specific_values: "rationale only — limit to service accounts or privileged users for fidelity"
+      disposition: context
+      target_question: Q8
+      notes: "User-scoped baseline and authentication questions surface the acting account; no fixed allowlist values to inject."
+    - element: RemoteHostList
+      dimension: tuning_parameter
+      specific_values: "rationale only — allowlist known admin jumpboxes/deployment tools"
+      disposition: context
+      target_question: Q12
+      notes: "source_host_identification asks whether the inbound source is an expected administrative origin; no concrete host values to inject as a query filter."
+  dedup_decisions:
+    - dropped: cue_user_actor.baseline_svc
+      reason: >-
+        service_principal_substitute pivots on ParentName + Image|endswith, but this is a CommandLine-only
+        rule (primary_binary null, all_binaries empty) — there is no binary or parent identity to pivot on,
+        so the substitute degenerates to an empty/unbound filter. The mechanism-identity pivot for this
+        binary-less rule is the rule's own :3389-plus-flag CommandLine pattern, already provided host-scoped
+        by Q6 (baseline_deviation, host_pattern) and fleet-scoped by Q7 (scope, fleet_pattern).
+      kept: cue_user_actor.baseline
+    - dropped: cue_user_actor.clustering_svc
+      reason: >-
+        Same binary-less degeneration as the baseline substitute — ParentName/Image pivot is unbound for a
+        CommandLine-only rule. The window-scoped mechanism pivot is covered by Q7 (fleet-wide count of the
+        rule's CommandLine pattern in -7d).
+      kept: cue_user_actor.clustering
+    - dropped: network_scope.same_action_other_hosts
+      reason: >-
+        Image|endswith %Image% cross-host query has no binary to bind for a CommandLine-only rule; its
+        intent (same pattern on other hosts) is covered precisely by Q7 (scope, fleet_pattern) which embeds
+        the rule's CommandLine selection.
+      kept: cue_process_tool.scope
+    - dropped: network_scope.actor_activity_network_wide
+      reason: "User network-wide activity duplicates Q9 (cue_user_actor.clustering); cue version kept."
+      kept: cue_user_actor.clustering
+  skipped_templates:
+    - template: universal.endpoint_protection_health
+      reason: >-
+        RECOMMENDED, not must_include. This is a lateral-movement/tunneling rule, not an execution or
+        credential-access rule where disposition turns on whether protection was weakened first.
+        Prior-alert tamper context is already carried by Q11 (cue_host_context.precursor), which surfaces
+        defense-tampering detections in the -6h window before the alert.
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "logsource 'security' (recommended by techniques: T1021) is not covered and no template family exists — author a custom question with category: security"
+      disposition: declined
+      reason: >-
+        Acted on in substance, not declined-silently: Q16 (attack:T1021.logon_correlation) is a
+        security-logsource question (logsource service: security, EventID 4624/4625/4648) that covers the
+        T1021 remote-logon chain stage. It uses service: security rather than category: security because the
+        Windows Security channel is addressed by product+service in this pipeline's field mappings and the
+        EventID/LogonType fields are not available under a process_creation category. Recorded here for the
+        audit trail since the coverage check keyed on category: security specifically.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - lateral_movement
+    - network_scope
+  generation_stats:
+    total_questions: 16
+    source_counts:
+      template: 15
+      attack: 1
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 13
+    logsource_diversity:
+      process_creation: 13
+      network_connection: 1
+      security: 1
+      sigma_alert: 1

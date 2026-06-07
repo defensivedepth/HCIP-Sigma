@@ -1,0 +1,457 @@
+name: HackTool - SharpLDAPmonitor Execution
+id: c7cae105-0394-4ea7-be52-bad4a9f7697a
+description: |
+  Detects execution of SharpLDAPmonitor, a utility that polls a domain controller over LDAP and
+  reports live changes to directory objects (creation, deletion, attribute modification). The rule
+  fires when EITHER the process image or original filename resolves to SharpLDAPmonitor.exe, OR the
+  command line carries all of the tool's authentication flags (/user:, /pass:, /dcip:) together.
+  Legitimately the tool is a sysadmin diagnostic, but it is built for operators who want to watch the
+  effect of directory tampering, time network poisoning to user logons, or detect account lockout
+  during password-spray. Because it is a passive read-only poller, its only signal is the steady,
+  repeated LDAP querying pattern itself; the investigation should determine who ran it, against which
+  DC, whether the run is authorized, and what other discovery or hands-on activity surrounds it.
+type: detection
+detection_id: 9f8fc146-1d1a-4dbf-b8fd-dfae15e08541
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-05
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does this event match what the rule detects — the SharpLDAPmonitor binary, or a command
+    line carrying all three of the /user, /pass, and /dcip flags?
+  context: Before investing investigation time, confirm the alert is a true positive. The rule fires
+    when EITHER the image or original filename is SharpLDAPmonitor.exe, OR the command line contains
+    all three of the /user, /pass, and /dcip flags together. Note which branch fired — a rename-to-something-else
+    that still carries the three flags is a deliberate evasion attempt and changes how much weight the
+    binary-name questions carry downstream.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- source: template:hacking_tool.authorized_engagement
+  question: Is this SharpLDAPmonitor execution part of an authorized penetration test or red team
+    engagement?
+  context: LDAP monitoring tools are used in authorized assessments to validate that an exploit changed
+    a target attribute or to watch for account lockout during password-spray. Before investing
+    investigation time, check whether a pentest or red team exercise is currently active on this host
+    or network segment. An authorized engagement with matching tool usage and timing resolves the alert
+    without further analysis.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:hacking_tool.tool_capability_used
+  question: What target and authentication did the command line specify — which DC via /dcip, which
+    account via /user, and any delay, page-size, or search-base tuning?
+  context: The tool is driven entirely by its flags. The /dcip flag names the domain controller being
+    polled, /user names the account whose credentials are in use, and tuning options like a randomized delay,
+    custom page size, or a scoped search base reveal an operator deliberately shaping the poll to avoid
+    bursty detection. Decode the full argument set to understand the scope and target of the monitoring.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:cue_process_tool.mechanism_decode
+  question: Across the SharpLDAPmonitor runs on this host in the surrounding window, what was the full
+    set of command lines and working directories?
+  context: A single logical monitoring session may span multiple sequential invocations as the operator
+    retunes the poll (delay, page size, search base) or retargets a different naming context. Pulling
+    every execution of the binary on this host within the window shows the full operation rather than
+    just the one event that tripped the rule, including the working directory the tool was launched from.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:hacking_tool.tool_specific_artifacts
+  question: Did SharpLDAPmonitor write a logfile or other output to disk on this host?
+  context: The tool supports logfile output, so a successful monitoring run may leave a capture of the
+    directory changes it observed on disk. Files written by the tool's process confirm execution and
+    reveal what the operator was collecting even after the process exits. Look for output paths under
+    the user's profile, temp, or wherever the working directory placed them.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: template:discovery_recon.discovery_user_context
+  question: Is this user expected to run domain directory monitoring or LDAP enumeration tooling?
+  context: Domain administrators and IT staff legitimately query and watch directory objects for
+    troubleshooting, but a standard user or a service account that has no directory-administration role
+    polling a DC over LDAP is anomalous. The user's role and typical toolset determine whether this run
+    is routine or hands-on-keyboard reconnaissance. The tool can only see attributes the running
+    account can read, so the account also bounds what was exposed.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - User
+- source: template:discovery_recon.discovery_parent_chain
+  question: What process spawned SharpLDAPmonitor, and is that parent chain normal for this kind of tool?
+  context: A directory-monitoring tool launched from cmd.exe under explorer.exe (an operator opened a
+    prompt) reads very differently from one spawned by a script interpreter, a download cradle, or
+    wmiprvse.exe / wsmprovhost.exe (remote execution). An unusual parent points to automated
+    post-exploitation rather than interactive administration.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+- source: template:cue_process_tool.process_chain
+  question: What spawned the parent process, and what else did that parent launch on this host?
+  context: The immediate parent is visible in the alert; walking one level further up reveals how the
+    operator arrived on the host. A parent that itself was launched from a remote-execution service,
+    a script host, or a freshly written binary, or that also spawned other discovery or credential
+    tooling, frames this monitoring run as one stage of a larger operation.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:discovery_recon.discovery_burst_detection
+  question: Did other reconnaissance commands run on this host around the same time?
+  context: A single discovery action may be legitimate troubleshooting, but multiple reconnaissance
+    commands in rapid succession — whoami, net user, nltest, dsquery, adfind — is a signature of
+    post-compromise enumeration. Directory monitoring paired with a burst of native discovery binaries
+    indicates an operator mapping the environment before the next stage.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_recon:
+        Image|endswith:
+          - '\whoami.exe'
+          - '\systeminfo.exe'
+          - '\ipconfig.exe'
+          - '\net.exe'
+          - '\net1.exe'
+          - '\nltest.exe'
+          - '\dsquery.exe'
+          - '\nbtstat.exe'
+          - '\arp.exe'
+          - '\netstat.exe'
+          - '\tasklist.exe'
+          - '\qprocess.exe'
+          - '\query.exe'
+          - '\quser.exe'
+          - '\hostname.exe'
+          - '\nslookup.exe'
+          - '\adfind.exe'
+          - '\csvde.exe'
+          - '\ldifde.exe'
+          - '\dnscmd.exe'
+          - '\cmdkey.exe'
+          - '\setspn.exe'
+      condition: selection and selection_recon
+    fields:
+      - Image
+      - User
+- source: template:cue_process_tool.follow_on
+  question: What child processes did SharpLDAPmonitor spawn afterward?
+  context: The tool itself is a passive read-only poller, so it should not spawn additional processes.
+    Any children — cmd.exe, powershell.exe, certutil.exe, or other tooling launched from it — would be
+    unexpected and point to the operator chaining the monitoring run into further action.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run SharpLDAPmonitor anywhere in the environment?
+  context: Compare this user's current action against their historical behavior. A user who has never
+    run this directory-monitoring tool is more suspicious than one who runs it regularly as part of a
+    known administrative routine. Zero or very low historical counts indicate first-time or rare use by
+    this account.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent+binary combination historically routine on this host or across the
+    environment, or is the parent unusual for SharpLDAPmonitor?
+  context: When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism — which parent process spawned the tool, and whether
+    that pair is historically common. A new or rare parent for this binary is the deviation worth
+    chasing; a pair that already accounts for many prior events is more likely automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning
+    multiple endpoints. If the same account triggered directory monitoring or other tooling on several
+    hosts, the scope of the operation may be larger than this single alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent+binary combination fire on other hosts in the same window — a
+    coordinated rollout, or activity isolated to this host?
+  context: Under a service principal, asking what else the user did network-wide returns agent-telemetry
+    noise. The meaningful question is whether the same launch mechanism — parent process plus spawned
+    binary — fired on other hosts in the alert window. Multiple hosts in the same window points to
+    scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining the process activity surrounding the alert
+    reveals what led to it and what followed — reconnaissance, privilege escalation, credential access,
+    or persistence — and whether the directory monitoring is one step in a larger sequence on this host.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired the rule's pattern, what parents and users normally
+    drive that activity, and does the current alert fit?
+  context: The query mirrors the rule's selection structure scoped to this host, so the resulting
+    parent/user distribution reflects how the rule's specific firing pattern — not generic binary
+    usage — has historically run here. A new parent process, an unexpected account, or an unusual
+    command-line shape relative to that history is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_img:
+      - Image|endswith: \SharpLDAPmonitor.exe
+      - OriginalFileName: SharpLDAPmonitor.exe
+      selection_cli:
+        CommandLine|contains|all:
+        - '/user:'
+        - '/pass:'
+        - '/dcip:'
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (1 of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired the rule's pattern in the past week, and does the cross-host
+    distribution look like consistent automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the result is a
+    fleet-wide count of the rule's firing pattern rather than generic use of the binary. Many hosts
+    firing the same pattern points to scripted deployment or vendor automation; one host or a small
+    unrelated set points to manual operator activity. Use the host distribution to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_img:
+      - Image|endswith: \SharpLDAPmonitor.exe
+      - OriginalFileName: SharpLDAPmonitor.exe
+      selection_cli:
+        CommandLine|contains|all:
+        - '/user:'
+        - '/pass:'
+        - '/dcip:'
+      condition: 1 of selection_*
+    fields:
+    - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering,
+    reconnaissance, credential access — may reveal the attack stages that preceded the directory
+    monitoring and help reconstruct the full timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: false
+  techniques: []
+  attack_chain_coverage: []
+  dimension_coverage: []
+  mutable_dispositions: []
+  dedup_decisions:
+    - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable; emit both (subject-pivot vs launch-mechanism pivot)"
+      kept: both
+    - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable; emit both (subject-pivot vs launch-mechanism pivot)"
+      kept: both
+    - dropped: cue_process_tool.baseline
+      reason: "host historical baseline subsumed by cue_process_tool.baseline_deviation (Q16), which mirrors the rule's selection and groups the same ParentImage/User distribution but filters to the rule's firing pattern rather than generic binary usage — strictly more specific"
+      kept: cue_process_tool.baseline_deviation
+    - dropped: cue_process_tool.clustering
+      reason: "host-wide concurrent-tool view duplicated by cue_host_context.clustering (Q14), which aggregates Image+ParentImage on this host in the same +/-15m window; host_context version surfaces novel parent-child pairs more directly"
+      kept: cue_host_context.clustering
+    - dropped: universal.host_user_context
+      reason: "discovery_recon.discovery_user_context (Q6) supersedes it per its own notes_to_llm — more specific to directory-discovery context; both pivot user role/expectation off the triggering ProcessGuid"
+      kept: discovery_recon.discovery_user_context
+  skipped_templates:
+    - template: universal.endpoint_protection_health
+      reason: "RECOMMENDED, not must_include. This rule detects a passive read-only LDAP discovery tool, not payload execution or credential access where the disposition turns on whether AV/EDR was weakened first. Prior-host context is already carried by cue_host_context.precursor (Q18, prior sigma alerts incl. tamper) and cue_host_context.clustering (Q14). Dropped to respect the 18-question hard cap; tamper-as-precursor is not a live question for a discovery-only alert."
+  reflection_overrides: []
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - discovery_recon
+    - hacking_tool
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 18
+      attack: 0
+      llm_generated: 0
+    phase_distribution:
+      triage: 1
+      analysis: 1
+      context: 16
+    logsource_diversity:
+      process_creation: 16
+      file_event: 1
+      sigma_alert: 1

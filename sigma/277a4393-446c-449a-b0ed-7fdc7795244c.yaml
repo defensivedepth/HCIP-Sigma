@@ -1,0 +1,426 @@
+name: Renamed FTP.EXE Execution
+id: 948d0357-9946-4669-a280-002a8b2bde28
+description: |
+  Detects a process whose PE metadata OriginalFileName is ftp.exe but whose on-disk Image path does not end in \ftp.exe, indicating the FTP client has been copied or renamed away from its canonical System32/SysWOW64 location. ftp.exe is a living-off-the-land binary that can run a scripted command file and spawn cmd /c, making a renamed copy a way to evade name-based detection while performing file transfer or indirect command execution. Investigation should establish the binary's true identity and hash, how the renamed copy arrived, what it spawned, and any outbound connections it opened.
+type: detection
+detection_id: 277a4393-446c-449a-b0ed-7fdc7795244c
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the alerting process carry OriginalFileName ftp.exe while running from an Image path that does not end in \ftp.exe?
+  context: Before investing investigation time, confirm the alert is a true positive. The rule fires when the embedded PE OriginalFileName is ftp.exe AND the process Image does not end in \ftp.exe. Review the Image path and OriginalFileName on the triggering event to verify both conditions hold and the binary really is a relocated or renamed FTP client.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - OriginalFileName
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run the FTP client from a non-standard path?
+  context: Legitimate administrative activity can trigger this detection. The canonical ftp.exe lives in System32 and SysWOW64; a copy under another path is unusual outside packaging, software bundles, or developer workflows. Knowing whether the user role and host function involve command-line file transfer is often the fastest way to separate routine operations from a renamed-binary masquerade.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:masquerading.true_identity
+  question: What is the actual identity of this binary based on its metadata and hash?
+  context: When a binary is renamed or relocated, the PE metadata OriginalFileName and the code-signing details still reflect the original tool. Here OriginalFileName says ftp.exe while the Image name on disk is something else. Compare the two, then use the signing party and signature status to tell whether this is the genuine Microsoft-signed FTP client copied elsewhere, a third-party signed tool, or an unsigned or tampered file. The hash enables a reputation lookup to confirm whether it matches the known legitimate ftp.exe or a modified binary.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - Hashes
+- source: template:cue_process_tool.mechanism_decode
+  question: What were the full command-line arguments to the renamed FTP client, and do they reference a script file or remote host?
+  context: The full command line reveals the action taken. ftp.exe accepts a -s:filename switch that runs a text file of FTP commands non-interactively, which is the common abuse path for unattended download or upload. Decode any -s:filename script-file argument, remote host, or inline command so you understand what transfer or indirect command the renamed client was driving.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:masquerading.binary_origin
+  question: How did this renamed or relocated FTP client arrive on the host?
+  context: 'A relocated ftp.exe did not appear spontaneously; it was copied from System32, downloaded, extracted from an archive, or dropped by a parent process. Tracing the file creation event for the binary by basename over a long window reveals the delivery mechanism and the process that wrote it. A user-writable landing directory such as Desktop, Downloads, Temp, or AppData points toward download or extraction; a system directory may indicate compromise of a privileged process or routine packaging.'
+  range: -30d
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains|expand: '%file_name%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: template:cue_process_tool.process_chain
+  question: What process spawned this renamed FTP client, and is that parent chain expected?
+  context: The parent process reveals how the renamed client was invoked. Interactive use launched from explorer.exe or a shell differs from invocation by a script host, an Office application, or a remote-execution tool. An unusual parent such as wscript.exe, mshta.exe, or a macro-enabled document points toward scripted or operator-driven abuse rather than routine file transfer.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:masquerading.renamed_binary_activity
+  question: What did the renamed FTP client spawn after execution, and is the same renamed binary present on other hosts?
+  context: The point of renaming a binary is to evade detection while it still performs its function. ftp.exe can run cmd /c as a child, so examine the child processes for command interpreters or secondary tools that indicate indirect command execution rather than a plain transfer. The same renamed binary appearing on multiple hosts suggests deliberate distribution rather than an isolated event.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: attack:T1202.network_connection
+  question: Did the renamed FTP client or its children open outbound network connections, and to where?
+  context: ftp.exe exists to move files over the network, so an outbound connection from the renamed client or a child it spawned is the effect this technique chain produces. Review the destination address and port to tell whether the egress matches an expected internal file server or reaches an external host, and whether the destination is a known-good transfer endpoint.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+- source: template:cue_process_tool.follow_on
+  question: What other child processes did this binary spawn on this host afterward?
+  context: The processes spawned by a tool reveal its actual impact. A renamed FTP client that spawns command interpreters, script hosts, or download utilities is being used for indirect command execution or staging rather than file transfer alone. Unexpected children are the signal that the binary did more than its name implies.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.baseline
+  question: Does this host normally run a copy of the FTP client from this path?
+  context: A process that has never been seen on a host is more suspicious than one that runs regularly. A relocated ftp.exe with zero or very low historical counts indicates a first-time or rare placement, which weighs toward deliberate staging; a steady count may reflect a bundled or packaged copy that is routine here.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired this renamed-FTP pattern, what parents and users drove it, and does the current alert fit?
+  context: Even relocated binaries can be routine in some environments. The query mirrors the rule's selection scoped to this host, so the resulting parent and user distribution reflects how this specific firing pattern has historically run here. A new parent process, an unexpected user account, or a first-ever appearance is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_original:
+        OriginalFileName: ftp.exe
+      filter_img:
+        Image|endswith: \ftp.exe
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection_original and not filter_img) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run the FTP client from a non-standard path?
+  context: Compare the current action against the user's historical behavior. A user who has never run a relocated FTP client is more suspicious than one who does so as part of a known workflow. User role and typical toolset should align with command-line file transfer for this to read as routine.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent and binary combination historically routine on this host or across the environment, or is the parent unusual for this binary?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior. The meaningful pivot is the launch mechanism: which parent process spawned this relocated FTP client, and whether that pair is historically common. A new or rare parent for this binary is the deviation worth chasing; a pair that already accounts for many prior events is packaging or automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints. If the same user drove similar activity on several hosts, the scope may be larger than a single endpoint and the renamed binary may be part of a coordinated operation.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent and binary combination fire on other hosts in the same window, or is the activity isolated to this host?
+  context: 'Under a service principal, asking what else the user did across the network returns agent-telemetry noise. The meaningful question is whether the same launch mechanism, parent process plus spawned binary, fired on other hosts in the alert window. Multiple hosts in the same window points to scheduled or pushed automation; a single host points to a host-local trigger.'
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired this renamed-FTP pattern in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: The query mirrors the rule's selection with no host scope, giving a fleet-wide count of this specific firing pattern rather than generic FTP client usage. Many hosts firing the same pattern points to scripted deployment or packaging that relocated the binary; one host or a small unrelated set points to manual operator activity. Use the host distribution to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_original:
+        OriginalFileName: ftp.exe
+      filter_img:
+        Image|endswith: \ftp.exe
+      condition: selection_original and not filter_img
+    fields:
+    - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host such as reconnaissance, defense tampering, or credential access may reveal the stages that preceded a renamed binary being staged and run, and help reconstruct the full timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+  - id: T1202
+    name: Indirect Command Execution
+    role: primary
+  - id: T1059
+    name: Command and Scripting Interpreter
+    role: secondary
+  attack_chain_coverage:
+  - stage: 1
+    label: indirection_utility_launch
+    description: A user or service launches an indirection utility (here, a renamed/relocated ftp.exe) that can run a scripted command file.
+    mapped_to: Q4
+    source: template:cue_process_tool.mechanism_decode
+  - stage: 2
+    label: secondary_program_or_network
+    description: The utility spawns a secondary program (cmd /c via ftp -s) and/or opens outbound network connections for transfer.
+    mapped_to: Q8
+    source: attack:T1202.network_connection
+  - stage: 3
+    label: child_command_execution
+    description: Optional child command execution spawned by the indirection utility (cmd.exe, powershell, download tools).
+    mapped_to: Q7
+    source: template:masquerading.renamed_binary_activity
+  dimension_coverage:
+  - dimension: command_analysis
+    technique: T1059
+    covered_by: Q4
+    source: template:cue_process_tool.mechanism_decode
+    coverage_type: direct
+  - dimension: parent_process_analysis
+    technique: T1059
+    covered_by: Q6
+    source: template:cue_process_tool.process_chain
+    coverage_type: direct
+  - dimension: time_correlation
+    technique: T1202
+    covered_by: Q15
+    source: template:cue_user_actor.clustering_svc
+    coverage_type: direct
+  - dimension: tuning_parameter
+    technique: T1202
+    covered_by: Q16
+    source: template:cue_process_tool.scope
+    coverage_type: partial
+  - dimension: user_context
+    technique: T1202
+    covered_by: Q12
+    source: template:cue_user_actor.baseline
+    coverage_type: direct
+  mutable_dispositions:
+  - element: CommandLinePattern
+    dimension: command_analysis
+    specific_values: rationale only
+    disposition: context
+    target_question: Q4
+    notes: No commandline_values in rule (OriginalFileName-only detection). Q4 context names the ftp -s:filename script-file abuse pattern; not query-injected because the rule does not filter on CommandLine and host+binary scope already returns this binary's invocations.
+  - element: ParentProcessName
+    dimension: parent_process_analysis
+    specific_values: rationale only
+    disposition: new_question
+    target_question: Q6
+    notes: Parent chain surfaced via process_chain question on ParentProcessGuid.
+  - element: TimeWindow
+    dimension: time_correlation
+    specific_values: 10-30 minutes correlation window
+    disposition: context
+    target_question: Q8
+    notes: Network-connection question uses +/-1h around the alert to correlate launcher and outbound transfer.
+  - element: AllowedUtilities
+    dimension: tuning_parameter
+    specific_values: forfiles, wsl, ssh (admin/jumphost allowlist)
+    disposition: context
+    target_question: Q16
+    notes: Allowlist is environment-specific tuning; the fleet-scope question lets the analyst spot consistent automation versus one-off activity rather than hardcoding an allowlist.
+  - element: HighRiskChildren
+    dimension: tuning_parameter
+    specific_values: powershell.exe, cmd.exe, rundll32.exe, regsvr32.exe, mshta.exe, msiexec.exe, curl.exe, bitsadmin.exe
+    disposition: context
+    target_question: Q7
+    notes: Child-process question surfaces all children; context names high-risk interpreters/download tools as the abuse signal. Not query-injected to avoid hiding an unexpected child the allowlist would not anticipate.
+  - element: UserContext
+    dimension: user_context
+    specific_values: standard/interactive user on workstation vs server/CI agent
+    disposition: context
+    target_question: Q12
+    notes: User-baseline question carries the standard-vs-service-account framing; service-principal substitute pair handles the SYSTEM/computer-account case.
+  - element: DestCIDRs
+    dimension: tuning_parameter
+    specific_values: known-good egress networks
+    disposition: context
+    target_question: Q8
+    notes: Egress allowlist is environment-specific; Q8 context tells the analyst to compare the destination against expected internal transfer endpoints rather than embedding CIDRs.
+  dedup_decisions:
+  - dropped: null
+    reason: 'user_actor pair — non-deduplicable. cue_user_actor.baseline (Q12) and cue_user_actor.baseline_svc (Q13) emitted as a pair; cue_user_actor.clustering (Q14) and cue_user_actor.clustering_svc (Q15) emitted as a pair.'
+    kept: cue_user_actor.baseline + baseline_svc; cue_user_actor.clustering + clustering_svc
+  - dropped: cue_process_tool.clustering
+    reason: 'cue_host_context.clustering would duplicate the same host-scoped around-the-time view; both were candidates but the host-context clustering and the user clustering pair already cover concurrent activity. Dropped process_tool.clustering and host_context.clustering to stay within the 18-question cap while keeping the more specific user and fleet pivots.'
+    kept: cue_user_actor.clustering / cue_user_actor.clustering_svc / cue_process_tool.scope
+  skipped_templates:
+  - template: cue_host_context.clustering
+    reason: 'Concurrent around-the-alert activity is already covered by the user-actor clustering pair and the scope/precursor questions; dropped to respect the 18-question cap.'
+  - template: universal.endpoint_protection_health
+    reason: 'RECOMMENDED, not must_include. This rule fires on a renamed binary identity, not on hands-on-keyboard payload execution or credential access where tamper-as-precursor is the live question; cue_host_context.precursor (Q17) already surfaces any prior tamper alerts on the host. Dropped to respect the 18-question cap.'
+  reflection_overrides: []
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+  - universal
+  - masquerading
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 16
+      attack: 1
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 14
+    logsource_diversity:
+      process_creation: 14
+      file_event: 1
+      network_connection: 1
+      sigma_alert: 1

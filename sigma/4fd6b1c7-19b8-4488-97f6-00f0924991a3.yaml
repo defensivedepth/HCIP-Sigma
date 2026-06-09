@@ -1,0 +1,436 @@
+name: PUA - NimScan Execution
+id: 2257e323-fd5a-4699-b98e-44eaee630145
+description: |
+  Detects execution of NimScan, a fast Windows port scanner, by process image name or by known IMPHASH values tied to specific builds of the tool. Port scanners enumerate open ports and reachable services across hosts and subnets, which is normal during sanctioned vulnerability assessment or IT troubleshooting but is also a common early step in post-compromise network service discovery before lateral movement. The investigation should determine who ran the scanner, what address ranges and ports it targeted, whether the activity was authorized, and whether it sits alongside other reconnaissance on the same host.
+type: detection
+detection_id: 4fd6b1c7-19b8-4488-97f6-00f0924991a3
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the process image or hash match the NimScan port scanner this rule detects?
+  context: Before investing investigation time, confirm the alert is a true positive. The rule fires when the process image name ends in NimScan.exe or the process IMPHASH matches one of the known NimScan builds. Review the image path and hash on the alerting event against the detection criteria.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - Hashes
+- source: template:discovery_recon.discovery_user_context
+  question: Is this user expected to run network port scanning tools?
+  context: Network administrators, vulnerability-assessment staff, and IT troubleshooters legitimately run port scanners. Standard users and service accounts rarely have a reason to enumerate ports across the network. The user's role and typical toolset determine whether scanner execution is routine or anomalous.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - User
+- source: template:remote_access_tool.tool_authorization
+  question: Is NimScan on the organization's approved software list?
+  context: Organizations typically sanction a specific set of scanning and assessment tools. NimScan is a third-party utility not bundled with Windows, so its presence may represent shadow IT, an authorized assessment, or attacker-deployed tooling. Unauthorized scanners should be checked regardless of who introduced them.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+- source: template:remote_access_tool.active_session_context
+  question: Is there an authorization, change ticket, or assessment window explaining this scan?
+  context: Legitimate scanning usually correlates with a documented vulnerability assessment, a scheduled maintenance window, or an IT troubleshooting request. If no authorization context exists for this execution, the scan may be an attacker enumerating reachable services before lateral movement.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:cue_process_tool.mechanism_decode
+  question: What hosts and ports did NimScan target? Decode the scan arguments from the command line.
+  context: The full command line reveals the scan scope. NimScan takes a host, IP, or CIDR target followed by a port specification such as -p:1-65535 or -p:80,443,445, plus options for threads, timeout, and raw-socket scanning. Decode the target range and port list to understand whether this was a narrow service check or a broad subnet sweep.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:discovery_recon.discovery_parent_chain
+  question: What process spawned NimScan, and is this a normal launch pattern?
+  context: A scanner launched from cmd.exe under explorer.exe (an interactive operator) reads differently from one spawned by a script interpreter, a WMI or WinRM provider host, or an Office application. An unusual parent points to automated post-exploitation enumeration rather than a hands-on administrator.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+- source: template:remote_access_tool.connection_destination
+  question: What hosts and ports did the scanner actually reach during this activity?
+  context: A port scanner generates a burst of outbound connection attempts to many destinations. The connection records show which addresses and ports were probed and whether any reachable service responded. A wide spread of destination IPs in a short window confirms network enumeration; concentration on a few internal services may indicate targeted reconnaissance toward specific assets.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationHostname
+      - DestinationPort
+- source: template:cue_process_tool.follow_on
+  question: What child processes did NimScan spawn afterward?
+  context: A standalone port scanner has no legitimate reason to spawn child processes. Children such as cmd.exe, powershell.exe, or certutil.exe following the scan suggest the operator pivoted from discovery into execution or staging, and indicate the scan was one step in a larger sequence.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:discovery_recon.discovery_burst_detection
+  question: Did other reconnaissance commands run on this host around the same time?
+  context: A single discovery action may be legitimate troubleshooting, but multiple reconnaissance commands in rapid succession is a signature pattern of post-compromise enumeration. A port scan paired with net, nltest, nslookup, or arp activity in the same window points to an operator mapping the environment before moving to the next stage.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_recon:
+        Image|endswith:
+          - '\whoami.exe'
+          - '\systeminfo.exe'
+          - '\ipconfig.exe'
+          - '\net.exe'
+          - '\net1.exe'
+          - '\nltest.exe'
+          - '\dsquery.exe'
+          - '\nbtstat.exe'
+          - '\arp.exe'
+          - '\netstat.exe'
+          - '\tasklist.exe'
+          - '\qprocess.exe'
+          - '\query.exe'
+          - '\quser.exe'
+          - '\hostname.exe'
+          - '\nslookup.exe'
+          - '\adfind.exe'
+          - '\csvde.exe'
+          - '\ldifde.exe'
+          - '\dnscmd.exe'
+          - '\cmdkey.exe'
+          - '\setspn.exe'
+      condition: selection and selection_recon
+    fields:
+      - Image
+      - User
+- source: template:cue_process_tool.baseline
+  question: Does this host normally run NimScan?
+  context: A scanner that has never appeared on a host is more suspicious than one that runs on a regular cadence. Zero or very low historical counts over the trailing window indicate first-time or rare execution, which raises the priority of confirming authorization.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run port scanning tools across the environment?
+  context: Compare this user's current action against their historical behavior. A user who has never run a scanner is more notable than one who does so as part of a regular assessment role. User role and typical toolset should align with running network enumeration utilities.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent and binary combination historically routine on this host or across the environment, or is the parent unusual for this scanner?
+  context: |
+    When the alert fires under a service principal, user identity does not attribute behavior. The meaningful pivot is the launch mechanism. Which parent process spawned the scanner, and is that pair historically common. A new or rare parent for this binary is the deviation worth chasing; a pair that already accounts for many prior events is scheduled automation or an assessment tool.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals whether the scan is isolated or part of broader hands-on activity. If the same user triggered related actions on multiple endpoints, the scope of the operation may extend beyond this host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent and binary combination fire on other hosts in the same window, or is the activity isolated to this host?
+  context: Under a service principal, asking what else the user did returns agent-telemetry noise. The meaningful question is whether the same launch mechanism, parent process plus the scanner binary, fired on other hosts in the alert window. Multiple hosts in the same window points to scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired the rule's pattern, what parents and users normally drive that activity, and does the current alert fit?
+  context: Even sanctioned scanning has a routine shape. The query mirrors the rule's selection scoped to this host, so the resulting parent and user distribution reflects how the rule's specific firing pattern has historically run here. A new parent process, an unexpected user account, or an unusual launch shape is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+      - Image|endswith: \NimScan.exe
+      - Hashes|contains:
+        - IMPHASH=41BB1C7571B3A724EB83A1D2B96DBB8C
+        - IMPHASH=B1B6ADACB172795480179EFD18A29549
+        - IMPHASH=0D1F896DC7642AD8384F9042F30279C2
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: |
+    Alerts rarely occur in isolation. Examining activity around the scan reveals the immediate context. What led to it, what happened after, and whether it is part of a larger sequence. Novel parent-child pairs at low counts stand out against the high-count repetitive baseline.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired the rule's pattern in the past week, and does the cross-host distribution look like consistent automation or one-off activity?
+  context: The query mirrors the rule's selection with no host scope, so the result is a fleet-wide count of the scanner's firing pattern. Many hosts firing the same pattern points to a deployed assessment tool or vendor automation; one host or a small unrelated set points to manual operator activity. Use the host distribution to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+      - Image|endswith: \NimScan.exe
+      - Hashes|contains:
+        - IMPHASH=41BB1C7571B3A724EB83A1D2B96DBB8C
+        - IMPHASH=B1B6ADACB172795480179EFD18A29549
+        - IMPHASH=0D1F896DC7642AD8384F9042F30279C2
+      condition: selection
+    fields:
+    - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host, such as defense tampering, credential access, or initial-access activity, may reveal the stages that preceded the scan and help reconstruct the timeline. Network service discovery typically follows an initial foothold, so prior alerts often explain how the operator arrived.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+  - id: T1046
+    name: Network Service Discovery
+    role: primary
+  attack_chain_coverage:
+  - stage: 1
+    label: scanner_process_creation
+    description: A scanner process is created on the host (NimScan by image name or known IMPHASH).
+    mapped_to: Q1
+    source: template:universal.verify_trigger_match
+  - stage: 2
+    label: scan_parameter_configuration
+    description: The scanner is invoked with target hosts/CIDR and a port specification defining scan scope.
+    mapped_to: Q5
+    source: template:cue_process_tool.mechanism_decode
+  - stage: 3
+    label: sequential_network_probing
+    description: The scanner issues a burst of socket connections to sequential destination IPs/ports within a time window.
+    mapped_to: Q7
+    source: template:remote_access_tool.connection_destination
+  dimension_coverage:
+  - dimension: time_correlation
+    technique: T1046
+    covered_by: Q7
+    source: template:remote_access_tool.connection_destination
+    coverage_type: direct
+  - dimension: tuning_parameter
+    technique: T1046
+    covered_by: Q5
+    source: template:cue_process_tool.mechanism_decode
+    coverage_type: direct
+  - dimension: user_context
+    technique: T1046
+    covered_by: Q2
+    source: template:discovery_recon.discovery_user_context
+    coverage_type: direct
+  mutable_dispositions:
+  - element: ScanRateThreshold
+    dimension: tuning_parameter
+    specific_values: rationale only
+    disposition: context
+    target_question: Q7
+    notes: No numeric threshold supplied in brief; the connection-destination question instructs the analyst to read the destination IP/port spread in the window as the scan-rate signal.
+  - element: KnownScannerExeList
+    dimension: tuning_parameter
+    specific_values: NimScan (this rule's binary)
+    disposition: context
+    target_question: Q3
+    notes: The rule already constrains the scanner to NimScan; tool_authorization asks whether this specific scanner is on the approved list, which is the analyst-side equivalent of the allow-list element.
+  - element: TimeWindow
+    dimension: time_correlation
+    specific_values: rationale only (e.g. 60 seconds)
+    disposition: context
+    target_question: Q7
+    notes: Correlation window is realized as the +/-15m range on the connection-destination and burst-detection questions; no exact second-count is queryable, so it informs how the analyst reads concentration of probes.
+  dedup_decisions:
+  - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc
+    reason: user_actor pair — non-deduplicable (subject-identity vs launch-mechanism pivots degenerate under different conditions)
+    kept: both
+  - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc
+    reason: user_actor pair — non-deduplicable (network-wide user pivot vs parent+binary pivot)
+    kept: both
+  - dropped: universal.host_user_context
+    reason: discovery_recon.discovery_user_context is more specific to discovery context and supersedes it per template notes
+    kept: discovery_recon.discovery_user_context
+  - dropped: cue_process_tool.process_chain
+    reason: discovery_recon.discovery_parent_chain (technique-set, must_include) covers the parent-launch question more specifically
+    kept: discovery_recon.discovery_parent_chain
+  - dropped: cue_process_tool.clustering
+    reason: cue_host_context.clustering covers the same "what else ran on this host" angle with a broader Image+ParentImage projection
+    kept: cue_host_context.clustering
+  skipped_templates:
+  - template: universal.endpoint_protection_health
+    reason: Rule is discovery (network service enumeration), not execution/credential-access/impact; tamper-as-precursor is not the live disposition question. cue_host_context.precursor is present and already carries prior-alert context including any tamper detections on the host.
+  reflection_overrides: []
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+  - universal
+  - discovery_recon
+  - remote_access_tool
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 18
+      attack: 0
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 15
+    logsource_diversity:
+      process_creation: 16
+      network_connection: 1
+      sigma_alert: 1

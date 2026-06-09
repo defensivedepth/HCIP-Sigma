@@ -1,0 +1,505 @@
+name: HackTool - Empire PowerShell UAC Bypass
+id: 3ee393eb-f365-4673-b943-bf6390adbe42
+description: |
+  Detects PowerShell command lines matching Empire's auto-elevated UAC bypass bootstrap, which reads a
+  staged payload from the HKCU\Software\Microsoft\Windows Update registry value and re-launches it with
+  -NoP -NonI -w Hidden to run hidden and non-interactive. The bypass works by writing a command into a
+  registry key that an auto-elevated binary (eventvwr.exe or fodhelper.exe) reads and executes at high
+  integrity without a consent prompt. The investigation should confirm the exact command matched, decode
+  what the staged payload does, locate the registry write that set up the bypass, and determine what ran
+  at high integrity afterward.
+type: detection
+detection_id: 3268b746-88d8-4cd3-bffc-30077d02c787
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line match the Empire UAC bypass bootstrap this rule detects?
+  context: Before investing investigation time, confirm the alert is a true positive by reviewing the exact
+    command line. The rule fires on PowerShell launched with the -NoP -NonI -w Hidden flags running a -c
+    block that reads a staged payload from the HKCU\Software\Microsoft\Windows Update Update value and
+    re-executes it. Confirm those flags and the registry read are present verbatim.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run hidden non-interactive PowerShell that re-executes a registry-staged payload?
+  context: Legitimate administrative activity can trigger many detections, but the staged-payload-from-registry
+    pattern this rule matches has essentially no benign administrative equivalent. Knowing whether the user
+    role and host function involve any scripted automation that mirrors this shape is the fastest path to
+    distinguishing a true positive from a rare benign case.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:hacking_tool.authorized_engagement
+  question: Is this Empire UAC bypass execution part of an authorized penetration test or red team engagement?
+  context: This bootstrap is a known offensive framework module used in authorized security assessments. Before
+    investing investigation time, check whether a penetration test or red team exercise is currently active on
+    this host or network segment. An authorized engagement with matching tooling and timing resolves the alert
+    without further analysis.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:hacking_tool.tool_capability_used
+  question: Which UAC bypass variant does the staged command indicate, and what does the staged payload do?
+  context: The command reads its payload from the HKCU\Software\Microsoft\Windows Update Update value, so the
+    visible command line is only the launcher. Identify which auto-elevated trigger the variant relies on
+    (eventvwr.exe or fodhelper.exe), then recover the staged payload content to determine what was set to run
+    at high integrity. The payload determines the scope of potential compromise and required response.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:cue_process_tool.mechanism_decode
+  question: Decode the full PowerShell command line - what does the registry-staged payload resolve to and execute?
+  context: The full command line reveals the specific action taken. This launcher reads the staged payload from
+    the registry and runs it, so the meaningful content is what that value holds. Decode any base64, string
+    concatenation, or download cradle in the recovered payload to understand what the bypass was set up to run
+    with elevated privileges.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:powershell.encoded_command_decode
+  question: Is the staged payload encoded or obfuscated, and what does it decode to?
+  context: Attackers frequently encode or obfuscate the payload that this launcher stages and re-executes -
+    base64, string concatenation, backtick escaping, or variable substitution. Decoding reveals the actual
+    payload, such as a download cradle, reverse shell, or in-memory execution of a .NET assembly. The value
+    read from the registry is the content to decode, since the visible command line only re-runs it.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: attack:T1548.002.registry_set
+  question: Was a payload written to the registry key this bypass reads from shortly before the alert?
+  context: This bypass relies on staging a command into a user-writable registry value that an auto-elevated
+    process reads and executes. The launcher reads from HKCU\Software\Microsoft\Windows Update, and Empire
+    variants also write the auto-elevation trigger to HKCU\Software\Classes\mscfile\shell\open\command
+    (eventvwr) or ms-settings\Shell\Open\command (fodhelper). Finding the write confirms the bypass mechanism
+    and recovers the exact payload set to run at high integrity.
+  range: -15m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|contains:
+          - '\Software\Microsoft\Windows Update'
+          - '\mscfile\shell\open\command'
+          - '\ms-settings\Shell\Open\command'
+          - '\ms-settings\shell\open\command'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+      - User
+- source: template:powershell.script_block_logging
+  question: Did PowerShell script block logging capture the deobfuscated content of the staged payload?
+  context: Script block logging records the deobfuscated script content that PowerShell actually executes,
+    even when the staged payload is encoded or read indirectly from the registry. This provides ground truth
+    about what ran, bypassing obfuscation in the launcher. If PowerShell operational logs are not ingested in
+    this environment, treat zero results as a visibility gap rather than evidence nothing ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- source: template:uac_bypass.elevated_action_after_bypass
+  question: What action was performed with elevated privileges after the UAC bypass?
+  context: UAC bypass is a means to an end. After elevation the operator typically installs persistence, dumps
+    credentials, tampers with security tools, or accesses protected resources. Examining processes spawned at
+    high or system integrity on this host shortly after the bypass reveals the objective.
+  range: +30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        IntegrityLevel:
+          - 'High'
+          - 'System'
+          - 'S-1-16-16384'
+          - 'S-1-16-12288'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - IntegrityLevel
+- source: attack:T1548.002.process_access
+  question: Did the auto-elevated process open a handle into a sensitive process around the alert window?
+  context: After a successful UAC bypass the high-integrity process is positioned to access protected memory,
+    most notably to read lsass.exe for credential material. A handle opened into lsass.exe or another security
+    process by an auto-elevated trigger (eventvwr.exe, fodhelper.exe) or a PowerShell child shortly after the
+    bypass points to credential access as the objective rather than benign elevation.
+  range: +/-30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_access
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetImage|endswith:
+          - '\lsass.exe'
+          - '\winlogon.exe'
+          - '\lsm.exe'
+      condition: selection
+    fields:
+      - SourceImage
+      - TargetImage
+      - GrantedAccess
+      - CallTrace
+- source: template:uac_bypass.other_escalation_attempts
+  question: Were other UAC bypass or privilege escalation techniques attempted on this host?
+  context: Operators who attempt one UAC bypass often try multiple methods until one succeeds, especially when
+    the OS version or configuration blocks certain techniques. Other privilege-escalation detections on the
+    same host from the same user or process confirm deliberate escalation activity rather than an isolated
+    false positive.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - rule.name
+      - rule.uuid
+      - event.severity_label
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host previously fired this Empire bypass pattern, what parents and users drove it, and does the current alert fit?
+  context: The query mirrors the rule's command-line selection scoped to this host, so the resulting parent and
+    user distribution reflects how this specific firing pattern has historically run here, not generic PowerShell
+    usage. A new parent process, an unexpected user account, or a first-ever appearance of this pattern is the
+    anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains:
+        - ' -NoP -NonI -w Hidden -c $x=$((gp HKCU:Software\Microsoft\Windows Update).Update)'
+        - ' -NoP -NonI -c $x=$((gp HKCU:Software\Microsoft\Windows Update).Update);'
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run PowerShell that reads and re-executes registry-staged payloads?
+  context: Compare this user's current action against their historical behavior. A user who has never produced
+    this command-line pattern is more suspicious than one who does so regularly. The query searches for this
+    user running this Empire bypass pattern across all hosts; zero or very low counts indicate the activity is
+    new for this account.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        CommandLine|contains:
+        - ' -NoP -NonI -w Hidden -c $x=$((gp HKCU:Software\Microsoft\Windows Update).Update)'
+        - ' -NoP -NonI -c $x=$((gp HKCU:Software\Microsoft\Windows Update).Update);'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple
+    endpoints. If the same user triggered related activity on several hosts, the scope of the operation may be
+    larger than this single alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent and PowerShell launch combination fire on other hosts in the same window, indicating a coordinated rollout?
+  context: When the alert fires under a service principal, user-based pivots return agent-telemetry noise because
+    every host runs system-owned agents constantly. The meaningful question is whether the same launch mechanism
+    - the parent process spawning PowerShell - fired on other hosts in the alert window. Multiple hosts in the
+    same window point to scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host - defense tampering,
+    reconnaissance, or credential access - may reveal the attack stages that preceded the bypass and help
+    reconstruct the full timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired this Empire bypass pattern in the past week, and does the distribution look like automation or isolated activity?
+  context: The query mirrors the rule's command-line selection with no host scope, so the result is a fleet-wide
+    count of this specific firing pattern rather than generic PowerShell usage. Many hosts firing the same
+    pattern points to scripted deployment; one host or a small unrelated set points to manual operator activity.
+    Use the host distribution to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains:
+        - ' -NoP -NonI -w Hidden -c $x=$((gp HKCU:Software\Microsoft\Windows Update).Update)'
+        - ' -NoP -NonI -c $x=$((gp HKCU:Software\Microsoft\Windows Update).Update);'
+      condition: selection
+    fields:
+    - host.name
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1548.002
+      name: Bypass User Account Control
+      role: primary
+    - id: T1548
+      name: Abuse Elevation Control Mechanism
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: registry_payload_staging
+      description: "Actor writes payload and auto-elevation trigger into user-writable registry keys"
+      mapped_to: Q7
+      source: attack:T1548.002.registry_set
+    - stage: 2
+      label: auto_elevated_invocation
+      description: "Auto-elevated binary reads the registry value and re-executes the staged payload at high integrity"
+      mapped_to: Q5
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 3
+      label: elevated_action
+      description: "High-integrity process performs the operator objective (credential access, persistence, tampering)"
+      mapped_to: Q9
+      source: template:uac_bypass.elevated_action_after_bypass
+  dimension_coverage:
+    - dimension: parent_process_analysis
+      technique: T1548.002
+      covered_by: Q12
+      source: template:cue_process_tool.baseline_deviation
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1548.002
+      covered_by: Q7
+      source: attack:T1548.002.registry_set
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1548.002
+      covered_by: Q9
+      source: template:uac_bypass.elevated_action_after_bypass
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1548
+      covered_by: Q13
+      source: template:cue_user_actor.baseline
+      coverage_type: direct
+  mutable_dispositions:
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "30 seconds (registry tamper to elevation)"
+      disposition: context
+      target_question: Q7
+      notes: "registry_set question uses -15m lookback for the staging write; precise sub-window correlation is left to analyst, threshold is rationale not directly queryable"
+    - element: ElevatedProcessNameList
+      dimension: tuning_parameter
+      specific_values: "sdclt.exe, eventvwr.exe, computerdefaults.exe, fodhelper.exe"
+      disposition: context
+      target_question: Q9
+      notes: "auto-elevated triggers named in context; elevated_action question filters on IntegrityLevel High/System rather than a fixed binary list to catch the post-elevation action"
+    - element: ParentProcessAnomalyThreshold
+      dimension: parent_process_analysis
+      specific_values: "rationale only (parent-child mismatch logic)"
+      disposition: context
+      target_question: Q12
+      notes: "baseline_deviation surfaces parent distribution for this firing pattern so analyst spots the non-elevated-spawns-auto-elevated anomaly"
+    - element: ElevatedProcessPath
+      dimension: tuning_parameter
+      specific_values: "rationale only (unsigned/unexpected elevated binary paths)"
+      disposition: context
+      target_question: Q9
+      notes: "T1548 secondary element; covered by Image/CommandLine projection on the high-integrity process query"
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "rationale only (control.exe spawning cmd.exe, etc.)"
+      disposition: context
+      target_question: Q12
+      notes: "T1548 secondary element; parent distribution surfaced by baseline_deviation"
+  dedup_decisions:
+    - dropped: cue_user_actor.baseline_svc
+      reason: "user_actor baseline pair — rule is CommandLine-only with null primary_binary; the service-principal substitute pivots on process.parent.name + Image|endswith %Image%, but %Image% has no value (no Image in detection) so the substitute query is unbindable. user-pivot baseline retained with the rule's CommandLine pattern as the scoping filter."
+      kept: cue_user_actor.baseline
+  skipped_templates:
+    - template: cue_process_tool.process_chain
+      reason: "ParentProcessGuid-scoped parent lookup; parent lineage anomaly is covered more specifically by baseline_deviation (parent distribution for this firing pattern) and the registry_set staging question. Avoids a low-value parent redisplay."
+    - template: cue_process_tool.baseline
+      reason: "Image-based 90d frequency; rule has null primary_binary (CommandLine-only) so Image|endswith %Image% is unbindable. Pattern-scoped baseline is provided by cue_user_actor.baseline using the rule's CommandLine values, and host-pattern history by baseline_deviation."
+    - template: cue_process_tool.follow_on
+      reason: "ParentImage|endswith %Image% child search; %Image% unbindable on this CommandLine-only rule. Post-execution activity is covered by elevated_action_after_bypass (high-integrity children) and host_context-equivalent clustering."
+    - template: cue_process_tool.clustering
+      reason: "Host-wide tool clustering subsumed by the retained cue_host_context.precursor (prior alerts on host) plus cue_user_actor.clustering (user network-wide activity); a third broad host sweep would not add a distinct investigative angle."
+    - template: cue_process_tool.baseline_deviation
+      reason: "not skipped — retained as Q12 (REFLECTED, kept verbatim)"
+    - template: universal.endpoint_protection_health
+      reason: "Generic host-tamper sweep. Tamper-as-precursor for this host is already carried by cue_host_context.precursor (prior alerts including defense-tampering detections) and uac_bypass.other_escalation_attempts; the rule is a bypass launcher, not a credential-access/execution payload whose disposition turns on AV being disabled first. Dropped to stay within the question cap without losing a distinct angle."
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "logsource 'image_load' (recommended by techniques: T1548.002) is not covered — pull in cue_image_load.* or author a custom question with `category: image_load`"
+      disposition: declined
+      reason: >-
+        The rule fires on a self-contained PowerShell launcher that reads a payload
+        from the registry; the T1548.002 image_load analytic targets DLL side-loading
+        into auto-elevated COM hosts, which is a different bypass family than the
+        registry-staged one this rule matches. The registry write that actually sets
+        up this bypass is covered directly by Q7 (attack:T1548.002.registry_set) and
+        the elevated outcome by Q9, so an image_load question on eventvwr/fodhelper
+        would return module-load volume without precision for the mechanism in scope.
+    - hint: "logsource 'security' (recommended by techniques: T1548.002) is not covered and no template family exists — author a custom question with `category: security`"
+      disposition: declined
+      reason: >-
+        The security-channel analytic keys on 4672 (special privileges assigned),
+        which marks that elevation occurred but not what the operator did with it.
+        Q9 (elevated_action_after_bypass) already enumerates the High/System
+        integrity processes spawned after the bypass via process_creation, which is
+        the actionable view of the same elevation event. A 4672 question would
+        duplicate that signal with coarser data, so no compensating security-category
+        question was authored.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - powershell
+    - hacking_tool
+    - uac_bypass
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 15
+      attack: 2
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 2
+      context: 13
+    logsource_diversity:
+      process_creation: 11
+      registry_set: 1
+      process_access: 1
+      powershell: 1
+      sigma_alert: 2

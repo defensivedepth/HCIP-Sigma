@@ -1,0 +1,526 @@
+name: Suspicious ArcSOC.exe Child Process
+id: a217cf42-49c9-459c-a072-82c1df902e8e
+description: |
+  Detects script interpreters and command-line tools spawned as child processes of ArcSOC.exe. ArcSOC.exe hosts ArcGIS Server REST service instances; its only expected children are a console host and a single cmd.exe for console services, plus a javaw.exe running from the ArcGIS install path. A child such as cmd.exe, powershell.exe, pwsh.exe, cscript.exe, wscript.exe, mshta.exe, regsvr32.exe, rundll32.exe, or wmic.exe indicates that crafted requests reached the service endpoint and drove code execution from the server process, consistent with a malicious Server Object Extension acting as a web shell. The rule fires when ArcSOC.exe is the parent AND the child is one of these interpreters, excluding a benign `cmd.exe /c "ver"` console probe. Investigation should determine what the child command did, what request drove it, and whether the same pattern reached other ArcGIS Server hosts.
+type: detection
+detection_id: 8e95e73e-ba02-4a87-b4d7-0929b8053038
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- source: template:universal.verify_trigger_match
+  question: Is the alerting process a script interpreter or command-line tool spawned directly by ArcSOC.exe?
+  context: Confirm the alert is a true positive by checking that the parent is ArcSOC.exe and the child Image is one of the
+    flagged interpreters (cmd.exe, powershell.exe, pwsh.exe, cscript.exe, wscript.exe, mshta.exe, regsvr32.exe, rundll32.exe,
+    or wmic.exe). The rule excludes a benign `cmd.exe /c "ver"` console probe, so verify the child is not that exact command.
+    ArcSOC.exe normally spawns only conhost.exe, one cmd.exe for console services, and a javaw.exe from the install path.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+- source: template:universal.host_user_context
+  question: Is this ArcGIS Server host expected to spawn interpreters from ArcSOC.exe, and who owns the process?
+  context: ArcSOC.exe runs under the ArcGIS Server service account, not an interactive user. Legitimate geoprocessing and
+    publishing workflows do not require ArcSOC.exe to launch general-purpose interpreters. Knowing the host's role (production
+    map service vs. a development or staging box where an admin may run scripts) and the owning account is often the fastest
+    way to separate routine operation from server-side code execution.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:parent_child.parent_process_legitimacy
+  question: What started the ArcSOC.exe parent, and is this interpreter a child it should ever spawn?
+  context: ArcSOC.exe is launched by the ArcGIS Server runtime to host a single service instance and is expected to spawn only
+    a console host, a console cmd.exe, and a javaw.exe from the install path. Tracing the parent's own origin and command line
+    confirms it is a genuine service-hosted ArcSOC.exe rather than a renamed or relocated binary, and establishes the chain
+    by which an inbound service request reached process execution.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- source: template:cue_process_tool.mechanism_decode
+  question: What exactly did the spawned interpreter do? Decode its full command line and working directory.
+  context: The child command line reveals the operational intent driven through the server. Decode any flags, encoded content,
+    file paths, or an HTTP/HTTPS URL. Watch for directory creation under system paths, file writes, or staging of additional
+    binaries. The working directory indicates where the operator was operating from; a workspace created under a system
+    directory is a known web-shell staging pattern.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentName|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:powershell.encoded_command_decode
+  question: If the child is PowerShell, was the command encoded or obfuscated, and what does it decode to?
+  context: When the spawned interpreter is powershell.exe or pwsh.exe, server-side operators frequently pass base64 via
+    -EncodedCommand (-enc) or use concatenation and backtick escaping to hide intent. Decoding reveals the real payload --
+    download cradles fetching from an HTTP/HTTPS URL, reverse shells, or in-memory loading of a .NET assembly. If the child
+    is not PowerShell, this question does not apply.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: attack:T1203.delivery_request
+  question: What service request reached ArcSOC.exe immediately before this child spawned?
+  context: Server-side exploitation of an ArcGIS Server begins with a crafted request to a public-facing service endpoint,
+    typically proxied through a web gateway to the internal server. Identifying the originating request, the operation name,
+    and the source address enables blocking at the perimeter and reveals whether a malicious Server Object Extension is
+    acting as a web shell. Correlate the alert time against web gateway and ArcGIS Server request logs; this query returns
+    the parent context to anchor that pivot.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+- source: attack:T1203.outbound_connection
+  question: Did this host make outbound network connections shortly after the interpreter ran?
+  context: After a client- or server-side exploit spawns an interpreter, a download cradle or command-and-control channel
+    commonly follows within minutes -- an outbound HTTPS connection to fetch a payload or establish a persistent tunnel.
+    Connections to an external address that are not part of normal ArcGIS Server operation, especially soon after the child
+    process, point to active operator control. Exclude known update and gateway endpoints when reviewing.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'true'
+      filter_local:
+        DestinationIp|cidr:
+          - '10.0.0.0/8'
+          - '172.16.0.0/12'
+          - '192.168.0.0/16'
+          - '127.0.0.0/8'
+      condition: selection and not filter_local
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Image
+- source: attack:T1203.file_write
+  question: Did the interpreter or its parent write or stage files in user-writable or system workspace paths?
+  context: Exploitation chains commonly drop or modify a file after gaining execution -- a script, a renamed legitimate tool,
+    or a workspace directory created under a system path. File creation under writable locations such as %TEMP%, %APPDATA%,
+    a public profile, or a newly created directory under a system folder, in the same window as the interpreter, indicates
+    payload staging rather than routine service activity.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains:
+          - '\Temp\'
+          - '\AppData\'
+          - '\Users\Public\'
+          - '\Windows\System32\'
+          - '\ProgramData\'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: template:cue_parent_process.follow_on
+  question: What other child processes did this ArcSOC.exe instance spawn?
+  context: A compromised server process is often used to run several tools in sequence -- reconnaissance, credential access,
+    persistence setup. Listing every child of this ArcSOC.exe instance reveals the full scope of activity driven through the
+    service and shows whether the alerting interpreter was a single action or one step in a chain.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_parent_process.baseline
+  question: Has ArcSOC.exe spawned this interpreter on this host before?
+  context: ArcSOC.exe spawning a general-purpose interpreter should be rare to nonexistent on a healthy ArcGIS Server. Zero
+    or very low historical counts for this specific parent-child pairing indicate a novel spawning relationship and raise the
+    likelihood of server-side code execution; a steady historical baseline points to an unusual but established operational
+    workflow worth confirming with the server administrators.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentName|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:cue_user_actor.baseline
+  question: Does the account owning this process normally run this interpreter anywhere in the environment?
+  context: Compare the owning account's current action against its historical pattern. The ArcGIS Server service account
+    should not be launching interpreters across the fleet; a near-zero history for this account running this tool strengthens
+    the case for abuse. If the alert fires under a service principal, account identity attributes little -- pair this with the
+    launch-mechanism baseline.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this ArcSOC.exe-to-interpreter launch mechanism historically routine on this host or across the environment?
+  context: When the alert fires under a service account, user identity does not attribute behavior; the meaningful pivot is
+    the launch mechanism -- which parent spawned this interpreter, and whether that pair is historically common. A new or rare
+    ArcSOC.exe-to-interpreter pairing is the deviation worth chasing; a pair already accounting for many prior events points
+    to an established workflow or vendor automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentName|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did the owning account do across the network around this time?
+  context: Tracking the owning account's activity across all hosts in the alert window reveals lateral movement or activity
+    spanning multiple endpoints. If the same account drove similar activity elsewhere, the scope is larger than one server.
+    Under a service account this view returns broad agent-telemetry noise -- pair it with the launch-mechanism cross-host view.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did the same ArcSOC.exe-to-interpreter pattern fire on other hosts in the same window?
+  context: Under a service account, asking what the account did network-wide returns telemetry noise. The meaningful question
+    is whether the same launch mechanism -- ArcSOC.exe spawning an interpreter -- appeared on other hosts in the alert window.
+    Multiple ArcGIS Server hosts showing the pattern in the same window points to a coordinated push against the server fleet;
+    a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentName|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:initial_access.campaign_scope
+  question: Did this same detection fire on other ArcGIS Server hosts recently?
+  context: Server exploitation campaigns rarely target a single host. Correlating this same detection across the environment
+    reveals how many ArcGIS Server systems show the suspicious ArcSOC.exe child pattern, identifying additional compromised
+    servers that need investigation and indicating campaign breadth.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        rule.name|expand: '%rule.name%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same ArcGIS Server host -- reconnaissance, defense
+    tampering, credential access -- may reveal the stages that preceded this execution and help reconstruct the timeline of
+    how the server was reached and what followed the initial code execution.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1203
+      name: Exploitation for Client Execution
+      role: primary
+    - id: T1059
+      name: Command and Scripting Interpreter
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: exploit_request
+      description: "Crafted request reaches the service endpoint and drives execution from ArcSOC.exe (malicious SOE acting as web shell)"
+      mapped_to: Q6
+      source: attack:T1203.delivery_request
+    - stage: 2
+      label: child_spawn
+      description: "ArcSOC.exe spawns an unexpected interpreter (cmd/powershell/mshta/rundll32/wscript etc.)"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 3
+      label: file_write
+      description: "Interpreter drops or modifies a file in user-writable/system workspace paths"
+      mapped_to: Q8
+      source: attack:T1203.file_write
+    - stage: 4
+      label: outbound_c2
+      description: "Host establishes outbound C2-like connection shortly after"
+      mapped_to: Q7
+      source: attack:T1203.outbound_connection
+  dimension_coverage:
+    - dimension: command_analysis
+      technique: T1059
+      covered_by: Q4
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1059
+      covered_by: Q3
+      source: template:parent_child.parent_process_legitimacy
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1059
+      covered_by: Q7
+      source: attack:T1203.outbound_connection
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1059
+      covered_by: Q1
+      source: template:universal.verify_trigger_match
+      coverage_type: indirect
+    - dimension: user_context
+      technique: T1059
+      covered_by: Q11
+      source: template:cue_user_actor.baseline
+      coverage_type: direct
+    - dimension: file_path_analysis
+      technique: T1203
+      covered_by: Q8
+      source: attack:T1203.file_write
+      coverage_type: direct
+  mutable_dispositions:
+    - element: CommandLinePattern
+      dimension: command_analysis
+      specific_values: "rationale only (encoded/uncommon script patterns)"
+      disposition: context
+      target_question: Q4
+      notes: "Decode-the-command-line question covers encoded/uncommon patterns; PowerShell-specific decode in Q5"
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "ArcSOC.exe"
+      disposition: query_injection
+      target_question: Q4
+      notes: "ParentName scoping pins the decode/baseline queries to the ArcSOC.exe parent (Q4, Q10, Q12, Q14)"
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only (correlation window)"
+      disposition: context
+      target_question: Q7
+      notes: "+/-15m correlation window applied between child spawn and outbound connection"
+    - element: HighRiskChildren
+      dimension: tuning_parameter
+      specific_values: "powershell.exe, cmd.exe, wscript.exe, mshta.exe, rundll32.exe, regsvr32.exe (overlaps rule's Image list)"
+      disposition: query_injection
+      target_question: Q1
+      notes: "Rule's own Image|endswith list IS the high-risk-children set; %Image% expand in verify_trigger_match and baselines enforces it"
+    - element: UserPaths
+      dimension: file_path_analysis
+      specific_values: "%TEMP%, %APPDATA%, Users\\Public, System32, ProgramData"
+      disposition: query_injection
+      target_question: Q8
+      notes: "Injected into file_event TargetFilename|contains list"
+    - element: AllowedPlugins
+      dimension: tuning_parameter
+      specific_values: "rationale only (suppression allowlist)"
+      disposition: context
+      target_question: Q7
+      notes: "Suppression of known update/CDN endpoints noted in context, not queryable as a placeholder"
+    - element: EgressAllowlist
+      dimension: tuning_parameter
+      specific_values: "rationale only (egress CIDR/domain allowlist)"
+      disposition: context
+      target_question: Q7
+      notes: "RFC1918 ranges excluded in query; named update/gateway endpoints noted in context for analyst suppression"
+  dedup_decisions:
+    - dropped: cue_process_tool.process_chain
+      reason: "parent_process is primary cue — its parent-legitimacy and follow_on questions subsume process_chain (hint)"
+      kept: template:parent_child.parent_process_legitimacy
+    - dropped: cue_process_tool.mechanism_decode
+      reason: "kept as Q4 but parent_process.mechanism_decode dropped — process_tool decode is the binary-centric version retained"
+      kept: template:cue_process_tool.mechanism_decode
+    - dropped: cue_user_actor.baseline / clustering paired with _svc variants
+      reason: "user_actor pair — non-deduplicable; both user-pivot and launch-mechanism variants emitted (Q11/Q12, Q13/Q14)"
+      kept: both
+  skipped_templates:
+    - template: cue_parent_process.mechanism_decode
+      reason: "Redundant with cue_process_tool.mechanism_decode (Q4) which decodes the child command; parent decode is the upstream lookup covered by parent_process_legitimacy (Q3)"
+    - template: cue_parent_process.clustering
+      reason: "follow_on (Q9) and host_context.precursor (Q16) already cover same-time parent and host activity; clustering would duplicate"
+    - template: cue_parent_process.scope
+      reason: "Cross-host parent-child scope covered by clustering_svc (Q14) and campaign_scope (Q15)"
+    - template: cue_process_tool.baseline
+      reason: "Host-level binary baseline covered by parent-child baseline (Q10), which is more specific to the ArcSOC.exe pairing"
+    - template: universal.endpoint_protection_health
+      reason: "Dropped to stay within 18-question cap; host_context.precursor (Q16) surfaces prior tamper alerts on this host, and the disposition here turns on server-side request origin rather than local AV tampering before payload"
+    - template: powershell.script_block_logging
+      reason: "Child is PowerShell only conditionally (one of nine possible interpreters); a powershell-service query would return 0 for the common non-PowerShell fires. Decode coverage retained via Q5 for the PowerShell case"
+    - template: powershell.powershell_security_bypass
+      reason: "Same conditional-PowerShell rationale; bypass-precursor sweep would be empty for non-PowerShell fires and overlaps prior-alert context in Q16"
+    - template: initial_access.delivery_vector
+      reason: "Superseded by custom attack:T1203.delivery_request (Q6), which frames the vector as a server-side service request rather than an email/document"
+    - template: initial_access.application_patch_status
+      reason: "ArcGIS Server patch level is relevant but folded into Q3/Q6 server-context prose; a dedicated KEEP_EXACT question would only redisplay parent Image"
+    - template: persistence_scope.process_based_persistence
+      reason: "is_persistence_rule is false; persistence stacking is a downstream concern covered generally by follow_on (Q9). Dropped to hold question count"
+    - template: persistence_scope.file_based_persistence
+      reason: "File-drop coverage retained via the broader attack:T1203.file_write question (Q8); a Startup/Run-key-only query is narrower than this rule's staging concern"
+    - template: parent_child.sibling_processes
+      reason: "Same ParentProcessGuid sibling enumeration is exactly what cue_parent_process.follow_on (Q9) provides; kept follow_on, dropped duplicate"
+    - template: cue_host_context.clustering
+      reason: "Host-wide same-time activity overlaps follow_on (Q9, same parent) and precursor (Q16); dropped to hold question count"
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "cmd.exe: too common for Image-based scoping — use CommandLine patterns for mechanism_decode"
+      disposition: declined
+      reason: >-
+        The mechanism_decode query (Q4) is scoped by ParentName=ArcSOC.exe AND
+        Image|endswith=%Image%, not by cmd.exe across the whole host. ArcSOC.exe
+        is an extremely rare parent for any interpreter, so the parent scope
+        already collapses the result to the alerting chain without a CommandLine
+        filter. No commandline_values exist on this rule to add, so a
+        CommandLine|contains constraint would be empty.
+    - hint: "powershell.encoded_command_decode replaces obfuscation.encoded_payload_decode"
+      disposition: declined
+      reason: >-
+        Acted-on in effect, recorded here for audit: powershell.encoded_command_decode
+        is included as Q5 and no obfuscation.encoded_payload_decode template was
+        emitted, so the replacement is honored by construction.
+    - hint: "logsource 'application' (recommended by techniques: T1203) is not covered and no template family exists — author a custom question with `category: application`"
+      disposition: declined
+      reason: >-
+        The application logsource (EventCode 1000, application crash) models the
+        client-side branch of T1203 — a browser/Office/reader crashing on a
+        malicious document. This rule is server-side: code executes from
+        ArcSOC.exe via a malicious Server Object Extension reached over a service
+        request, with no crashing client application on the monitored host. An
+        EventCode 1000 query would return unrelated server-process stability
+        events. The server-side delivery vector is instead covered by Q6
+        (attack:T1203.delivery_request), which directs the analyst to the service
+        request that drove execution.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - parent_child
+    - powershell
+    - initial_access
+  generation_stats:
+    total_questions: 16
+    source_counts:
+      template: 13
+      attack: 3
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 2
+      context: 12
+    logsource_diversity:
+      process_creation: 12
+      network_connection: 1
+      file_event: 1
+      sigma_alert: 2

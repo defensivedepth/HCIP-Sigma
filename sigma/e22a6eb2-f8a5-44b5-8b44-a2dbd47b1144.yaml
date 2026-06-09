@@ -1,0 +1,462 @@
+name: Potential MsiExec Masquerading
+id: 994b2b2f-dcbf-4060-af4f-de96345e5503
+description: |
+  Detects msiexec.exe executing from a directory other than the canonical Windows install locations
+  (System32, SysWOW64, WinSxS), matched either by the Image name ending in msiexec.exe or by the PE
+  OriginalFileName metadata being msiexec.exe. Legitimately, msiexec.exe runs only from those system
+  directories; a copy or renamed binary running from a user-writable or non-standard path is a masquerading
+  pattern used to blend a proxy-execution LOLBin into trusted-name traffic. The investigation should
+  confirm the actual on-disk path and metadata, establish how the binary arrived, and determine whether
+  it performed installer-style proxy execution or other post-execution activity.
+type: detection
+detection_id: e22a6eb2-f8a5-44b5-8b44-a2dbd47b1144
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-09
+questions:
+- source: template:universal.verify_trigger_match
+  question: Is the alerting process msiexec.exe (by Image name or OriginalFileName) running from a directory outside System32, SysWOW64, and WinSxS?
+  context: Before investing investigation time, confirm the alert is a true positive. The rule fires when the process is identified as msiexec.exe — either the Image path ends in msiexec.exe or the PE OriginalFileName is msiexec.exe — AND the Image does not start with C:\Windows\System32\, C:\Windows\SysWOW64\, or C:\Windows\WinSxS\. Review the exact Image path and OriginalFileName on the triggering event to confirm both conditions hold.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run msiexec.exe from a non-standard directory?
+  context: Legitimate msiexec.exe activity almost always runs from the canonical system directories. Some software vendors stage and run installer copies from temporary or application-specific paths, so knowing whether this user role and host function routinely perform such installs is often the fastest way to separate a packaged-software install from masquerading.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What did this msiexec.exe instance actually do? Decode its full command line and working directory.
+  context: msiexec.exe is a proxy-execution LOLBin — it can install or invoke MSI packages and DLLs from local paths or URLs. Decode the full command line for the package or transform path, any /i, /package, /y (DLL load), or quiet/no-UI switches, and the working directory, to establish what payload or action this invocation carried out. Because installer operations can span sequential invocations, this query returns all msiexec.exe executions on the host within the window, not only the triggering event.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:masquerading.true_identity
+  question: What is the actual identity of this binary based on its OriginalFileName, signature, and hash?
+  context: When a binary is copied or renamed, the on-disk Image path can be made to say msiexec.exe while the embedded PE OriginalFileName and code-signing details still reflect the true tool. Compare the Image path against OriginalFileName, and confirm whether the file is Microsoft-signed, third-party signed, or unsigned. The file hash enables reputation lookups to determine whether this is the genuine Windows Installer binary, a known-bad sample, or a novel binary requiring deeper analysis.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - Hashes
+- source: template:masquerading.binary_origin
+  question: How did this msiexec.exe binary arrive at its non-standard location, and how long before execution was it created?
+  context: 'A binary running from a non-canonical path was copied, downloaded, extracted, or dropped there. Tracing the file creation event for msiexec.exe by basename reveals the delivery mechanism and the process that wrote it — a download tool, an archive extractor, a remote-admin copy, or a dropper. The interval between file creation and execution also matters: a file created moments before it ran differs from one placed at software-install time weeks earlier.'
+  range: -30d
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains|expand: '%file_name%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: template:cue_process_tool.process_chain
+  question: What process spawned this msiexec.exe, and is that parent chain expected for an installer launch?
+  context: The parent process reveals how msiexec.exe was invoked. Legitimate installs are typically launched by explorer.exe, a software-deployment service, or a setup bootstrapper. Script hosts, Office applications, mshta.exe, or other interpreters as the parent point to scripted or macro-driven invocation rather than a user-initiated install.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:masquerading.renamed_binary_activity
+  question: What child processes did this msiexec.exe spawn, and does the same non-standard binary appear on other hosts?
+  context: The point of running a renamed or misplaced proxy-execution binary is to perform its function while evading name- or path-based controls. Examining the child processes it spawned reveals its actual objective — installer-launched scripts, command interpreters, or network tooling. The same binary appearing at a comparable path on other hosts suggests deliberate distribution rather than an isolated event.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.baseline
+  question: Has this host run msiexec.exe before, and how often over the past 90 days?
+  context: A process that has rarely or never been seen on a host is more suspicious than one that runs regularly. msiexec.exe itself is common from system directories, so use this historical count alongside the path and parent details to judge whether this execution is routine for the host.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired the rule's pattern, what parents and users normally drive it, and does the current alert fit?
+  context: Even common tools can be abused. This query mirrors the rule's selection structure — msiexec.exe by Image or OriginalFileName, outside the canonical system directories — scoped to this host, so the resulting parent and user distribution reflects how this specific masquerading pattern has historically run here rather than generic msiexec.exe usage. A new parent process, an unexpected user account, or an unusual launch shape is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+      - Image|endswith: \msiexec.exe
+      - OriginalFileName: \msiexec.exe
+      filter:
+        Image|startswith:
+        - C:\Windows\System32\
+        - C:\Windows\SysWOW64\
+        - C:\Windows\WinSxS\
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection and not filter) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run msiexec.exe?
+  context: Compare this user's current action against their historical behavior. A user who has never run msiexec.exe — or never from a non-standard path — is more suspicious than one who installs software regularly. The user's role and typical toolset should align with running an installer this way.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent and msiexec.exe combination historically routine on this host or across the environment?
+  context: When the alert fires under a service principal, user identity does not attribute the behavior. The meaningful pivot is the launch mechanism — which parent process spawned msiexec.exe, and whether that pair is historically common. A new or rare parent for this binary is the deviation worth chasing; a pair that already accounts for many prior events is vendor or OS automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints. If the same user triggered similar activity on several hosts, the scope of the event may be larger than a single host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent and msiexec.exe combination fire on other hosts in the same window?
+  context: Under a service principal, pivoting on user activity returns agent-telemetry noise because every host runs system-owned services constantly. The meaningful question is whether the same launch mechanism — the parent process spawning msiexec.exe — fired on other hosts in the alert window. Multiple hosts in the same window points to scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: 'Alerts rarely occur in isolation. Examining activity around the alert reveals the immediate context: what led to this event, what happened after, and whether it is part of a larger sequence. Look for reconnaissance, privilege escalation, or persistence mechanisms near the alert time.'
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering, reconnaissance, or credential access — may reveal the stages that preceded this event and help reconstruct the timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:lolbin.technique_class_lateral
+  question: Were any other proxy-execution LOLBins used on this host recently?
+  context: Operators who use one proxy-execution LOLBin often use several. msiexec.exe sits alongside rundll32, regsvr32, mshta, installutil, and similar binaries that can run arbitrary code under a trusted name. Finding several such binaries invoked for the same objective on this host strengthens the case for deliberate proxy execution.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_img:
+        Image|endswith:
+          - '\rundll32.exe'
+          - '\regsvr32.exe'
+          - '\mshta.exe'
+          - '\msbuild.exe'
+          - '\cmstp.exe'
+          - '\installutil.exe'
+          - '\forfiles.exe'
+          - '\pcalua.exe'
+          - '\presentationhost.exe'
+          - '\control.exe'
+          - '\infdefaultinstall.exe'
+          - '\msdt.exe'
+          - '\mavinject.exe'
+          - '\wmic.exe'
+          - '\xwizard.exe'
+          - '\ie4uinit.exe'
+      condition: selection and selection_img
+    fields:
+      - Image
+      - CommandLine
+- source: template:lolbin.renamed_binary_check
+  question: From what path did this msiexec.exe run, and is that the expected install location?
+  context: msiexec.exe legitimately runs from System32, SysWOW64, or WinSxS. A copy running from a user-writable or otherwise non-standard directory may have been placed there to evade path-based allowlists. Confirm the exact Image path on the triggering event and compare it against the canonical install locations.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- source: template:lolbin.historical_lolbin_baseline
+  question: How often has this host fired the rule's msiexec.exe pattern over the past 90 days, and what command-line shapes are typical?
+  context: A pattern with no prior history on a host is more suspicious than one used routinely under stable parents. This query mirrors the rule's selection structure — msiexec.exe outside the canonical system directories — scoped to this host, so the count reflects the rule's specific firing pattern rather than generic msiexec.exe usage. The command-line projection lets the analyst compare typical invocation shapes against the alerting one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+      - Image|endswith: \msiexec.exe
+      - OriginalFileName: \msiexec.exe
+      filter:
+        Image|startswith:
+        - C:\Windows\System32\
+        - C:\Windows\SysWOW64\
+        - C:\Windows\WinSxS\
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection and not filter) and _pb_scope
+    fields:
+    - CommandLine
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1036.005
+      name: Match Legitimate Resource Name or Location
+      role: primary
+    - id: T1036
+      name: Masquerading
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: binary_placement
+      description: "Adversary copies or drops a binary named or metadata-identified as msiexec.exe to a non-canonical location"
+      mapped_to: Q5
+      source: template:masquerading.binary_origin
+    - stage: 2
+      label: execution_under_trusted_name
+      description: "The binary executes from the non-standard path under the trusted msiexec.exe name/metadata"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 3
+      label: post_execution_objective
+      description: "Renamed/misplaced binary performs its intended proxy-execution function inconsistent with legitimate installer usage"
+      mapped_to: Q7
+      source: template:masquerading.renamed_binary_activity
+  dimension_coverage:
+    - dimension: tuning_parameter
+      technique: T1036.005
+      covered_by: Q17
+      source: template:lolbin.renamed_binary_check
+      coverage_type: direct
+    - dimension: execution_context
+      technique: T1036
+      covered_by: Q6
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1036
+      covered_by: Q5
+      source: template:masquerading.binary_origin
+      coverage_type: direct
+  mutable_dispositions:
+    - element: trusted_directory_list
+      dimension: tuning_parameter
+      specific_values: "C:\\Windows\\System32, C:\\Windows\\SysWOW64, C:\\Windows\\WinSxS"
+      disposition: query_injection
+      target_question: Q9
+      notes: "Trusted-directory filter is embedded in the rule's detection block, reflected verbatim into the baseline_deviation and historical_lolbin_baseline queries (Q9, Q18); also surfaced in Q17 context as the expected install locations."
+    - element: process_baseline_age
+      dimension: tuning_parameter
+      specific_values: "30 days (novelty window)"
+      disposition: context
+      target_question: Q8
+      notes: "Realized as the -90d historical baseline window on Q8/Q18; the brief's 30-day novelty rationale informs how to read low counts."
+    - element: OriginalFilenameMismatch
+      dimension: tuning_parameter
+      specific_values: "Compare Image path vs PE OriginalFileName"
+      disposition: query_injection
+      target_question: Q4
+      notes: "true_identity query projects Image, OriginalFileName, Hashes so the analyst can compare on-disk name against PE metadata."
+    - element: KnownSystemUtilityPaths
+      dimension: tuning_parameter
+      specific_values: "expected install directories for signed binaries"
+      disposition: context
+      target_question: Q17
+      notes: "Expressed as the canonical-path comparison in renamed_binary_check context."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "correlation window between file creation and execution"
+      disposition: context
+      target_question: Q5
+      notes: "binary_origin question explicitly asks how long before execution the file was created."
+  dedup_decisions:
+    - dropped: cue_process_tool.follow_on
+      reason: "Same query shape (ParentImage|endswith %Image% on host) and same investigative intent as masquerading.renamed_binary_activity, which is more specific (adds cross-host scope) — technique-set version subsumes the cue version."
+      kept: masquerading.renamed_binary_activity
+    - dropped: cue_process_tool.clustering
+      reason: "Host-scoped same-window clustering duplicates cue_host_context.clustering; kept the host_context version which projects Image+ParentImage for novel-pair scanning."
+      kept: cue_host_context.clustering
+    - dropped: cue_process_tool.scope
+      reason: "Fleet-wide rule-pattern count; cross-host scope is already addressed by masquerading.renamed_binary_activity (same binary on other hosts) and the rule-pattern host history by lolbin.historical_lolbin_baseline. Dropped to stay within the 18-question cap."
+      kept: lolbin.historical_lolbin_baseline
+    - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable; both emitted (Q10, Q11) per AGENTS.md service-principal handling."
+      kept: cue_user_actor.baseline + cue_user_actor.baseline_svc
+    - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable; both emitted (Q12, Q13) per AGENTS.md service-principal handling."
+      kept: cue_user_actor.clustering + cue_user_actor.clustering_svc
+  skipped_templates:
+    - template: universal.endpoint_protection_health
+      reason: "RECOMMENDED, not must_include. This rule fires on a masquerading / location-anomaly pattern, not on payload execution, credential access, or privilege escalation, so tamper-as-precursor is not a live triage question here. cue_host_context.precursor (Q15) already surfaces any prior tamper alerts on the host, and the 18-question cap is reached by must_include and always_include templates."
+  reflection_overrides: []
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - masquerading
+    - lolbin
+    - cue_process_tool
+    - cue_user_actor
+    - cue_host_context
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 18
+      attack: 0
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 15
+    logsource_diversity:
+      process_creation: 16
+      file_event: 1
+      sigma_alert: 1

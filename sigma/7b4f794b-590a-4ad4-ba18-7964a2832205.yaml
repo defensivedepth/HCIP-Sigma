@@ -1,0 +1,527 @@
+name: Renamed Vmnat.exe Execution
+id: 3c180771-5cce-4227-b627-4386a17d2fe2
+description: |
+  Detects a process whose embedded PE metadata identifies it as vmnat.exe (the
+  VMware NAT service binary) but which runs under a different filename on disk —
+  the rule fires when OriginalFileName is vmnat.exe AND the Image does not end in
+  vmnat.exe. Legitimate vmnat.exe ships with VMware Workstation/Player and runs
+  from its install directory under its real name; a renamed copy is a hallmark of
+  DLL side-loading, where a trusted, signed binary is dropped beside an
+  attacker-controlled DLL so the malicious code loads inside a process that looks
+  benign. The investigation should confirm the name/metadata mismatch, identify
+  the binary's hash and signer, determine how it arrived on the host, and — most
+  importantly — establish which DLLs it loaded from non-standard directories.
+type: detection
+detection_id: 7b4f794b-590a-4ad4-ba18-7964a2832205
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- source: template:universal.verify_trigger_match
+  question: Is this binary running under a name other than vmnat.exe while its OriginalFileName metadata still reads vmnat.exe?
+  context: Confirm the alert is a true positive before investing investigation time. The rule fires when the embedded OriginalFileName
+    is vmnat.exe AND the on-disk Image name does not end in vmnat.exe. Compare the Image path against OriginalFileName on the
+    triggering event — a genuine match means the VMware NAT binary was copied and renamed, which is the precondition for DLL
+    side-loading.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - OriginalFileName
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run a VMware component such as vmnat.exe?
+  context: Legitimate vmnat.exe runs on machines with VMware Workstation or Player installed, under its real name from the
+    VMware install directory. A renamed copy running on a host that does not run VMware, or under a user who has no reason
+    to invoke virtualization tooling, is harder to explain as routine activity.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:masquerading.true_identity
+  question: What is the actual identity of this binary based on its metadata, signer, and hash?
+  context: When a binary is renamed, the PE metadata (OriginalFileName) and code-signing details still reflect the original
+    tool. The Image path is the name on disk; OriginalFileName reads vmnat.exe. The signing party and signature status indicate
+    whether this is the genuine VMware-signed binary that was merely relocated and renamed, or an unsigned/tampered copy. The
+    file hash enables a reputation lookup to determine whether this is the known-good VMware binary, a known malicious sample,
+    or a novel file requiring deeper analysis.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - Hashes
+- source: cue_process_tool.mechanism_decode
+  question: What command line did the renamed vmnat.exe run with, and what does it reveal about its operation?
+  context: The full command line reveals the specific action taken by the renamed binary. Decode any flags, parameters, file
+    paths, or URLs. For a side-loading host process, the arguments often look benign — the malicious behavior comes from the
+    DLL it loads rather than from its own command line — so an empty or trivial command line does not clear the alert; pair
+    this with the DLL-load review.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: attack:T1574.001.image_load
+  question: Which DLLs did the renamed vmnat.exe load, and were any loaded from a non-standard directory?
+  context: DLL side-loading works by placing an attacker-controlled DLL in the same directory as a trusted binary so it loads
+    in place of, or ahead of, the legitimate library. Module-load telemetry for this process shows every DLL it mapped; DLLs
+    loaded from the binary's own drop directory, a user-writable path, or any location outside System32/SysWOW64 and the
+    genuine VMware install tree are the side-loading evidence. Compare the load paths and, where available, the loaded-module
+    signatures against what a genuine vmnat.exe loads. If module-load events are not ingested in this environment, treat zero
+    results as a visibility gap rather than evidence nothing was side-loaded.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Hashes
+      - Signed
+- source: template:masquerading.binary_origin
+  question: How did this renamed binary arrive on the host?
+  context: 'Renamed binaries do not appear spontaneously — they were copied, downloaded, or dropped by a parent process. Tracing
+    the file-creation event for this binary by name reveals the delivery mechanism: a download tool, a malware dropper, a
+    manual copy via explorer or remote access, or lateral movement from another host. The process that created the file
+    (Image in the file event) is the dropper, installer, or copy operation; the drop directory matters because a side-loaded
+    DLL typically lands in the same folder.'
+  range: -30d
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains|expand: '%file_name%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: template:masquerading.renamed_binary_activity
+  question: What did the renamed binary do after execution, and is the same renamed binary present on other hosts?
+  context: The purpose of renaming a binary is to evade detection while still performing its function — here, hosting a
+    side-loaded DLL. Examining the child processes, file operations, and network connections originating from the renamed
+    binary reveals its actual objective. The same renamed binary appearing on multiple hosts suggests deliberate distribution
+    rather than an isolated incident; the cross-host pattern is covered by the fleet-scope question.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: cue_process_tool.process_chain
+  question: What process spawned this renamed binary, and is that parent chain expected?
+  context: The parent process reveals how the binary was invoked. A signed VMware component launched by a VMware installer
+    or service is routine; a renamed copy launched by a script host (wscript.exe, mshta.exe), an Office application, an
+    archive utility, or a remote-access tool points to delivery via a loader or an interactive operator.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: cue_process_tool.baseline_deviation
+  question: When this host has previously fired the rule's pattern, what parents and users normally drive that activity, and
+    does the current alert fit that pattern?
+  context: Even legitimate VMware components can be relocated by an admin. This query mirrors the rule's selection structure
+    scoped to this host — the resulting parent/user distribution reflects how the rule's specific firing pattern (a vmnat.exe-metadata
+    process running under a different name) has historically run here. A new parent process, an unexpected user account, or
+    a first-ever occurrence is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        OriginalFileName: vmnat.exe
+      filter_rename:
+        Image|endswith: vmnat.exe
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection and not 1 of filter_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: cue_process_tool.scope
+  question: Have other hosts fired the rule's pattern in the past week, and does the cross-host distribution look like consistent
+    automation or one-off activity?
+  context: This query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of the
+    rule's firing pattern, not generic vmnat.exe usage. Many hosts firing the same pattern points to a scripted deployment
+    or a packaged tool that legitimately ships a renamed VMware binary; one host or a small unrelated set points to targeted
+    side-loading. Use the host distribution and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        OriginalFileName: vmnat.exe
+      filter_rename:
+        Image|endswith: vmnat.exe
+      condition: selection and not 1 of filter_*
+    fields:
+    - host.name
+- source: cue_user_actor.baseline
+  question: Does this user normally run this binary anywhere in the environment?
+  context: Compare this user's current action against their historical behavior. A user who has never run this binary is more
+    suspicious than one who does so regularly, and a user's role and typical toolset should align with running a VMware
+    component. Zero or very low historical counts indicate first-time or rare execution for this account.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: cue_user_actor.baseline_svc
+  question: Is this parent+binary combination historically routine on this host or across the environment, or is the parent
+    unusual for this binary?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior. The meaningful pivot
+    is the launch mechanism: which parent process spawned this binary, and is that pair historically common. A new or rare
+    parent for this binary on this host or environment-wide is the deviation worth chasing; a pair that already accounts for
+    thousands of prior events is vendor or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints. If
+    the same user triggered similar activity on several hosts, the scope of compromise may be larger than the single alerting
+    host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: cue_user_actor.clustering_svc
+  question: Did this same parent+binary combination fire on other hosts in the same window — i.e., is this a coordinated automation
+    rollout, or is the activity isolated to this host?
+  context: Under a service principal, asking what else the user did across the network returns agent-telemetry noise, because
+    every host runs service-owned processes constantly. The meaningful question is whether the same launch mechanism — parent
+    process plus spawned binary — fired on other hosts in the alert window. Multiple hosts in the same window points to
+    scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: 'Alerts rarely occur in isolation. Examining activity around the alert reveals the immediate context: what led to
+    this event, what happened after, and whether it is part of a larger sequence. Look for reconnaissance, privilege escalation,
+    or persistence mechanisms appearing as novel parent-child pairs at low counts.'
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering, reconnaissance,
+    credential access — may reveal the attack stages that preceded the side-loading attempt and help reconstruct the full
+    timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:persistence_scope.process_based_persistence
+  question: Were other process-based persistence mechanisms installed on this host?
+  context: Attackers rarely rely on a single persistence mechanism. After establishing a side-loading foothold, they commonly
+    install backup mechanisms using different techniques — scheduled tasks, services, registry Run keys, BITS jobs, or WMI
+    subscriptions. Multiple persistence installations in the same timeframe indicate intentional stacking rather than
+    isolated administrative action.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1574.001
+      name: DLL Search Order Hijacking / DLL Side-Loading
+      role: primary
+    - id: T1574
+      name: Hijack Execution Flow
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: renamed_trusted_binary_present
+      description: A trusted, signed binary (vmnat.exe) is copied and renamed so it runs under a non-canonical name — the precondition for side-loading.
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: binary_delivery
+      description: The renamed binary (and its co-located malicious DLL) is dropped onto the host via download, copy, or dropper.
+      mapped_to: Q6
+      source: template:masquerading.binary_origin
+    - stage: 3
+      label: malicious_dll_load
+      description: The renamed binary loads an attacker-controlled DLL from a non-standard directory (the actual side-load).
+      mapped_to: Q5
+      source: attack:T1574.001.image_load
+    - stage: 4
+      label: post_load_activity
+      description: The side-loaded code executes — child processes, file/network operations originating from the host binary.
+      mapped_to: Q7
+      source: template:masquerading.renamed_binary_activity
+  dimension_coverage:
+    - dimension: time_correlation
+      technique: T1574.001
+      covered_by: Q15
+      source: template:cue_host_context.clustering
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1574.001
+      covered_by: Q9
+      source: template:cue_process_tool.baseline_deviation
+      coverage_type: direct
+    - dimension: file_path_analysis
+      technique: T1574
+      covered_by: Q5
+      source: attack:T1574.001.image_load
+      coverage_type: direct
+  mutable_dispositions:
+    - element: AllowedDllPaths
+      dimension: tuning_parameter
+      specific_values: 'rationale only (e.g., C:\Windows\System32)'
+      disposition: context
+      target_question: Q5
+      notes: No specific list to inject; the image_load question's context tells the analyst to flag DLLs loaded from outside System32/SysWOW64 and the genuine VMware install tree.
+    - element: ProcessAllowList
+      dimension: tuning_parameter
+      specific_values: rationale only (development tools expected to load DLLs from non-standard locations)
+      disposition: context
+      target_question: Q9
+      notes: Baseline-deviation question establishes which parents/users normally drive the rule's pattern here, serving as the per-environment allow-list judgment.
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: rationale only (correlation interval between file creation, registry change, and module load)
+      disposition: context
+      target_question: Q15
+      notes: No numeric threshold given; host-clustering and precursor questions provide the temporal correlation window around the alert.
+    - element: HashBaseline
+      dimension: tuning_parameter
+      specific_values: rationale only (baseline hashes for legitimate DLLs)
+      disposition: context
+      target_question: Q3
+      notes: true_identity question surfaces the binary Hashes for reputation lookup; the image_load question surfaces loaded-module hashes/signatures for substitution detection.
+    - element: ServiceBaseline
+      dimension: tuning_parameter
+      specific_values: rationale only (expected registry keys and service paths)
+      disposition: context
+      target_question: Q9
+      notes: T1574 (secondary) service/registry baseline; the rule fires on process_creation metadata mismatch, not service-path modification, so handled as baseline context rather than a registry query.
+  dedup_decisions:
+    - dropped: cue_process_tool.process_chain
+      reason: kept — parent_process cue is NOT active (has_parent_in_detection false, parent_binaries empty), so process_chain is the only parent-lineage question and is retained, not dropped.
+      kept: cue_process_tool.process_chain
+    - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc
+      reason: user_actor pair — non-deduplicable; emit BOTH (subject pivot vs. launch-mechanism pivot). Both marked always_include in the brief.
+      kept: both
+    - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc
+      reason: user_actor pair — non-deduplicable; emit BOTH (network-wide user pivot vs. parent+binary rollout pivot). Both marked always_include in the brief.
+      kept: both
+  skipped_templates:
+    - template: cue_process_tool.baseline
+      reason: Superseded by cue_process_tool.baseline_deviation, which mirrors the rule's actual firing pattern (OriginalFileName mismatch) instead of generic %Image% volume. The generic binary-frequency baseline would over-count any legitimately-named vmnat.exe and add little over the rule-pattern baseline.
+    - template: cue_process_tool.follow_on
+      reason: Subsumed by masquerading.renamed_binary_activity, which asks the same "what did this binary spawn afterward" question with the same ParentImage|endswith|expand %Image% query shape; keeping both would be a within-phase duplicate.
+    - template: cue_process_tool.clustering
+      reason: Subsumed by cue_host_context.clustering (identical host-scoped aggregation of surrounding tools); the host-context version is the canonical surrounding-activity question.
+    - template: universal.endpoint_protection_health
+      reason: RECOMMENDED, not must_include. This rule fires on a renamed-binary masquerade (the precondition for side-loading), not on a hands-on-keyboard payload-execution or credential-access action where the disposition turns on whether AV/EDR was weakened first. cue_host_context.precursor already surfaces prior tamper alerts on the host. Dropped to keep the user_actor pair and the load-bearing image_load question within the 18-question cap.
+    - template: organizational_context.change_ticket
+      reason: RECOMMENDED, not must_include. A renamed VMware binary running under a non-canonical name is not the kind of routine, ticketed system change (scheduled task, account, service deployment) this question targets; a side-load precondition is unlikely to have an approval record, so the question's discriminating power is low. Dropped to stay within the question cap.
+    - template: organizational_context.human_recall
+      reason: RECOMMENDED, not must_include. host_user_context already captures the "is this expected for this user/host" judgment; a separate human-recall question adds little for a metadata-mismatch detection and was dropped to stay within the cap.
+    - template: organizational_context.timing_alignment
+      reason: RECOMMENDED, not must_include. Temporal context is covered by cue_host_context.clustering and cue_host_context.precursor; a standalone work-hours question adds marginal value for a side-loading precondition and was dropped to stay within the cap.
+    - template: organizational_context.procedural_consistency
+      reason: RECOMMENDED, not must_include. This rule does not detect a tool-driven change (schtasks/net/reg) where org procedure is the discriminator; the relevant "is this routine" judgment is carried by host_user_context and the baseline-deviation question. Dropped to stay within the cap.
+    - template: persistence_scope.file_based_persistence
+      reason: RECOMMENDED, not must_include. The side-loading mechanism here is a renamed binary plus a co-located DLL, not a Startup-folder/Run-key file drop; process_based_persistence covers the parallel persistence-stacking question, and masquerading.binary_origin already inspects file-creation events for the binary. Dropped to stay within the cap.
+  hint_dispositions:
+    - hint: "logsource 'image_load' (recommended by techniques: T1574.001) is not covered — pull in cue_image_load.* or author a custom question with `category: image_load`"
+      disposition: acted-on
+      reason: >-
+        Authored a custom image_load question (Q5, source attack:T1574.001.image_load)
+        querying ImageLoaded/Hashes/Signed for the renamed binary on this host. This is
+        the load-bearing question for a DLL side-loading rule — the malicious behavior is
+        the DLL the host process maps, which process_creation telemetry cannot see.
+    - hint: "logsource 'create_stream_hash' (recommended by techniques: T1574.001) is not covered and no template family exists — author a custom question with `category: create_stream_hash`"
+      disposition: declined
+      reason: >-
+        create_stream_hash (Sysmon EID 15 / Alternate Data Stream + zone-identifier
+        evidence) characterizes how the FILE arrived (mark-of-the-web / ADS), which Q6
+        (masquerading.binary_origin, file_event) already addresses by tracing the
+        file-creation event and dropper for the binary. The side-load itself is a DLL
+        load, covered by Q5 (image_load), not an ADS write on the renamed exe. Adding a
+        create_stream_hash query would duplicate the delivery-mechanism dimension Q6
+        covers without surfacing the side-loading evidence. No compensating
+        attack:T1574.001.create_stream_hash question authored.
+    - hint: "logsource 'registry_set' (recommended by techniques: T1574.001) is not covered — pull in cue_registry_key.* or author a custom question with `category: registry_set`"
+      disposition: declined
+      reason: >-
+        registry_set in the T1574 analytic targets the registry-redirection variant of
+        hijack execution flow (KnownDLLs, service ImagePath, AppInit_DLLs). This rule's
+        detection logic is specifically the renamed-binary/co-located-DLL search-order
+        variant (OriginalFileName: vmnat.exe AND NOT Image endswith vmnat.exe) — there is
+        no registry artifact in the rule's firing pattern. The actual side-load evidence
+        is the module load (Q5, image_load). A registry_set sweep would investigate a
+        different T1574 sub-mechanism than the one this rule fires on. No compensating
+        attack:T1574.001.registry_set question authored.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - masquerading
+    - persistence_scope
+    - cue_process_tool
+    - cue_user_actor
+    - cue_host_context
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 16
+      attack: 1
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 14
+    logsource_diversity:
+      process_creation: 14
+      file_event: 1
+      image_load: 1
+      sigma_alert: 1

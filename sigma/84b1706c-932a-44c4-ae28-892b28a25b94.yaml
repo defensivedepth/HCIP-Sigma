@@ -1,0 +1,491 @@
+name: OneNote.EXE Execution of Malicious Embedded Scripts
+id: c188b27d-1f16-41c9-8ed0-0662782b6486
+description: |
+  Detects onenote.exe spawning a command interpreter or script host (cmd.exe, cscript.exe, mshta.exe, powershell.exe, pwsh.exe, or wscript.exe) with a command line referencing the OneNote attachment-export directories \exported\ or \onenoteofflinecache_files\. This is the launch behavior of a malicious .one document: when a user clicks an embedded link, OneNote writes the embedded payload to one of those directories and the chosen interpreter runs it. Legitimate OneNote use rarely shells out to script interpreters from these paths, so the investigation focuses on identifying the .one file, decoding what the interpreter executed, and finding any follow-on payload or network activity it produced.
+type: detection
+detection_id: 84b1706c-932a-44c4-ae28-892b28a25b94
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- source: template:universal.verify_trigger_match
+  question: Did onenote.exe spawn a script interpreter with a command line referencing \exported\ or \onenoteofflinecache_files\?
+  context: Confirm the alert is a true positive by reviewing the triggering event. The rule fires only when onenote.exe is the parent, the child is cmd.exe, cscript.exe, mshta.exe, powershell.exe, pwsh.exe, or wscript.exe, and the command line contains one of the OneNote export directories. Verify all three conditions hold against the alert.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to open OneNote documents that launch script interpreters?
+  context: OneNote shelling out to a command interpreter or script host is not a routine end-user action. Knowing whether the user role and host function involve scripted automation tied to OneNote helps separate an unusual-but-benign workflow from attachment-borne execution.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:initial_access.delivery_vector
+  question: What .one file was opened, and was it received via email or downloaded from a link?
+  context: The execution begins when a user opens a malicious OneNote document and clicks an embedded link. Identifying the .one file and how it arrived — an email attachment or a downloaded link — enables blocking the sender or URL at the perimeter and searching for other recipients. The parent command line and the export path in the child command line point to the originating document.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+- source: template:parent_child.parent_process_legitimacy
+  question: Is onenote.exe expected to spawn this interpreter on this host, and what spawned onenote.exe itself?
+  context: The onenote.exe-to-interpreter relationship is the core signal. Tracing onenote.exe's own parent reveals whether the chain started from a user opening an attachment (explorer.exe, outlook.exe) or from something less expected. A grandparent that is itself an email or browser process supports an attachment-delivery story.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- source: template:parent_child.sibling_processes
+  question: What other child processes did this onenote.exe instance spawn?
+  context: A malicious .one document may drop and run more than one payload. Examining all children of the same onenote.exe instance reveals whether multiple interpreters or tools were launched, which points to staged execution rather than a single benign action.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.mechanism_decode
+  question: What exactly did the interpreter run from the OneNote export directory? Decode the command line.
+  context: The full command line reveals what the exported payload does. Decode any flags, encoded content, file paths, or URLs, and identify the exported script or executable referenced under \exported\ or \onenoteofflinecache_files\. This scopes to interpreter activity tied to those export paths on the host so multi-step invocations are visible together.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains:
+          - \exported\
+          - \onenoteofflinecache_files\
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - CurrentDirectory
+- source: template:powershell.encoded_command_decode
+  question: If the interpreter was PowerShell, was the command encoded or obfuscated, and what does it decode to?
+  context: Embedded OneNote payloads frequently use PowerShell's -EncodedCommand (-enc) parameter or string concatenation, backtick escaping, and variable substitution to hide intent. Base64-encoded commands are the most common form. Decoding reveals the actual payload — download cradles, reverse shells, or in-memory execution of .NET assemblies. If the interpreter was cmd, wscript, cscript, or mshta, examine the referenced script file instead.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:powershell.script_block_logging
+  question: Did PowerShell script block logging capture the full script content?
+  context: Script block logging records the deobfuscated script content PowerShell actually executes, even when the command line is encoded or obfuscated, providing ground truth about what ran. If PowerShell operational logs are not ingested in this environment, treat zero results as a visibility gap rather than evidence nothing ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- source: template:powershell.powershell_security_bypass
+  question: Were PowerShell security controls bypassed or weakened before this execution?
+  context: Attackers often disable or bypass PowerShell security controls before running a payload. Common techniques include AMSI bypass (patching amsi.dll in memory), execution policy changes (Set-ExecutionPolicy or -ep bypass), constrained language mode escape, and downgrade attacks (powershell.exe v2, which lacks logging). Finding these precursor events strengthens the case for malicious activity.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- source: attack:T1218.001.file_event
+  question: What file did the interpreter write or read under the OneNote export directories?
+  context: When a user clicks an embedded link, OneNote exports the payload to \exported\ or \onenoteofflinecache_files\ before the interpreter runs it. File events under those directories reveal the exact dropped payload — its name, extension, and write time — which is the artifact to hash, submit, and hunt for across other hosts.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains:
+          - \exported\
+          - \onenoteofflinecache_files\
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: attack:T1218.001.network_connection
+  question: Did the interpreter make outbound network connections after running the exported payload?
+  context: Embedded OneNote payloads commonly fetch a second-stage download or beacon to command-and-control after the interpreter launches. Outbound connections from the interpreter that are not to known internal infrastructure point to payload retrieval or C2; correlate the destination with the decoded command line to confirm what was contacted.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      filter_local:
+        DestinationIp|cidr:
+          - 10.0.0.0/8
+          - 172.16.0.0/12
+          - 192.168.0.0/16
+          - 127.0.0.0/8
+      condition: selection and not filter_local
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - CommandLine
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run this interpreter?
+  context: Compare this user's current action against their historical pattern. A user who has never launched this interpreter is more suspicious than one who does so regularly. User role and typical toolset should align with running command interpreters or script hosts.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is the onenote.exe-to-interpreter launch pair historically routine on this host or across the environment?
+  context: When the alert fires under a service principal, user identity does not attribute behavior. The meaningful pivot is the launch mechanism — onenote.exe spawning this interpreter — and whether that pair is historically common. A new or rare pair on this host or environment-wide is the deviation worth chasing; a pair already accounting for many prior events is established automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity across multiple endpoints. If the same user triggered similar activity on multiple hosts, the scope of the incident may be larger than the single alerting host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did the same onenote.exe-to-interpreter pair fire on other hosts in the same window — a coordinated rollout, or isolated to this host?
+  context: Under a service principal, asking what else the user did across the network returns agent-telemetry noise. The meaningful question is whether the same launch mechanism — onenote.exe spawning this interpreter — fired on other hosts in the alert window. Multiple hosts in the same window points to a phishing wave that landed widely; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:initial_access.campaign_scope
+  question: Did this same detection fire on other hosts or for other users?
+  context: Phishing campaigns rarely target a single user. If one employee received a malicious OneNote document, others likely did too. Correlating this detection across the environment reveals campaign breadth and identifies additional hosts that need investigation.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        rule.uuid|expand: '%rule.uuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — reconnaissance, defense tampering, or credential access — may reveal the stages that preceded this execution and help reconstruct the timeline of how the document was opened and what followed.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1218.001
+      name: Compiled HTML File
+      role: primary
+    - id: T1218
+      name: System Binary Proxy Execution
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: document_open_delivery
+      description: "User opens a malicious .one document and clicks an embedded link; OneNote exports the payload to \\exported\\ or \\onenoteofflinecache_files\\"
+      mapped_to: Q3
+      source: template:initial_access.delivery_vector
+    - stage: 2
+      label: payload_export_to_disk
+      description: "OneNote writes the embedded payload to the export directory"
+      mapped_to: Q10
+      source: attack:T1218.001.file_event
+    - stage: 3
+      label: interpreter_execution
+      description: "A command interpreter or script host runs the exported payload"
+      mapped_to: Q6
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 4
+      label: follow_on_network
+      description: "Interpreter fetches a second stage or beacons to C2"
+      mapped_to: Q11
+      source: attack:T1218.001.network_connection
+  dimension_coverage:
+    - dimension: time_correlation
+      technique: T1218.001
+      covered_by: Q11
+      source: attack:T1218.001.network_connection
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1218.001
+      covered_by: Q6
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: direct
+    - dimension: command_analysis
+      technique: T1218
+      covered_by: Q6
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1218
+      covered_by: Q4
+      source: template:parent_child.parent_process_legitimacy
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1218
+      covered_by: Q14
+      source: template:cue_user_actor.baseline_svc
+      coverage_type: indirect
+  mutable_dispositions:
+    - element: CHMPathRegex
+      dimension: tuning_parameter
+      specific_values: "rationale only (CHM-specific; rule targets OneNote export paths)"
+      disposition: context
+      target_question: Q6
+      notes: "T1218.001 brief is CHM-oriented; the analogous tunable for this rule is the OneNote export-path filter \\exported\\ / \\onenoteofflinecache_files\\, injected into the mechanism_decode and file_event queries."
+    - element: ChildProcessList
+      dimension: tuning_parameter
+      specific_values: "powershell.exe, cmd.exe, mshta.exe, wscript.exe (rule list also adds cscript.exe, pwsh.exe)"
+      disposition: query_injection
+      target_question: Q1
+      notes: "The rule's own Image|endswith list enumerates the suspicious children; verify_trigger_match displays Image and the trigger-match question states the full interpreter set."
+    - element: NetworkDestinationAllowlist
+      dimension: tuning_parameter
+      specific_values: "rationale only (filter for legitimate destinations)"
+      disposition: query_injection
+      target_question: Q11
+      notes: "Implemented as a not-filter excluding RFC1918/loopback CIDRs in the network_connection question so only external destinations surface."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only (threshold between launch and follow-on)"
+      disposition: context
+      target_question: Q11
+      notes: "Expressed as the +/-15m range on the follow-on network question correlating interpreter launch to outbound activity."
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "rationale only (profile unexpected parent-child)"
+      disposition: query_injection
+      target_question: Q14
+      notes: "onenote.exe parent pivot drives the baseline_svc launch-mechanism question."
+    - element: SignedBinaryList
+      dimension: tuning_parameter
+      specific_values: "rationale only (msiexec.exe, regsvr32.exe — not applicable to this rule's interpreters)"
+      disposition: context
+      target_question: Q6
+      notes: "T1218 signed-binary list is for proxy binaries this rule does not target; the interpreters here are the relevant binaries and are enumerated in trigger-match."
+    - element: CommandLineRegex
+      dimension: command_analysis
+      specific_values: "URLs, script paths, DLL entrypoints"
+      disposition: query_injection
+      target_question: Q6
+      notes: "mechanism_decode query filters CommandLine|contains the OneNote export paths; decode covers URLs/script paths surfaced there."
+    - element: RemoteDomainAllowlist
+      dimension: tuning_parameter
+      specific_values: "rationale only (suppress legitimate enterprise domains)"
+      disposition: query_injection
+      target_question: Q11
+      notes: "Realized as the RFC1918/loopback not-filter on the network_connection question."
+  dedup_decisions:
+    - dropped: cue_process_tool.process_chain
+      reason: "parent_process is primary cue and parent_child technique set active — parent_process_legitimacy (Q4) subsumes process_chain"
+      kept: template:parent_child.parent_process_legitimacy
+    - dropped: cue_parent_process.mechanism_decode
+      reason: "parent's own event already retrieved by parent_process_legitimacy (Q4); cue_process_tool.mechanism_decode (Q6) covers the child interpreter decode"
+      kept: template:parent_child.parent_process_legitimacy
+    - dropped: cue_parent_process.follow_on
+      reason: "sibling_processes (Q5) covers other children of the same onenote.exe instance with tighter ParentProcessGuid scoping"
+      kept: template:parent_child.sibling_processes
+    - dropped: cue_user_actor.baseline + cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable; both emitted (Q12, Q13)"
+      kept: both
+    - dropped: cue_user_actor.clustering + cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable; both emitted (Q14, Q15)"
+      kept: both
+  skipped_templates:
+    - template: cue_parent_process.baseline
+      reason: "cue_user_actor.baseline_svc (Q13) covers the onenote.exe-to-interpreter pair historical frequency with the same launch-mechanism pivot"
+    - template: cue_parent_process.clustering
+      reason: "sibling_processes (Q5) and host_context.precursor (Q17) cover same-time parent activity and host context"
+    - template: cue_parent_process.scope
+      reason: "initial_access.campaign_scope (Q16) and clustering_svc (Q15) cover cross-host spread of the same pattern more directly"
+    - template: cue_process_tool.baseline
+      reason: "cue_user_actor.baseline_svc (Q13) covers host/env historical frequency of the launch pair; per-binary baseline would duplicate it"
+    - template: cue_host_context.clustering
+      reason: "sibling_processes (Q5) and precursor (Q16) already provide same-window host context; aggregated host sweep would not add unique fields"
+    - template: universal.endpoint_protection_health
+      reason: "powershell.powershell_security_bypass (Q9) already surfaces prior AV/EDR and PowerShell-control tampering on the host; this rule is initial-access/execution and the bypass question carries the tamper-as-precursor signal without a second generic sweep"
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "logsource 'image_load' (recommended by techniques: T1218.001) is not covered — pull in cue_image_load.* or author a custom question with `category: image_load`"
+      disposition: declined
+      reason: >-
+        The rule fires on onenote.exe spawning a script interpreter with an
+        export-path command line; the investigation pivots on what the
+        interpreter executed (Q6 mechanism_decode), the dropped payload file
+        (Q10 file_event), and follow-on network (Q11). image_load on the
+        interpreter would return generic module-load volume (mscoree, amsi)
+        without precision for this attachment-export pattern, and the .NET
+        in-memory cradle path is already addressed by Q7
+        (powershell.encoded_command_decode) and Q8 (script block logging). No
+        compensating attack:T1218.001.image_load question authored.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - powershell
+    - initial_access
+    - parent_child
+    - cue_parent_process
+    - cue_process_tool
+    - cue_user_actor
+    - cue_host_context
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 15
+      attack: 2
+      llm_generated: 0
+    phase_distribution:
+      triage: 1
+      analysis: 2
+      context: 14
+    logsource_diversity:
+      process_creation: 12
+      sigma_alert: 2
+      powershell: 1
+      file_event: 1
+      network_connection: 1

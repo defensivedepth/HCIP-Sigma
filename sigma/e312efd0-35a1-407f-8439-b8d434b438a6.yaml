@@ -1,0 +1,471 @@
+name: Potential PowerShell Obfuscation Via WCHAR/CHAR
+id: 13f3dac3-b967-4aed-aed8-eb30b8faa988
+description: |
+  Detects PowerShell command lines that build characters from numeric code points using
+  '[char]0x' or '(WCHAR)0x' syntax. This substitutes encoded character sequences for literal
+  dashes, slashes, and other parameter delimiters so that string-matching detection rules do
+  not spot the real flags or payload. Legitimate scripts almost never construct argument
+  delimiters this way; the technique is a defense-evasion measure used to obscure what
+  PowerShell was actually told to do. Determine what the obfuscated command decodes to, whether
+  PowerShell security controls were weakened beforehand, and whether the same pattern ran
+  elsewhere on the host or fleet.
+type: detection
+detection_id: e312efd0-35a1-407f-8439-b8d434b438a6
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-09
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the alerting command line contain '[char]0x' or '(WCHAR)0x' encoded character syntax?
+  context: Before investing investigation time, confirm the alert is a true positive by reading the exact command line and checking that it builds characters from numeric code points with '[char]0x' or '(WCHAR)0x'. Either token matching satisfies the rule, so note which form fired and where in the command it appears.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run PowerShell with encoded character syntax?
+  context: Legitimate administrative scripting almost never assembles parameter delimiters from numeric code points. Knowing whether the user role and host function involve hand-written or generated PowerShell that uses this construction is often the fastest path to separating a true positive from an unusual but sanctioned automation.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:powershell.encoded_command_decode
+  question: Reconstruct the obfuscated characters from the '[char]0x' / '(WCHAR)0x' sequences. What command or parameters do they form?
+  context: The '[char]0x' and '(WCHAR)0x' constructs convert hex code points into characters at runtime, commonly substituting for the dash and slash that introduce PowerShell parameters or for letters inside a payload. Convert each code point to its character and rebuild the intended command to reveal the real flags, cradle, or in-memory loader the syntax was hiding.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:cue_process_tool.mechanism_decode
+  question: Across this host, what other PowerShell command lines used the same encoded character syntax around this time, and do they form one logical operation?
+  context: The triggering event shows a single invocation, but obfuscated PowerShell activity often spans several sequential commands that together stage and run a payload. This scopes to other command lines on this host that use the same '[char]0x' / '(WCHAR)0x' construction within a few minutes so the full obfuscated operation is visible, not just the one command that fired.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains:
+        - '[char]0x'
+        - (WCHAR)0x
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:powershell.script_block_logging
+  question: Did PowerShell script block logging capture the deobfuscated content of this execution?
+  context: Script block logging records the script content PowerShell actually executed after the engine resolves '[char]0x' and '(WCHAR)0x' code points, giving ground truth that bypasses the command-line obfuscation. If PowerShell operational logs are not ingested in this environment, treat zero results as a visibility gap rather than evidence nothing ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- source: template:powershell.powershell_security_bypass
+  question: Were PowerShell security controls bypassed or weakened on this host before this execution?
+  context: Operators frequently disable or evade PowerShell defenses before running an obfuscated payload. Common precursors include AMSI bypass (patching amsi.dll in memory), execution policy changes such as -ep bypass, and downgrade to PowerShell v2 which lacks logging. Finding these precursor events strengthens the case that the encoded-character command was malicious.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- source: template:cue_process_tool.process_chain
+  question: What process spawned this PowerShell instance, and is that parent chain expected?
+  context: The parent process reveals how PowerShell was invoked. Interactive use typically descends from explorer.exe or a terminal; unusual parents such as office applications, mshta.exe, wscript.exe, or a service binary point to macro-borne or scripted execution. Walk up from the parent to see what launched it and what else it spawned.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.follow_on
+  question: What child processes did this PowerShell instance spawn afterward?
+  context: The processes a script launches reveal its actual impact. Obfuscated PowerShell often spawns cmd.exe, additional powershell.exe instances, certutil.exe, or a dropped binary for the next stage. This walks forward from the alerting process to its children.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired this encoded-character pattern, what parents and users normally drive it, and does the current alert fit?
+  context: Even where this construction has been seen before, the parent and user distribution describes how the rule's specific firing pattern has historically run on this host. A new parent process, an unexpected user account, or an unusual command-line shape relative to that history is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains:
+        - '[char]0x'
+        - (WCHAR)0x
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_user_actor.baseline
+  question: Has this user previously run PowerShell with this encoded character syntax?
+  context: Compare this user's current action against their history. A user who has never invoked PowerShell with '[char]0x' or '(WCHAR)0x' construction is more suspicious than one who does so as part of a known workflow. User role and typical toolset should align with the activity.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        CommandLine|contains:
+        - '[char]0x'
+        - (WCHAR)0x
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Has this encoded-character pattern fired routinely across the environment regardless of user, or is it new here?
+  context: When the alert fires under a service principal, user identity does not attribute behavior, so the meaningful pivot is the firing pattern itself. A construction that already accounts for many prior events across the environment points to a sanctioned generator or tooling; a pattern with little or no history is the deviation worth chasing.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains:
+        - '[char]0x'
+        - (WCHAR)0x
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the environment around this time?
+  context: Tracking the user's activity across all hosts in the alert window reveals lateral movement or parallel activity on multiple endpoints. If the same user drove similar activity elsewhere, the scope of the event may be larger than this single host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did the same encoded-character pattern fire on other hosts in this window, or is it isolated to this host?
+  context: Under a service principal, surveying the user's network-wide activity returns agent-telemetry noise. The meaningful question is whether the same obfuscation pattern fired on other hosts in the alert window. Multiple hosts in the same window points to scheduled or pushed activity; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains:
+        - '[char]0x'
+        - (WCHAR)0x
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: 'Alerts rarely occur in isolation. Examining the activity surrounding the alert reveals the immediate context: what led to this event, what happened after, and whether it is part of a larger sequence. Look for reconnaissance, privilege escalation, or persistence mechanisms.'
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host -- defense tampering, reconnaissance, credential access -- may reveal the attack stages that preceded this event and help reconstruct the timeline. Defense tampering followed by execution, or reconnaissance followed by exploitation, are common orderings.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired this encoded-character pattern in the past week, and does the cross-host distribution look like consistent automation or one-off activity?
+  context: This counts the rule's firing pattern fleet-wide with no host scope, so the result reflects the obfuscation pattern itself rather than generic PowerShell usage. Many hosts firing the same pattern points to scripted deployment or vendor tooling; one host or a small unrelated set points to manual operator activity. Use the host distribution and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains:
+        - '[char]0x'
+        - (WCHAR)0x
+      condition: selection
+    fields:
+    - host.name
+- source: template:universal.evidence_preservation
+  question: If the decoded command references a file, is that file still on disk for analysis?
+  context: If the deobfuscated command references a file -- a downloaded payload, a decoded output, or a script -- checking whether it still exists on disk enables deeper analysis such as hash lookup, sandbox submission, or content review. Scope to the paths reconstructed from the command line.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1059.001
+      name: PowerShell
+      role: primary
+    - id: T1027
+      name: Obfuscated Files or Information
+      role: secondary
+    - id: T1059
+      name: Command and Scripting Interpreter
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: obfuscated_invocation
+      description: "PowerShell launched with encoded character syntax substituting for parameter delimiters or payload characters"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: deobfuscation
+      description: "Resolve the encoded code points to recover the real command, flags, and payload"
+      mapped_to: Q3
+      source: template:powershell.encoded_command_decode
+    - stage: 3
+      label: control_bypass
+      description: "PowerShell security controls (AMSI, execution policy, downgrade) weakened before payload execution"
+      mapped_to: Q6
+      source: template:powershell.powershell_security_bypass
+    - stage: 4
+      label: parent_and_followon
+      description: "Abnormal parent invocation and child processes / network or file artifacts produced after execution"
+      mapped_to: Q7
+      source: template:cue_process_tool.process_chain
+  dimension_coverage:
+    - dimension: command_analysis
+      technique: T1059.001
+      covered_by: Q3
+      source: template:powershell.encoded_command_decode
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1059.001
+      covered_by: Q7
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1059.001
+      covered_by: Q14
+      source: template:cue_host_context.clustering
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1059.001
+      covered_by: Q9
+      source: template:cue_process_tool.baseline_deviation
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1059
+      covered_by: Q10
+      source: template:cue_user_actor.baseline
+      coverage_type: direct
+    - dimension: obfuscation_check
+      technique: T1027
+      covered_by: Q3
+      source: template:powershell.encoded_command_decode
+      coverage_type: direct
+  mutable_dispositions:
+    - element: CommandLinePattern
+      dimension: command_analysis
+      specific_values: "[char]0x, (WCHAR)0x (rule's own selection values)"
+      disposition: query_injection
+      target_question: Q4
+      notes: "Rule's CommandLine|contains values injected into mechanism_decode (host-scoped) and into the reflected baseline_deviation/scope and user-actor pattern queries; the rule has no Image field so binary scoping is replaced by the CommandLine pattern per the CommandLine-only hint."
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "rationale only (Excel, WinWord, mshta examples)"
+      disposition: context
+      target_question: Q7
+      notes: "Abnormal-parent examples enrich process_chain context; no specific parent in the rule to inject."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only (off-hours, maintenance windows)"
+      disposition: context
+      target_question: Q14
+      notes: "Time-correlation rationale informs clustering context; not a queryable value."
+    - element: LoadedModuleList
+      dimension: tuning_parameter
+      specific_values: "rationale only (rare .NET assemblies)"
+      disposition: context
+      target_question: Q9
+      notes: "image_load tuning rationale; covered via baseline_deviation parent/user distribution. image_load logsource declined - see hint_dispositions."
+    - element: ScriptBlockLengthThreshold
+      dimension: tuning_parameter
+      specific_values: "rationale only (4104 script-block length)"
+      disposition: context
+      target_question: Q5
+      notes: "Script-block threshold rationale informs script_block_logging context; not a fixed queryable value."
+    - element: PayloadEntropyThreshold
+      dimension: obfuscation_check
+      specific_values: "rationale only (entropy to distinguish obfuscation)"
+      disposition: context
+      target_question: Q3
+      notes: "Entropy tuning rationale (T1027); informs decode context, no fixed value to inject."
+    - element: SuspiciousParentProcessList
+      dimension: tuning_parameter
+      specific_values: "rationale only (LOLBins / misused admin tools)"
+      disposition: context
+      target_question: Q7
+      notes: "T1027 suspicious-parent rationale; reinforces process_chain context."
+  dedup_decisions:
+    - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable; emitted both (subject pivot vs. firing-pattern pivot)"
+      kept: both
+    - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable; emitted both (subject pivot vs. firing-pattern pivot)"
+      kept: both
+    - dropped: universal.endpoint_protection_health
+      reason: "powershell.powershell_security_bypass already sweeps host -1h for AMSI/Defender/execution-policy tamper precursors; the generic host-tamper sweep duplicates that prior-tamper coverage for this execution rule"
+      kept: powershell.powershell_security_bypass
+    - dropped: cue_process_tool.baseline
+      reason: "binary-frequency baseline relies on Image|endswith %Image%; rule is CommandLine-only with no binary, and the firing-pattern frequency is already covered by baseline_deviation (host, -14d) and scope (fleet, -7d)"
+      kept: cue_process_tool.baseline_deviation
+  skipped_templates:
+    - template: obfuscation.encoded_payload_decode
+      reason: "replaced_by: powershell.encoded_command_decode (parent is powershell.exe; more specific decode question supersedes the generic one)"
+  hint_dispositions:
+    - hint: "logsource 'image_load' (recommended by techniques: T1059.001) is not covered — pull in cue_image_load.* or author a custom question with `category: image_load`"
+      disposition: declined
+      reason: >-
+        The rule fires on literal '[char]0x' / '(WCHAR)0x' string obfuscation
+        inside a process_creation CommandLine — direct powershell.exe invocation,
+        not the .NET-hosted (System.Management.Automation) indirect execution that
+        image_load analytics target. Q5 (powershell.script_block_logging) recovers
+        the deobfuscated script content as ground truth and Q3 decodes the encoded
+        characters, which together resolve what executed without image_load
+        precision. No compensating attack:T1059.001.image_load question authored.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - powershell
+    - obfuscation
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 17
+      attack: 0
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 2
+      context: 13
+    logsource_diversity:
+      process_creation: 15
+      powershell_script_block: 1
+      file_event: 1

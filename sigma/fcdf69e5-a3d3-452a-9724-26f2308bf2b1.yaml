@@ -1,0 +1,544 @@
+name: Phishing Pattern ISO in Archive
+id: 2c1e95ff-6583-4586-96c9-7a64b9c8e88c
+description: |
+  Fires when an archive utility (WinRAR, 7-Zip File Manager, or PeaZip) spawns an ISO or
+  disk-image handler (isoburn.exe, PowerISO.exe, or ImgBurn.exe). Threat actors nest a small
+  ISO or IMG file inside an emailed archive so that mounting the image strips the
+  mark-of-the-web from the contained payload, sidestepping attachment filters and
+  SmartScreen-style protections. Legitimately, a user may double-click an image file inside an
+  archive instead of extracting it. Determine what archive was opened, where it came from, what
+  the mounted image contained, and whether anything executed from it afterward.
+type: detection
+detection_id: fcdf69e5-a3d3-452a-9724-26f2308bf2b1
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-09
+questions:
+- source: template:universal.verify_trigger_match
+  question: Did an archive utility spawn an ISO or disk-image handler as the rule expects?
+  context: Confirm the alert is a true positive by reviewing the actual parent and child binaries.
+    The rule requires the parent to end in Winrar.exe, 7zFM.exe, or peazip.exe AND the child to
+    end in isoburn.exe, PowerISO.exe, or ImgBurn.exe. Verify both halves of the pairing matched
+    rather than an unrelated launch.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+- source: template:universal.host_user_context
+  question: Is this user and host expected to open disk images out of archive utilities?
+  context: Opening an ISO or IMG directly from inside a WinRAR or 7-Zip window is unusual for most
+    business workflows. Software packagers, IT imaging staff, or developers may do it routinely;
+    a finance or HR endpoint doing it shortly after receiving an email attachment is far more
+    likely phishing. Knowing the user role and host function is often the fastest triage step.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:parent_child.parent_process_legitimacy
+  question: Is the archive utility expected to spawn this image handler, and what started the
+    archive utility itself?
+  context: The archive-spawns-image-handler pairing is the core signal. Tracing the archiver's own
+    parent reveals whether the chain is benign (the user double-clicked an emailed or downloaded
+    archive from explorer.exe) or part of a delivery chain. Look at what opened the archive and
+    where that archive file lives.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- source: template:parent_child.sibling_processes
+  question: What other child processes did the same archive utility instance spawn?
+  context: If the archive utility opened the image handler, it may also have launched other
+    processes from the same archive session. Sibling processes reveal the full scope of what the
+    user opened or what auto-executed once the image was mounted.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:initial_access.delivery_vector
+  question: What archive was opened, and how did it reach this host?
+  context: Initial access here begins with an archive attachment containing a nested ISO or IMG.
+    Identifying the archive file, its name, and how it arrived (email attachment, web download,
+    USB) enables blocking at the perimeter and searching for other recipients. The parent command
+    line and parent's working directory point to the archive file path; correlate with email and
+    web-proxy records for the original delivery.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+- source: template:initial_access.application_patch_status
+  question: Is the archive utility patched against known mark-of-the-web bypass flaws?
+  context: Archive utilities have carried flaws that let a crafted archive bypass mark-of-the-web
+    propagation or execute a payload alongside the file the user opened. An out-of-date archiver
+    raises the likelihood that opening the archive itself, not just mounting the image, advanced
+    the intrusion. Confirm the installed version and patch level of the parent utility.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+- source: template:initial_access.campaign_scope
+  question: Did the same detection fire on other hosts or for other users?
+  context: Phishing waves rarely target a single recipient. If one user opened an ISO-in-archive
+    attachment, others likely received the same lure. Correlating this rule across hosts and users
+    reveals the breadth of the campaign and identifies additional endpoints that need to be checked
+    for follow-on execution.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        rule.uuid|expand: '%rule.uuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in the hour
+    before the alert?
+  context: Mounting a nested ISO is a delivery step that commonly precedes payload execution.
+    The query surfaces direct attempts to disable AV/EDR services, flip Defender flags, add broad
+    exclusions, clear logs, or patch AMSI/ETW around the same time. Zero rows is a useful
+    "protection looks healthy" signal; populated rows shift the disposition toward operator
+    preparation, so review the parent process and signing chain of any writer.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+- source: template:cue_process_tool.mechanism_decode
+  question: What exactly did the image handler do? Decode its full command line and working
+    directory.
+  context: The image handler's command line and working directory show which ISO or IMG file was
+    mounted or burned and from what path. The query scopes to all executions of this binary on the
+    host within a few minutes so multi-step image operations are captured together. Identify the
+    image file path so it can be located, hashed, and inspected for the staged payload.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:cue_parent_process.baseline
+  question: Has this archive utility ever spawned this image handler on this host before?
+  context: A first-time or rare archiver-to-image-handler pairing on this host is a stronger
+    signal than a recurring one. Imaging or packaging workstations may show this pair regularly;
+    a zero or near-zero historical count on a general-purpose endpoint points to novel activity
+    consistent with a phishing lure.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:cue_parent_process.clustering
+  question: What other activity did this archive utility generate around the time of the alert?
+  context: Beyond the image handler, the archive utility may have produced file events or other
+    process launches in the same window. This reveals what else the user opened from the archive
+    and whether the archive session led to additional execution.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        process.parent.name|expand: '%ParentName%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_parent_process.scope
+  question: Is the same archive-utility-to-image-handler pairing occurring on other hosts?
+  context: The same parent-child pairing appearing across multiple hosts points to a phishing wave
+    rather than a one-off. Enterprise-wide comparison helps gauge campaign scope and identify other
+    recipients who opened the same nested-image attachment.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+      - CommandLine
+- source: template:cue_user_actor.baseline
+  question: Does this user normally open disk images from archive utilities?
+  context: Compare this user's action against their historical behavior. A user who has never
+    mounted an ISO out of an archiver is more suspicious than one who does so as part of their
+    role. User role and typical toolset should align with handling disk images.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this archive-utility-to-image-handler pairing historically routine on this host or
+    across the environment, or is the parent unusual for this binary?
+  context: When the alert fires under a service principal, user identity does not attribute the
+    behavior. The meaningful pivot is the launch mechanism — which archive utility spawned this
+    image handler, and whether that pair is historically common. A new or rare parent for this
+    handler is the deviation worth chasing; a pair already accounting for thousands of prior events
+    is packaging or OS automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals whether the same person triggered
+    similar activity on multiple endpoints. If the user opened the same attachment on more than one
+    host, the scope of exposure is larger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same archive-utility-to-image-handler pairing fire on other hosts in the same
+    window, or is it isolated to this host?
+  context: Under a service principal, asking what else the user did across the network returns
+    agent-telemetry noise. The meaningful question is whether the same launch mechanism — archive
+    utility spawning the image handler — fired on other hosts in the alert window. Multiple hosts
+    in the same window points to a pushed or scheduled rollout; a single host points to a host-local
+    trigger such as one user opening an attachment.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host — reconnaissance, defense tampering, or other
+    delivery activity — may reveal stages that preceded this event and help reconstruct the
+    timeline. Initial-access alerts gain meaning when read alongside what came before and after.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1566
+      name: Phishing
+      role: primary
+  attack_chain_coverage:
+    - stage: 1
+      label: delivery
+      description: "Phishing message delivers an archive attachment containing a nested ISO/IMG"
+      mapped_to: Q5
+      source: template:initial_access.delivery_vector
+    - stage: 2
+      label: image_mount
+      description: "User opens the archive and the image handler mounts/burns the nested ISO, stripping mark-of-the-web"
+      mapped_to: Q9
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 3
+      label: follow_on_execution
+      description: "Processes launched from the mounted image or the archive session"
+      mapped_to: Q4
+      source: template:parent_child.sibling_processes
+  dimension_coverage:
+    - dimension: tuning_parameter
+      technique: T1566
+      covered_by: Q1
+      source: template:universal.verify_trigger_match
+      coverage_type: partial
+  mutable_dispositions:
+    - element: SuspiciousFileTypes
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q1
+      notes: "No concrete values in brief. The rule already fixes the high-risk file-handling
+        pattern (archiver parent + ISO/IMG handler child); verify_trigger_match enumerates that
+        parent/child binary list, which is this rule's instantiation of the suspicious-file-type
+        knob."
+    - element: AllowedSenders
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q5
+      notes: "No concrete values in brief. Sender allow-listing is a false-positive control surfaced
+        in the delivery-vector question, where the analyst correlates the originating email/sender
+        for the archive."
+  dedup_decisions:
+    - dropped: cue_parent_process.mechanism_decode
+      reason: "Same parent-lookup query (ProcessGuid|expand %ParentProcessGuid%) as parent_child.parent_process_legitimacy; technique-set version is more specific and KEEP_EXACT"
+      kept: parent_child.parent_process_legitimacy
+    - dropped: cue_parent_process.follow_on
+      reason: "Other-children-of-parent overlaps parent_child.sibling_processes; technique-set version scopes by ParentProcessGuid (exact instance) and is more specific"
+      kept: parent_child.sibling_processes
+    - dropped: cue_process_tool.baseline
+      reason: "Host-baseline of the image handler overlaps cue_parent_process.baseline, which is the more relevant pairing baseline for a parent-primary rule"
+      kept: cue_parent_process.baseline
+    - dropped: cue_host_context.clustering
+      reason: "Host-wide activity-around-alert overlaps cue_parent_process.clustering (parent-scoped activity in the same window); parent-scoped is tighter for this parent-primary rule and precursor already supplies broad host context"
+      kept: cue_parent_process.clustering
+    - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable; both emitted (Q13/Q14)"
+      kept: both
+    - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable; both emitted (Q15/Q16)"
+      kept: both
+  skipped_templates:
+    - template: cue_process_tool.process_chain
+      reason: "Hint: parent_process is primary — drop cue_process_tool:process_chain. Parent chain covered by parent_child.parent_process_legitimacy (Q3)"
+    - template: data_staging_exfil.data_scope
+      reason: "data_staging_exfil was confirmed on the title keyword 'archive', but here the archive is the inbound delivery container (nested ISO to bypass mark-of-the-web), not an outbound collection/staging tool. Collected-files framing does not represent this initial-access rule; image-contents inspection is covered by cue_process_tool.mechanism_decode (Q9)"
+    - template: data_staging_exfil.archive_destination
+      reason: "Same incidental-keyword rationale: no outbound archive/export workflow in an ISO-in-archive phishing rule. Where the image handler wrote/extracted is covered by cue_process_tool.mechanism_decode (Q9) and the sibling-process scan (Q4)"
+    - template: data_staging_exfil.encryption_password
+      reason: "Same incidental-keyword rationale: the image handler's CommandLine carries no archive-encryption flags (-p/-hp/--passphrase), and the rule detection has no CommandLine; archive password protection is an email/attachment-inspection step the delivery-vector question (Q5) directs the analyst toward"
+  reflection_overrides: []
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - initial_access
+    - parent_child
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 17
+      attack: 0
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 14
+    logsource_diversity:
+      process_creation: 16
+      sigma_alert: 1

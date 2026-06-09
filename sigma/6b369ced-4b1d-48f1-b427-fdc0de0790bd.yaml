@@ -1,0 +1,407 @@
+name: Suspicious Diantz Alternate Data Stream Execution
+id: 1ac0eb88-2186-445a-94aa-7b74a15af12b
+description: |
+  Detects diantz.exe invoked with a command line that names a .cab destination written into an Alternate Data Stream
+  (ADS), identified by a colon in the target path that is not followed by a backslash. Diantz is a built-in cabinet
+  packager; the ADS form lets an actor compress a file into a stream hidden on another file, where it does not show in
+  normal directory listings. The rule fires when the command line contains diantz.exe and .cab and the ADS colon syntax
+  together. Legitimate use of this exact form is rare, so the investigation should decode the source and stream targets,
+  confirm whether the stream artifact exists on disk, and determine whether the parent and user are expected to package
+  data into hidden streams.
+type: detection
+detection_id: 6b369ced-4b1d-48f1-b427-fdc0de0790bd
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line match what this rule detects, with diantz.exe packaging into a .cab target written to an Alternate Data Stream?
+  context: Before investing investigation time, confirm the alert is a true positive by reviewing the exact command line. The rule fires only when the command line contains diantz.exe AND .cab AND a colon in the target path that is not followed by a backslash, which is the ADS write syntax (for example, target.exe:hidden.cab). Confirm all three are present in the actual event and read off the source file and the host file whose stream receives the cab.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to package files into cabinet archives or write data into Alternate Data Streams?
+  context: Routine archiving rarely uses diantz, and writing a cabinet into an Alternate Data Stream is almost never part of normal workflows. Knowing whether the user role and host function involve any legitimate ADS or cabinet packaging is often the fastest path to distinguishing administrative activity from data hiding or staging.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: Decode the diantz command line. What is the source file, and which host file receives the cab in its Alternate Data Stream?
+  context: The full command line reveals the operation. Diantz in ADS form takes a source file as the first argument and a destination of the form hostfile:stream.cab, so the colon separates the carrier file from the stream name. Read off both paths to learn what is being compressed and where the hidden cab lands. Legitimate ADS usage exists for system and AV tooling, so check whether the carrier path looks like a normal data location or a temp or user-writable directory used for staging.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+          - diantz.exe
+          - .cab
+        CommandLine|re: ':[^\\]'
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: attack:T1564.004.ads_stream_creation
+  question: Was a stream-bearing file write recorded for the carrier file around the time of this alert?
+  context: The defining artifact of this technique is a named Alternate Data Stream attached to a carrier file. Stream-hash events record the carrier path and the stream name when a non-default stream is written, which confirms the cab actually landed in an ADS rather than the command merely being attempted. A matching write near the alert ties the process execution to the on-disk hidden stream; absence may mean the write failed, the path is not monitored, or stream-hash logging is not collected here.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: create_stream_hash
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - Hash
+- source: attack:T1564.004.cab_artifact
+  question: Do the source file or the carrier file named on the command line still exist on disk for analysis?
+  context: The command line names a source file being compressed and a carrier file receiving the hidden cab stream. Checking whether those paths still exist enables deeper analysis, hash lookups, or content review of what was packaged. The carrier file may look benign in a directory listing because the cab lives in its stream rather than its main data; the stream content is what to recover. File paths here are derived from the diantz command line itself.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: template:cue_process_tool.process_chain
+  question: What process spawned diantz.exe, and is that parent chain expected?
+  context: The parent process reveals how diantz was invoked. Interactive packaging usually descends from explorer.exe or a shell launched by a user; service automation from services.exe. Parents like powershell.exe, cmd.exe, wscript.exe, mshta.exe, or an Office application point to scripted or macro-driven execution rather than a deliberate administrator action, which raises the priority of the ADS write. Walk up the tree to see what spawned the parent.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.follow_on
+  question: What child processes did diantz.exe spawn afterward on this host?
+  context: The processes spawned after the packaging step reveal the actual impact. A benign archiving action usually spawns nothing further; staging for exfiltration or follow-on execution may be accompanied by a shell, a transfer utility, or a binary that reads back the hidden stream. Review any children and their command lines.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith: '\diantz.exe'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.baseline
+  question: Does this host normally run diantz.exe to package cabinets into Alternate Data Streams?
+  context: A command pattern that has never been seen on a host is more suspicious than one that runs regularly. Zero or very low historical counts for diantz writing a cab into an ADS indicate first-time or rare execution, which on a general-purpose endpoint raises the priority of the decode result. Legitimate ADS usage by system or AV tooling, if any exists here, would show as a recurring baseline.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains|all:
+          - diantz.exe
+          - .cab
+        CommandLine|re: ':[^\\]'
+      condition: selection
+    fields:
+      - User
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired the rule's pattern, what parents and users normally drive that activity, and does the current alert fit that pattern?
+  context: Even built-in utilities can be abused. The query mirrors the rule's selection structure scoped to this host, so the resulting parent and user distribution reflects how this specific diantz ADS firing pattern has historically run here, not generic diantz usage. A new parent process, an unexpected user account, or an unusual command shape is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - diantz.exe
+        - .cab
+        CommandLine|re: :[^\\]
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run diantz to package data into Alternate Data Streams across the environment?
+  context: Compare this user's current action against their historical behavior. A user who has never written a cabinet into an ADS is more suspicious than one who does so regularly as part of a known workflow. User role and typical toolset should align with packaging data into hidden streams, which is unusual for most accounts.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        CommandLine|contains|all:
+          - diantz.exe
+          - .cab
+        CommandLine|re: ':[^\\]'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent and diantz combination historically routine on this host or across the environment, or is the parent unusual for this utility?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior. The meaningful pivot is the launch mechanism: which parent process spawned diantz, and is that pair historically common. A new or rare parent for diantz on this host or environment-wide is the deviation worth chasing; a pair that already accounts for many prior events points to vendor or scheduled automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        CommandLine|contains: diantz.exe
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity across multiple endpoints. If the same user staged or hid data on multiple hosts, the scope of the operation may be larger than a single endpoint.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent and diantz combination fire on other hosts in the same window, indicating a coordinated automation rollout rather than isolated activity?
+  context: Under a service principal, asking what else this user did across the network returns agent-telemetry noise, since every host runs SYSTEM-owned agents constantly. The meaningful question is whether the same launch mechanism, parent process plus diantz, fired on other hosts in the alert window. Multiple hosts in the same window points to scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        CommandLine|contains: diantz.exe
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: 'Alerts rarely occur in isolation, and this technique gains meaning from what surrounds it: the timing between the ADS write and the process that reads or transfers the stream is what separates idle packaging from active staging. Examining activity in the minutes around the alert reveals what led to this event and what happened after. Look for reconnaissance, collection, archiving, or transfer utilities that would place the hidden cab in a data-staging sequence.'
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired the rule's pattern in the past week, and does the cross-host distribution look like consistent automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of this diantz ADS firing pattern, not generic diantz usage. Many hosts firing the same pattern points to scripted deployment or vendor automation; one host or a small unrelated set points to manual operator activity. Use the host distribution and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - diantz.exe
+        - .cab
+        CommandLine|re: :[^\\]
+      condition: selection
+    fields:
+    - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: 'Alerts rarely happen in isolation. Earlier detections on the same host, reconnaissance, credential access, or collection activity, may reveal the stages that preceded this event and help reconstruct the timeline. Look for patterns: collection followed by hiding data in a stream, or hiding followed by a transfer attempt.'
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1564.004
+      name: NTFS File Attributes
+      role: primary
+    - id: T1564
+      name: Hide Artifacts
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: command_execution
+      description: diantz.exe is invoked with a .cab destination written into an Alternate Data Stream (colon-not-backslash syntax).
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: command_decode
+      description: The source file and the carrier:stream.cab destination are decoded from the command line.
+      mapped_to: Q3
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 3
+      label: ads_metadata_anomaly
+      description: A named Alternate Data Stream is written to a carrier file, recorded as a stream-hash / file write artifact.
+      mapped_to: Q4
+      source: attack:T1564.004.ads_stream_creation
+    - stage: 4
+      label: process_lineage_correlation
+      description: Process lineage and surrounding activity are correlated with the ADS write to establish staging context.
+      mapped_to: Q6
+      source: template:cue_process_tool.process_chain
+  dimension_coverage:
+    - dimension: time_correlation
+      technique: T1564.004
+      covered_by: Q14
+      source: template:cue_host_context.clustering
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1564.004
+      covered_by: Q3
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1564
+      covered_by: Q3
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: direct
+  mutable_dispositions:
+    - element: ADSPathWhitelist
+      dimension: tuning_parameter
+      specific_values: "rationale only (exclude legitimate ADS usage by system or AV tools)"
+      disposition: context
+      target_question: Q3
+      notes: "No fixed whitelist values supplied; mechanism_decode and baseline context tell the analyst to check whether the carrier path is a normal location used by system/AV tooling versus a staging directory."
+    - element: ProcessScope
+      dimension: tuning_parameter
+      specific_values: "powershell.exe, cmd.exe, wscript.exe (example suspicious parents)"
+      disposition: context
+      target_question: Q6
+      notes: "Example suspicious parents named in process_chain context; rule is CommandLine-only with no parent in detection, so not hard-coded into a query selection."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only (correlate ADS creation with subsequent process execution)"
+      disposition: context
+      target_question: Q14
+      notes: "Threshold has no queryable value; the +/-15m host-clustering window and the stream-write question carry the temporal-correlation intent."
+    - element: FileExtensions
+      dimension: tuning_parameter
+      specific_values: "rationale only (sensitive file types likely targeted for hiding)"
+      disposition: context
+      target_question: Q5
+      notes: "No fixed extension list in brief; cab_artifact file question recovers the source/carrier paths so the analyst sees the actual file types involved."
+    - element: ADSDetection
+      dimension: tuning_parameter
+      specific_values: "rationale only (enable/disable ADS detection per business use)"
+      disposition: context
+      target_question: Q4
+      notes: "Deployment toggle, not a queryable value; the stream-hash question notes that absence may reflect logging not being collected here."
+  dedup_decisions:
+    - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable (subject vs. launch-mechanism pivot); both emitted"
+      kept: both
+    - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable (subject vs. launch-mechanism pivot); both emitted"
+      kept: both
+    - dropped: cue_process_tool.clustering
+      reason: "host-clustering coverage provided by cue_host_context.clustering (same +/-15m host-scoped Image aggregation); process_tool variant redundant"
+      kept: cue_host_context.clustering
+  skipped_templates:
+    - template: universal.endpoint_protection_health
+      reason: "RECOMMENDED, not must_include. Rule fires on a defense-evasion data-hiding action (diantz packaging into an ADS), not on payload execution, credential access, or impact, so tamper-as-precursor is not a live disposition driver here. cue_host_context.precursor is present and carries any prior-alert tamper signal on this host. Dropped per the template's own drop criteria (b)."
+  reflection_overrides: []
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+  generation_stats:
+    total_questions: 16
+    source_counts:
+      template: 14
+      attack: 2
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 13
+    logsource_diversity:
+      process_creation: 13
+      create_stream_hash: 1
+      file_event: 1
+      sigma_alert: 1

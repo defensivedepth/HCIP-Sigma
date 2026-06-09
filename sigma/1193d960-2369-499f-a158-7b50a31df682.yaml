@@ -1,0 +1,439 @@
+name: Potential Suspicious Browser Launch From Document Reader Process
+id: 7cb5474c-424b-492f-ab32-671f910b21d0
+description: |
+  Detects a browser process (chrome, msedge, firefox, brave, opera, vivaldi, maxthon, seamonkey) spawned by a document-reader application whose ParentImage path contains "Acrobat Reader", "Microsoft Office", or "PDF Reader", where the browser command line carries an http or https URL. The rule fires when the selection matches and none of the known-benign URL filters (Microsoft fwlink help, Foxit ad/redirect endpoints) match. Opening a document and following an embedded link is routine, but a reader handing off to a browser with an attacker-controlled URL is a common phishing redirect or second-stage delivery step, so the investigation should establish what document was opened, what URL the browser was sent to, and whether the same hand-off appears on other hosts.
+type: detection
+detection_id: 1193d960-2369-499f-a158-7b50a31df682
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- source: template:universal.verify_trigger_match
+  question: Did a document-reader parent (Acrobat Reader, Microsoft Office, or PDF Reader) spawn this browser with an http or https URL on the command line?
+  context: Confirm the alert is a true positive before investing time. Verify the ParentImage path contains a document-reader product string, the Image is one of the browser binaries the rule lists, and the browser command line carries an http(s) URL that is not one of the benign Microsoft help or Foxit endpoints the rule excludes.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to open documents that hand off to a browser for external links?
+  context: Routine document workflows do open browsers for embedded links, so the user role and host function matter. A user who regularly works with PDFs and Office documents that link out is a different disposition than an unattended server or a user whose role does not involve document handling.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:initial_access.delivery_vector
+  question: What document was open in the reader, and how was it delivered to this host?
+  context: The hand-off begins with a document opened in Acrobat Reader, a PDF reader, or an Office application. Identifying the specific file and how it arrived — email attachment, web download, or shared drive — enables blocking the source and finding other recipients. The reader's own command line and parent context point at the file path.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+- source: template:cue_process_tool.mechanism_decode
+  question: What is the full URL the browser was launched with, and where does it lead?
+  context: The command line carries the URL the reader handed to the browser. Decode it fully — note the domain, any URL-encoded or redirector parameters, IP-literal hosts, and whether it points at a login page, a file download, or a redirect chain. The benign Microsoft fwlink and Foxit endpoints are already excluded by the rule, so a URL reaching this alert is neither of those.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+        CommandLine|contains: http
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:parent_child.parent_process_legitimacy
+  question: What started the document-reader parent, and is a browser launch an expected child for it?
+  context: The reader-to-browser hand-off is the core signal. Tracing what spawned the reader itself — a mail client opening an attachment, explorer.exe from a double-click, or an unexpected scripted parent — distinguishes a user opening a delivered document from an automated or scripted chain.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- source: template:parent_child.sibling_processes
+  question: What other child processes did this same reader instance spawn?
+  context: If the reader spawned the browser as part of a malicious hand-off, it may have spawned other processes too. Examining the exact parent instance's other children reveals whether the document also launched script interpreters or other living-off-the-land binaries alongside the browser.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_parent_process.baseline
+  question: Does this document reader normally spawn this browser on this host?
+  context: Some reader-to-browser pairings are routine where users frequently follow document links; others are novel. Historical frequency of this specific parent product spawning this browser binary on this host distinguishes a habitual workflow from a first-time hand-off worth chasing.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:cue_parent_process.clustering
+  question: What files did the reader open or write on this host around the time of the alert?
+  context: The document that triggered the hand-off, and any payload it dropped, appear as file events from the reader process around the alert time. File activity scoped to the reader can reveal the source document path and any staged second-stage file in a user-writable location.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|contains|expand: '%ParentName%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: template:initial_access.campaign_scope
+  question: Did the same detection fire on other hosts or for other users recently?
+  context: A document-to-browser phishing hand-off rarely targets a single user. Correlating the same rule across hosts and users reveals the breadth of the delivery and identifies additional systems where the same document was opened and the same URL followed.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        rule.uuid|expand: '%rule.uuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:initial_access.application_patch_status
+  question: Is the document-reader application up to date with security patches?
+  context: A reader handing off to a browser can be a benign link click, but it can also follow exploitation of the reader itself. Confirming the Acrobat, PDF reader, or Office version is fully patched helps distinguish a user-driven link follow from exploitation of a known reader vulnerability and flags other unpatched hosts at risk.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+- source: template:universal.evidence_preservation
+  question: Are any files dropped by the reader or downloaded by the browser still on disk for analysis?
+  context: If the hand-off staged a file — a downloaded payload, a saved document, or output written to a user-writable path — checking whether it still exists enables hash lookups, sandbox submission, or content review. Files derived from the activity show up under the host's user-writable paths.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: template:cue_user_actor.baseline
+  question: Does this user normally trigger reader-to-browser hand-offs across the environment?
+  context: Compare this user's current action against their historical pattern. A user who routinely follows document links is a different disposition than one who has never produced this activity. User role and typical document workflow should align with the alert.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this reader-and-browser launch pair historically routine on this host or across the environment?
+  context: When the alert fires under a service principal, user identity does not attribute behavior. The meaningful pivot is the launch mechanism — which reader product spawned this browser, and whether that pair is historically common. A new or rare reader-to-browser pair is the deviation worth chasing; a pair accounting for thousands of prior events is benign automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals whether the document hand-off was isolated or part of broader activity on multiple endpoints. The same user producing similar activity across hosts widens the scope of investigation.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same reader-and-browser launch pair fire on other hosts in the same window?
+  context: Under a service principal, network-wide user activity returns agent-telemetry noise. The meaningful question is whether the same launch mechanism — reader product spawning this browser — fired on other hosts in the alert window. Multiple hosts in the same window points to a pushed document or coordinated delivery; a single host points to a local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host may reveal the stages that preceded the document hand-off and help reconstruct the timeline leading up to it.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: attack:T1204.002.create_stream_hash
+  question: Does the source document carry a mark-of-the-web zone identifier indicating it came from email or a download?
+  context: Files saved from email, web, or untrusted shares carry a Zone.Identifier alternate data stream recording the origin zone. A mark-of-the-web on the opened document confirms external delivery and corroborates a phishing hand-off; its absence points toward a locally-created or trusted-source file. The stream is recorded when the file is written to disk.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: create_stream_hash
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Contents
+      - Image
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+  - id: T1204.002
+    name: Malicious File
+    role: primary
+  - id: T1204
+    name: User Execution
+    role: secondary
+  attack_chain_coverage:
+  - stage: 1
+    label: file_delivered_opened
+    description: User opens a document delivered by email, web, or share in a reader/handler application
+    mapped_to: Q3
+    source: template:initial_access.delivery_vector
+  - stage: 2
+    label: handler_spawns_child
+    description: The reader/handler application spawns a new child process (here a browser)
+    mapped_to: Q1
+    source: template:universal.verify_trigger_match
+  - stage: 3
+    label: outbound_request
+    description: Immediate outbound HTTP(S) from the spawned lineage (browser launched with an http(s) URL)
+    mapped_to: Q4
+    source: template:cue_process_tool.mechanism_decode
+  - stage: 4
+    label: origin_marking
+    description: FileStreamCreated mark-of-the-web on the delivered file (optional precursor)
+    mapped_to: Q17
+    source: attack:T1204.002.create_stream_hash
+  dimension_coverage:
+  - dimension: file_path_analysis
+    technique: T1204.002
+    covered_by: Q11
+    source: template:universal.evidence_preservation
+    coverage_type: direct
+  - dimension: time_correlation
+    technique: T1204.002
+    covered_by: Q8
+    source: template:cue_parent_process.clustering
+    coverage_type: direct
+  - dimension: tuning_parameter
+    technique: T1204.002
+    covered_by: Q7
+    source: template:cue_parent_process.baseline
+    coverage_type: indirect
+  - dimension: user_context
+    technique: T1204
+    covered_by: Q2
+    source: template:universal.host_user_context
+    coverage_type: direct
+  mutable_dispositions:
+  - element: TimeWindow
+    dimension: time_correlation
+    specific_values: '0-5m / 15m correlate file write to child spawn'
+    disposition: context
+    target_question: Q8
+    notes: Reader file activity correlated to the spawn within +/-15m
+  - element: SuspiciousExtensions
+    dimension: tuning_parameter
+    specific_values: 'exe,scr,lnk,pif,cpl,js,vbs,bat,cmd,ps1,hta,iso,docm,xlsm'
+    disposition: context
+    target_question: Q11
+    notes: Evidence-preservation scopes to user-writable file paths; exact extension list is environment-tunable, kept as context not a hard query filter
+  - element: UserPaths
+    dimension: file_path_analysis
+    specific_values: 'Downloads, Temp, Desktop, AppData staging'
+    disposition: context
+    target_question: Q11
+    notes: '%file_paths% placeholder resolves the rule-derived paths; user-writable staging described in context'
+  - element: ParentApps / HighRiskParents
+    dimension: tuning_parameter
+    specific_values: 'winword.exe, excel.exe, acrord32.exe (document readers)'
+    disposition: context
+    target_question: Q7
+    notes: Parent product is already constrained by the rule (Acrobat Reader, Microsoft Office, PDF Reader); baseline question reflects the specific parent
+  - element: HighRiskChildren
+    dimension: tuning_parameter
+    specific_values: 'powershell.exe, cmd.exe, mshta.exe, rundll32.exe (LOLBINs)'
+    disposition: new_question
+    target_question: Q6
+    notes: Rule's child is a browser, not a LOLBIN; sibling-process question surfaces any LOLBIN children spawned by the same reader instance
+  - element: SignerAllowList
+    dimension: tuning_parameter
+    specific_values: rationale only
+    disposition: context
+    target_question: Q1
+    notes: Trusted-signer suppression is a tuning rationale without rule-specific values
+  - element: EgressAllowList
+    dimension: tuning_parameter
+    specific_values: rationale only
+    disposition: context
+    target_question: Q4
+    notes: Benign egress endpoints (Microsoft fwlink, Foxit) are already excluded by the rule's filters; URL-decode question notes this
+  dedup_decisions:
+  - dropped: cue_parent_process.scope
+    reason: 'campaign-breadth overlaps initial_access.campaign_scope (rule.uuid-scoped, more precise and must_include)'
+    kept: initial_access.campaign_scope
+  - dropped: cue_parent_process.follow_on
+    reason: 'parent-binary-scoped +4h children overlaps parent_child.sibling_processes (exact ParentProcessGuid instance, more precise and must_include)'
+    kept: parent_child.sibling_processes
+  - dropped: cue_process_tool.baseline
+    reason: 'host-tool baseline for the browser binary overlaps cue_parent_process.baseline, which scopes the reader-to-browser pair more meaningfully for this hand-off'
+    kept: cue_parent_process.baseline
+  - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc
+    reason: 'user_actor pair — non-deduplicable'
+    kept: both
+  - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc
+    reason: 'user_actor pair — non-deduplicable'
+    kept: both
+  skipped_templates:
+  - template: cue_parent_process.mechanism_decode
+    reason: 'parent-decode overlaps parent_child.parent_process_legitimacy (technique-set version is more specific; lists up the chain)'
+  - template: cue_process_tool.process_chain
+    reason: 'hint: parent_process is primary — drop cue_process_tool:process_chain; parent chain covered by parent_child.parent_process_legitimacy'
+  - template: universal.endpoint_protection_health
+    reason: 'recommended-only generic tamper sweep; this rule fires on a phishing-redirect hand-off, not a payload-execution or credential-access action an operator would precede by disabling AV/EDR. Prior-alert tamper context is carried by cue_host_context.precursor.'
+  reflection_overrides: []
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+  - universal
+  - initial_access
+  - parent_child
+  - cue_parent_process
+  - cue_user_actor
+  - cue_host_context
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 16
+      attack: 1
+      llm_generated: 0
+    phase_distribution:
+      triage: 1
+      analysis: 1
+      context: 15
+    logsource_diversity:
+      process_creation: 12
+      file_event: 2
+      create_stream_hash: 1
+      sigma_alert: 2

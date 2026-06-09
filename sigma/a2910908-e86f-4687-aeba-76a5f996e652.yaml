@@ -1,0 +1,436 @@
+name: DLL Execution Via Register-cimprovider.exe
+id: 7ce93303-91b6-460c-a341-bf96ef9714a5
+description: |
+  Detects register-cimprovider.exe running with a command line that contains both -path and dll, the
+  invocation pattern that loads and executes code from an arbitrary DLL. register-cimprovider.exe is a
+  signed Windows binary normally used to register WMI providers, so an operator can use it as a
+  living-off-the-land loader to run a planted DLL under the cover of a trusted executable, hijacking the
+  execution flow into attacker code. Investigation should confirm the exact -path DLL argument, identify
+  where that DLL lives and whether it is signed or recently written, determine what spawned
+  register-cimprovider.exe and what it spawned in turn, and judge whether this matches any expected
+  administrative or vendor automation on the host and user.
+type: detection
+detection_id: a2910908-e86f-4687-aeba-76a5f996e652
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line show register-cimprovider.exe with a -path argument pointing at a DLL?
+  context: Before investing investigation time, confirm the alert is a true positive by reviewing the triggering event against the rule's criteria. The rule fires on a single condition, an Image ending in \register-cimprovider.exe whose command line contains both -path and dll. Confirm the exact -path value and note the DLL it references, since that DLL is the payload the rest of the investigation pivots on.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to register WMI providers from the command line?
+  context: register-cimprovider.exe legitimately registers WMI providers, an action normally performed by installers or administrators, not by everyday user activity. Knowing whether the logged-on user's role and this host's function involve provider registration or DLL deployment is often the fastest way to separate routine setup work from a binary being used as a loader for attacker code.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What DLL did register-cimprovider.exe load? Decode the full command line and identify the -path target.
+  context: The full command line reveals which DLL was loaded and from where. Extract the absolute path that follows -path, note whether it sits in a system directory or a user-writable or temporary location, and decode any additional flags or arguments. A DLL under a user profile, ProgramData, or a temp path is a stronger signal of operator-supplied code than one under the Windows directory. Scoping to all register-cimprovider.exe executions on this host within the window captures any repeated or sequential invocations.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: attack:T1574.dll_load_verification
+  question: Did register-cimprovider.exe actually load the referenced DLL, and is that module signed or from an abnormal path?
+  context: The command line states which DLL was requested, but the module-load record confirms what was actually mapped into register-cimprovider.exe and reports its signing status and on-disk path. A module loaded from a user-writable or temporary directory, or an unsigned or recently created DLL, is the hijacked execution-flow step this technique relies on. If image-load events are not collected in this environment, treat zero results as a visibility gap rather than evidence nothing loaded, and fall back to the -path value from the alerting command line.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith: \register-cimprovider.exe
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+- source: attack:T1574.dll_provenance
+  question: When and by what process was the referenced DLL written to disk on this host?
+  context: How and when the DLL arrived determines whether this is a planted payload or an existing legitimate component. A DLL written shortly before register-cimprovider.exe ran, especially by a browser, archive utility, script host, or download tool, points to attacker-supplied code; a DLL placed long ago by an installer points to legitimate provider registration. Correlating the file-write time with the execution time establishes whether the load followed a fresh drop.
+  range: -24h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith: .dll
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - Hashes
+- source: template:cue_process_tool.process_chain
+  question: What process spawned register-cimprovider.exe, and is that parent chain expected?
+  context: The parent process reveals how the binary was invoked. Legitimate provider registration is usually launched by an installer, msiexec.exe, or an administrative shell. Unusual parents such as a browser, mshta.exe, wscript.exe, an Office application, or a download tool point to the binary being driven as a loader rather than running as part of normal software setup.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.follow_on
+  question: What child processes did register-cimprovider.exe spawn afterward?
+  context: The DLL executed through register-cimprovider.exe may carry out its actions in-process or spawn further programs. Child processes such as cmd.exe, powershell.exe, rundll32.exe, regsvr32.exe, or network tools indicate the loaded code moved on to post-exploitation; an absence of children does not clear the alert, since the DLL can act entirely within the host process.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.baseline
+  question: Does this host normally run register-cimprovider.exe?
+  context: register-cimprovider.exe is an uncommon binary on most endpoints outside of software installation events. A host that has never or rarely run it is more suspicious than one where provider registration is a recurring part of deployment. Zero or very low historical counts indicate first-time or rare execution worth closer scrutiny.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired this register-cimprovider.exe DLL-load pattern, what parents and users normally drive it, and does the current alert fit?
+  context: Even an occasionally legitimate loader has a normal profile. The query mirrors the rule's selection, register-cimprovider.exe with -path and dll, scoped to this host, so the resulting parent and user distribution reflects how this specific firing pattern has historically run here rather than generic binary usage. A new parent process, an unexpected user account, or an unusual command-line shape against that baseline is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \register-cimprovider.exe
+        CommandLine|contains|all:
+        - -path
+        - dll
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run register-cimprovider.exe with a DLL path across the environment?
+  context: Compare this user's current action against their historical behavior. A user account that has never loaded a DLL through register-cimprovider.exe is more suspicious than one that does so as part of a known deployment role. The user's role and typical toolset should align with provider registration or DLL deployment for this to look routine.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent-and-register-cimprovider.exe combination historically routine on this host or environment-wide, or is the parent unusual for this binary?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior. The meaningful pivot is the launch mechanism: which parent process spawned register-cimprovider.exe, and whether that pair is historically common. A new or rare parent for this binary on this host or environment-wide is the deviation worth chasing; a pair that already accounts for many prior events is vendor or OS deployment automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints. If the same user triggered similar DLL-loading or follow-on activity on other hosts in the window, the scope of the operation may be larger than this single endpoint.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent-and-register-cimprovider.exe combination fire on other hosts in the same window, indicating a coordinated rollout rather than isolated activity?
+  context: Under a service principal, asking what else this user did across the network returns agent-telemetry noise, since every host runs SYSTEM-owned agents constantly. The meaningful question is whether the same launch mechanism, this parent spawning register-cimprovider.exe, fired on other hosts in the alert window. Multiple hosts in the same window points to scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired this register-cimprovider.exe DLL-load pattern in the past week, and does the distribution look like automation or one-off activity?
+  context: The query mirrors the rule's selection with no host scope, so the result is a fleet-wide count of this specific firing pattern rather than generic use of the binary. Many hosts firing the same pattern points to scripted deployment or vendor automation; one host or a small unrelated set points to manual operator activity. Use the host distribution to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \register-cimprovider.exe
+        CommandLine|contains|all:
+        - -path
+        - dll
+      condition: selection
+    fields:
+    - host.name
+- source: template:persistence_scope.process_based_persistence
+  question: Were other process-based persistence mechanisms installed on this host around the same time?
+  context: A DLL loaded through a living-off-the-land binary can serve as a foothold, and operators rarely rely on a single mechanism. After one foothold they commonly add backups using scheduled tasks, services, registry Run keys, BITS jobs, or WMI subscriptions. Multiple persistence installations clustered in the same window indicate intentional stacking rather than isolated administrative action.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: 'Alerts rarely occur in isolation. Examining activity around the alert reveals the immediate context: what led to this event, what happened after, and whether it is part of a larger sequence. Look for reconnaissance, privilege escalation, persistence installation, or further execution close in time to the register-cimprovider.exe DLL load.'
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: 'Alerts rarely happen in isolation. Earlier detections on the same host, such as defense tampering, reconnaissance, a file drop, or credential access, may reveal the attack stages that preceded the DLL load and help reconstruct the timeline. Look for patterns: a download or file write followed by this execution.'
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1574
+      name: Hijack Execution Flow
+      role: primary
+    - id: T1218
+      name: System Binary Proxy Execution
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: dll_staged_on_disk
+      description: An attacker-supplied DLL is written to a path on the host that register-cimprovider.exe will be pointed at.
+      mapped_to: Q5
+      source: attack:T1574.dll_provenance
+    - stage: 2
+      label: lolbin_invoked_with_dll
+      description: register-cimprovider.exe is invoked with -path referencing the DLL (the rule's trigger).
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 3
+      label: alternate_execution_flow
+      description: register-cimprovider.exe loads the DLL into its process, executing attacker code under a trusted signed binary.
+      mapped_to: Q4
+      source: attack:T1574.dll_load_verification
+  dimension_coverage:
+    - dimension: file_path_analysis
+      technique: T1574
+      covered_by: Q4
+      source: attack:T1574.dll_load_verification
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1574
+      covered_by: Q5
+      source: attack:T1574.dll_provenance
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1574
+      covered_by: Q9
+      source: template:cue_process_tool.baseline_deviation
+      coverage_type: indirect
+  mutable_dispositions:
+    - element: ServiceBaseline
+      dimension: tuning_parameter
+      specific_values: "rationale only (expected registry keys / service paths for comparison)"
+      disposition: context
+      target_question: Q9
+      notes: "No fixed value list; baseline_deviation establishes the host's normal parent/user profile for this firing pattern so deviations stand out. The rule does not write registry keys or service paths, so a literal service-baseline comparison does not apply."
+    - element: AllowedDllPaths
+      dimension: tuning_parameter
+      specific_values: "rationale only (directories considered valid for DLL loading)"
+      disposition: context
+      target_question: Q4
+      notes: "No fixed allowlist; the dll_load_verification question directs the analyst to judge whether the loaded module's path is a normal system directory versus a user-writable or temp location, which is the analyst-side allowed-paths check."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only (correlation interval between file/registry modification and process execution)"
+      disposition: context
+      target_question: Q5
+      notes: "No fixed numeric value is queryable; the dll_provenance question's -24h file-write range plus the correlation framing carry the modification-to-execution timing intent."
+  dedup_decisions:
+    - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable (subject vs. launch-mechanism pivot); both emitted"
+      kept: both
+    - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable (subject vs. launch-mechanism pivot); both emitted"
+      kept: both
+  skipped_templates:
+    - template: registry.registry_key_context
+      reason: "registry technique set was confirmed solely by filename_prefix 'registry', but register-cimprovider.exe loads a DLL via -path and does not write a registry key or value. A registry_set query scoped to this ProcessGuid returns nothing meaningful. The Phase-2 decode role is filled by cue_process_tool.mechanism_decode (Q3, the -path DLL decode) and attack:T1574.dll_load_verification (Q4, the actual module load) instead."
+    - template: registry.registry_related_modifications
+      reason: "same misfire: the registry technique set matched on filename_prefix only. This rule's mechanism is DLL execution, not registry modification, so a reg.exe/regedit.exe write sweep does not correspond to anything the rule detects. Host-wide co-activity is covered by cue_host_context.clustering (Q16)."
+    - template: registry.registry_value_persistence_check
+      reason: "applicability is_persistence_rule passed via tactic tag, but this rule writes no registry value pointing at an executable path; there is no Run-key payload to verify on disk. The DLL-on-disk verification this rule actually needs is covered by attack:T1574.dll_provenance (Q5, file_event) and attack:T1574.dll_load_verification (Q4, image_load)."
+    - template: universal.endpoint_protection_health
+      reason: "recommended-only generic tamper sweep. This is a LOLBin DLL-execution rule whose disposition turns on the DLL's origin and load path, not on whether AV/EDR was disabled first. cue_host_context.precursor (Q17) already surfaces any prior tamper alerts on the host, and the slots are spent on image_load, file_event, and the user-actor service-principal pairs that are specific to this chain."
+    - template: persistence_scope.file_based_persistence
+      reason: "Startup-folder / Run-key file-drop sweep. The persistence question worth the slot for a DLL-loader is whether OTHER process-based persistence mechanisms were installed (Q15, process_based_persistence); a dropped-DLL-to-disk check is already covered more precisely by attack:T1574.dll_provenance (Q5), which looks at the actual DLL written, not generic Startup-folder writes."
+    - template: organizational_context.change_ticket
+      reason: "recommended-only. DLL execution via a LOLBin is not a routine change-ticketed action the way scheduled-task or account changes are; host_user_context (Q2) and the user/host baselines (Q8, Q10, Q11) carry the authorized-vs-unauthorized judgment without spending a slot on a ticket lookup that rarely exists for this behavior."
+    - template: organizational_context.human_recall
+      reason: "recommended-only and redundant with host_user_context (Q2), which already asks whether this user/host is expected to register WMI providers or deploy DLLs; the human-recall variant adds no distinct query (ProcessGuid boilerplate) and would push the count past the useful range."
+    - template: organizational_context.timing_alignment
+      reason: "recommended-only. Timing-versus-work-hours judgment is subsumed by cue_host_context.clustering (Q16) and the precursor timeline (Q17), which give the analyst the surrounding-activity context needed to assess whether the timing is anomalous, without a separate ProcessGuid-boilerplate question."
+    - template: organizational_context.procedural_consistency
+      reason: "recommended-only. Whether DLL/provider deployment follows standard tooling is captured by host_user_context (Q2) and the user-actor baseline questions (Q10, Q11); a separate procedural-consistency question would duplicate that judgment with boilerplate query and exceed the question budget."
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "registry.registry_key_context replaces cue_process_tool.mechanism_decode"
+      disposition: declined
+      reason: >-
+        The replacement assumes the rule modifies the registry, but
+        register-cimprovider.exe loads a DLL via -path and writes no registry
+        key or value; a registry_set query would return nothing. Kept
+        cue_process_tool.mechanism_decode (Q3) for the -path DLL decode and
+        added attack:T1574.dll_load_verification (Q4) for the actual module
+        load. The registry replacement template is recorded as a skipped
+        template with the misfire rationale.
+  hints_acted_on:
+    - hint: "logsource 'image_load' (recommended by techniques: T1574) is not covered — pull in cue_image_load.* or author a custom question with category: image_load"
+      action: "authored Q4 attack:T1574.dll_load_verification with category: image_load — confirms the module register-cimprovider.exe actually loaded, its path, and signing status (the hijacked-execution-flow step)."
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - persistence_scope
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 15
+      attack: 2
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 14
+    logsource_diversity:
+      process_creation: 14
+      image_load: 1
+      file_event: 1
+      sigma_alert: 1

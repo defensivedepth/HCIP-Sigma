@@ -1,0 +1,461 @@
+name: Potential Process Execution Proxy Via CL_Invocation.ps1
+id: d5cee792-dd39-408a-974d-9f38ad9bbe17
+description: |
+  Detects command lines containing "SyncInvoke ", a function exported by the Microsoft-signed
+  diagnostic script CL_Invocation.ps1. That script is imported into a PowerShell session and its
+  SyncInvoke function launches an arbitrary executable through System.Diagnostics.Process, letting
+  an operator proxy execution of an untrusted binary behind a trusted, signed script (T1216, System
+  Script Proxy Execution). Legitimate use is rare outside Windows diagnostics; investigation should
+  determine what executable and arguments SyncInvoke launched, what spawned the PowerShell session,
+  and whether the resulting child process is signed and expected.
+type: detection
+detection_id: a0459f02-ac51-4c09-b511-b8c9203fc429
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line contain the SyncInvoke call this rule detects?
+  context: Before investing investigation time, confirm the alert is a true positive by reviewing the
+    exact command line against the rule's criterion. The rule fires when a command line contains the
+    literal token "SyncInvoke " followed by a target. Read the full command line and identify the
+    executable and arguments passed to SyncInvoke.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run Windows diagnostic scripts that proxy execution?
+  context: Legitimate administrative or diagnostic activity can trigger this detection. CL_Invocation.ps1
+    ships with Windows diagnostics, but interactive use of its SyncInvoke proxy function is uncommon.
+    Knowing whether the user role and host function are consistent with diagnostic-script execution is
+    often the fastest path to distinguishing a true positive from routine operations.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What executable and arguments did SyncInvoke launch? Decode the full command line.
+  context: SyncInvoke takes a target executable and its arguments and runs them through
+    System.Diagnostics.Process. The full command line reveals what was proxied. Decode any flags,
+    encoded content, file paths, or URLs that follow the SyncInvoke token, and identify whether the
+    target is a download cradle, a script interpreter, or an unsigned binary from a user-writable
+    path. This query returns SyncInvoke command lines on this host within the window so multi-step
+    operations are visible together.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains: 'SyncInvoke '
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: attack:T1216.parent_process_analysis
+  question: What process spawned the PowerShell session that ran SyncInvoke, and is that parent chain expected?
+  context: The parent process reveals how the diagnostic script was imported and invoked. Interactive
+    administrative use typically descends from explorer.exe or a console host. Parents such as
+    mshta.exe, wscript.exe, cscript.exe, an Office application, or a service binary point to scripted
+    or exploitation-driven invocation rather than a human running diagnostics.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: attack:T1216.signed_to_unsigned_transition
+  question: What child processes did the SyncInvoke session spawn, and are they signed and expected?
+  context: SyncInvoke launches its target through System.Diagnostics.Process, so the proxied executable
+    appears as a child of the alerting PowerShell process. The signed-script-to-unsigned-child
+    transition is the core of this technique. Review what the session spawned and whether each child is
+    a known signed binary or an unsigned payload from a user-writable directory.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: attack:T1216.tuning_parameter
+  question: Did the proxied child command line carry a download cradle or decode pattern?
+  context: The payload SyncInvoke runs often pulls or decodes a second stage. This query surfaces
+    child command lines on this host that match common download-cradle or decode markers so the
+    analyst can judge whether the proxied execution led to network retrieval or in-memory decoding.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_payload:
+        CommandLine|contains:
+          - 'DownloadString'
+          - 'DownloadFile'
+          - 'DownloadData'
+          - 'Invoke-WebRequest'
+          - 'Invoke-RestMethod'
+          - 'Net.WebClient'
+          - 'BitsTransfer'
+          - 'FromBase64String'
+          - '-EncodedCommand'
+          - '-enc '
+          - 'frombase64'
+      condition: selection_host and selection_payload
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.baseline
+  question: Has the SyncInvoke pattern run on this host before?
+  context: A pattern that has never been seen on a host is more suspicious than one that runs
+    regularly. Zero or very low historical counts for SyncInvoke command lines indicate first-time or
+    rare execution; recurring counts suggest a local diagnostic or automation that the analyst can
+    characterize.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains: 'SyncInvoke '
+      condition: selection
+    fields:
+      - User
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired the SyncInvoke pattern, what parents and users normally drive it, and does the current alert fit?
+  context: Even routine tooling can be abused. The query mirrors the rule's selection scoped to this
+    host, so the resulting parent and user distribution reflects how this specific firing pattern has
+    historically run here. A new parent process, an unexpected user account, or an unusual
+    command-line shape is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains: 'SyncInvoke '
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run diagnostic-script proxy execution?
+  context: Compare this user's current action against their historical behavior. A user who has never
+    run a SyncInvoke proxy call is more suspicious than one who does so regularly, and the user's role
+    should align with running Windows diagnostic scripts. This query searches for the same pattern run
+    by this user across all hosts.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        CommandLine|contains: 'SyncInvoke '
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is the parent process that launched this SyncInvoke session historically routine on this host or environment-wide?
+  context: When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism — which parent process spawned the PowerShell session
+    that ran SyncInvoke, and whether that parent is historically common with this pattern. A new or
+    rare parent is the deviation worth chasing; a parent that already accounts for many prior events
+    is automation or a scheduled diagnostic.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith|expand: '%ParentImage%'
+        CommandLine|contains: 'SyncInvoke '
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity across
+    multiple endpoints. If the same user triggered similar activity on multiple hosts, the scope of
+    the event may be larger than the single alerting host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did the same SyncInvoke launch mechanism fire on other hosts in the same window — a coordinated rollout, or isolated to this host?
+  context: Under a service principal, asking what else the user did across the network returns
+    agent-telemetry noise. The meaningful question is whether the same SyncInvoke pattern from a
+    matching parent fired on other hosts in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith|expand: '%ParentImage%'
+        CommandLine|contains: 'SyncInvoke '
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired the SyncInvoke pattern in the past week, and does the distribution look like consistent automation or one-off activity?
+  context: The query mirrors the rule's selection with no host scope, so the result is a fleet-wide
+    count of the SyncInvoke firing pattern rather than generic PowerShell usage. Many hosts firing the
+    same pattern points to scripted deployment or vendor diagnostics; one host or a small unrelated set
+    points to manual operator activity. Use the host distribution to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains: 'SyncInvoke '
+      condition: selection
+    fields:
+    - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: 'Alerts rarely occur in isolation. Examining activity around the alert reveals the immediate
+    context: what led to this event, what happened after, and whether it is part of a larger sequence.
+    Look for reconnaissance, privilege escalation, or persistence mechanisms.'
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering,
+    reconnaissance, credential access — may reveal the stages that preceded this event and help
+    reconstruct the timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1216
+      name: System Script Proxy Execution
+      role: primary
+  attack_chain_coverage:
+    - stage: 1
+      label: signed_script_invocation
+      description: "Microsoft-signed CL_Invocation.ps1 is imported and SyncInvoke is called to proxy execution"
+      mapped_to: Q3
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 2
+      label: proxy_launch_parent
+      description: "PowerShell session that invoked the signed script is launched by some parent"
+      mapped_to: Q4
+      source: attack:T1216.parent_process_analysis
+    - stage: 3
+      label: signed_to_unsigned_child
+      description: "SyncInvoke launches an arbitrary (often unsigned) executable via System.Diagnostics.Process"
+      mapped_to: Q5
+      source: attack:T1216.signed_to_unsigned_transition
+  dimension_coverage:
+    - dimension: parent_process_analysis
+      technique: T1216
+      covered_by: Q4
+      source: attack:T1216.parent_process_analysis
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1216
+      covered_by: Q5
+      source: attack:T1216.signed_to_unsigned_transition
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1216
+      covered_by: Q6
+      source: attack:T1216.tuning_parameter
+      coverage_type: direct
+  mutable_dispositions:
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "rationale only (wscript.exe, cscript.exe, pubprn.vbs, installutil.exe named as examples)"
+      disposition: context
+      target_question: Q4
+      notes: "Example interpreter parents named in Q4 context; rule has no parent in detection so no query injection"
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only (delta between signed-script execution and child creation)"
+      disposition: context
+      target_question: Q5
+      notes: "Child-process query uses ParentProcessGuid +4h window to capture the signed-to-unsigned transition timing"
+    - element: ChildCommandLineRegex
+      dimension: tuning_parameter
+      specific_values: "download cradle / decode markers (DownloadString, Invoke-WebRequest, FromBase64String, -EncodedCommand, etc.)"
+      disposition: query_injection
+      target_question: Q6
+      notes: "Concrete cradle/decode markers injected into Q6 selection_payload CommandLine|contains"
+    - element: SignedToUnsignedTransition
+      dimension: tuning_parameter
+      specific_values: "rationale only (signed parent, unsigned/unknown child)"
+      disposition: context
+      target_question: Q5
+      notes: "Signing-transition framing carried in Q5 context; signature status is checked from the child event manually"
+  dedup_decisions:
+    - dropped: cue_process_tool.process_chain
+      reason: "parent-process analysis is covered by attack:T1216.parent_process_analysis (Q4), which is the same ParentProcessGuid lookup with technique-specific framing"
+      kept: attack:T1216.parent_process_analysis
+    - dropped: cue_process_tool.follow_on
+      reason: "child-process discovery is covered by attack:T1216.signed_to_unsigned_transition (Q5); reframed to ParentProcessGuid scope since the rule is CommandLine-only with no %Image% value"
+      kept: attack:T1216.signed_to_unsigned_transition
+    - dropped: cue_user_actor.baseline | cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable; both emitted (Q9 user-pivot, Q10 parent+pattern substitute)"
+      kept: both
+    - dropped: cue_user_actor.clustering | cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable; both emitted (Q11 user-pivot, Q12 parent+pattern substitute)"
+      kept: both
+  skipped_templates:
+    - template: cue_process_tool.clustering
+      reason: "host-wide concurrent-tool clustering is covered by cue_host_context.clustering (Q14), same host+window aggregation by Image/ParentImage"
+    - template: universal.endpoint_protection_health
+      reason: "rule fires on proxy execution, not credential access or hands-on impact; defense_tampering technique set not confirmed and cue_host_context.precursor (Q15) already surfaces prior tamper alerts on the host. Dropped to stay within 15 questions while keeping the technique chain intact."
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "CommandLine-only detection — no Image field in rule. Use CommandLine pattern matching for scoping, not Image-based queries"
+      disposition: acted_on
+      reason: >-
+        Acted on across all scoping queries. primary_binary is null, so every
+        template that defaulted to Image|endswith|expand '%Image%' or
+        ParentImage|endswith|expand '%Image%' was rewritten to scope on
+        CommandLine|contains 'SyncInvoke ' (mechanism_decode Q3, baseline Q7,
+        user baseline Q9, scope Q13) or on ParentProcessGuid for child discovery
+        (Q5). Recorded here for the audit trail; outcome is a query rewrite, not
+        a declined hint.
+    - hint: "logsource 'file_event' (recommended by techniques: T1216) is not covered — pull in cue_artifact.* or author a custom question with category: file_event"
+      disposition: declined
+      reason: >-
+        Rule's detection is CommandLine|contains 'SyncInvoke ' on
+        process_creation with no file reference (has_file_reference false). The
+        proxied payload SyncInvoke launches is observable as a child process via
+        ParentProcessGuid (Q5, signed_to_unsigned_transition) and its
+        cradle/decode behavior via Q6, both on process_creation. No dropped-file
+        artifact is part of this technique's invocation, so a file_event query
+        keyed on %file_paths% would have no scoping anchor and return host-wide
+        file noise. No compensating attack:T1216.file_event question authored.
+    - hint: "logsource 'image_load' (recommended by techniques: T1216) is not covered — pull in cue_image_load.* or author a custom question with category: image_load"
+      disposition: declined
+      reason: >-
+        image_load would surface the .NET assemblies loaded by the PowerShell
+        host, but the rule fires on the SyncInvoke command-line token, not on a
+        module load, and the .NET hosting modules (System.Management.Automation,
+        clr.dll) load on every PowerShell session — image_load on this binary
+        returns volume without precision for the proxy behavior. The proxied
+        execution is captured with precision via the child process Q5 and its
+        payload markers Q6. No compensating attack:T1216.image_load question
+        authored.
+    - hint: "logsource 'process_access' (recommended by techniques: T1216) is not covered and no template family exists — author a custom question with category: process_access"
+      disposition: declined
+      reason: >-
+        process_access (handle/memory access) is relevant to T1216 variants that
+        inject into a target, but CL_Invocation.ps1's SyncInvoke launches a new
+        child process via System.Diagnostics.Process rather than accessing an
+        existing process's memory. The investigative signal is the spawned child
+        (Q5) and its command line (Q6), not a cross-process access mask. A
+        process_access query would have no target-process anchor for this rule.
+        No compensating attack:T1216.process_access question authored.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+  generation_stats:
+    total_questions: 15
+    source_counts:
+      template: 12
+      attack: 3
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 12
+    logsource_diversity:
+      process_creation: 14
+      sigma_alert: 1

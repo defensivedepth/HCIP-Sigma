@@ -1,0 +1,443 @@
+name: Potential Arbitrary Command Execution Using Msdt.EXE
+id: 38dbee9a-bf48-4d24-8a6c-07832aaf149a
+description: |
+  Detects msdt.exe (or a binary whose OriginalFileName is msdt.exe) running with command lines associated with
+  the ms-msdt diagnostic handler abuse pattern. The rule fires when the msdt binary is present AND the command line
+  matches EITHER the inline IT_BrowseForFile= form OR the answer-file form (a PCWDiagnostic token together with an
+  -af answer-file parameter). Msdt is a Windows indirection utility that can be coerced into running arbitrary code
+  supplied through a diagnostic package or answer file, so it executes payloads without the parent appearing to launch
+  them directly. Legitimate msdt usage is driven by user-invoked troubleshooters from explorer or the control panel;
+  malicious usage is typically launched from Office applications or scripting hosts and is followed by a secondary
+  payload process or outbound connection. Determine which branch fired, what the command line actually does, what child
+  process or network activity followed, and whether this user and host normally run diagnostic troubleshooters.
+type: detection
+detection_id: 258fc8ce-8352-443a-9120-8a11e4857fa5
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the alerting event show msdt.exe running with EITHER the inline IT_BrowseForFile= command OR the PCWDiagnostic answer-file form?
+  context: Confirm the alert is a true positive before investing time. The rule fires when the msdt binary (Image ending in msdt.exe or OriginalFileName msdt.exe) is present AND the command line matches one of two branches. Note which branch fired. The inline branch carries IT_BrowseForFile=, while the answer-file branch carries a PCWDiagnostic token together with an -af answer-file path. The answer-file branch is the more evasive form and means the payload is staged in a separate answer file rather than inline, so read the -af path and pull that file for review.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run Windows diagnostic troubleshooters?
+  context: Legitimate msdt activity is usually a user manually launching a troubleshooter from the control panel or a help link. A server, a service account, or a user with no support role invoking msdt with these specific arguments is harder to explain as routine troubleshooting and shifts the disposition toward indirect execution.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What does the full msdt command line do? Decode the IT_BrowseForFile value or the answer-file path.
+  context: The full command line reveals the action taken. For the inline branch, the IT_BrowseForFile= value points at the file or payload msdt was directed to open. For the answer-file branch, the -af parameter names an answer file (often staged locally or on a network share) that drives the diagnostic package. Read the referenced file or path to understand what code the diagnostic was set up to execute.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:cue_process_tool.process_chain
+  question: What process spawned msdt.exe and is that parent chain expected?
+  context: The parent reveals how msdt was invoked. User-driven troubleshooting comes from explorer or control-panel hosts. A document application or a scripting host as the parent is consistent with an external link or macro coercing the diagnostic handler, which is the indirect-execution path of concern.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: attack:T1202.follow_on
+  question: What child processes did msdt.exe spawn afterward?
+  context: Indirect execution through msdt shows its real impact in the child processes it launches. A secondary program such as powershell.exe, cmd.exe, rundll32.exe, regsvr32.exe, mshta.exe, msiexec.exe, curl.exe, or bitsadmin.exe spawning from msdt is the payload stage and is the strongest evidence that the diagnostic handler was used to run code rather than to troubleshoot.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: attack:T1202.file_event
+  question: What files did msdt.exe or its child processes write on this host around the alert?
+  context: The diagnostic-handler abuse path frequently drops a staged answer file, a script, or a downloaded payload before or during execution. Files written by msdt or its spawned children in the alert window — particularly under user-writable locations such as the user profile, public, or temp directories — point to where the payload was staged and what was created on disk.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: attack:T1202.network_connection
+  question: Did msdt.exe or its child processes make outbound network connections around the alert?
+  context: Indirect execution often pulls a payload from or beacons to an external host. Outbound connections initiated by msdt or its spawned children in the alert window — especially to addresses outside known-good administrative egress — indicate the diagnostic was used to reach a remote resource rather than to run a local troubleshooter. An answer file loaded from a network share is one such pattern.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+- source: template:cue_process_tool.baseline
+  question: Does this host normally run msdt.exe?
+  context: A diagnostic binary that has never or rarely run on a host is more suspicious than one seen regularly. Zero or very low historical counts indicate first-time or rare execution and raise the weight of the current alert.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired the rule's msdt pattern, what parents and users normally drive it, and does the current alert fit?
+  context: Even legitimate diagnostic activity can be coerced. The query mirrors the rule's selection structure scoped to this host, so the parent and user distribution reflects how the rule's specific firing pattern has historically run here, not generic msdt usage. A new parent, an unexpected user account, or an unusual command-line shape is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \msdt.exe
+      - OriginalFileName: msdt.exe
+      selection_cmd_inline:
+        CommandLine|contains: IT_BrowseForFile=
+      selection_cmd_answerfile_flag:
+        CommandLine|contains: ' PCWDiagnostic'
+      selection_cmd_answerfile_param:
+        CommandLine|contains|windash: ' -af '
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection_img and (selection_cmd_inline or all of selection_cmd_answerfile_*)) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run diagnostic troubleshooters like msdt.exe?
+  context: Compare this user's current action against their historical behavior. A user who has never run msdt is more suspicious than one who does so regularly. The user's role and typical toolset should align with launching Windows troubleshooters.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent and msdt.exe combination historically routine on this host or across the environment, or is the parent unusual for msdt?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior. The meaningful pivot is the launch mechanism: which parent spawned msdt, and whether that pair is historically common. A new or rare parent for msdt on this host or environment-wide is the deviation worth chasing; a pair that already accounts for thousands of prior events is OS or vendor automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity on multiple endpoints. If the same user triggered similar activity on several hosts, the scope of the incident may be larger than this one alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent and msdt.exe combination fire on other hosts in the same window, indicating a coordinated rollout rather than isolated activity?
+  context: Under a service principal, asking what else the user did across the network returns agent-telemetry noise. The meaningful question is whether the same launch mechanism — parent process plus msdt — fired on other hosts in the alert window. Multiple hosts in the same window points to scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering, reconnaissance, credential access — may reveal the stages that preceded this event and help reconstruct the full timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:lolbin.technique_class_lateral
+  question: Were any other proxy-execution LOLBins used on this host recently?
+  context: Operators who use one indirect-execution LOLBin often use several. If msdt was coerced into running code, check whether other proxy-execution binaries such as rundll32, regsvr32, mshta, msbuild, or installutil were also used on this host. Finding multiple proxy-execution LOLBins performing the same objective strengthens the case for malicious activity.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_img:
+        Image|endswith:
+          - '\rundll32.exe'
+          - '\regsvr32.exe'
+          - '\mshta.exe'
+          - '\msbuild.exe'
+          - '\cmstp.exe'
+          - '\installutil.exe'
+          - '\msiexec.exe'
+          - '\forfiles.exe'
+          - '\pcalua.exe'
+          - '\presentationhost.exe'
+          - '\control.exe'
+          - '\infdefaultinstall.exe'
+          - '\mavinject.exe'
+          - '\wmic.exe'
+          - '\xwizard.exe'
+      condition: selection and selection_img
+    fields:
+      - Image
+      - CommandLine
+- source: template:lolbin.renamed_binary_check
+  question: Was msdt.exe executed from its expected System32 path?
+  context: A binary whose OriginalFileName is msdt.exe but whose Image path is outside System32 or SysWOW64 may have been copied or renamed to evade path-based allowlists. Msdt running from a user profile, temp, or other user-writable directory is more suspicious than one in System32.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- source: template:lolbin.historical_lolbin_baseline
+  question: How often has this host fired the rule's msdt pattern over the past 90 days, and what command-line shapes are typical?
+  context: A LOLBin pattern with no prior history on a host is more suspicious than one used regularly under stable parents. The query mirrors the rule's selection structure scoped to this host, so the count reflects the rule's specific firing pattern, not generic msdt usage. The command-line projection lets the analyst compare typical invocation shapes against the alerting one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \msdt.exe
+      - OriginalFileName: msdt.exe
+      selection_cmd_inline:
+        CommandLine|contains: IT_BrowseForFile=
+      selection_cmd_answerfile_flag:
+        CommandLine|contains: ' PCWDiagnostic'
+      selection_cmd_answerfile_param:
+        CommandLine|contains|windash: ' -af '
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection_img and (selection_cmd_inline or all of selection_cmd_answerfile_*)) and _pb_scope
+    fields:
+    - CommandLine
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1202
+      name: Indirect Command Execution
+      role: primary
+  attack_chain_coverage:
+    - stage: 1
+      label: indirection_utility_launch
+      description: "A user or service launches an indirection utility (here msdt.exe) coerced via the ms-msdt handler / answer file"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: secondary_program_or_network
+      description: "The utility spawns a secondary program (powershell/cmd/rundll32/regsvr32/mshta/msiexec/curl/bitsadmin) and/or opens outbound connections"
+      mapped_to: Q5
+      source: attack:T1202.follow_on
+    - stage: 3
+      label: precursor_config_or_staging
+      description: "Optional precursor modification / payload staging — for msdt this manifests as answer-file or payload files written and read rather than SSH config; covered by file_event evidence"
+      mapped_to: Q6
+      source: attack:T1202.file_event
+  dimension_coverage:
+    - dimension: time_correlation
+      technique: T1202
+      covered_by: Q5
+      source: attack:T1202.follow_on
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1202
+      covered_by: Q5
+      source: attack:T1202.follow_on
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1202
+      covered_by: Q2
+      source: template:universal.host_user_context
+      coverage_type: direct
+  mutable_dispositions:
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "10-30 minutes correlation window"
+      disposition: context
+      target_question: Q5
+      notes: "follow_on uses +4h and file_event/network_connection use +/-15m to correlate the launcher with spawned child / network activity"
+    - element: AllowedUtilities
+      dimension: tuning_parameter
+      specific_values: "forfiles, wsl, ssh"
+      disposition: context
+      target_question: Q11
+      notes: "Rationale element about permitted utilities on jumphosts; rule is msdt-specific so the allowed-utility list is informational. baseline/baseline_deviation questions surface whether the parent/user pairing is routine here."
+    - element: HighRiskChildren
+      dimension: tuning_parameter
+      specific_values: "powershell.exe, cmd.exe, rundll32.exe, regsvr32.exe, mshta.exe, msiexec.exe, curl.exe, bitsadmin.exe"
+      disposition: new_question
+      target_question: Q5
+      notes: "Named with exact values in Q5 (follow_on) context as the high-risk child set; the proxy-execution subset also drives the LOLBin sweep selection_img list in Q15"
+    - element: UserContext
+      dimension: user_context
+      specific_values: "standard/interactive user on workstation vs server / CI agent"
+      disposition: context
+      target_question: Q2
+      notes: "host_user_context question asks whether this user/host is expected to run diagnostic troubleshooters; baseline_svc handles the service-principal case"
+    - element: DestCIDRs
+      dimension: tuning_parameter
+      specific_values: "known-good egress networks"
+      disposition: context
+      target_question: Q7
+      notes: "network_connection question tells the analyst to weigh connections outside known-good administrative egress"
+  dedup_decisions:
+    - dropped: cue_process_tool.clustering
+      reason: "host-wide concurrent-activity clustering is covered by cue_host_context.precursor (prior alerts) plus the user clustering questions; cue_host_context.clustering not emitted to stay within 17-question budget and because precursor carries the on-host timeline signal"
+      kept: cue_host_context.precursor
+    - dropped: cue_host_context.clustering
+      reason: "redundant with cue_host_context.precursor on-host timeline and cue_user_actor.clustering network-wide view for this single-technique rule"
+      kept: cue_host_context.precursor
+    - dropped: cue_user_actor.baseline + cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable; both emitted (Q10 user-pivot, Q11 parent+binary substitute)"
+      kept: both
+    - dropped: cue_user_actor.clustering + cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable; both emitted (Q12 user-pivot, Q13 parent+binary substitute)"
+      kept: both
+  skipped_templates:
+    - template: cue_process_tool.scope
+      reason: "fleet-wide reflected scope question dropped in favor of lolbin.historical_lolbin_baseline (host-scoped reflected, more decisive for triage) and cue_user_actor.clustering_svc (cross-host rollout check); keeping both reflected fleet+host questions plus the LOLBin baseline would over-weight cross-host counting in a 17-question budget"
+    - template: universal.endpoint_protection_health
+      reason: "RECOMMENDED, not must_include; this is an indirect-execution rule, not a credential-access/impact rule, and cue_host_context.precursor already surfaces prior tamper alerts on the host, so the generic tamper sweep does not earn its slot here"
+  reflection_overrides: []
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - lolbin
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 14
+      attack: 3
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 14
+    logsource_diversity:
+      process_creation: 14
+      file_event: 1
+      network_connection: 1
+      sigma_alert: 1

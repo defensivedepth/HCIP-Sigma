@@ -1,0 +1,646 @@
+name: PowerShell SAM Copy
+id: 24131466-b240-4e47-a12b-8402e53136a7
+description: |
+  Detects PowerShell command lines that read the local SAM registry hive out of a Volume Shadow Copy and copy it to another
+  location. The rule fires only when both conditions hold: the command line references a shadow-copy path into
+  System32\config\sam AND it performs a copy operation (Copy-Item, cp/cpi/copy of a pipeline object, or [System.IO.File]::Copy).
+  Copying the SAM hive from a shadow copy bypasses the file lock the live OS holds on the registry, yielding an offline copy
+  from which local account password hashes can be extracted. Legitimate triggers are rare (some backup workflows, or scripts
+  remediating the HiveNightmare/SeriousSAM ACL exposure); the investigation should determine whether all three hives
+  (SAM, SYSTEM, SECURITY) were taken, which account ran it, and whether the copies were moved off the host.
+type: detection
+detection_id: 1af57a4b-460a-4738-9034-db68b880c665
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line both reference a shadow-copy path into System32\config\sam AND perform a copy operation?
+  context: Confirm the alert is a true positive before investing time. The rule fires only when the command line contains a
+    \HarddiskVolumeShadowCopy reference into System32\config\sam together with a copy operation (Copy-Item, cp/cpi/copy of a
+    pipeline object, or a .NET File::Copy call). Read the full command line and verify both elements are present.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to copy the SAM hive from a shadow copy?
+  context: Legitimate backup or ACL-remediation activity can trigger this detection. Knowing whether the running account and
+    host function are consistent with shadow-copy/registry-hive handling is often the fastest way to separate a true positive
+    from sanctioned administration.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:universal.evidence_preservation
+  question: Are the copied hive files still on disk for analysis?
+  context: The command copies the SAM hive (and often SYSTEM and SECURITY) to a destination path. If those output files still
+    exist, they enable hash extraction confirmation, content review, and recovery of what was staged. Their absence may mean
+    the copies were already moved or deleted after exfiltration.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in the hour before the alert?
+  context: Credential dumping is frequently preceded by weakening protection. This query surfaces direct attempts to disable
+    AV/EDR services, flip Defender flags, add broad exclusions, clear logs, or patch AMSI/ETW. Zero rows is a useful "protection
+    looks healthy" signal; kernel-level driver tampering and in-memory patches will not appear here. Populated rows shift the
+    disposition toward operator preparation — review the parent process and signing chain to identify the writer.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+- source: template:credential_access.credential_target_identification
+  question: Was the SAM database exported, and were the SYSTEM and SECURITY hives also taken?
+  context: Extracting local account hashes offline requires both the SAM hive and the SYSTEM hive (SYSTEM holds the boot key
+    that decrypts SAM); SECURITY is often grabbed alongside for LSA secrets. Inspect the full command line for whether all
+    of SAM, SYSTEM, and SECURITY were copied — taking all of them confirms intent to crack local credentials offline rather
+    than a single-file mishap.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:powershell.encoded_command_decode
+  question: Was the copy command obfuscated or wrapped in a download cradle, and what does it resolve to?
+  context: The rule matches a plain-text copy pattern, but the surrounding command may add concatenation, backtick escaping,
+    variable substitution, or a -EncodedCommand wrapper to hide the shadow-copy path or the destination. Decode any encoding
+    and resolve the actual source hive path and destination so the staged location can be identified and checked.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:powershell.script_block_logging
+  question: Did PowerShell script block logging capture the full script content?
+  context: Script block logging records the deobfuscated script PowerShell actually executed, even when the command line is
+    encoded or built dynamically. This provides ground truth about the shadow-copy enumeration and copy loop that ran. If
+    PowerShell operational logs are not ingested in this environment, treat zero results as a visibility gap rather than
+    evidence nothing ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- source: template:powershell.powershell_security_bypass
+  question: Were PowerShell security controls bypassed or weakened before this execution?
+  context: Operators often disable or bypass PowerShell controls before running a hands-on payload. Common precursors include
+    AMSI bypass (patching amsi.dll in memory), execution policy changes, constrained language mode escape, and downgrade to
+    PowerShell v2 (which lacks logging). Finding these shortly before the SAM copy strengthens the case for malicious intent.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- source: template:credential_access.credential_exposure_assessment
+  question: Which local accounts may be exposed, and do any have elevated or reused privileges?
+  context: Severity depends on what the SAM hive contains on this host. A workstation SAM exposes local accounts, including
+    the local Administrator; if that password is shared across the fleet (a common image-build mistake) it enables lateral
+    movement to every host with the same hash. Cross-reference the local accounts and any shared local-admin credential
+    against organizational records.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:credential_access.post_access_lateral_movement
+  question: Were any new logon sessions or remote connections initiated on this host after the copy?
+  context: Local hashes pulled from SAM are typically used for pass-the-hash or offline cracking followed by reuse. Surfacing
+    follow-on alerts on this host — remote authentication, SMB/WinRM/RDP activity, or remote-execution tooling — shows whether
+    the copied credentials are already being exercised. Offline cracking can delay reuse, so absence here does not clear the host.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - rule.name
+      - rule.uuid
+      - event.severity_label
+- source: template:cue_user_actor.baseline
+  question: Has this user run shadow-copy SAM-hive commands before?
+  context: Compare this account's current action against its history. A user who has never issued a shadow-copy SAM-hive copy
+    is more suspicious than one who does so as part of a known backup or remediation role. Zero or very low counts point to
+    first-time or rare execution for this identity.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        CommandLine|contains|all:
+          - \HarddiskVolumeShadowCopy
+          - System32\config\sam
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is the parent process that launched this shadow-copy SAM command historically routine on this host or across the
+    environment?
+  context: When the alert fires under a service principal, user identity does not attribute behavior; the meaningful pivot is
+    the launch mechanism. Which parent process spawned the shadow-copy SAM-hive copy, and is that parent historically common
+    for this pattern? A new or rare parent is the deviation worth chasing; a parent that already accounts for many prior
+    events is likely a backup product or scheduled remediation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith|expand: '%ParentImage%'
+        CommandLine|contains|all:
+          - \HarddiskVolumeShadowCopy
+          - System32\config\sam
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the account's activity across all hosts in the alert window reveals lateral movement or parallel action on
+    multiple endpoints. If the same user drove SAM access or other credential activity on several hosts at once, the scope of
+    compromise is larger than this single alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did the same parent process launch shadow-copy SAM commands on other hosts in the same window?
+  context: Under a service principal, pivoting on user identity returns agent-telemetry noise from every host. The meaningful
+    question is whether the same launch mechanism — the parent process driving this shadow-copy SAM copy — fired on other
+    hosts in the alert window. Multiple hosts at once points to scheduled or pushed automation; a single host points to a
+    host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith|expand: '%ParentImage%'
+        CommandLine|contains|all:
+          - \HarddiskVolumeShadowCopy
+          - System32\config\sam
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired this shadow-copy SAM pattern, what parents and users normally drive it, and
+    does the current alert fit?
+  context: Even sanctioned backup or remediation can match this pattern. The query mirrors the rule's selection scoped to this
+    host, so the resulting parent/user distribution reflects how this specific firing pattern has historically run here. A new
+    parent, an unexpected account, or an unusual command shape is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_1:
+        CommandLine|contains|all:
+        - \HarddiskVolumeShadowCopy
+        - System32\config\sam
+      selection_2:
+        CommandLine|contains:
+        - Copy-Item
+        - cp $_.
+        - cpi $_.
+        - copy $_.
+        - .File]::Copy(
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: Credential dumping rarely occurs in isolation. Examining the surrounding process activity reveals what led to the
+    SAM copy and what followed — reconnaissance, shadow-copy creation (vssadmin/wmic), privilege escalation, archiving of the
+    copied hives, or staging for exfiltration. Aggregating by Image and ParentImage collapses repetitive telemetry while novel
+    pairs stand out at low counts.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host — defense tampering, reconnaissance, shadow-copy creation, or privilege
+    escalation — may reveal the stages that preceded the SAM copy and help reconstruct the timeline. The sequence of alerts
+    often tells the attack story leading up to credential access.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired this shadow-copy SAM pattern in the past week, and does the cross-host distribution look
+    like automation or one-off activity?
+  context: The query mirrors the rule's selection with no host scope, giving a fleet-wide count of this firing pattern rather
+    than generic PowerShell usage. Many hosts firing the same pattern points to scripted deployment or a backup product;
+    one host or a small unrelated set points to manual operator activity. Use the host distribution to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_1:
+        CommandLine|contains|all:
+        - \HarddiskVolumeShadowCopy
+        - System32\config\sam
+      selection_2:
+        CommandLine|contains:
+        - Copy-Item
+        - cp $_.
+        - cpi $_.
+        - copy $_.
+        - .File]::Copy(
+      condition: all of selection*
+    fields:
+    - host.name
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1003.002
+      name: Security Account Manager
+      role: primary
+    - id: T1003
+      name: OS Credential Dumping
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: shadow_copy_sam_access
+      description: "Command line references a Volume Shadow Copy path into System32\\config\\sam, accessing the hive while the live OS lock is bypassed"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: hive_copy_operation
+      description: "A copy operation (Copy-Item / cp/cpi/copy of a pipeline object / .NET File::Copy) stages the SAM hive, typically with SYSTEM and SECURITY, to a destination path"
+      mapped_to: Q5
+      source: template:credential_access.credential_target_identification
+    - stage: 3
+      label: offline_extraction_and_reuse
+      description: "Copied hives are taken offline for hash extraction and the credentials are reused for lateral movement"
+      mapped_to: Q10
+      source: template:credential_access.post_access_lateral_movement
+  dimension_coverage:
+    - dimension: command_analysis
+      technique: T1003.002
+      covered_by: Q5
+      source: template:credential_access.credential_target_identification
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1003.002
+      covered_by: Q12
+      source: template:cue_user_actor.baseline_svc
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1003.002
+      covered_by: Q16
+      source: template:cue_host_context.clustering
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1003.002
+      covered_by: Q3
+      source: template:universal.evidence_preservation
+      coverage_type: direct
+    - dimension: access_verification
+      technique: T1003
+      covered_by: Q5
+      source: template:credential_access.credential_target_identification
+      coverage_type: indirect
+  mutable_dispositions:
+    - element: CommandLinePattern
+      dimension: command_analysis
+      specific_values: "reg save / reg.exe save / PowerShell hive-dump equivalents; this rule's pattern is shadow-copy file copy of System32\\config\\sam"
+      disposition: context
+      target_question: Q5
+      notes: "Rule's own pattern (shadow-copy + copy operation) is the specific command variant; credential_target_identification context directs the analyst to confirm SAM+SYSTEM+SECURITY were taken."
+    - element: TargetFilePath
+      dimension: tuning_parameter
+      specific_values: "%TEMP%\\sam.save, C:\\Users\\Public\\*.dmp"
+      disposition: context
+      target_question: Q3
+      notes: "evidence_preservation uses %file_paths% derived from the CommandLine destination; dump-path patterns described in context. Not hard-coded since the rule's destination path is variable per invocation."
+    - element: RegistryPath
+      dimension: tuning_parameter
+      specific_values: "HKLM\\SAM, HKLM\\SYSTEM, \\Device\\Harddisk direct access"
+      disposition: context
+      target_question: Q5
+      notes: "This rule accesses the hive via the shadow-copy FILE path, not the live registry; registry_set coverage declined (see hint_dispositions). Hive targets surfaced in context."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "~3 min gap between SAM and SYSTEM hive dumping"
+      disposition: context
+      target_question: Q16
+      notes: "Threshold not directly queryable; surrounding-activity clustering (+/-15m) lets the analyst see whether SAM/SYSTEM/SECURITY copies cluster together."
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "rationale only — suppress known-good backup tools"
+      disposition: query_injection
+      target_question: Q12
+      notes: "Parent-process baseline (baseline_svc) pivots on ParentImage + the rule's SAM CommandLine pattern so known-good backup parents surface as high-count rows."
+    - element: AccessMask
+      dimension: access_verification
+      specific_values: "0x1F0FFF (full access)"
+      disposition: context
+      target_question: Q5
+      notes: "T1003 process_access element; this rule is process_creation/CommandLine, no GrantedAccess field. Access is via shadow-copy file read — covered indirectly by confirming which hives were copied."
+  dedup_decisions:
+    - dropped: cue_process_tool.baseline
+      reason: "Generic 'does host run this tool' over Image=powershell is high-volume/low-signal and is subsumed by the host-scoped reflected baseline_deviation, which counts the rule's actual SAM pattern on this host."
+      kept: cue_process_tool.baseline_deviation
+    - dropped: cue_process_tool.clustering
+      reason: "Host-scoped 'what other tools ran around this time' duplicates cue_host_context.clustering; kept the host_context version."
+      kept: cue_host_context.clustering
+    - dropped: cue_user_actor.baseline
+      reason: "user_actor pair — non-deduplicable; emitted alongside baseline_svc (recorded for audit, both present)"
+      kept: cue_user_actor.baseline_svc
+    - dropped: cue_user_actor.clustering
+      reason: "user_actor pair — non-deduplicable; emitted alongside clustering_svc (recorded for audit, both present)"
+      kept: cue_user_actor.clustering_svc
+  skipped_templates:
+    - template: cue_process_tool.mechanism_decode
+      reason: "replaced_by: credential_access.credential_target_identification (Phase 2 supersedes it for credential-access rules)"
+    - template: cue_process_tool.process_chain
+      reason: "Parent-chain analysis for this credential-dump pattern is covered by cue_user_actor.baseline_svc (ParentImage + SAM pattern) and cue_host_context.clustering; dropped to stay within the 18-question cap. CommandLine-only rule has no parent in detection, so a generic ParentProcessGuid lookup adds little beyond those."
+    - template: cue_process_tool.follow_on
+      reason: "Child-process follow-on for the launching binary is covered by cue_host_context.clustering (surrounding activity) and credential_access.post_access_lateral_movement (follow-on alerts); dropped for cap."
+    - template: cue_artifact.mechanism_decode
+      reason: "Artifact is a binary registry hive (SAM), not a script/payload — base64/obfuscation/string content analysis does not apply. The copied-file artifact is covered by evidence_preservation (still on disk?) and credential_target_identification (which hives)."
+    - template: cue_artifact.artifact_verification
+      reason: "Hash/AV-reputation lookup is meaningless for a copied SAM hive (it is per-host data, not a known-malicious file). What matters is that the hive was copied, covered by credential_target_identification and evidence_preservation."
+    - template: cue_artifact.baseline
+      reason: "First-seen file-event baseline of the copied hive output adds little — the SAM hive is always present; the relevant baseline is whether this SAM-copy COMMAND pattern is new (cue_user_actor.baseline / baseline_deviation cover that)."
+  hint_dispositions:
+    - hint: "cue_artifact: derived: \\bcopy\\s in CommandLine"
+      disposition: declined
+      reason: >-
+        The derived artifact cue's file_event templates (mechanism_decode content
+        analysis, artifact_verification hash/VT lookup) do not fit a copied binary
+        SAM registry hive: it is per-host credential data, not a script payload to
+        decode or a known-malicious file to reputation-check. The copy artifact is
+        instead covered by Q3 (evidence_preservation — are the copied hives still on
+        disk) and Q5 (credential_target_identification — which of SAM/SYSTEM/SECURITY
+        were taken).
+    - hint: >-
+        logsource 'registry_set' (recommended by techniques: T1003.002) is not covered
+        — pull in cue_registry_key.* or author a custom question with `category: registry_set`
+      disposition: declined
+      reason: >-
+        This rule's specific detection logic constrains the method to FILE access of
+        the SAM hive through a Volume Shadow Copy path (\\HarddiskVolumeShadowCopy...
+        System32\\config\\sam), which bypasses the live registry entirely — there is
+        no registry_set event for this access path. registry_set coverage would target
+        a different SAM-dumping variant (reg save / direct HKLM\\SAM access) that this
+        rule does not fire on, so it is genuinely out of scope for this alert.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - powershell
+    - credential_access
+    - cue_process_tool
+    - cue_user_actor
+    - cue_host_context
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 18
+      attack: 0
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 2
+      context: 14
+    logsource_diversity:
+      process_creation: 14
+      file_event: 1
+      powershell: 1
+      sigma_alert: 2

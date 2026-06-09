@@ -1,0 +1,598 @@
+name: PUA - Kernel Driver Utility (KDU) Execution
+id: 856f3c7f-b414-4f5f-bc50-05fbaa694762
+description: |
+  Fires when a process named kdu.exe or hamakaze.exe (or carrying the
+  hamakaze.exe original filename) runs with a KDU operation flag (-map, -prv,
+  -dse, or -ps) on its command line. KDU is a bring-your-own-vulnerable-driver
+  utility: it loads a known-vulnerable signed driver to gain arbitrary kernel
+  read/write, then disables Driver Signature Enforcement (-dse), maps an
+  unsigned "driverless" payload into the kernel (-map), selects a vulnerable
+  provider (-prv), or tampers with a protected process object (-ps). Legitimate
+  use is largely limited to driver development, hardware troubleshooting, or
+  security research; in an unsanctioned context the same flags grant kernel-level
+  code execution that can disable security controls, escalate privilege, and
+  establish kernel persistence. Determine which operation ran, what driver or
+  payload it touched, who launched it and from where, and whether security
+  controls were weakened around the same time.
+type: detection
+detection_id: e76ca062-4de0-4d79-8d90-160a0d335eca
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-09
+questions:
+- source: template:universal.verify_trigger_match
+  question: Did the alerting process run KDU (kdu.exe / hamakaze.exe) with a -map, -prv, -dse, or -ps operation flag?
+  context: Confirm the alert is a true positive. The rule fires only when both conditions hold together — the image is kdu.exe or hamakaze.exe (or the original filename is hamakaze.exe) AND the command line carries one of the KDU operation flags. Read the exact Image, OriginalFileName, and CommandLine and note which flag fired, since the flag determines what the tool actually did and which downstream questions carry weight.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run a kernel driver utility?
+  context: Driver development, hardware troubleshooting, and security research are the legitimate reasons to run KDU, and they are confined to a small set of engineering or lab hosts and operators. A standard workstation or server account running it is rarely consistent with role and is the fastest signal to separate sanctioned testing from operator activity.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:service_persistence.service_configuration
+  question: Did a driver or service get installed on this host around the alert, and what binary path does it execute?
+  context: KDU loads its vulnerable provider driver and can register mapped payloads as kernel-mode services, so the service-install record is the structured evidence of what was placed on the host. The image path is the payload; paths in world-writable directories (C:\Users\Public, C:\Windows\Temp) or unsigned binaries registered as a service are the high-concern outcomes. The account the service runs under indicates the privilege level obtained.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: system
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 7045
+      condition: selection
+    fields:
+      - ServiceName
+      - ImagePath
+      - StartType
+      - AccountName
+- source: attack:T1543.003.driver_payload
+  question: Which KDU operation ran and which driver or payload did it act on — was a .sys file mapped or was DSE disabled?
+  context: The operation flag and its argument define the impact. -map loads an unsigned "driverless" payload (often a .sys path passed on the command line) into the kernel by overwriting an already-loaded victim module; -dse disables Driver Signature Enforcement so unsigned drivers can load; -prv selects which vulnerable provider driver to abuse (KDU ships providers such as RTCore64, DBUtil_2_3, Mimidrv, Dbk64); -ps tampers with a protected process object. Pull the full command line on this host and read the flag argument to identify the payload path, target process, or DSE value.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+        CommandLine|contains:
+          - '-map '
+          - '-prv '
+          - '-dse '
+          - '-ps '
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: attack:T1543.003.registry_service_path
+  question: Was a driver service registered or modified under the Services registry hive on this host around the alert?
+  context: Loading a kernel driver leaves a service definition under HKLM\System\CurrentControlSet\Services even when the install is driven by an API rather than sc.exe. New or modified driver-service keys — particularly ones pointing ImagePath at a .sys file in a user-writable directory or flipping a Start value to load at boot — are the registry-side artifact of the mapped or provider driver and reveal kernel persistence that the command line alone may not show.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|contains: '\System\CurrentControlSet\Services\'
+      selection_driver:
+        - TargetObject|endswith: '\ImagePath'
+        - TargetObject|endswith: '\Start'
+        - TargetObject|endswith: '\Type'
+      condition: selection and selection_driver
+    fields:
+      - TargetObject
+      - Details
+      - Image
+- source: template:cue_process_tool.process_chain
+  question: What process spawned KDU, and is that parent chain expected?
+  context: The parent reveals how KDU was invoked. A launch from an interactive shell, a remote-access or deployment tool, an Office application, or a script host (mshta.exe, wscript.exe, powershell.exe) points toward hands-on-keyboard or scripted abuse, whereas a developer or IT engineer launching it from explorer.exe or a build environment fits sanctioned testing. Walk up to the parent's own parent if the immediate parent is itself a generic shell.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.baseline
+  question: Has this host run KDU before?
+  context: A kernel driver utility that has never run on a host is far more concerning than one that appears regularly on a known engineering or lab system. Zero or very low historical counts over the window indicate first-time or rare execution and raise the priority of the operation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired the KDU pattern, what parents and users normally drive it, and does the current alert fit that pattern?
+  context: Even on a host where KDU appears, the launch mechanism matters. This query mirrors the rule's exact selection — image plus operation flag — scoped to this host, so the resulting parent and user distribution reflects how the rule's specific firing pattern has historically run here. A new parent process, an unexpected account, or an unfamiliar command-line shape is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \kdu.exe
+        - \hamakaze.exe
+      - OriginalFileName: hamakaze.exe
+      selection_cli_suspicious:
+        CommandLine|contains:
+        - '-map '
+        - '-prv '
+        - '-dse '
+        - '-ps '
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.follow_on
+  question: What child processes did KDU spawn afterward?
+  context: The processes KDU launches after gaining kernel access reveal its actual purpose. Spawning of cmd.exe, powershell.exe, certutil.exe, or other tooling points to post-exploitation chaining once driver signature enforcement is down or a payload is mapped; a clean tool that exits without spawning children fits a one-off troubleshooting run.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.clustering
+  question: What other tools ran on this host around the same time?
+  context: Kernel-level tampering rarely stands alone. Activity surrounding the KDU execution may surface reconnaissance, credential access, additional driver drops, or persistence installation that frames the broader operation and tells the analyst whether this was an isolated test or one step in a multi-stage sequence.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired the KDU pattern in the past week, and does the cross-host distribution look like consistent automation or one-off activity?
+  context: This query mirrors the rule's exact selection with no host scope, so the result is a fleet-wide count of the rule's firing pattern rather than generic binary usage. Many hosts firing the same pattern points to scripted or pushed deployment; one host or a small unrelated set points to manual operator activity. Use the host distribution and parent/binary consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \kdu.exe
+        - \hamakaze.exe
+      - OriginalFileName: hamakaze.exe
+      selection_cli_suspicious:
+        CommandLine|contains:
+        - '-map '
+        - '-prv '
+        - '-dse '
+        - '-ps '
+      condition: all of selection_*
+    fields:
+    - host.name
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run a kernel driver utility?
+  context: Compare this account's current action against its historical behavior. A user who has never run KDU or any driver-loading tool is more suspicious than one who does so regularly as part of an engineering or research role. The user's role and typical toolset should align with kernel-level activity.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent+binary combination historically routine on this host or across the environment, or is the parent unusual for KDU?
+  context: When the alert fires under a service principal, the user identity does not attribute behavior, so the meaningful pivot is the launch mechanism — which parent process spawned KDU, and whether that pair is historically common. A new or rare parent for this binary, on this host or environment-wide, is the deviation worth chasing; a pair already accounting for many prior events is automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the account's activity across all hosts reveals lateral movement or parallel activity on multiple endpoints. If the same user drove KDU or related tooling on more than one host, the scope of the operation is larger than the single alerting machine.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent+binary combination fire on other hosts in the same window — a coordinated automation rollout, or isolated to this host?
+  context: Under a service principal, asking what else the user did network-wide returns agent-telemetry noise, since every host runs SYSTEM-owned agents constantly. The meaningful question is whether the same launch mechanism — parent process plus spawned binary — fired on other hosts in the alert window. Multiple hosts in the same window points to scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining the surrounding activity reveals what led to the KDU execution and what followed it, and whether it sits inside a larger sequence. Novel parent-child pairs stand out against the repetitive agent and OS telemetry that dominates the host.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host — defense tampering, reconnaissance, or credential access — may reveal the attack stages that preceded the KDU execution and help reconstruct the timeline. Driver-loading utilities are often run after an operator has already gained a foothold and is preparing to weaken kernel-level defenses.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:universal.endpoint_protection_health
+  question: Were other tamper attempts against endpoint protection seen on this host in the hour before the alert?
+  context: KDU's purpose is to defeat kernel-level protections by disabling Driver Signature Enforcement and tampering with protected process objects, so operators frequently pair it with attempts to disable AV/EDR services, flip Defender flags, add exclusions, or clear logs. This sweep surfaces those command-line tamper attempts. Zero rows is a useful signal that user-mode protection looks healthy — though kernel-level driver tampering and in-memory patches will not appear here. Populated rows shift the disposition toward operator preparation; review the parent process and signing chain to identify the writer.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1543.003
+      name: Windows Service
+      role: primary
+    - id: T1543
+      name: Create or Modify System Process
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: tool_invocation
+      description: "KDU is launched with a kernel operation flag (-map/-prv/-dse/-ps)"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: kernel_operation_decode
+      description: "Which operation ran and which vulnerable driver / unsigned payload it touched"
+      mapped_to: Q4
+      source: attack:T1543.003.driver_payload
+    - stage: 3
+      label: service_driver_install
+      description: "Driver/service installation under SYSTEM with the payload binary path"
+      mapped_to: Q3
+      source: template:service_persistence.service_configuration
+    - stage: 4
+      label: registry_service_registration
+      description: "Driver-service definition created/modified under the Services hive"
+      mapped_to: Q5
+      source: attack:T1543.003.registry_service_path
+    - stage: 5
+      label: parent_lineage
+      description: "Parent-child lineage establishing how the tool was invoked"
+      mapped_to: Q6
+      source: template:cue_process_tool.process_chain
+  dimension_coverage:
+    - dimension: tuning_parameter
+      technique: T1543.003
+      covered_by: Q4
+      source: attack:T1543.003.driver_payload
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1543
+      covered_by: Q6
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+  mutable_dispositions:
+    - element: ServiceNamePattern
+      dimension: tuning_parameter
+      specific_values: "rationale only (regex for uncommon service names)"
+      disposition: context
+      target_question: Q3
+      notes: "service_configuration is KEEP_EXACT; uncommon/anomalous service-name framing carried in Q3 context. No specific values to inject."
+    - element: ImagePathFilter
+      dimension: tuning_parameter
+      specific_values: "C:\\Users\\, C:\\Temp\\"
+      disposition: context
+      target_question: Q3
+      notes: "world-writable image-path concern surfaced in Q3 and Q5 context; ImagePath is a returned field on Q3 (EventID 7045)."
+    - element: DriverExtensionList
+      dimension: tuning_parameter
+      specific_values: ".sys files loaded via sc/Registry/ZwLoadDriver"
+      disposition: new_question
+      target_question: Q5
+      notes: ".sys/driver-service registration handled by attack:T1543.003.registry_service_path (Q5) and the -map payload decode (Q4)."
+    - element: StartupTypeChangeWindow
+      dimension: tuning_parameter
+      specific_values: "rationale only (temporal correlation window)"
+      disposition: context
+      target_question: Q5
+      notes: "Start-key change is a returned TargetObject pattern in Q5; correlation-window tuning is not directly queryable."
+    - element: UnsignedBinaryAlert
+      dimension: tuning_parameter
+      specific_values: "rationale only (unsigned binary registered as service)"
+      disposition: context
+      target_question: Q3
+      notes: "unsigned-binary-as-service concern carried in Q3 context; signing verification is a manual/EDR step on the ImagePath."
+    - element: ParentProcessFilter
+      dimension: parent_process_analysis
+      specific_values: "rationale only (non-admin processes starting service tools)"
+      disposition: query_injection
+      target_question: Q6
+      notes: "parent lineage retrieved by process_chain (Q6) via ParentProcessGuid; unusual-parent rationale in context."
+    - element: RegistryPathList
+      dimension: tuning_parameter
+      specific_values: "HKLM\\System\\CurrentControlSet\\Services"
+      disposition: query_injection
+      target_question: Q5
+      notes: "injected as TargetObject|contains '\\System\\CurrentControlSet\\Services\\' in Q5 registry_set query."
+  dedup_decisions:
+    - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable; emit both (subject vs. launch-mechanism pivot)"
+      kept: both (Q12, Q13)
+    - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable; emit both (subject vs. launch-mechanism pivot)"
+      kept: both (Q14, Q15)
+  skipped_templates:
+    - template: cue_process_tool.mechanism_decode
+      reason: "replaced_by: service_persistence.service_configuration (acted on hint 1); CLI-flag decode additionally covered by attack:T1543.003.driver_payload (Q4)"
+    - template: organizational_context.change_ticket
+      reason: "template notes_to_llm: skip for pua/hktl/apt prefixes — change tickets are irrelevant for a PUA kernel-driver utility detection"
+    - template: organizational_context.procedural_consistency
+      reason: "no standard org procedure exists for kernel driver loading; the legitimacy question is role/sanction (host_user_context, Q2), not change-management tooling"
+    - template: organizational_context.human_recall
+      reason: "user/admin recall is covered by the role-and-sanction judgment in host_user_context (Q2) and user baseline (Q12); a separate recall slot is redundant against the 18-question cap"
+    - template: organizational_context.timing_alignment
+      reason: "off-hours timing is a weak discriminator for a tool whose only legitimate use is engineering/lab work that can occur any time; dropped to keep cap, sanction is the decisive axis (Q2)"
+    - template: remote_access_tool.tool_authorization
+      reason: "remote_access_tool set matched on filename_prefix pua, but KDU is a BYOVD kernel-driver utility, not a remote access tool; approved-RAT-list framing does not apply"
+    - template: remote_access_tool.active_session_context
+      reason: "no remote support session concept applies to a kernel driver utility; helpdesk-ticket framing is incidental to the pua prefix match"
+    - template: remote_access_tool.connection_destination
+      reason: "KDU performs no outbound relay/tunnel connection; a network_connection-by-binary query would mislead — the relevant artifacts are kernel/driver/service-side, covered by Q3/Q4/Q5"
+    - template: persistence_scope.process_based_persistence
+      reason: "KDU persistence is kernel-driver/service registration, covered directly by service_configuration (Q3) and registry service-path (Q5); the generic schtasks/at/reg/bitsadmin sweep adds breadth that is lower-value than the endpoint-protection-health precursor at the 18-question cap"
+    - template: persistence_scope.file_based_persistence
+      reason: "Startup-folder / Run-key file drops are not KDU's persistence vector (it loads kernel drivers, not autostart user files); dropped at cap in favor of kernel/service-focused questions"
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "logsource 'security' (recommended by techniques: T1543.003) is not covered and no template family exists — author a custom question with `category: security`"
+      disposition: declined
+      reason: >-
+        The service-creation investigative need (which service/driver was
+        installed and what binary it runs) is covered by the service-install
+        question (service_persistence.service_configuration, Q3), which queries
+        the Windows System log EventID 7045 and returns structured ServiceName /
+        ImagePath / StartType / AccountName fields. Security-log EventCode 4697
+        carries the same service-installation facts; adding a parallel
+        category:security question would re-ask the same question against a
+        less commonly forwarded channel. No compensating attack:T1543.003.security
+        question authored.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - service_persistence
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 16
+      attack: 2
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 2
+      context: 14
+    logsource_diversity:
+      process_creation: 15
+      service_system: 1
+      registry_set: 1
+      sigma_alert: 1

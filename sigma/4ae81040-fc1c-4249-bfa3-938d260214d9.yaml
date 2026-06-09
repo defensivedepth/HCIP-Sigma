@@ -1,0 +1,514 @@
+name: Use Icacls to Hide File to Everyone
+id: e23718c1-36d3-41cc-baa8-55b0d6a3287b
+description: |
+  Detects icacls.exe invoked with the /deny flag against the Everyone SID (S-1-1-0), which strips
+  read and traverse access for all users on a file or directory. Denying Everyone is a low-effort way
+  to make a dropped payload, staging directory, or output file effectively invisible to ordinary
+  enumeration while leaving it on disk. Legitimate administrators occasionally tighten ACLs this way,
+  so the investigation should establish what path was targeted, who and what launched the command,
+  and whether the access denial was paired with file drops or other defense-evasion activity in the
+  same window.
+type: detection
+detection_id: 4ae81040-fc1c-4249-bfa3-938d260214d9
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line show icacls denying access to the Everyone SID with /deny and S-1-1-0?
+  context: Before investing investigation time, confirm the alert is a true positive by reviewing the
+    exact command line and process metadata. The rule fires only when icacls.exe (by Image name or
+    OriginalFileName) runs with both /deny and a target containing the Everyone SID S-1-1-0. Read the
+    full command to confirm both elements are present and to capture the file or directory being hidden.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to modify file ACLs with icacls?
+  context: Legitimate administrative activity can trigger this detection. Account-management and
+    deployment workflows sometimes tighten permissions on files or directories. Knowing whether the
+    user role and host function normally include ACL changes via command-line tools is often the
+    fastest path to distinguishing routine administration from an attempt to hide an artifact.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:defense_tampering.what_was_disabled
+  question: Which file or directory was hidden, and what access was denied to which principal?
+  context: The command line carries the target path and the SID whose access was stripped. Read the
+    argument after /deny to identify the exact file or directory and confirm the principal is the
+    Everyone SID S-1-1-0 (rather than a narrower, more routine grant). Note whether other inheritance
+    or grant flags were combined with the denial, since the precise path and access mask determine
+    whether the file is now invisible to enumeration and what should be inspected on disk.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:cue_process_tool.process_chain
+  question: What process spawned icacls, and is that parent chain expected for an ACL change?
+  context: The parent process reveals how the command was invoked. Interactive administration usually
+    descends from explorer.exe or a console shell, while a script host, Office application, or other
+    payload parent suggests the access denial was driven by automation an operator did not initiate.
+    Walk up from the immediate parent to see what launched it and what else it spawned.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.baseline
+  question: Does this host normally run icacls?
+  context: A binary that has never been seen on a host is more suspicious than one that runs regularly.
+    Zero or very low historical counts for icacls indicate first-time or rare use of the tool here,
+    which raises the weight of an access-denial command targeting the Everyone SID.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously run icacls with /deny on the Everyone SID, what parents and
+    users normally drive that activity, and does the current alert fit that pattern?
+  context: Even common tools can be abused. This query mirrors the rule's selection structure scoped to
+    this host, so the resulting parent and user distribution reflects how the rule's specific firing
+    pattern (not generic icacls usage) has historically run here. A new parent process, an unexpected
+    user account, or an unusual command shape against this pattern is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_icacls:
+      - OriginalFileName: iCACLS.EXE
+      - Image|endswith: \icacls.exe
+      selection_cmd:
+        CommandLine|contains|all:
+        - /deny
+        - '*S-1-1-0:'
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.follow_on
+  question: What child processes did icacls spawn afterward?
+  context: The processes spawned by a tool reveal its actual impact. icacls itself does little beyond
+    altering ACLs, so any child process is notable and may point to the broader operation the access
+    denial was meant to conceal, such as launching or staging the hidden artifact.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.scope
+  question: Have other hosts run icacls with /deny on the Everyone SID in the past week, and does the
+    cross-host distribution look like consistent automation or one-off activity?
+  context: This query mirrors the rule's selection structure with no host scope, so the result is a
+    fleet-wide count of the rule's firing pattern rather than generic icacls usage. Many hosts firing
+    the same access-denial pattern points to scripted deployment or vendor automation; one host or a
+    small unrelated set points to manual operator activity. Use the host distribution and parent
+    consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_icacls:
+      - OriginalFileName: iCACLS.EXE
+      - Image|endswith: \icacls.exe
+      selection_cmd:
+        CommandLine|contains|all:
+        - /deny
+        - '*S-1-1-0:'
+      condition: all of selection_*
+    fields:
+    - host.name
+- source: template:cue_user_actor.baseline
+  question: Does this user normally perform ACL changes with icacls?
+  context: Compare this user's current action against their historical behavior. A user who has never
+    run icacls, or never run it with a /deny against the Everyone SID, is more suspicious than one who
+    does so regularly. User role and typical toolset should align with command-line permission changes.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent and icacls combination historically routine on this host or across the
+    environment, or is the parent unusual for this binary?
+  context: When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism, which parent process spawned icacls, and whether that
+    pair is historically common. A new or rare parent for icacls on this host or environment-wide is the
+    deviation worth chasing; a pair that already accounts for thousands of prior events is vendor or OS
+    automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning
+    multiple endpoints. If the same user denied Everyone access to files or performed related staging on
+    several hosts in this window, the scope of the operation may be larger than the single alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent and icacls combination fire on other hosts in the same window, pointing
+    to a coordinated automation rollout rather than isolated activity?
+  context: Under a service principal, asking what else the user did across the network returns
+    agent-telemetry noise because every host runs SYSTEM-owned agents constantly. The meaningful
+    question is whether the same launch mechanism, parent process plus icacls, fired on other hosts in
+    the alert window. Multiple hosts in the same window points to scheduled or pushed automation; a
+    single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: 'Alerts rarely occur in isolation. Examining activity around the access denial reveals the
+    immediate context: what led to it, what happened after, and whether it is part of a larger sequence.
+    Look for file drops, archive staging, reconnaissance, or persistence mechanisms in the same window.'
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host, such as suspicious
+    downloads, defense evasion, or reconnaissance, may reveal the stages that preceded the access denial
+    and help reconstruct what artifact the icacls command was meant to hide.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:defense_tampering.protection_status
+  question: Is the access denial still in effect on the target file, or has the ACL been restored?
+  context: The denial may be temporary (for a specific action) or persistent. Checking the current ACL
+    on the targeted path reveals whether the file remains hidden from ordinary enumeration. If the
+    Everyone deny is still applied, the artifact is still concealed and should be examined directly on
+    the host before any cleanup removes evidence.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:defense_tampering.activity_after_tampering
+  question: What activity occurred on this host after the access denial was applied?
+  context: Access to a file is denied for a reason, usually to conceal a payload, staging directory, or
+    output while subsequent actions run. Examining activity immediately after the icacls command reveals
+    what the concealment was meant to support, such as execution of the hidden file, archive creation,
+    or data movement. Correlate this window with file events and network connections.
+  range: +1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - User
+- source: template:defense_tampering.other_tampering_activity
+  question: Were other defense-evasion or artifact-hiding actions performed on this host?
+  context: An operator who hides one file via ACL denial often combines several evasion actions, such
+    as setting hidden or system attributes, clearing logs, deleting shadow copies, or adding exclusions.
+    Finding multiple evasion events from the same user or parent process in the same window indicates a
+    deliberate effort to reduce visibility rather than an isolated permission change.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_tamper:
+        Image|endswith:
+          - '\wevtutil.exe'
+          - '\vssadmin.exe'
+          - '\bcdedit.exe'
+          - '\wbadmin.exe'
+          - '\netsh.exe'
+          - '\attrib.exe'
+          - '\powershell.exe'
+        CommandLine|contains:
+          - 'cl '
+          - 'clear-log'
+          - 'delete shadows'
+          - 'recoveryenabled'
+          - '+h'
+          - '+s'
+          - 'DisableRealtimeMonitoring'
+          - 'advfirewall'
+      condition: selection and selection_tamper
+    fields:
+      - Image
+      - User
+- source: template:persistence_scope.file_based_persistence
+  question: Were files dropped to persistence locations such as the Startup folder or Run key paths on
+    this host?
+  context: Hiding a file via ACL denial is often paired with placing an artifact where it will run
+    automatically. Dropping an executable or script into a Startup folder or a path referenced by a
+    registry Run key achieves persistence without invoking schtasks, sc, or reg. File event monitoring
+    captures these drops even when the artifact itself was subsequently hidden from enumeration.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist_paths:
+        TargetFilename|contains:
+          - '\Start Menu\Programs\Startup\'
+          - '\CurrentVersion\Run'
+          - '\CurrentVersion\RunOnce'
+      condition: selection and selection_persist_paths
+    fields:
+      - TargetFilename
+      - Image
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1564.001
+      name: Hidden Files and Directories
+      role: primary
+    - id: T1564
+      name: Hide Artifacts
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: attribute_or_acl_modification
+      description: Process modifies file/directory visibility — here icacls denies Everyone (S-1-1-0)
+        access to conceal an artifact on disk.
+      mapped_to: Q3
+      source: template:defense_tampering.what_was_disabled
+    - stage: 2
+      label: concealed_artifact_present
+      description: The hidden file/directory remains on disk; confirm the target path and whether the
+        denial is still in effect.
+      mapped_to: Q15
+      source: template:defense_tampering.protection_status
+    - stage: 3
+      label: post_concealment_activity
+      description: Activity the concealment supports — execution, staging, or persistence drops in the
+        window after the access denial.
+      mapped_to: Q16
+      source: template:defense_tampering.activity_after_tampering
+  dimension_coverage:
+    - dimension: tuning_parameter
+      technique: T1564.001
+      covered_by: Q3
+      source: template:defense_tampering.what_was_disabled
+      coverage_type: indirect
+    - dimension: tuning_parameter
+      technique: T1564
+      covered_by: Q17
+      source: template:defense_tampering.other_tampering_activity
+      coverage_type: indirect
+  mutable_dispositions:
+    - element: MonitoredExtensions
+      dimension: tuning_parameter
+      specific_values: "rationale only (.exe, .dll, .bat examples — not concrete values for this rule)"
+      disposition: context
+      target_question: Q3
+      notes: Rule detects an icacls ACL command, not a file-write event, so the sensitive-extension
+        filter is not directly queryable here. The what-was-targeted question directs the analyst to
+        read the exact target path/extension from the command line.
+    - element: ADSMonitoring
+      dimension: tuning_parameter
+      specific_values: "rationale only (alternate data stream toggle)"
+      disposition: context
+      target_question: Q17
+      notes: ADS detection is a file_event tuning toggle with no concrete value to inject into a
+        process_creation query. Other-evasion sweep and the file-event persistence question carry the
+        cross-logsource hiding angle.
+    - element: FileExtensions
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q3
+      notes: Same as MonitoredExtensions for the broader T1564 analytic — no concrete values; covered
+        as context on the target-identification question.
+    - element: ADSDetection
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q17
+      notes: Same as ADSMonitoring for the broader T1564 analytic — tuning toggle, no concrete value.
+  dedup_decisions:
+    - dropped: cue_user_actor.baseline
+      reason: "user_actor pair — non-deduplicable; emitted alongside service-principal substitute baseline_svc"
+      kept: cue_user_actor.baseline
+    - dropped: cue_user_actor.clustering
+      reason: "user_actor pair — non-deduplicable; emitted alongside service-principal substitute clustering_svc"
+      kept: cue_user_actor.clustering
+    - dropped: persistence_scope.process_based_persistence
+      reason: "recommended template dropped to hold the 18-question cap; file_based_persistence kept
+        because it supplies the file_event logsource coverage the hide-artifact technique calls for,
+        and ACL-based hiding is not persistence-tool-centric"
+      kept: persistence_scope.file_based_persistence
+  skipped_templates:
+    - template: cue_process_tool.mechanism_decode
+      reason: "replaced_by: defense_tampering.what_was_disabled (per brief hint)"
+    - template: universal.endpoint_protection_health
+      reason: "recommended-only generic AV/EDR tamper sweep; defense_tampering technique set is confirmed
+        for this rule and its what_was_disabled / other_tampering_activity questions supersede the generic
+        sweep. The rule's action is ACL-based file hiding, not AV/EDR service tampering, so the
+        Defender/EDR service-name sweep adds no signal here."
+  reflection_overrides: []
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - defense_tampering
+    - persistence_scope
+    - cue_process_tool
+    - cue_user_actor
+    - cue_host_context
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 18
+      attack: 0
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 15
+    logsource_diversity:
+      process_creation: 16
+      sigma_alert: 1
+      file_event: 1

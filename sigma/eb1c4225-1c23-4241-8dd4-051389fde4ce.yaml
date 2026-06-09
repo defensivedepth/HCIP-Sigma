@@ -1,0 +1,719 @@
+name: Suspicious DumpMinitool Execution
+id: e2c88550-44e9-4922-83af-66faa1244567
+description: |
+  Detects execution of DumpMinitool.exe (or its x86/arm64 variants, including renamed
+  copies identified by OriginalFileName) under conditions that diverge from normal Visual
+  Studio test tooling. DumpMinitool is a signed Microsoft utility that creates process
+  memory dumps; an operator can point it at lsass.exe to harvest credentials offline, which
+  is why the rule fires when the binary runs from outside its Visual Studio Extensions
+  directory, OR writes to a .txt output, OR carries a dump-type flag (Full/Mini/WithHeap)
+  without the matching --dumpType switch. Investigation should confirm what process was
+  dumped, where the dump landed, and whether the activity is a developer running tests or
+  an operator staging credential theft.
+type: detection
+detection_id: eb1c4225-1c23-4241-8dd4-051389fde4ce
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-09
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does this DumpMinitool execution match what the rule detects?
+  context: >-
+    Confirm the alert is a true positive before investing time. The rule fires when the
+    process is DumpMinitool.exe / .x86.exe / .arm64.exe (by Image name or by OriginalFileName
+    if renamed) AND at least one of three branches holds: it runs from outside a Visual
+    Studio Extensions path, OR its command line contains a .txt output target, OR it carries
+    a Full / Mini / WithHeap flag without the expected --dumpType switch. Note which branch
+    fired: a binary outside the Visual Studio directory and a missing --dumpType flag both
+    point away from normal test-platform usage and toward hand-crafted invocation.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run DumpMinitool or other memory-dump tooling?
+  context: >-
+    Legitimate DumpMinitool use is tied to Visual Studio test execution and developer
+    workstations. On a server, a domain controller, or a non-developer endpoint, or under
+    an account with no development role, the same execution is far more likely to be an
+    operator using a signed binary to dump process memory. Match the user role and host
+    function against the detected behavior.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:masquerading.true_identity
+  question: What is the actual identity of this binary based on its metadata, path, and hash?
+  context: >-
+    DumpMinitool normally lives under a Visual Studio TestPlatform Extensions directory and
+    is Microsoft-signed. Compare the Image path on disk against OriginalFileName: a copy
+    relocated to a user-writable or unexpected directory, or a file renamed while keeping
+    the DumpMinitool OriginalFileName, indicates the binary was staged deliberately rather
+    than installed by Visual Studio. Submit the hash for reputation lookup and confirm the
+    signature is intact and Microsoft-issued.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - Hashes
+- source: template:credential_access.credential_target_identification
+  question: What process did DumpMinitool target, and was lsass.exe memory dumped?
+  context: >-
+    DumpMinitool takes a target process id and a dump type; pointed at lsass.exe it produces
+    a memory dump that yields credentials when parsed offline. Read the full command line to
+    identify the --processId value (resolve it to the targeted process), the dump type
+    (Full / Mini / WithHeap), and the output file path. Note that the positional arguments
+    are loosely validated, so the operative values are the process id and the output target
+    rather than fixed flag positions. A Full dump of the LSASS process id confirms credential
+    theft intent.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: attack:T1003.001.access_verification
+  question: Did a process open lsass.exe with credential-dump-typical access rights on this host around the alert?
+  context: >-
+    Reading LSASS memory requires opening a handle with broad access rights; masks granting
+    full or memory-read access (such as 0x1FFFFF, 0x1F0FFF, 0x1010, or 0x143A) to lsass.exe
+    from a process that is not a known security tool are the direct signature of credential
+    scraping. Correlate the granting process and timing with the DumpMinitool execution to
+    confirm whether this binary, or a related tool in the same window, actually touched LSASS
+    memory rather than dumping a benign process. If process access events are not collected in
+    this environment, treat zero results as a visibility gap rather than evidence nothing
+    accessed LSASS.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_access
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetImage|endswith: \lsass.exe
+        GrantedAccess|contains:
+          - '0x1FFFFF'
+          - '0x1F0FFF'
+          - '0x1010'
+          - '0x143A'
+      condition: selection
+    fields:
+      - SourceImage
+      - TargetImage
+      - GrantedAccess
+      - CallTrace
+- source: attack:T1003.001.dump_artifact
+  question: What memory dump file did this execution write, and where did it land?
+  context: >-
+    DumpMinitool writes the captured memory to the output path given on its command line
+    (the rule keys on a .txt target). The dump file location distinguishes routine test
+    output from staging for exfiltration: dumps in %TEMP%, C:\Windows\Temp, a user profile,
+    or another user-writable directory, especially under a name unrelated to a crash dump,
+    indicate credential-theft staging. Correlate the file-creation time with the process
+    execution to confirm this process produced the artifact and to bound the credential
+    exposure window.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: template:cue_process_tool.process_chain
+  question: What process spawned DumpMinitool, and is that parent chain expected?
+  context: >-
+    The parent process reveals how the tool was launched. Visual Studio test runs spawn
+    DumpMinitool from the test-platform host process; an invocation from a shell
+    (cmd.exe, powershell.exe), a script host (wscript.exe, mshta.exe), an Office
+    application, or a remote-execution service points to hands-on-keyboard operator activity
+    rather than an IDE workflow. Walk up the tree to see what launched the parent.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:masquerading.binary_origin
+  question: How did this DumpMinitool binary arrive on the host?
+  context: >-
+    A DumpMinitool copy running from outside the Visual Studio Extensions directory did not
+    appear on its own. Tracing the file-creation event for the binary by name reveals the
+    delivery mechanism: a download tool, an archive extraction, a manual copy, a dropper, or
+    lateral movement from another host. The process that created the file (download utility,
+    archiver, remote-admin tool, or a routine Visual Studio installer) is the key tell.
+  range: -30d
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains|expand: '%file_name%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: template:masquerading.renamed_binary_activity
+  question: What did DumpMinitool spawn afterward, and is the same binary present on other hosts?
+  context: >-
+    Examining the child processes launched by this binary reveals follow-on activity such as
+    moving or compressing the dump file, copying it off-host, or running additional tooling.
+    The same binary copy appearing on multiple hosts, particularly outside Visual Studio
+    paths, suggests deliberate distribution of a credential-dumping LOLBIN rather than an
+    isolated developer action.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:credential_access.post_access_lateral_movement
+  question: Were new logon sessions or remote connections initiated on this host after the alert?
+  context: >-
+    Credentials harvested from an LSASS dump are typically used to move to other systems.
+    Follow-on alerts on this host for remote logon, SMB or WinRM activity, or remote-execution
+    tooling shortly after the dump indicate the stolen credentials are already in active use.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - rule.name
+      - rule.uuid
+      - event.severity_label
+- source: template:credential_access.credential_exposure_assessment
+  question: Which accounts may be exposed by this dump, and do any have elevated privileges?
+  context: >-
+    The severity of an LSASS dump depends on which credentials were resident in memory on
+    this host: interactive sessions, service accounts, and cached domain credentials. If a
+    domain administrator, service account with broad rights, or other privileged identity had
+    logged on to this host, those credentials should be treated as compromised and rotated.
+    Cross-reference the host's recent logons against directory group memberships.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in the hour before the alert?
+  context: >-
+    Operators frequently weaken AV/EDR before dumping LSASS so the dump tool and its output
+    are not blocked or flagged. The query surfaces direct attempts to disable protection
+    services, add exclusions, clear logs, or patch AMSI/ETW. Zero rows is a useful
+    "protection looks healthy" signal; populated rows shift the disposition toward operator
+    preparation, so review the writing process and its signing chain.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired this rule's pattern, what parents and users drive it, and does the current alert fit?
+  context: >-
+    The query mirrors the rule's selection structure scoped to this host, so the resulting
+    parent and user distribution reflects how this specific firing pattern (not generic
+    DumpMinitool usage) has historically run here. A new parent process, an unexpected user
+    account, or a first-ever occurrence is the deviation worth chasing; a stable parent/user
+    pattern points to recurring local tooling.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+      - Image|endswith:
+        - \DumpMinitool.exe
+        - \DumpMinitool.x86.exe
+        - \DumpMinitool.arm64.exe
+      - OriginalFileName:
+        - DumpMinitool.exe
+        - DumpMinitool.x86.exe
+        - DumpMinitool.arm64.exe
+      filter_folder:
+        Image|contains:
+        - \Microsoft Visual Studio\
+        - \Extensions\
+      susp_flags:
+        CommandLine|contains: .txt
+      cmd_has_flags:
+        CommandLine|contains:
+        - ' Full'
+        - ' Mini'
+        - ' WithHeap'
+      filter_cmd_misses_flags:
+        CommandLine|contains: --dumpType
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection and ( ( not filter_folder ) or susp_flags or ( cmd_has_flags and not filter_cmd_misses_flags ) )) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired this rule's pattern in the past week, and does the spread look like automation or one-off activity?
+  context: >-
+    The query mirrors the rule's selection structure with no host scope, returning a
+    fleet-wide count of this firing pattern rather than generic DumpMinitool usage. Many
+    hosts firing the same pattern points to scripted deployment or shared build automation;
+    one host or a small unrelated set points to manual operator activity. Use the host
+    distribution and parent/binary consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+      - Image|endswith:
+        - \DumpMinitool.exe
+        - \DumpMinitool.x86.exe
+        - \DumpMinitool.arm64.exe
+      - OriginalFileName:
+        - DumpMinitool.exe
+        - DumpMinitool.x86.exe
+        - DumpMinitool.arm64.exe
+      filter_folder:
+        Image|contains:
+        - \Microsoft Visual Studio\
+        - \Extensions\
+      susp_flags:
+        CommandLine|contains: .txt
+      cmd_has_flags:
+        CommandLine|contains:
+        - ' Full'
+        - ' Mini'
+        - ' WithHeap'
+      filter_cmd_misses_flags:
+        CommandLine|contains: --dumpType
+      condition: selection and ( ( not filter_folder ) or susp_flags or ( cmd_has_flags and not filter_cmd_misses_flags ) )
+    fields:
+    - host.name
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run DumpMinitool or similar memory-dump tooling?
+  context: >-
+    Compare this user's current action against their historical behavior across all hosts. A
+    user who has never run this binary is more suspicious than a developer who runs it as
+    part of routine test work. The user's role should align with using a process-dump tool.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent+binary combination historically routine on this host or across the environment, or is the parent unusual for this binary?
+  context: >-
+    When the alert fires under a service principal, user identity does not attribute the
+    behavior; the meaningful pivot is the launch mechanism. Which parent process spawned
+    DumpMinitool, and is that pair historically common here or environment-wide? A new or
+    rare parent for this binary is the deviation worth chasing; a pair that already accounts
+    for thousands of prior events is build or test automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: >-
+    Tracking the user's activity across all hosts in the surrounding window reveals lateral
+    movement or staging across multiple endpoints. If the same user triggered similar
+    activity elsewhere, the scope of the credential-theft attempt may be larger than this
+    one host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent+binary combination fire on other hosts in the same window, or is the activity isolated to this host?
+  context: >-
+    Under a service principal, asking what else the user did across the network returns
+    agent-telemetry noise. The meaningful question is whether the same launch mechanism (the
+    parent process spawning DumpMinitool) fired on other hosts in the alert window. Multiple
+    hosts in the same window points to scheduled or pushed automation; a single host points
+    to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1003.001
+      name: LSASS Memory
+      role: primary
+    - id: T1036
+      name: Masquerading
+      role: secondary
+    - id: T1003
+      name: OS Credential Dumping
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: binary_staging_identity
+      description: "DumpMinitool (signed Microsoft LOLBIN) is run, often relocated/renamed, from outside its Visual Studio Extensions path"
+      mapped_to: Q3
+      source: template:masquerading.true_identity
+    - stage: 2
+      label: lsass_handle_access
+      description: "A process opens lsass.exe with full memory-read access (0x1F0FFF) to scrape credentials"
+      mapped_to: Q5
+      source: attack:T1003.001.access_verification
+    - stage: 3
+      label: dump_command_execution
+      description: "DumpMinitool is pointed at a target process id with a dump type, producing a memory dump"
+      mapped_to: Q4
+      source: template:credential_access.credential_target_identification
+    - stage: 4
+      label: dump_file_written
+      description: "The captured memory is written to an output file (rule keys on .txt target)"
+      mapped_to: Q6
+      source: attack:T1003.001.dump_artifact
+  dimension_coverage:
+    - dimension: execution_context
+      technique: T1036
+      covered_by: Q3
+      source: template:masquerading.true_identity
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1003.001
+      covered_by: Q6
+      source: attack:T1003.001.dump_artifact
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1003.001
+      covered_by: Q6
+      source: attack:T1003.001.dump_artifact
+      coverage_type: direct
+    - dimension: access_verification
+      technique: T1003.001
+      covered_by: Q5
+      source: attack:T1003.001.access_verification
+      coverage_type: direct
+    - dimension: command_analysis
+      technique: T1003.001
+      covered_by: Q4
+      source: template:credential_access.credential_target_identification
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1003.001
+      covered_by: Q7
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+  mutable_dispositions:
+    - element: AccessMask
+      dimension: access_verification
+      specific_values: "0x1F0FFF (also 0x1FFFFF, 0x1010, 0x143A)"
+      disposition: new_question
+      target_question: Q5
+      notes: "process_access question selects lsass.exe TargetImage AND GrantedAccess masks granting full/memory-read access; these handles are the credential-scrape signature."
+    - element: DumpFilePath
+      dimension: tuning_parameter
+      specific_values: "%TEMP%, C:\\Windows\\Temp, user-writable paths; rule keys on .txt output"
+      disposition: new_question
+      target_question: Q6
+      notes: "file_event question surfaces the dump output location and ties its creation time to the execution."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "~5 minutes between LSASS access and dump file creation"
+      disposition: new_question
+      target_question: Q6
+      notes: "dump_artifact and access_verification both scoped to +/-5m to correlate execution, LSASS access, and dump file write."
+    - element: CommandLinePattern
+      dimension: command_analysis
+      specific_values: "rundll32, procdump, comsvcs.dll, Invoke-Mimikatz (generic dumping syntax)"
+      disposition: context
+      target_question: Q4
+      notes: "Rule targets DumpMinitool specifically; the generic dumping-syntax list is rationale, not injected. Q4 decodes the DumpMinitool processId/dumpType/output args directly."
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "allowlist known AV/EDR tools accessing lsass.exe"
+      disposition: context
+      target_question: Q7
+      notes: "Parent legitimacy assessed in process_chain question; tuning allowlist is rationale."
+    - element: OriginalFilenameMismatch
+      dimension: tuning_parameter
+      specific_values: "compare Image basename against PE OriginalFilename"
+      disposition: context
+      target_question: Q3
+      notes: "true_identity question compares Image path against OriginalFileName directly."
+    - element: KnownSystemUtilityPaths
+      dimension: tuning_parameter
+      specific_values: "expected install dirs for signed binaries (Visual Studio Extensions path)"
+      disposition: context
+      target_question: Q3
+      notes: "Visual Studio Extensions path is the expected-location anchor in true_identity and binary_origin context."
+  dedup_decisions:
+    - dropped: cue_user_actor.baseline + cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable (subject vs. launch-mechanism pivot); emit both per AGENTS.md"
+      kept: both
+    - dropped: cue_user_actor.clustering + cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable (subject vs. launch-mechanism pivot); emit both per AGENTS.md"
+      kept: both
+    - dropped: cue_host_context.clustering
+      reason: "host activity-around-alert is covered by cue_user_actor.clustering (user network-wide) and cue_process_tool.baseline_deviation (host firing pattern); dropped to stay within the 18-question cap"
+      kept: cue_user_actor.clustering
+    - dropped: cue_host_context.precursor
+      reason: "prior-alert context on this host is carried by universal.endpoint_protection_health (tamper-as-precursor, the live question for a credential-access rule) plus credential_access.post_access_lateral_movement; dropped to stay within the 18-question cap"
+      kept: universal.endpoint_protection_health
+  skipped_templates:
+    - template: cue_process_tool.mechanism_decode
+      reason: "replaced_by: credential_access.credential_target_identification (Q4) — more specific for LSASS dumping"
+  hint_dispositions:
+    - hint: "logsource 'registry_set' (recommended by techniques: T1003.001) is not covered — pull in cue_registry_key.* or author a custom question with `category: registry_set`"
+      disposition: declined
+      reason: >-
+        The registry_set recommendation comes from the broad T1003.001 analytic that covers
+        multiple credential-store techniques (e.g., reg save of SAM/SYSTEM/SECURITY hives).
+        DumpMinitool's mechanism is a process-memory dump written to a file, not a registry
+        operation; the rule constrains the behavior to a .txt dump output and dump-type flags.
+        The dump artifact is covered by Q6 (attack:T1003.001.dump_artifact, file_event). No
+        registry write is part of this rule's detection or this technique's DumpMinitool path,
+        so no compensating registry_set question was authored.
+    - hint: "logsource 'security' (recommended by techniques: T1003.001) is not covered and no template family exists — author a custom question with `category: security`"
+      disposition: declined
+      reason: >-
+        The security-channel recommendation maps to handle/object-access auditing
+        (EventCode 4663/4656/4673) of lsass.exe. That access-verification dimension is already
+        covered by Q5 (attack:T1003.001.access_verification) using the process_access logsource,
+        which is the more reliable source for the 0x1F0FFF LSASS handle in this environment and
+        does not depend on SACL audit policy being enabled. No separate security-channel question
+        was authored.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - credential_access
+    - masquerading
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 16
+      attack: 2
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 2
+      context: 14
+    logsource_diversity:
+      process_creation: 13
+      process_access: 1
+      file_event: 2
+      sigma_alert: 2

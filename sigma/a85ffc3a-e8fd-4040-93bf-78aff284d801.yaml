@@ -1,0 +1,449 @@
+name: Use Of The SFTP.EXE Binary As A LOLBIN
+id: cd75f52c-9768-4c8f-b790-17b423824d38
+description: |
+  Detects sftp.exe (the OpenSSH client shipped with Windows) invoked with the
+  -D flag pointing at a local path, which causes sftp.exe to launch the
+  referenced executable as its SFTP server subsystem. The rule fires when the
+  process Image ends in sftp.exe AND the command line contains ' -D ..' or
+  ' -D C:\'. This is a proxy-execution pattern: a Microsoft-signed binary is
+  used to start an attacker-chosen executable, so process ancestry attributes
+  the activity to sftp.exe rather than the payload. Legitimate use is rare;
+  investigate which executable was launched, the parent that spawned sftp.exe,
+  and whether the host normally runs this pattern.
+type: detection
+detection_id: a85ffc3a-e8fd-4040-93bf-78aff284d801
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line show sftp.exe invoked with a -D flag pointing at a local executable path?
+  context: Confirm the alert is a true positive by reading the exact command line and process details. The rule fires when the Image ends in sftp.exe and the command line contains ' -D ..' or ' -D C:\'. The path that follows -D is the executable sftp.exe will start as its subsystem; note its full path and name.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run sftp.exe with a -D subsystem argument?
+  context: Interactive SFTP use normally connects to a remote host and does not pass -D with a local path. Knowing whether the user role and host function involve OpenSSH file transfers helps distinguish routine activity from proxy execution of an unrelated binary.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What executable does the -D argument point to, and what is the full command sftp.exe ran?
+  context: The -D value is the path sftp.exe launches as its SFTP server subsystem -- the actual payload of the proxy-execution pattern. Decode the full command line and identify the referenced executable, its directory, and any arguments. A path under a user-writable or temporary directory, or a renamed binary, raises the concern that this is operator-supplied rather than a real SFTP server.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: attack:T1218.command_analysis
+  question: Does the -D argument reference a URL, script path, DLL entrypoint, or other content not characteristic of a legitimate SFTP server binary?
+  context: Proxy-execution abuse uses the trusted binary's arguments to point at attacker-controlled content. Examine the argument for indicators such as an HTTP/HTTPS URL, a scripting host invocation, a path to a DLL entrypoint, or an executable in a staging directory. Legitimate sftp.exe usage targets a remote endpoint, not a local executable supplied via -D.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith: \sftp.exe
+        CommandLine|contains:
+        - ' -D ..'
+        - ' -D C:\'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:cue_artifact.mechanism_decode
+  question: Confirm the executable launched via -D -- check its file size, hash, signing status, and strings to determine whether it is a known tool or a renamed or planted binary.
+  context: The path referenced by -D is the executable sftp.exe started. Retrieve that file and analyze its content -- signing chain, embedded strings, imports, and packer signatures. A signed, recognized utility is a different disposition than an unsigned or renamed binary sitting in a user-writable directory. Content retrieval requires manual collection from the endpoint.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: template:cue_artifact.artifact_verification
+  question: What is the hash of the executable launched via -D, and does it have known threat-intel detections?
+  context: A file hash is a unique identifier for reputation lookup. Submit the hash of the -D-referenced executable to a threat-intelligence service to determine whether it is known malicious, known benign, or previously unseen. This is distinct from reading the file's content -- it answers whether the binary is already known.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Hashes
+- source: template:universal.evidence_preservation
+  question: Is the executable referenced by -D still present on disk for analysis?
+  context: If the -D-referenced executable still exists on disk, it can be hashed, submitted for analysis, or reviewed directly. If it has been removed, file-event records may still capture its prior existence and the process that wrote it.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: template:cue_process_tool.process_chain
+  question: What process spawned sftp.exe and is that parent chain expected?
+  context: The parent process reveals how sftp.exe was invoked. A launch from explorer.exe or a terminal during interactive use differs from a launch by a script host, an Office application, or another LOLBIN. An unexpected parent for an OpenSSH client invoked with a local -D path points toward scripted or operator-driven proxy execution.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: attack:T1218.parent_process_analysis
+  question: Across this host, which parent processes have launched sftp.exe, and does the alerting parent stand out as unusual for this binary?
+  context: Proxy-execution abuse often shows an unexpected parent-child relationship -- a signed binary spawned by something that does not normally launch it. Profiling the parents of sftp.exe on this host establishes the routine launch mechanisms so the alerting parent can be judged against them.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - ParentImage
+- source: template:cue_process_tool.follow_on
+  question: What child processes did sftp.exe spawn afterward?
+  context: The processes started by sftp.exe reveal the actual effect of the -D invocation. The referenced executable, and anything it launches in turn -- cmd.exe, powershell.exe, certutil.exe, or other tooling -- show whether this was a benign subsystem start or the entry point of a longer execution chain.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.baseline
+  question: Does this host normally run sftp.exe at all?
+  context: A binary that has never been seen on a host is more notable than one that runs regularly. Zero or very low historical counts for sftp.exe indicate first-time or rare execution, which sharpens the concern that the -D invocation is not part of routine operations.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously run sftp.exe with a -D local path, what parents and users drove it, and does the current alert fit that pattern?
+  context: The query mirrors the rule's selection scoped to this host, so the resulting parent and user distribution reflects how this specific firing pattern -- not generic sftp.exe usage -- has historically run here. A new parent process, an unexpected user, or an unusual command shape relative to that history is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \sftp.exe
+        CommandLine|contains:
+        - ' -D ..'
+        - ' -D C:\'
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run sftp.exe at all?
+  context: Compare this user's current action against their historical behavior. A user who has never run sftp.exe is more notable than one who does so regularly. User role and typical toolset should align with OpenSSH file-transfer activity.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent and sftp.exe combination historically routine on this host or across the environment, or is the parent unusual for this binary?
+  context: When the alert fires under a service principal, user identity does not attribute the behavior; the launch mechanism does. A parent that already accounts for many prior sftp.exe events is automation or routine operations, while a new or rare parent for this binary is the deviation worth chasing.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints. If the same user triggered similar activity elsewhere, the scope of the activity may be larger than this single host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent and sftp.exe combination fire on other hosts in the same window -- a coordinated rollout, or activity isolated to this host?
+  context: Under a service principal, user-scoped activity returns agent-telemetry noise. The meaningful question is whether the same launch mechanism -- parent process plus spawned binary -- fired on other hosts in the alert window. Multiple hosts point to scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_process_tool.scope
+  question: Have other hosts run sftp.exe with a -D local path in the past week, and does the distribution look like automation or one-off activity?
+  context: The query mirrors the rule's selection with no host scope, giving a fleet-wide count of this firing pattern rather than generic sftp.exe usage. Many hosts running the same pattern points to scripted deployment or vendor automation; one host or a small unrelated set points to manual operator activity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \sftp.exe
+        CommandLine|contains:
+        - ' -D ..'
+        - ' -D C:\'
+      condition: selection
+    fields:
+    - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host -- defense tampering, reconnaissance, or credential access -- may reveal the stages that preceded this event and help reconstruct the timeline around the proxy execution.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1218
+      name: System Binary Proxy Execution
+      role: primary
+  attack_chain_coverage:
+    - stage: 1
+      label: trusted_binary_invocation
+      description: "sftp.exe (Microsoft-signed) is invoked with a -D flag pointing at a local executable path"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: argument_payload_identification
+      description: "The -D argument references the executable sftp.exe launches as its subsystem"
+      mapped_to: Q3
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 3
+      label: payload_execution
+      description: "The referenced executable runs as a child of sftp.exe and may spawn further processes"
+      mapped_to: Q10
+      source: template:cue_process_tool.follow_on
+  dimension_coverage:
+    - dimension: command_analysis
+      technique: T1218
+      covered_by: Q4
+      source: attack:T1218.command_analysis
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1218
+      covered_by: Q9
+      source: attack:T1218.parent_process_analysis
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1218
+      covered_by: Q17
+      source: template:cue_process_tool.scope
+      coverage_type: indirect
+  mutable_dispositions:
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "rationale only"
+      disposition: new_question
+      target_question: Q9
+      notes: "Parent-child profiling for sftp.exe authored as attack:T1218.parent_process_analysis; process_chain (Q8) covers the immediate parent"
+    - element: SignedBinaryList
+      dimension: tuning_parameter
+      specific_values: "rationale only (msiexec.exe, regsvr32.exe etc. are examples, not values for this rule which fixes Image to sftp.exe)"
+      disposition: context
+      target_question: Q4
+      notes: "Rule already constrains the trusted binary to sftp.exe; allow-list framing captured in command_analysis context"
+    - element: CommandLineRegex
+      dimension: command_analysis
+      specific_values: "rationale only (URLs, script paths, DLL entrypoints)"
+      disposition: new_question
+      target_question: Q4
+      notes: "Argument-content examination authored as attack:T1218.command_analysis; query enforces the rule's -D pattern, prose describes the suspicious-content categories"
+    - element: RemoteDomainAllowlist
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q4
+      notes: "Network-connection allow-list tuning; this rule's detection is process_creation-only with a local -D path, so the domain allowlist is a tuning rationale, not a queryable value here"
+  dedup_decisions:
+    - dropped: cue_process_tool.clustering
+      reason: "host-wide Image aggregation around the alert time overlaps cue_user_actor.clustering (user-pivot, same window) without adding a distinct angle; dropped to stay within the 18-question cap"
+      kept: cue_user_actor.clustering
+    - dropped: cue_host_context.clustering
+      reason: "around-the-time host activity (Image+ParentImage aggregation) overlaps cue_user_actor.clustering and the precursor prior-alert sweep; dropped to stay within the 18-question cap while keeping the user-pivot and prior-alert context"
+      kept: cue_host_context.precursor
+    - dropped: cue_user_actor.baseline_svc + cue_user_actor.baseline (user_actor pair)
+      reason: "user_actor pair -- non-deduplicable; both Q13 (user-pivot) and Q14 (parent+binary substitute) emitted per AGENTS.md"
+      kept: both
+    - dropped: cue_user_actor.clustering_svc + cue_user_actor.clustering (user_actor pair)
+      reason: "user_actor pair -- non-deduplicable; both Q15 (user-pivot) and Q16 (parent+binary substitute) emitted per AGENTS.md"
+      kept: both
+  skipped_templates:
+    - template: cue_artifact.baseline
+      reason: "file_event baseline of the -D-referenced executable overlaps evidence_preservation (Q7) and artifact_verification (Q6); the -D payload is identified from the CommandLine, and first-seen file presence is already addressed without a third file_event aggregation"
+    - template: universal.endpoint_protection_health
+      reason: "generic host-tamper sweep is RECOMMENDED, not must_include; this rule fires on a single proxy-execution event with no tamper-as-precursor question driving disposition, and cue_host_context.precursor (Q18) already surfaces prior tamper alerts on the host. Dropped to keep within the 18-question cap"
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "logsource 'image_load' (recommended by techniques: T1218) is not covered -- pull in cue_image_load.* or author a custom question with category: image_load"
+      disposition: declined
+      reason: >-
+        T1218's image_load analytic targets DLL-loading proxy binaries
+        (rundll32.exe, regsvr32.exe loading a module). This rule's specific
+        mechanism is sftp.exe launching a standalone executable via -D, which
+        manifests as a process_creation child, not a DLL load into sftp.exe.
+        The payload-execution stage is covered by Q10 (follow_on) and Q4
+        (command_analysis) via process_creation evidence. No compensating
+        attack:T1218.image_load question authored because the launched payload
+        is a process, not a loaded module.
+    - hint: "logsource 'network_connection' (recommended by techniques: T1218) is not covered -- pull in cue_network_endpoint.* or author a custom question with category: network_connection"
+      disposition: declined
+      reason: >-
+        The rule's detection constrains -D to a LOCAL path (' -D ..' or
+        ' -D C:\'), so the proxy-execution payload is read from disk, not
+        retrieved over the network at sftp.exe invocation. Q4
+        (command_analysis) directs the analyst to inspect the argument for a
+        URL should one appear, and Q10 (follow_on) surfaces any network-capable
+        child process. No standalone network_connection question authored
+        because this rule's firing pattern is local-file proxy execution.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 16
+      attack: 2
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 4
+      context: 12
+    logsource_diversity:
+      process_creation: 14
+      file_event: 3
+      sigma_alert: 1

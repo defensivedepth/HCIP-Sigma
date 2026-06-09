@@ -1,0 +1,534 @@
+name: IIS WebServer Log Deletion via CommandLine Utilities
+id: 5da77d7d-c8f4-4da1-8afb-862cc53a80a3
+description: |
+  Detects a command interpreter (cmd.exe, powershell.exe, powershell_ise.exe, or pwsh.exe) running a
+  file-deletion command (del, erase, rm, remove-item, or rmdir) whose command line references the IIS log
+  directory path \inetpub\logs\. Administrators legitimately prune IIS logs as part of disk-retention
+  maintenance, often via scripted cleanup of files older than a set age. The same deletion is abused after
+  web-application exploitation to destroy the request logs that would record the initial access, so the
+  investigation should determine whether the deletion was scheduled/scripted maintenance or an interactive
+  removal that followed suspicious server activity, and whether the deleted logs can be recovered.
+type: detection
+detection_id: 0649be4a-aeb0-45b0-b89e-7f1668f6d9c0
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line match what this rule detects — a shell running a delete command against the IIS log path?
+  context: Confirm the alert is a true positive before investing time. The rule fires only when all three conditions hold together —
+    the process is cmd.exe, powershell.exe, powershell_ise.exe, or pwsh.exe; the command line contains a deletion verb (del,
+    erase, rm, remove-item, or rmdir); and the command line references the \inetpub\logs\ directory. Read the full command line
+    and confirm all three are present and that the target path is the real IIS log directory rather than an incidental string match.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to delete IIS log files from the command line?
+  context: IIS log pruning is a routine maintenance task, but it is normally performed by a scheduled job or a known
+    administrative account rather than an interactive deletion. Knowing whether this host is an IIS web server and whether
+    the user account is one that performs log maintenance is often the fastest way to separate routine cleanup from
+    anti-forensic deletion following a web-application compromise.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:defense_tampering.what_was_disabled
+  question: Which IIS log files or subfolders were targeted for deletion, and was it a single file, a date range, or the whole log directory?
+  context: The deletion scope determines impact. Removing a single recent log file points at hiding one event, while wiping
+    an entire date range or the full \inetpub\logs\ tree points at broad anti-forensic destruction. Parse the command line for
+    wildcards, recursive flags (rmdir /s, Remove-Item -Recurse), specific W3SVC site subfolders, and date or age filters to
+    establish exactly what evidence was destroyed.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:cue_artifact.artifact_verification
+  question: Can the deleted IIS logs be recovered, and is there another copy of the request records elsewhere?
+  context: The deleted artifact is the IIS request log itself, which is the primary record of who accessed the web
+    application. Check whether the files can be restored from Volume Shadow Copies, backups, or a forwarded log copy, and
+    whether IIS logging was configured to write to a remote system or central collector. Recovering even a partial log window
+    around the deletion may reveal the web requests the deletion was meant to erase.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains|expand: '%file_dirs%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: template:universal.evidence_preservation
+  question: Are any of the referenced IIS log files still on disk, or were file-delete events recorded for them?
+  context: If the deletion command did not fully succeed, or if only specific files were targeted, some IIS log files may
+    remain on disk for direct analysis. File events for the \inetpub\logs\ path confirm which files were created or removed
+    and when, providing a timeline of the log directory's contents around the deletion.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains|expand: '%file_dirs%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: template:cue_process_tool.process_chain
+  question: What process spawned this shell, and is that parent chain expected for IIS log maintenance?
+  context: The parent process reveals how the deletion was invoked. Scheduled maintenance typically descends from
+    taskeng.exe or svchost.exe (Task Scheduler) or from cscript.exe running a retention script. An interactive parent such as
+    explorer.exe, a remote-shell tool, or a web-server worker process (w3wp.exe) spawning the deletion points toward
+    hands-on activity rather than a scheduled cleanup job.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired this deletion pattern, what parents and users normally drive it, and does the current alert fit?
+  context: Even routine IIS log cleanup leaves a stable signature on a given host — the same scheduled-task parent and the
+    same maintenance account. The query mirrors the rule's selection structure scoped to this host, so the resulting
+    parent and user distribution reflects how this specific deletion pattern has historically run here. A new parent process,
+    an unexpected account, or an unusual command shape is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \cmd.exe
+        - \powershell_ise.exe
+        - \powershell.exe
+        - \pwsh.exe
+      - OriginalFileName:
+        - cmd.exe
+        - powershell.exe
+        - powershell_ise.exe
+        - pwsh.dll
+      selection_cli_del:
+        CommandLine|contains:
+        - 'del '
+        - 'erase '
+        - 'rm '
+        - 'remove-item '
+        - 'rmdir '
+      selection_cli_iis_dir:
+        CommandLine|contains: \inetpub\logs\
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired this IIS log deletion pattern in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, returning a fleet-wide count of this specific
+    deletion pattern rather than generic shell usage. Many hosts running the same pattern points to a scripted retention job
+    pushed across the IIS fleet; a single host or a small unrelated set points to manual operator activity. Use the host
+    distribution and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \cmd.exe
+        - \powershell_ise.exe
+        - \powershell.exe
+        - \pwsh.exe
+      - OriginalFileName:
+        - cmd.exe
+        - powershell.exe
+        - powershell_ise.exe
+        - pwsh.dll
+      selection_cli_del:
+        CommandLine|contains:
+        - 'del '
+        - 'erase '
+        - 'rm '
+        - 'remove-item '
+        - 'rmdir '
+      selection_cli_iis_dir:
+        CommandLine|contains: \inetpub\logs\
+      condition: all of selection_*
+    fields:
+    - host.name
+- source: template:cue_process_tool.clustering
+  question: What other tools ran on this host around the same time as the log deletion?
+  context: Anti-forensic log deletion rarely happens in isolation. Activity surrounding the deletion may reveal the web-shell
+    or exploitation tooling that preceded it, reconnaissance, credential access, or staging. A cluster of unfamiliar tools in
+    the same window broadens the investigation beyond the single deletion event.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+- source: template:cue_user_actor.baseline
+  question: Does this user normally delete IIS logs or run shell-based file deletion on web servers?
+  context: Compare this user's current action against their historical behavior. An account that has never performed
+    command-line log deletion is more suspicious than a maintenance account that does so on a regular schedule. The user's
+    role should align with IIS administration if this is legitimate maintenance.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent and shell combination historically routine on this host or across the environment, or is the parent unusual for it?
+  context: When the alert fires under a service principal or computer account, user identity does not attribute behavior. The
+    meaningful pivot is the launch mechanism — which parent process spawned the shell, and whether that pair is historically
+    common. A new or rare parent for this shell is the deviation worth chasing; a pair that already accounts for many prior
+    events is scheduled maintenance or OS automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or parallel activity on multiple endpoints.
+    If the same account triggered similar deletions or other suspicious activity on other web servers, the scope of the
+    incident may be larger than a single host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent and shell combination fire on other hosts in the same window — a coordinated rollout, or isolated to this host?
+  context: Under a service principal, asking what else the user did across the network returns agent-telemetry noise because
+    every host runs system-owned agents constantly. The meaningful question is whether the same launch mechanism — parent
+    process and spawned shell — fired on other hosts in the alert window. Multiple hosts in the same window points to
+    scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:defense_tampering.activity_after_tampering
+  question: What activity occurred on this host after the IIS logs were deleted?
+  context: Log deletion is often the cleanup phase of an intrusion. Examining process activity immediately after the deletion
+    reveals whether the operator continued with additional destruction, persistence, or data staging once the request
+    records were gone. A gap in IIS logging followed by further process creation in that window points to the activity the
+    deletion was meant to obscure.
+  range: +1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - User
+- source: template:defense_tampering.other_tampering_activity
+  question: Were other defense tampering or log clearing actions performed on this host?
+  context: An operator who deletes IIS request logs often clears other evidence as well — wiping Windows event logs,
+    deleting shadow copies, or disabling endpoint protection. Finding multiple tampering events from the same user or parent
+    process indicates a deliberate anti-forensic effort spanning several controls rather than an isolated log cleanup.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_tamper:
+        Image|endswith:
+          - '\wevtutil.exe'
+          - '\vssadmin.exe'
+          - '\bcdedit.exe'
+          - '\wbadmin.exe'
+          - '\netsh.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\powershell.exe'
+        CommandLine|contains:
+          - 'cl '
+          - 'clear-log'
+          - 'delete shadows'
+          - 'recoveryenabled'
+          - 'DisableRealtimeMonitoring'
+          - 'advfirewall'
+          - 'stop'
+          - 'delete'
+      condition: selection and selection_tamper
+    fields:
+      - Image
+      - User
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Anti-forensic log deletion typically follows the activity it is meant to hide. Earlier detections on the same host
+    — web-application exploitation, web-shell execution, reconnaissance, or credential access — may reveal the intrusion
+    stages that preceded the deletion and help reconstruct the timeline the deleted logs would otherwise show.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1070
+      name: Indicator Removal
+      role: primary
+  attack_chain_coverage:
+    - stage: 1
+      label: suspicious_precursor_activity
+      description: "Suspicious process activity / web-application exploitation precedes the indicator removal"
+      mapped_to: Q16
+      source: template:cue_host_context.precursor
+    - stage: 2
+      label: log_deletion_execution
+      description: "Actor runs a shell deletion command against the IIS log directory to remove request records"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 3
+      label: deletion_scope_and_recovery
+      description: "Identify which log files were destroyed and whether the evidence can be recovered"
+      mapped_to: Q3
+      source: template:defense_tampering.what_was_disabled
+    - stage: 4
+      label: post_removal_activity
+      description: "Activity following the deletion that the log removal was meant to obscure"
+      mapped_to: Q14
+      source: template:defense_tampering.activity_after_tampering
+  dimension_coverage:
+    - dimension: file_path_analysis
+      technique: T1070
+      covered_by: Q3
+      source: template:defense_tampering.what_was_disabled
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1070
+      covered_by: Q16
+      source: template:cue_host_context.precursor
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1070
+      covered_by: Q3
+      source: template:defense_tampering.what_was_disabled
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1070
+      covered_by: Q2
+      source: template:universal.host_user_context
+      coverage_type: direct
+  mutable_dispositions:
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only (correlate removal within X mins after precursor activity)"
+      disposition: context
+      target_question: Q16
+      notes: "No specific threshold given; precursor (-6h) and activity_after_tampering (+1h) bracket the correlation window in context."
+    - element: TargetFilePathPattern
+      dimension: tuning_parameter
+      specific_values: "\\inetpub\\logs\\ (the IIS log directory the rule already targets)"
+      disposition: context
+      target_question: Q3
+      notes: "Path pattern is the rule's own selection_cli_iis_dir; surfaced in what_was_disabled context and in the file_event recovery/preservation queries via %file_dirs%."
+  dedup_decisions:
+    - dropped: cue_process_tool.mechanism_decode
+      reason: "replaced_by: defense_tampering.what_was_disabled — recorded in skipped_templates"
+      kept: defense_tampering.what_was_disabled
+    - dropped: cue_process_tool.baseline
+      reason: "generic host+binary 90d baseline subsumed by the host_pattern reflected baseline_deviation, which scopes to the rule's actual deletion pattern rather than all shell usage"
+      kept: cue_process_tool.baseline_deviation
+    - dropped: cue_process_tool.follow_on
+      reason: "host+binary forward child-process query overlaps defense_tampering.activity_after_tampering, which covers post-deletion host activity"
+      kept: defense_tampering.activity_after_tampering
+    - dropped: cue_artifact.baseline
+      reason: "90d file_event baseline of the deleted log is uninformative — IIS logs rotate constantly by design; recoverability (artifact_verification) and on-disk presence (evidence_preservation) are the load-bearing artifact questions"
+      kept: cue_artifact.artifact_verification
+    - dropped: cue_host_context.clustering
+      reason: "host-scoped +/-15m process clustering duplicates cue_process_tool.clustering, which already provides the around-the-time tool view"
+      kept: cue_process_tool.clustering
+    - dropped: cue_user_actor.baseline
+      reason: "user_actor pair — non-deduplicable; emitted alongside baseline_svc substitute"
+      kept: cue_user_actor.baseline
+    - dropped: cue_user_actor.clustering
+      reason: "user_actor pair — non-deduplicable; emitted alongside clustering_svc substitute"
+      kept: cue_user_actor.clustering
+  skipped_templates:
+    - template: cue_process_tool.mechanism_decode
+      reason: "replaced_by: defense_tampering.what_was_disabled"
+    - template: cue_artifact.mechanism_decode
+      reason: "Content-analysis of the deleted file is impossible — the artifact is an IIS request log that has been deleted, not a payload to read. The investigative angle is recovery, covered by artifact_verification (reframed to recoverability) and evidence_preservation."
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "defense_tampering → persistence_scope cascade activated"
+      disposition: declined
+      reason: >-
+        persistence_scope questions (process_based_persistence, file_based_persistence) were not included.
+        This rule detects anti-forensic IIS log deletion (T1070, defense-evasion), not persistence
+        installation — applicability.is_persistence_rule is false and the detection has no persistence
+        tooling or autostart-path indicators. The defense_tampering set (what_was_disabled,
+        activity_after_tampering, other_tampering_activity) is the directly applicable cascade member and
+        is fully applied; the persistence-scoping branch investigates a behavior absent from this alert.
+    - hint: "File paths derived from CommandLine — use %file_paths% placeholder"
+      disposition: declined
+      reason: >-
+        The two file_event queries (artifact_verification recovery, evidence_preservation) use %file_dirs%
+        with TargetFilename|contains|expand instead of %file_paths%. The rule's selection_cli_iis_dir matches
+        the IIS log DIRECTORY (\inetpub\logs\), not a specific filename, so a |contains match on the derived
+        directory is the correct scope; %file_paths% with |endswith would miss the per-file log names under
+        that directory. The %file_dirs% directory placeholder is the right derivation here.
+    - hint: "powershell.encoded_command_decode replaces obfuscation.encoded_payload_decode"
+      disposition: declined
+      reason: >-
+        Both powershell encoding/obfuscation questions are out of scope for this rule. The rule fires on a
+        plaintext deletion command (del/erase/rm/remove-item/rmdir against \inetpub\logs\), not on
+        -EncodedCommand or obfuscated payload execution. There is no encoded payload to decode; the full
+        command is already human-readable in verify_trigger_match and what_was_disabled.
+    - hint: "logsource 'file_delete' (recommended by techniques: T1070) is not covered — pull in cue_artifact.* or author a custom question with `category: file_delete`"
+      disposition: declined
+      reason: >-
+        The deleted-artifact investigation is covered via file_event queries on the \inetpub\logs\ directory
+        (artifact_verification reframed to recoverability, and evidence_preservation) using %file_dirs%.
+        file_delete (Sysmon EID 23) would add the precise deletion record, but file_event already surfaces
+        the create/delete activity for that path and the analyst pivot is recovery, not detecting the delete
+        a second time after process_creation already fired the rule. No file_delete template family is wired
+        for process_creation-derived rules, so a custom question would duplicate the recovery angle.
+    - hint: "logsource 'registry_set' (recommended by techniques: T1070) is not covered — pull in cue_registry_key.* or author a custom question with `category: registry_set`"
+      disposition: declined
+      reason: >-
+        This rule detects file deletion of IIS logs only — there is no registry indicator in its detection
+        logic. registry_set covers the registry-key-removal flavor of T1070, which is a different artifact
+        class the rule does not target. Adding a registry_set question would investigate an indicator type
+        absent from this alert.
+    - hint: "logsource 'security' (recommended by techniques: T1070) is not covered and no template family exists — author a custom question with `category: security`"
+      disposition: declined
+      reason: >-
+        Security-channel coverage of indicator removal (e.g., 1102 log-clear) is addressed at the analyst
+        level by other_tampering_activity (surfaces wevtutil/Clear-EventLog and related log-clearing tools
+        on the host) and by the precursor sigma-alert sweep. The rule itself fires on IIS file deletion via
+        process_creation; a Security-channel 1102 question would investigate Windows event-log clearing,
+        which is a parallel tampering action already captured by other_tampering_activity rather than this
+        rule's specific behavior.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - defense_tampering
+  generation_stats:
+    total_questions: 16
+    source_counts:
+      template: 16
+      attack: 0
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 2
+      context: 12
+    logsource_diversity:
+      process_creation: 13
+      file_event: 2
+      sigma_alert: 1

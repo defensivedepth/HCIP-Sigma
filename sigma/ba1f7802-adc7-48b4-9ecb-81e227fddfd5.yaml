@@ -1,0 +1,489 @@
+name: Potential Network Sniffing Activity Using Network Tools
+id: 2028009d-bff6-42be-94d0-0753b0165b0d
+description: |
+  Detects execution of packet-capture tools by matching EITHER tshark.exe with an interface-selection flag (-i) OR windump.exe by name. Either branch alone satisfies the rule. These tools place a network interface into capture mode to read traffic in transit, which administrators use to troubleshoot connectivity and which an operator can use to passively collect credentials, session tokens, or other data crossing the wire. Determine whether the capture was started by an expected user and parent, what interface and filter were specified, and whether the activity sits alongside reconnaissance, privilege changes, or follow-on use of captured data.
+type: detection
+detection_id: ba1f7802-adc7-48b4-9ecb-81e227fddfd5
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the alerting event match either the tshark capture pattern or the windump pattern this rule detects?
+  context: >-
+    Confirm the alert is a true positive before investing further. The rule fires when EITHER tshark.exe ran with an
+    interface-selection flag (-i) OR windump.exe ran by name. Note which branch fired: the tshark branch carries an explicit
+    capture-interface argument worth reading, while the windump branch matches on binary name alone. Review the full Image
+    path and CommandLine against these criteria.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run packet-capture tools?
+  context: >-
+    Network and IT staff legitimately run capture utilities for troubleshooting; standard users and most servers do not.
+    Knowing whether the user role and host function are consistent with packet capture is often the fastest way to separate
+    routine administration from passive data collection by an operator.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:credential_access.credential_target_identification
+  question: What interface and capture filter did the command specify, and could the traffic expose credentials?
+  context: >-
+    Read the full command line to determine what was captured. For the tshark branch the -i argument names the target
+    interface and any capture or display filter narrows the traffic; an unfiltered capture on a busy segment can record
+    authentication exchanges, session tokens, and cleartext protocols. For the windump branch, examine the BPF expression and
+    any output-file (-w) argument that would write captured packets to disk for later extraction. The scope of the capture
+    determines which credentials or data may be exposed.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:cue_process_tool.process_chain
+  question: What process spawned this capture tool and is that parent chain expected?
+  context: >-
+    The parent process reveals how the capture was launched. Interactive administration usually shows explorer.exe or a shell
+    as the parent; capture tools spawned by script interpreters (wscript.exe, mshta.exe), Office applications, or remote-execution
+    services such as wmiprvse.exe point to automated or operator-driven collection rather than hands-on troubleshooting.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.follow_on
+  question: What child processes did this capture tool spawn afterward?
+  context: >-
+    A capture tool that spawns command interpreters, archivers, or transfer utilities suggests the captured data is being
+    processed or exfiltrated rather than read interactively. Unexpected children (cmd.exe, powershell.exe, certutil.exe, compression
+    utilities) indicate the capture is one stage of a larger operation.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.baseline
+  question: Does this host normally run this capture tool?
+  context: >-
+    A capture binary that has never run on this host is more suspicious than one that runs regularly for monitoring. Zero or
+    very low counts over the baseline window indicate first-time or rare execution and raise the priority of the other questions.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired the rule's pattern, what parents and users normally drive that activity, and does the current alert fit?
+  context: >-
+    Even routine capture tools can be abused. The query mirrors the rule's EITHER-tshark-OR-windump selection scoped to this
+    host, so the resulting parent and user distribution reflects how this specific firing pattern has historically run here.
+    A new parent process, an unexpected account, or an unusual command-line shape is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_tshark:
+        Image|endswith: \tshark.exe
+        CommandLine|contains: -i
+      selection_windump:
+        Image|endswith: \windump.exe
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (1 of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired the rule's pattern in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: >-
+    The query mirrors the rule's selection structure with no host scope, giving a fleet-wide count of this firing pattern
+    rather than generic usage of the binaries. Many hosts firing the same pattern points to scripted deployment or monitoring
+    automation; one host or a small unrelated set points to manual operator activity. Use the host distribution and parent
+    consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_tshark:
+        Image|endswith: \tshark.exe
+        CommandLine|contains: -i
+      selection_windump:
+        Image|endswith: \windump.exe
+      condition: 1 of selection_*
+    fields:
+    - host.name
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run packet-capture tools across the environment?
+  context: >-
+    Compare this user's current action against their historical behavior. A user who has never run a capture tool is more
+    suspicious than one who does so regularly as part of their role. User role and typical toolset should align with passive
+    network monitoring.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent and capture-tool combination historically routine on this host or across the environment, or is the parent unusual for this binary?
+  context: >-
+    When the alert fires under a service principal, user identity does not attribute behavior. The meaningful pivot is the
+    launch mechanism: which parent process spawned the capture tool, and whether that pair is historically common. A new or
+    rare parent for this binary is the deviation worth chasing; a pair that already accounts for thousands of prior events is
+    monitoring or vendor automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: >-
+    Tracking the user's activity across all hosts reveals whether the capture is isolated or part of broader hands-on activity.
+    If the same user triggered similar activity on multiple hosts, the scope of the operation may be larger than this single
+    alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent and capture-tool combination fire on other hosts in the same window?
+  context: >-
+    Under a service principal, a user-wide pivot returns agent-telemetry noise because every host runs system-owned services
+    constantly. The meaningful question is whether the same launch mechanism — parent process plus capture binary — fired on
+    other hosts in the alert window. Multiple hosts in the same window points to scheduled or pushed automation; a single host
+    points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: >-
+    Alerts rarely occur in isolation. Examining activity around the capture event reveals what led to it and what followed,
+    and whether it is part of a larger sequence. Look for reconnaissance, privilege changes, or staging of captured data.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Earlier detections on the same host — defense tampering, reconnaissance, or privilege escalation — may reveal the attack
+    stages that preceded the capture and help reconstruct the timeline. Promiscuous-mode capture often follows initial access
+    and discovery.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:credential_access.post_access_lateral_movement
+  question: Were any new logon sessions or remote connections initiated after this event?
+  context: >-
+    Credentials harvested from captured traffic are typically reused to reach other systems. New logon events or outbound
+    remote connections shortly after the capture — RDP, SMB, WinRM, or remote-execution activity — indicate active use of
+    collected data rather than benign troubleshooting.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - rule.name
+      - rule.uuid
+      - event.severity_label
+- source: template:credential_access.credential_exposure_assessment
+  question: Which accounts or services could have credentials exposed in the captured traffic, and do any have elevated privileges?
+  context: >-
+    The severity of a capture depends on what crosses the monitored segment. Authentication to domain controllers, administrative
+    shares, or service endpoints can expose privileged credentials and warrants escalation; a capture on an isolated workstation
+    segment may only need monitoring. Identify which accounts and services route traffic through the captured interface.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:discovery_recon.discovery_burst_detection
+  question: Did other reconnaissance commands run on this host around the same time?
+  context: >-
+    A single capture may be legitimate troubleshooting, but capture alongside multiple reconnaissance commands in rapid
+    succession — whoami, ipconfig, net, arp, netstat, nbtstat — is a signature of post-compromise enumeration. Network discovery
+    binaries are especially relevant here because an operator maps the segment before or while capturing it.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_recon:
+        Image|endswith:
+          - '\whoami.exe'
+          - '\systeminfo.exe'
+          - '\ipconfig.exe'
+          - '\net.exe'
+          - '\net1.exe'
+          - '\nltest.exe'
+          - '\dsquery.exe'
+          - '\nbtstat.exe'
+          - '\arp.exe'
+          - '\netstat.exe'
+          - '\tasklist.exe'
+          - '\qprocess.exe'
+          - '\query.exe'
+          - '\quser.exe'
+          - '\hostname.exe'
+          - '\nslookup.exe'
+          - '\adfind.exe'
+          - '\csvde.exe'
+          - '\ldifde.exe'
+          - '\dnscmd.exe'
+          - '\cmdkey.exe'
+          - '\setspn.exe'
+      condition: selection and selection_recon
+    fields:
+      - Image
+      - User
+- source: template:discovery_recon.discovery_parent_chain
+  question: What process spawned the capture command, and is this a normal pattern?
+  context: >-
+    Capture tools launched from cmd.exe under explorer.exe or from a known automation script are typically administrative.
+    Capture commands spawned by Office applications, script interpreters (wscript.exe, cscript.exe, mshta.exe), wmiprvse.exe,
+    or wsmprovhost.exe indicate automated or remote post-exploitation rather than interactive troubleshooting.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1040
+      name: Network Sniffing
+      role: primary
+  attack_chain_coverage:
+    - stage: 1
+      label: capture_tool_execution
+      description: "Execution of a network monitoring tool (tshark with -i, or windump)"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: capture_scope_decode
+      description: "Interface selection and capture/output filters that determine what traffic is recorded"
+      mapped_to: Q3
+      source: template:credential_access.credential_target_identification
+    - stage: 3
+      label: privilege_and_launch_context
+      description: "Driver/promiscuous-mode access requires elevated context; the launching parent reveals whether escalation or remote execution drove the capture"
+      mapped_to: Q4
+      source: template:cue_process_tool.process_chain
+  dimension_coverage:
+    - dimension: time_correlation
+      technique: T1040
+      covered_by: Q13
+      source: template:cue_host_context.clustering
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1040
+      covered_by: Q3
+      source: template:credential_access.credential_target_identification
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1040
+      covered_by: Q2
+      source: template:universal.host_user_context
+      coverage_type: direct
+  mutable_dispositions:
+    - element: ToolNames
+      dimension: tuning_parameter
+      specific_values: "tshark.exe, windump.exe (rule selection); environment-tunable list"
+      disposition: context
+      target_question: Q17
+      notes: "Rule's own tool list is the fixed detection; the recon burst question (Q17) surfaces accompanying enumeration binaries. The known-good capture-tool list is an environment tuning concern, recorded as context rather than queryable values."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only (tune frequency/time-of-day of capture sessions)"
+      disposition: context
+      target_question: Q13
+      notes: "No concrete threshold given; host-clustering (Q13) and recon-burst (Q17) windows carry the time-correlation intent."
+  dedup_decisions:
+    - dropped: cue_process_tool.mechanism_decode
+      reason: "replaced_by credential_access.credential_target_identification (hint); the cred-target question, adapted to capture scope, serves the Phase 2 decode role"
+      kept: credential_access.credential_target_identification
+    - dropped: cue_process_tool.clustering
+      reason: "host-around-time clustering subsumed by cue_host_context.clustering (same host+/-15m aggregation intent)"
+      kept: cue_host_context.clustering
+    - dropped: discovery_recon.discovery_user_context
+      reason: "overlaps universal.host_user_context per template notes; kept the universal triage anchor (Q2) for user/host role check"
+      kept: universal.host_user_context
+    - dropped: universal.endpoint_protection_health
+      reason: "RECOMMENDED-only; rule is capture/discovery-centric, not payload-execution or credential-dumping. cue_host_context.precursor (Q14) already surfaces prior tamper alerts on the host, so the generic tamper sweep does not earn a slot"
+      kept: cue_host_context.precursor
+    - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc pairing
+      reason: "user_actor pair — non-deduplicable; both emitted (Q9 user-pivot, Q10 parent+binary substitute)"
+      kept: both
+    - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc pairing
+      reason: "user_actor pair — non-deduplicable; both emitted (Q11 user-pivot, Q12 parent+binary substitute)"
+      kept: both
+  skipped_templates:
+    - template: cue_process_tool.mechanism_decode
+      reason: "replaced_by: credential_access.credential_target_identification"
+  reflection_overrides: []
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - credential_access
+    - discovery_recon
+    - cue_process_tool
+    - cue_user_actor
+    - cue_host_context
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 18
+      attack: 0
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 15
+    logsource_diversity:
+      process_creation: 16
+      sigma_alert: 2

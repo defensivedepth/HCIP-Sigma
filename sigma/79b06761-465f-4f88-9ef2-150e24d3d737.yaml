@@ -1,0 +1,571 @@
+name: Potential SysInternals ProcDump Evasion
+id: 263b7e2b-4b40-4de1-82ba-f5f2b5cb4f82
+description: |
+  Detects command lines that copy or rename ProcDump or its dump output, a technique used to defeat
+  endpoint protection that quarantines memory dumps shortly after they are written. The rule fires
+  when EITHER a command copies or moves a file named procdump, OR a copy of a .dmp file references
+  an lsass / out.dmp / 2.dmp name, OR a command copies or moves a renamed lsass.exe_ artifact —
+  any one branch is sufficient. Legitimate use exists (an operator relocating a dump for analysis),
+  but the rename-and-copy pattern is most often an attempt to race AV quarantine and preserve LSASS
+  credential material, so the investigation should determine whether a real memory dump was produced
+  and where the copy landed.
+type: detection
+detection_id: 79b06761-465f-4f88-9ef2-150e24d3d737
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line copy or rename ProcDump or an lsass/.dmp dump file as this rule detects?
+  context: Confirm the alert is a true positive by reviewing the exact command line. The rule fires on
+    any one of three patterns - a copy/move of a file named procdump, a copy of a .dmp file naming lsass
+    or out.dmp or 2.dmp, or a copy/move of a renamed lsass.exe_ artifact. Note which branch fired, because
+    it determines whether the focus is the renamed tool (procdump branch) or the dump output itself (.dmp
+    and lsass.exe_ branches).
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to copy or relocate memory dump files?
+  context: Legitimate administrative or support activity can move a dump for offline analysis. Knowing
+    whether the user role and host function include diagnostics, crash-dump collection, or incident
+    response work is often the fastest way to separate a routine relocation from credential-theft staging.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:masquerading.true_identity
+  question: What is the actual identity of the binary referenced in this command - is it really ProcDump?
+  context: The copy/move target may be ProcDump renamed to evade name-based detection. Compare the on-disk
+    name against the PE OriginalFileName and signing details - a Microsoft-signed file whose OriginalFileName
+    is procdump.exe confirms the real tool under an arbitrary name. The hash enables a reputation lookup to
+    distinguish the genuine SysInternals utility from a decoy or a trojanized copy.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - Hashes
+- source: template:credential_access.credential_target_identification
+  question: Was LSASS memory the dump target, and what dumping method produced the file being copied?
+  context: This rule's .dmp and lsass.exe_ branches point at LSASS credential material. Decode the command
+    line to identify the dump source and method - ProcDump against lsass, a renamed dumper, comsvcs.dll
+    MiniDump, or direct memory access. The method indicates operator sophistication and confirms whether
+    credentials in memory were captured before the copy.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: attack:T1003.001.access_verification
+  question: Did a process open a full-access handle to lsass.exe on this host around the time of the alert?
+  context: A memory dump of LSASS is preceded by a handle open with full access rights (0x1F0FFF) to
+    lsass.exe. Process-access events naming lsass.exe as the target, granting that mask, from a process
+    that is not a known AV/EDR component, corroborate that the copied .dmp is genuine credential material
+    rather than an unrelated crash dump. If process-access telemetry is not collected in this environment,
+    treat the absence of results as a visibility gap, not as evidence the dump was benign.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_access
+      product: windows
+    detection:
+      selection:
+        TargetImage|endswith: '\lsass.exe'
+        GrantedAccess: '0x1F0FFF'
+      filter_host:
+        host.name|expand: '%hostname%'
+      condition: selection and filter_host
+    fields:
+      - SourceImage
+      - GrantedAccess
+      - CallTrace
+- source: attack:T1003.001.dump_file_path
+  question: Where did the copied dump file land, and is it still on disk for analysis?
+  context: The point of the copy is to preserve the dump before AV quarantine removes it. Recovering the
+    destination file enables hash lookup, strings review, and credential-exposure assessment. Dumps are
+    commonly written to user-writable or temporary locations such as %TEMP% or C:\Windows\Temp; a file
+    surviving in one of these directories means the credential material is recoverable and the exposure
+    is live.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: template:cue_artifact.artifact_verification
+  question: What is the hash of the dump or relocated file, and does threat intel flag the source binary?
+  context: A hash of the dump output or the copied binary enables a reputation lookup to determine whether
+    the file is a known dumping tool, a known-benign diagnostic artifact, or previously unseen. Submit the
+    hash to a threat intel platform to confirm the source binary's identity independent of its on-disk name.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Hashes
+- source: template:masquerading.binary_origin
+  question: How did the renamed ProcDump or dump file arrive on this host?
+  context: A renamed tool or a relocated dump does not appear spontaneously - it was downloaded, extracted,
+    or dropped by a parent process. Tracing the file-creation event by basename over a long window reveals
+    the delivery mechanism, whether a download tool, an archive extraction, a remote admin copy, or a
+    malware dropper. The creating process shown in the file event identifies who placed the file.
+  range: -30d
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains|expand: '%file_name%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: template:cue_process_tool.process_chain
+  question: What process spawned this command, and is that parent chain expected?
+  context: The parent process reveals how the copy/rename was invoked. An interactive shell launched from
+    explorer.exe suggests hands-on-keyboard operator activity, while parents like wscript.exe, mshta.exe,
+    or an Office application point toward scripted or macro-driven execution. An unexpected parent for a
+    dump-handling command is the anomaly worth chasing.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:credential_access.post_access_lateral_movement
+  question: Were any new logon sessions or remote connections initiated on this host after the dump was copied?
+  context: Captured LSASS credentials are typically used to move laterally. Follow-on alerts on the same
+    host - RDP sessions, SMB connections, WinRM usage, or new authentication events - shortly after the
+    dump indicate the stolen credentials are being exercised rather than merely staged.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - rule.name
+      - rule.uuid
+      - event.severity_label
+- source: template:credential_access.credential_exposure_assessment
+  question: Which accounts may be exposed by this dump, and do any have elevated privileges?
+  context: An LSASS dump exposes every credential cached in memory on the host - interactive logons,
+    service accounts, and any cached domain credentials. Cross-reference the accounts that logged on to
+    this host with directory group memberships; domain admin or broad service-account exposure requires
+    escalation, while a single standard-user session may only need a password reset.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired this copy/rename pattern, what parents and users drove it,
+    and does the current alert fit?
+  context: The query mirrors the rule's selection structure scoped to this host, so the resulting
+    parent/user distribution reflects how this specific dump-handling pattern has historically run here -
+    not generic file-copy activity. A new parent process, an unexpected user, or an unusual command shape
+    against an otherwise quiet baseline is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_1:
+        CommandLine|contains:
+        - copy procdump
+        - move procdump
+      selection_2:
+        CommandLine|contains|all:
+        - 'copy '
+        - '.dmp '
+        CommandLine|contains:
+        - 2.dmp
+        - lsass
+        - out.dmp
+      selection_3:
+        CommandLine|contains:
+        - copy lsass.exe_
+        - move lsass.exe_
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (1 of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_user_actor.baseline
+  question: Does this user normally copy or relocate dump files or run ProcDump?
+  context: Compare this user's current action against their historical behavior. A user who has never run
+    dump-handling commands is more suspicious than one who does so as part of a diagnostics or IR role.
+    Zero or very low historical counts indicate first-time activity for this account.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_1:
+        CommandLine|contains:
+        - copy procdump
+        - move procdump
+      selection_2:
+        CommandLine|contains|all:
+        - 'copy '
+        - '.dmp '
+        CommandLine|contains:
+        - 2.dmp
+        - lsass
+        - out.dmp
+      selection_3:
+        CommandLine|contains:
+        - copy lsass.exe_
+        - move lsass.exe_
+      _pb_user:
+        User|expand: '%User%'
+      condition: (1 of selection_*) and _pb_user
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent and command pattern historically routine on this host, or is the launch mechanism unusual?
+  context: When the alert fires under a service principal, user identity does not attribute the behavior;
+    the meaningful pivot is the launch mechanism. The query mirrors the rule's pattern scoped to the
+    alerting host's history, so a parent that already accounts for many prior firings is automation, while
+    a new or rare parent for this pattern is the deviation worth chasing.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_1:
+        CommandLine|contains:
+        - copy procdump
+        - move procdump
+      selection_2:
+        CommandLine|contains|all:
+        - 'copy '
+        - '.dmp '
+        CommandLine|contains:
+        - 2.dmp
+        - lsass
+        - out.dmp
+      selection_3:
+        CommandLine|contains:
+        - copy lsass.exe_
+        - move lsass.exe_
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (1 of selection_*) and _pb_scope
+    fields:
+      - ParentImage
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired this copy/rename pattern in the past week, and does the spread look like
+    automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the result is a
+    fleet-wide count of this dump-handling pattern - not generic file-copy usage. Many hosts firing the
+    same pattern points to scripted deployment or a vendor diagnostic routine; one host or a small
+    unrelated set points to manual operator activity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_1:
+        CommandLine|contains:
+        - copy procdump
+        - move procdump
+      selection_2:
+        CommandLine|contains|all:
+        - 'copy '
+        - '.dmp '
+        CommandLine|contains:
+        - 2.dmp
+        - lsass
+        - out.dmp
+      selection_3:
+        CommandLine|contains:
+        - copy lsass.exe_
+        - move lsass.exe_
+      condition: 1 of selection_*
+    fields:
+    - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: A credential dump is usually one stage of a longer operation. Earlier detections on the same
+    host - defense tampering, reconnaissance, privilege escalation - help reconstruct what preceded the
+    dump and whether protection was weakened first.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1003.001
+      name: LSASS Memory
+      role: primary
+    - id: T1036
+      name: Masquerading
+      role: secondary
+    - id: T1003
+      name: OS Credential Dumping
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: lsass_access
+      description: "A process opens a full-access (0x1F0FFF) handle to lsass.exe to read memory"
+      mapped_to: Q5
+      source: attack:T1003.001.access_verification
+    - stage: 2
+      label: dump_file_creation
+      description: "Memory dump written to disk (e.g. %TEMP%, C:\\Windows\\Temp), then copied/renamed to evade quarantine"
+      mapped_to: Q6
+      source: attack:T1003.001.dump_file_path
+    - stage: 3
+      label: dump_handling_command
+      description: "Operator copies/renames procdump or the .dmp output - the rule's triggering command"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 4
+      label: renamed_tool_identity
+      description: "Renamed binary masquerades as a benign file; PE metadata reveals true identity"
+      mapped_to: Q3
+      source: template:masquerading.true_identity
+    - stage: 5
+      label: credential_use
+      description: "Stolen credentials exercised via new logons / lateral movement"
+      mapped_to: Q10
+      source: template:credential_access.post_access_lateral_movement
+  dimension_coverage:
+    - dimension: execution_context
+      technique: T1036
+      covered_by: Q9
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1036
+      covered_by: Q5
+      source: attack:T1003.001.access_verification
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1036
+      covered_by: Q6
+      source: attack:T1003.001.dump_file_path
+      coverage_type: direct
+    - dimension: access_verification
+      technique: T1003.001
+      covered_by: Q5
+      source: attack:T1003.001.access_verification
+      coverage_type: direct
+    - dimension: command_analysis
+      technique: T1003.001
+      covered_by: Q4
+      source: template:credential_access.credential_target_identification
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1003.001
+      covered_by: Q9
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+  mutable_dispositions:
+    - element: OriginalFilenameMismatch
+      dimension: tuning_parameter
+      specific_values: "OriginalFileName vs Image basename"
+      disposition: query_injection
+      target_question: Q3
+      notes: "true_identity query projects Image + OriginalFileName + Hashes for the rename comparison"
+    - element: KnownSystemUtilityPaths
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q8
+      notes: "binary_origin traces install/drop path; expected-directory tuning is analyst-side judgment"
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "~5 min between lsass access and dump file creation"
+      disposition: context
+      target_question: Q5
+      notes: "access_verification uses +/-15m window; dump_file_path uses +/-15m to bracket the access-to-write gap"
+    - element: AccessMask
+      dimension: access_verification
+      specific_values: "0x1F0FFF"
+      disposition: query_injection
+      target_question: Q5
+      notes: "GrantedAccess: '0x1F0FFF' injected into the process_access selection"
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "allowlist AV/EDR accessing lsass"
+      disposition: context
+      target_question: Q5
+      notes: "context tells analyst to exclude known AV/EDR SourceImage; SourceImage projected for that judgment"
+    - element: DumpFilePath
+      dimension: tuning_parameter
+      specific_values: "%TEMP%, C:\\Windows\\Temp"
+      disposition: context
+      target_question: Q6
+      notes: "named in dump_file_path context as common write locations; query scopes via %file_paths%"
+    - element: CommandLinePattern
+      dimension: command_analysis
+      specific_values: "rundll32, procdump, comsvcs.dll, Invoke-Mimikatz"
+      disposition: context
+      target_question: Q4
+      notes: "credential_target_identification context lists dumping methods; rule's own CommandLine values already trigger it"
+  dedup_decisions:
+    - dropped: cue_process_tool.mechanism_decode
+      reason: "replaced_by credential_access.credential_target_identification (Q4) - more specific for the credential-access dimension; also cmd.exe is too common for Image-based mechanism_decode scoping per hint"
+      kept: credential_access.credential_target_identification
+    - dropped: cue_artifact.mechanism_decode
+      reason: "filename-pattern rule - analyst already recognizes procdump/lsass dump; content-decode collapses into true_identity (Q3) and credential_target_identification (Q4)"
+      kept: masquerading.true_identity
+    - dropped: cue_user_actor.clustering
+      reason: "user_actor pair - non-deduplicable in general, but user-pivot clustering omitted in favor of the parent+binary baseline pair already carrying the routine-vs-anomaly signal; full clustering pair dropped to stay within 18 and because copy/move pattern is host-local not network-fan-out"
+      kept: cue_user_actor.baseline_svc
+  skipped_templates:
+    - template: cue_process_tool.baseline
+      reason: "Image-based baseline meaningless for a CommandLine-only rule (primary_binary cmd.exe is universal); replaced by pattern-scoped baseline_deviation (Q12)"
+    - template: cue_process_tool.follow_on
+      reason: "ParentImage|endswith %Image% over cmd.exe returns fleet-wide noise; post-execution activity covered by post_access_lateral_movement (Q10) and renamed_binary_activity intent folded into Q3/Q8"
+    - template: cue_process_tool.clustering
+      reason: "host_context.clustering omitted in favor of host_context.precursor (Q16) for prior-stage context; generic host clustering adds little over the precursor alert sweep within the question cap"
+    - template: cue_artifact.baseline
+      reason: "file baseline over %file_paths% duplicates evidence_preservation/dump_file_path (Q6); dump output is by definition new, so a 90d file baseline answers nothing"
+    - template: cue_user_actor.clustering_svc
+      reason: "paired with cue_user_actor.clustering which was dropped; copy/move is host-local, network-wide parent+binary fan-out not load-bearing here"
+    - template: universal.evidence_preservation
+      reason: "covered by attack:T1003.001.dump_file_path (Q6) which is the same file_event/%file_paths% question framed specifically for the dump artifact"
+    - template: universal.endpoint_protection_health
+      reason: "defense-evasion context already carried by host_context.precursor (Q16); the rule's evasion is quarantine-racing via copy, not AV/EDR service tampering, so the generic tamper sweep is not the live precursor question. Tamper-as-precursor signal still surfaces in the precursor alert query."
+    - template: masquerading.renamed_binary_activity
+      reason: "local-activity thread folded into process_chain (Q9) and post_access_lateral_movement (Q10); cross-host scope thread covered by cue_process_tool.scope (Q15) which counts the rule pattern fleet-wide"
+  hint_dispositions:
+    - hint: "logsource 'registry_set' (recommended by techniques: T1003.001) is not covered - pull in cue_registry_key.* or author a custom question with category: registry_set"
+      disposition: declined
+      reason: >-
+        This rule's detection is a copy/move of procdump or a .dmp/lsass dump
+        artifact - a file-handling and process-memory pattern. The registry_set
+        analytic for T1003.001 targets registry-based credential staging
+        (hive saves / LSA secret keys), which this rule does not detect and the
+        copied .dmp does not imply. LSASS access is instead verified directly via
+        process_access in attack:T1003.001.access_verification (Q5). No
+        compensating registry_set question authored.
+    - hint: "logsource 'security' (recommended by techniques: T1003.001) is not covered and no template family exists - author a custom question with category: security"
+      disposition: declined
+      reason: >-
+        The T1003.001 security-channel analytic keys on EventCode 4673
+        (privileged service called) as a proxy for LSASS access. The same
+        access is captured with more precision by the Sysmon process_access
+        full-handle (0x1F0FFF) query in attack:T1003.001.access_verification
+        (Q5), making a parallel security-log question redundant. No security
+        question authored.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - credential_access
+    - masquerading
+  generation_stats:
+    total_questions: 16
+    source_counts:
+      template: 14
+      attack: 2
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 13
+    logsource_diversity:
+      process_creation: 10
+      file_event: 3
+      process_access: 1
+      sigma_alert: 2

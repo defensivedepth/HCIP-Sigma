@@ -1,0 +1,436 @@
+name: Suspicious Provlaunch.EXE Child Process
+id: 888b6477-d188-44a7-aae1-8fae70154abe
+description: |
+  Detects provlaunch.exe spawning a child process that is either a common interpreter or system binary (calc.exe, cmd.exe, cscript.exe, mshta.exe, notepad.exe, powershell.exe, pwsh.exe, regsvr32.exe, rundll32.exe, wscript.exe) or a process whose image lives in a user-writable or temporary path (PerfLogs, Temp, Users\Public, AppData\Temp, Windows\Tasks). provlaunch.exe is a signed Windows launcher that executes a command stored under the HKLM Provisioning\Commands registry hierarchy, so an attacker can stage a command in the registry and have a trusted binary proxy its execution. The rule fires when both the provlaunch.exe parent and a matching child are present, so the investigation should confirm what command provlaunch.exe was configured to run, what the child process did, and whether the provisioning registry path was recently written.
+type: detection
+detection_id: f9999590-1f94-4a34-a91e-951e47bedefd
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-09
+questions:
+- source: template:universal.verify_trigger_match
+  question: Is the alerting process a child of provlaunch.exe, and does its image match a flagged binary or a user-writable path?
+  context: Confirm the alert is a true positive by reviewing the triggering event. The rule requires the parent to be provlaunch.exe AND the child to either be one of the listed interpreter/system binaries or run from a temporary or user-writable directory. Verify both halves are present before investing further.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run provisioning or device-setup workflows that involve provlaunch.exe?
+  context: provlaunch.exe is normally invoked by Windows provisioning and device-setup workflows. Knowing whether this host performs provisioning tasks and whether the acting user role is consistent with that activity is often the fastest way to separate routine setup from abuse.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:parent_child.parent_process_legitimacy
+  question: What started provlaunch.exe, and what command line did it carry?
+  context: provlaunch.exe reads a command from the HKLM Provisioning\Commands registry hierarchy and executes it under a trusted, signed binary. Tracing what spawned provlaunch.exe and its command line reveals whether this was a legitimate provisioning flow or an operator staging registry keys to proxy arbitrary execution.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- source: template:parent_child.sibling_processes
+  question: What other child processes did this same provlaunch.exe instance spawn?
+  context: The reference material notes provlaunch.exe can launch multiple commands within one run. If this provlaunch.exe instance spawned the detected child, it may have spawned others. Multiple children from the same parent instance reveal the full scope of what was proxied through it.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.mechanism_decode
+  question: What exactly did the child process do? Decode its full command line and working directory.
+  context: The full command line of the child reveals the action that provlaunch.exe proxied. Decode any flags, encoded content, file paths, URLs, or DLL entrypoints. For interpreters (cmd.exe, cscript.exe, wscript.exe, mshta.exe) the arguments show the script or command; for rundll32.exe/regsvr32.exe the arguments show the DLL and exported function.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: attack:T1218.command_analysis
+  question: Does the child command line reference a URL, remote share, script path, or DLL entrypoint that pulls in external content?
+  context: System binary proxy execution commonly passes a URL, UNC path, script file, or DLL export on the command line so the trusted binary retrieves or runs externally hosted content. Arguments such as http/https URLs, \\\\ shares, .hta/.js/.vbs/.ps1 paths, or rundll32 DllName,Export entrypoints identify what payload was fetched or executed.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      filter_indicators:
+        CommandLine|contains:
+          - 'http'
+          - 'ftp'
+          - '\\'
+          - '.hta'
+          - '.js'
+          - '.vbs'
+          - '.ps1'
+          - '.sct'
+          - '.dll'
+          - 'javascript:'
+      condition: selection and filter_indicators
+    fields:
+      - CommandLine
+- source: attack:T1218.network_connection
+  question: Did the child process make any outbound network connections after it started?
+  context: Proxy-execution payloads frequently retrieve a second stage or beacon to a remote host. Correlating the child process to outbound connections in the window after it started shows whether the proxied command reached out to the network and to which destinations.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+- source: attack:T1218.image_load
+  question: What modules did the child process load, and were any unsigned or loaded from a user-writable path?
+  context: When a trusted binary such as rundll32.exe or regsvr32.exe proxies execution, the payload often arrives as a DLL loaded into that process. Reviewing the modules loaded by the child, especially unsigned modules or modules in temporary or user-writable directories, identifies the code that actually executed.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - ImageLoaded
+      - Signed
+      - Signature
+- source: template:powershell.encoded_command_decode
+  question: If the child is powershell.exe or pwsh.exe, was the command encoded or obfuscated, and what does it decode to?
+  context: When the proxied child is PowerShell, attackers frequently use -EncodedCommand (-enc), string concatenation, backtick escaping, or variable substitution to hide intent. Decoding the base64 or deobfuscating the command reveals the actual payload, such as a download cradle, reverse shell, or in-memory .NET assembly load.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:powershell.script_block_logging
+  question: If the child is PowerShell, did script block logging capture the full script content?
+  context: Script block logging records the deobfuscated script content PowerShell actually executes, even when the command line is encoded or obfuscated, providing ground truth about what ran. If PowerShell operational logs are not ingested in this environment, treat zero results as a visibility gap rather than evidence nothing ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- source: template:powershell.powershell_security_bypass
+  question: Were PowerShell security controls bypassed or weakened on this host before the alert?
+  context: Operators often disable or bypass PowerShell protections before running a payload, including AMSI bypass, execution-policy changes, and downgrade to PowerShell v2 which lacks logging. Finding these precursor events strengthens the case that the proxied execution was malicious.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- source: template:cue_parent_process.baseline
+  question: Has provlaunch.exe spawned this child binary on this host before?
+  context: Routine provisioning rarely spawns interpreters or system binaries from temporary paths. Historical frequency of this specific provlaunch.exe-to-child pairing on this host distinguishes an established setup workflow from a novel, first-time spawning relationship. The list of binaries the rule treats as suspicious is itself a tuning surface; a pairing that already accounts for many prior events may be sanctioned automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:cue_user_actor.baseline
+  question: Does this user normally trigger provisioning execution or run this child binary?
+  context: Compare this user's current activity against their historical behavior. A user who has never been associated with provlaunch.exe-driven execution or this child binary is more notable than one who does so regularly. User role and typical toolset should align with provisioning activity.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this provlaunch.exe-to-child pairing historically routine on this host or across the environment, or is it a new launch mechanism?
+  context: When the alert fires under a service principal, user identity does not attribute behavior; the meaningful pivot is the launch mechanism. A new or rare provlaunch.exe parent for this child binary is the deviation worth chasing, while a pair that already accounts for many prior events is provisioning or OS automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around the time of the alert?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints. If the same user triggered similar activity on multiple hosts, the scope of the operation may be larger than this single alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same provlaunch.exe-to-child pairing fire on other hosts in the same window, or is it isolated to this host?
+  context: Under a service principal, network-wide user activity returns agent-telemetry noise. The meaningful question is whether the same launch mechanism fired on other hosts in the alert window. Multiple hosts in the same window points to scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host, such as defense tampering, reconnaissance, or registry modification of provisioning keys, may reveal the attack stages that preceded this event and help reconstruct the timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1218
+      name: System Binary Proxy Execution
+      role: primary
+  attack_chain_coverage:
+    - stage: 1
+      label: provlaunch_invocation
+      description: "provlaunch.exe is invoked and reads a command from the HKLM Provisioning\\Commands registry hierarchy"
+      mapped_to: Q3
+      source: template:parent_child.parent_process_legitimacy
+    - stage: 2
+      label: proxied_child_execution
+      description: "A trusted binary proxies execution of a listed interpreter/system binary or a process from a user-writable path"
+      mapped_to: Q5
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 3
+      label: external_content_retrieval
+      description: "Command-line parameters or network retrieval pull in externally hosted or unsigned payloads"
+      mapped_to: Q6
+      source: attack:T1218.command_analysis
+  dimension_coverage:
+    - dimension: command_analysis
+      technique: T1218
+      covered_by: Q6
+      source: attack:T1218.command_analysis
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1218
+      covered_by: Q3
+      source: template:parent_child.parent_process_legitimacy
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1218
+      covered_by: Q12
+      source: template:cue_parent_process.baseline
+      coverage_type: indirect
+  mutable_dispositions:
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "rationale only (provlaunch.exe parent profiling)"
+      disposition: context
+      target_question: Q3
+      notes: "Parent is fixed to provlaunch.exe by the rule; parent legitimacy and origin covered by parent_process_legitimacy."
+    - element: SignedBinaryList
+      dimension: tuning_parameter
+      specific_values: "calc.exe, cmd.exe, cscript.exe, mshta.exe, notepad.exe, powershell.exe, pwsh.exe, regsvr32.exe, rundll32.exe, wscript.exe"
+      disposition: context
+      target_question: Q12
+      notes: "Child binary list is the rule's selection; baseline question frames it as a tuning surface (sanctioned vs novel pairings). Not query-injected because the rule already constrains the child set."
+    - element: CommandLineRegex
+      dimension: command_analysis
+      specific_values: "URLs, script paths, DLL entrypoints"
+      disposition: query_injection
+      target_question: Q6
+      notes: "Injected as CommandLine|contains indicators (http, ftp, UNC, .hta/.js/.vbs/.ps1/.sct/.dll, javascript:) on the ProcessGuid-scoped child event."
+    - element: RemoteDomainAllowlist
+      dimension: tuning_parameter
+      specific_values: "rationale only (enterprise-domain suppression)"
+      disposition: context
+      target_question: Q7
+      notes: "Destination review for the child's outbound connections; allowlisting of known enterprise domains is the analyst's tuning step at triage."
+  dedup_decisions:
+    - dropped: cue_process_tool.process_chain
+      reason: "parent_process is primary cue and parent_child set active — parent_process_legitimacy subsumes process_chain"
+      kept: parent_child.parent_process_legitimacy
+    - dropped: cue_parent_process.mechanism_decode
+      reason: "parent_child technique set active — parent_process_legitimacy is more specific for parent origin"
+      kept: parent_child.parent_process_legitimacy
+    - dropped: cue_parent_process.follow_on
+      reason: "sibling_processes (ParentProcessGuid-scoped) covers children of this parent instance more precisely than the parent-binary-scoped follow_on"
+      kept: parent_child.sibling_processes
+    - dropped: cue_parent_process.clustering
+      reason: "host-context and child outbound-connection questions cover surrounding activity; parent-binary clustering would duplicate sibling_processes scope"
+      kept: parent_child.sibling_processes
+    - dropped: cue_process_tool.baseline
+      reason: "cue_parent_process.baseline covers parent+child frequency on the host more specifically than tool-only baseline"
+      kept: cue_parent_process.baseline
+    - dropped: cue_host_context.clustering
+      reason: "sibling_processes and the child outbound-connection question already surface co-occurring activity for this parent instance"
+      kept: parent_child.sibling_processes
+    - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable; both emitted"
+      kept: both
+    - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable; both emitted"
+      kept: both
+  skipped_templates:
+    - template: cue_parent_process.scope
+      reason: "cross-host scope covered by cue_user_actor.clustering_svc (same parent+binary across hosts in window) without an additional near-duplicate question; kept count within 14-18"
+    - template: universal.endpoint_protection_health
+      reason: "powershell.powershell_security_bypass already surfaces prior tamper/bypass activity on the host for the PowerShell-child case; rule is proxy-execution detection, not a credential-access/impact rule whose disposition turns on AV/EDR state, so the generic host-tamper sweep does not earn a separate slot"
+  reflection_overrides: []
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - powershell
+    - parent_child
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 14
+      attack: 3
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 2
+      context: 13
+    logsource_diversity:
+      process_creation: 13
+      network_connection: 1
+      image_load: 1
+      powershell: 1
+      sigma_alert: 1

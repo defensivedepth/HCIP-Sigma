@@ -1,0 +1,582 @@
+name: Lolbin Runexehelper Use As Proxy
+id: ae632243-8984-4a0f-989f-dab35c5dda9f
+description: |
+  Detects a process whose parent image ends in runexehelper.exe, a Microsoft-signed Windows utility that
+  duplicates the calling thread's token and launches the executable named in its first argument via
+  CreateProcessAsUser, redirecting that program's output to a file. Because runexehelper is a trusted signed
+  binary, an attacker can use it as a proxy launcher to run an arbitrary executable while the visible parent
+  remains a legitimate system tool, breaking the expected parent-child lineage of the payload. Legitimate use
+  of this binary is rare, so the investigation should identify the spawned child executable, confirm what it
+  is and what it did, determine what launched runexehelper itself, and establish whether the user, host, and
+  spawning context fit a benign explanation or trusted-binary proxy execution.
+type: detection
+detection_id: cd71385d-fd9b-4691-9b98-2b1f7e508714
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-09
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the parent image of the alerting process end in runexehelper.exe?
+  context: Before investing investigation time, confirm the alert is a true positive. The rule fires when a
+    process is spawned by a parent whose image path ends in runexehelper.exe. Read the full ParentImage and
+    confirm the parent is runexehelper.exe rather than an unrelated binary with a similar name. The alerting
+    process itself is the child runexehelper launched — that child is the proxied payload.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+- source: template:universal.host_user_context
+  question: Is this user and host expected to launch executables through runexehelper.exe?
+  context: Legitimate use of runexehelper.exe as a launcher is uncommon, so administrative or developer activity
+    that explains it is the exception rather than the rule. Knowing whether the user role and host function fit
+    running arbitrary executables through a trusted proxy binary is often the fastest path to distinguishing a
+    rare-but-benign invocation from proxy execution. Activity under a standard user points toward user-initiated
+    execution; activity under an elevated or service context shifts the interpretation.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_parent_process.mechanism_decode
+  question: What launched runexehelper.exe, and what was its full command line?
+  context: runexehelper.exe takes the executable to run as its first argument, so its own command line names the
+    proxied payload and its path directly. Retrieving runexehelper's process_creation event also reveals the
+    grandparent that started it — for example a script host, a shell, or a scheduled-task host — which shows how
+    the proxy launch was initiated. A grandparent such as cmd.exe, powershell.exe, wscript.exe, or an Office
+    application points toward operator-driven or macro-driven invocation.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+- source: template:cue_process_tool.mechanism_decode
+  question: What exactly did the proxied child process do? Decode its command-line arguments.
+  context: The child launched through runexehelper.exe is the executable the proxy was used to run. Decode its
+    full command line for flags, encoded content, file paths, or URLs that reveal the operation it carried out.
+    A URL, IP address, or script path in the arguments indicates download or follow-on execution; matching the
+    arguments against suspicious-argument patterns (remote URLs, script paths, DLL entrypoints) helps separate a
+    benign relocated tool from a payload run under a trusted-binary cover.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: attack:T1218.proxied_payload_identity
+  question: What is the actual identity of the child executable that runexehelper launched?
+  context: The proxied child is the payload the trusted binary was used to run. Comparing the Image path against
+    OriginalFileName reveals whether the child is a renamed tool, and the signing details indicate whether it is
+    a Microsoft-signed system binary, a third-party signed tool, or unsigned. Proxy execution through a signed
+    launcher is most concerning when the child itself is unsigned or runs from a user-writable directory such as
+    %TEMP%, AppData, or a download folder; a Microsoft-signed child from System32 is more consistent with a known
+    binary list of allowed executables. The file hash enables a reputation lookup to determine whether this is a
+    known-good tool, known malware, or a novel binary.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - Hashes
+- source: attack:T1218.network_activity
+  question: Did the child executable launched through runexehelper.exe make outbound network connections?
+  context: System binary proxy execution is frequently used to run a downloader or a payload that beacons to an
+    external host. Outbound connections from the proxied child — especially to external IP addresses or to
+    destinations outside the organization's known enterprise domains — indicate command-and-control or payload
+    retrieval. Connections only to internal infrastructure or known-good update endpoints are more consistent
+    with routine activity. If network telemetry is not collected for this host, treat zero results as a
+    visibility gap rather than evidence nothing connected.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+- source: template:cue_parent_process.follow_on
+  question: What other child processes did runexehelper.exe spawn?
+  context: A proxy launcher may be used more than once to run several executables in sequence — for example a
+    downloader followed by the payload it retrieved. Seeing every child of runexehelper.exe on this host reveals
+    the full scope of activity initiated through the proxy rather than only the one process that tripped the
+    alert.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        process.parent.name|expand: '%ParentName%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_parent_process.clustering
+  question: What process activity occurred around runexehelper.exe at the same time?
+  context: Beyond its direct children, the activity surrounding the proxy launch helps reconstruct what set it in
+    motion and what followed. Examining process activity tied to runexehelper.exe in a tight window around the
+    alert can surface the staging of the proxied executable, related shell or script-host activity, or follow-on
+    tools run shortly after.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        process.parent.name|expand: '%ParentName%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_parent_process.baseline
+  question: Has runexehelper.exe spawned this child binary on this host before?
+  context: A parent-child pairing that has never been seen on the host is more suspicious than a recurring one.
+    Because runexehelper.exe is rarely used as a launcher in normal operations, almost any historical match is
+    itself notable; a zero or very low count confirms this is a novel proxy-launch relationship rather than an
+    established workflow, while a recurring pair points to vendor or administrative automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run executables through a proxy launcher like this?
+  context: Compare this user's current action against their historical behavior. A user who has never run this
+    binary, or never used trusted-binary proxy launchers, is more suspicious than one who does so routinely.
+    User role and typical toolset should align with the activity.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent-name and child-binary combination historically routine on this host or environment-wide?
+  context: When the alert fires under a service principal, user identity does not attribute behavior. The
+    meaningful pivot is the launch mechanism — runexehelper.exe spawning this binary, and whether that pair is
+    historically common. A new or rare child for this proxy launcher is the deviation worth chasing; a pair that
+    already accounts for many prior events is more likely established automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals whether the proxy execution was an isolated event
+    or part of broader hands-on activity. If the same user triggered similar activity on multiple endpoints in the
+    same window, the scope of the incident may be larger than one host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent-name and child-binary combination fire on other hosts in the same window?
+  context: Under a service principal, asking what else the user did returns agent-telemetry noise. The meaningful
+    question is whether the same launch mechanism — runexehelper.exe plus the spawned binary — fired on other
+    hosts in the alert window. Multiple hosts in the same window points to a coordinated rollout or scripted
+    deployment; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_parent_process.scope
+  question: Is runexehelper.exe spawning this binary on other hosts?
+  context: The same proxy-launch pairing appearing across multiple hosts may indicate a scripted deployment or a
+    distribution pattern, while a single occurrence is more likely targeted. An environment-wide comparison helps
+    calibrate severity and identify the scope of the activity.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+      - CommandLine
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in the hour before the alert?
+  context: Proxy execution through a trusted binary is an execution step, and operators frequently weaken AV/EDR
+    before running a payload. This query surfaces direct attempts to disable AV/EDR services, flip Defender flags,
+    add broad exclusions, clear logs, or patch AMSI/ETW. Zero rows is a useful "protection looks healthy" signal —
+    kernel-level driver tampering and in-memory patches will not appear here. Populated rows shift the disposition
+    toward operator preparation; review the parent process and signing chain to identify the writer.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining activity around the alert reveals the immediate context —
+    what led to this execution and what happened after. Aggregating by Image and ParentImage collapses repetitive
+    agent telemetry while novel parent-child pairs stand out at low counts, which is what distinguishes the proxy
+    execution chain from background noise.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host — reconnaissance, defense tampering, or credential access — may
+    reveal the stages that preceded this proxy execution and help reconstruct the timeline. Defense tampering or
+    credential access followed by execution is a common ordering; the absence of prior alerts is consistent with
+    this being an early step in the activity.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+  - id: T1218
+    name: System Binary Proxy Execution
+    role: primary
+  attack_chain_coverage:
+  - stage: 1
+    label: trusted_binary_invocation
+    description: runexehelper.exe, a Microsoft-signed binary, is launched with a target executable as its first
+      argument so it can proxy the launch via CreateProcessAsUser.
+    mapped_to: Q3
+    source: template:cue_parent_process.mechanism_decode
+  - stage: 2
+    label: proxied_payload_execution
+    description: runexehelper.exe spawns the target executable, which is the alerting child process — the payload
+      run under the trusted launcher's lineage.
+    mapped_to: Q1
+    source: template:universal.verify_trigger_match
+  - stage: 3
+    label: payload_action_and_network
+    description: The proxied child carries out its operation, often decoding arguments or contacting an external
+      host to retrieve or exfiltrate.
+    mapped_to: Q6
+    source: attack:T1218.network_activity
+  dimension_coverage:
+  - dimension: command_analysis
+    technique: T1218
+    covered_by: Q4
+    source: template:cue_process_tool.mechanism_decode
+    coverage_type: direct
+  - dimension: parent_process_analysis
+    technique: T1218
+    covered_by: Q9
+    source: template:cue_parent_process.baseline
+    coverage_type: direct
+  - dimension: tuning_parameter
+    technique: T1218
+    covered_by: Q5
+    source: attack:T1218.proxied_payload_identity
+    coverage_type: direct
+  mutable_dispositions:
+  - element: ParentProcessName
+    dimension: parent_process_analysis
+    specific_values: rationale only
+    disposition: query_injection
+    target_question: Q9
+    notes: The parent-child baseline keys on process.parent.name (runexehelper.exe) and the child Image to profile
+      whether this proxy-launch pairing is historically routine on the host; follow_on (Q7) and scope (Q14) use the
+      same parent-name pivot to surface unexpected parent-child relationships.
+  - element: SignedBinaryList
+    dimension: tuning_parameter
+    specific_values: rationale only (allowed-signed-binary list; runexehelper.exe is the proxy launcher, not the
+      payload)
+    disposition: query_injection
+    target_question: Q5
+    notes: The payload-identity question returns Image, OriginalFileName, and Hashes for the proxied child so the
+      analyst can judge whether the executed binary is a Microsoft-signed/allowed binary or an unsigned/relocated
+      payload. Signing-status framing is surfaced in Q5 context rather than hard-filtered, since the rule does not
+      constrain the child binary.
+  - element: CommandLineRegex
+    dimension: command_analysis
+    specific_values: rationale only (regex for suspicious arguments — URLs, script paths, DLL entrypoints)
+    disposition: context
+    target_question: Q4
+    notes: No concrete values in the analytic, only a rationale; surfaced in Q4 context directing the analyst to
+      match the proxied child's arguments against suspicious-argument patterns. The mechanism_decode query is
+      ADAPT_STRUCTURALLY scoped to host+child Image, returning the full CommandLine for manual inspection.
+  - element: RemoteDomainAllowlist
+    dimension: tuning_parameter
+    specific_values: rationale only (allowlist of legitimate enterprise domains to suppress)
+    disposition: context
+    target_question: Q6
+    notes: No concrete values; surfaced in Q6 (network_activity) context as the basis for separating external/C2
+      connections from known enterprise destinations. The query returns DestinationIp/DestinationPort/DestinationHostname
+      so the analyst can apply their own allowlist.
+  dedup_decisions:
+  - dropped: cue_user_actor.baseline + cue_user_actor.baseline_svc
+    reason: user_actor pair — non-deduplicable
+    kept: both emitted (Q10 user-pivot, Q11 service-principal substitute)
+  - dropped: cue_user_actor.clustering + cue_user_actor.clustering_svc
+    reason: user_actor pair — non-deduplicable
+    kept: both emitted (Q12 user-pivot, Q13 service-principal substitute)
+  skipped_templates:
+  - template: cue_process_tool.process_chain
+    reason: "parent_process is primary cue (per hint) — drop cue_process_tool:process_chain. The parent chain is
+      investigated by Q3 (cue_parent_process.mechanism_decode), which walks up via ParentProcessGuid to identify
+      what launched runexehelper itself."
+  - template: cue_process_tool.baseline
+    reason: >-
+      Child-binary host baseline is subsumed by the parent-child baseline Q9 (cue_parent_process.baseline), which
+      is the discriminating pivot for a parent-keyed rule. A bare child-binary baseline would return volume for the
+      child without isolating the runexehelper.exe proxy-launch relationship that is the actual anomaly.
+  reflection_overrides: []
+  hint_dispositions:
+  - hint: "logsource 'image_load' (recommended by techniques: T1218) is not covered — pull in cue_image_load.* or author a custom question with `category: image_load`"
+    disposition: declined
+    reason: >-
+      The T1218 image_load analytic targets signed binaries that load a payload DLL (rundll32.exe, regsvr32.exe,
+      msiexec.exe). runexehelper.exe is a process launcher — it duplicates the thread token and runs argv[1] as a
+      separate executable via CreateProcessAsUser, it does not host the payload as a loaded module of itself.
+      Image-load events on runexehelper.exe would return only its own normal dependency DLLs, not the proxied
+      payload, so they add no precision for this rule. The proxied executable's own identity and behavior are
+      covered by Q5 (attack:T1218.proxied_payload_identity, Image/OriginalFileName/Hashes) and Q4
+      (cue_process_tool.mechanism_decode). No compensating attack:T1218.image_load question authored.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+  - universal
+  - cue_parent_process
+  - cue_process_tool
+  - cue_user_actor
+  - cue_host_context
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 15
+      attack: 2
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 2
+      context: 13
+    logsource_diversity:
+      process_creation: 15
+      network_connection: 1
+      sigma_alert: 1

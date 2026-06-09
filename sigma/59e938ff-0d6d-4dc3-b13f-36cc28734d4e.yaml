@@ -1,0 +1,618 @@
+name: Execute Code with Pester.bat
+id: 03e0175b-c78f-4824-a0d3-0aae1ec708de
+description: |
+  Detects code execution proxied through Pester.bat, the batch helper shipped with the Pester PowerShell testing module,
+  which can be coerced into running arbitrary commands under cover of a legitimate test-runner invocation. The rule fires
+  when either powershell.exe or pwsh.exe runs with both Pester and Get-Help on the command line, OR cmd.exe runs with both
+  pester and a semicolon present AND the command line also contains help or \?. The technique abuses a signed/legitimate
+  script entry point to run attacker code, so the investigation should decode the full command line, confirm the user and
+  host are expected to run PowerShell test tooling, and determine whether the invocation drives a legitimate test run or
+  proxies follow-on execution.
+type: detection
+detection_id: 59e938ff-0d6d-4dc3-b13f-36cc28734d4e
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the alerting event match the rule's pattern — either powershell.exe/pwsh.exe with both Pester and Get-Help, or cmd.exe with pester and a semicolon plus help or \?
+  context: Before investing investigation time, confirm the alert is a true positive by reviewing the exact command line and process image. The rule fires on either of two branches, so note which one matched. The PowerShell branch requires powershell.exe or pwsh.exe with both Pester and Get-Help present; the cmd branch requires cmd.exe with both pester and a semicolon, plus help or \? in the command line. The branch that fired shapes which downstream questions carry weight — the cmd branch in particular implies a chained command sequence after the semicolon.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run the Pester testing module or its batch helper?
+  context: Pester is a legitimate PowerShell testing framework used by developers and CI/build automation, but it is uncommon on general-purpose endpoints and non-developer servers. Knowing whether the user role and host function involve PowerShell module development or test execution is often the fastest path to separating a routine test run from proxied code execution.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: Decode the full command line. What is the Pester/Get-Help invocation actually doing, and is there a chained command after a semicolon?
+  context: The full command line reveals the specific operation. Reconstruct the arguments passed to the interpreter, identify whether the Pester and Get-Help tokens form a genuine help/test invocation or a pretext wrapping other code, and decode any chained statements following a semicolon. The cmd branch in particular fires only when a semicolon is present, so a follow-on command after the separator is the load-bearing artifact to read.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+        CommandLine|contains:
+          - Pester
+          - pester
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:powershell.encoded_command_decode
+  question: Was the command encoded or obfuscated, and what does it decode to?
+  context: Code proxied through a test-runner entry point is frequently wrapped in PowerShell's -EncodedCommand (-enc) parameter, string concatenation, backtick escaping, or variable substitution to hide intent. Base64-encoded commands are the most common form. Decoding reveals the actual payload — download cradles, reverse shells, or in-memory loading of .NET assemblies. If the command line is already readable plain text, focus on what the readable cradle fetches and executes instead.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:powershell.script_block_logging
+  question: Did PowerShell script block logging capture the deobfuscated script content?
+  context: Script block logging records the deobfuscated script content that PowerShell actually executes, even when the command line is encoded or obfuscated. This provides ground truth about what ran, bypassing any wrapping applied at the test-runner entry point. If PowerShell operational logs are not ingested in this environment, treat zero results as a visibility gap rather than evidence nothing ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- source: template:powershell.powershell_security_bypass
+  question: Were PowerShell security controls bypassed or weakened before this execution?
+  context: Operators often disable or bypass PowerShell security controls before running a payload. Common techniques include AMSI bypass (patching amsi.dll in memory), execution policy changes (Set-ExecutionPolicy or -ep bypass), constrained language mode escape, and version downgrade attacks (powershell.exe v2, which lacks logging). Finding these precursor events on the host strengthens the case that the test-runner invocation is a cover for malicious execution.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- source: template:cue_process_tool.process_chain
+  question: What process spawned this interpreter, and is that parent chain expected?
+  context: The parent process reveals how the interpreter was invoked. Legitimate Pester usage typically descends from explorer.exe, a shell, or a CI/build agent. Parents like winword.exe, mshta.exe, wscript.exe, cscript.exe, or an archive tool indicate macro-driven or staged execution rather than interactive testing. Walk up the tree to see what spawned the parent.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: attack:T1216.signed_to_unsigned_child
+  question: What child processes did this interpreter spawn afterward, and do any of them launch shells or living-off-the-land binaries?
+  context: Proxying execution through a signed or legitimate script entry point typically shows up in the children it spawns rather than in the interpreter itself. A genuine Pester test run usually spawns little; a proxy invocation commonly spawns cmd.exe, powershell.exe, certutil.exe, rundll32.exe, or a side-loaded signed binary to carry the actual payload. Review the children and their command lines for follow-on staging, especially an unsigned or unexpected binary launched from the signed parent.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.baseline
+  question: Does this host normally run this interpreter?
+  context: An interpreter that has rarely or never been seen on a host is more suspicious than one that runs regularly. Zero or very low historical counts indicate first-time or rare execution, which on a non-developer endpoint raises the priority of the decode result.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired the rule's pattern, what parents and users normally drive that activity, and does the current alert fit that pattern?
+  context: Even legitimate Pester usage can be abused. The query mirrors the rule's selection structure scoped to this host, so the resulting parent and user distribution reflects how this specific firing pattern has historically run here, not generic PowerShell usage. A new parent process, an unexpected user account, or an unusual command-line shape is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      powershell_module:
+        Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+        CommandLine|contains|all:
+        - Pester
+        - Get-Help
+      cmd_execution:
+        Image|endswith: \cmd.exe
+        CommandLine|contains|all:
+        - pester
+        - ;
+      get_help:
+        CommandLine|contains:
+        - help
+        - \?
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (powershell_module or (cmd_execution and get_help)) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired the rule's pattern in the past week, and does the cross-host distribution look like consistent automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of this firing pattern, not generic PowerShell usage. Many hosts firing the same pattern points to scripted deployment or CI/build automation that legitimately runs Pester; one host or a small unrelated set points to manual operator activity. Use the host distribution and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      powershell_module:
+        Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+        CommandLine|contains|all:
+        - Pester
+        - Get-Help
+      cmd_execution:
+        Image|endswith: \cmd.exe
+        CommandLine|contains|all:
+        - pester
+        - ;
+      get_help:
+        CommandLine|contains:
+        - help
+        - \?
+      condition: powershell_module or (cmd_execution and get_help)
+    fields:
+    - host.name
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run PowerShell test tooling across the environment?
+  context: Compare this user's current action against their historical behavior. A user who has never run the interpreter or Pester is more suspicious than one who does so regularly as part of their role. User role and typical toolset should align with running a PowerShell testing framework.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent and interpreter combination historically routine on this host or across the environment, or is the parent unusual for this binary?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior. The meaningful pivot is the launch mechanism: which parent process spawned this interpreter, and is that pair historically common. A new or rare parent for this binary on this host or environment-wide is the deviation worth chasing; a pair that already accounts for thousands of prior events is vendor, CI, or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity across multiple endpoints. If the same user triggered similar activity on multiple hosts, the scope of the operation may be larger than a single endpoint.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent and interpreter combination fire on other hosts in the same window, indicating a coordinated automation rollout rather than isolated activity?
+  context: Under a service principal, asking what else this user did across the network returns agent-telemetry noise, since every host runs SYSTEM-owned agents constantly. The meaningful question is whether the same launch mechanism, parent process plus spawned interpreter, fired on other hosts in the alert window. Multiple hosts in the same window points to scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: 'Alerts rarely occur in isolation. Examining activity around the alert reveals the immediate context: what led to this event, what happened after, and whether it is part of a larger sequence. Look for reconnaissance, privilege escalation, persistence installation, or data staging.'
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: 'Alerts rarely happen in isolation. Earlier detections on the same host, defense tampering, reconnaissance, or credential access, may reveal the stages that preceded this event and help reconstruct the timeline. Look for patterns: tampering followed by execution, or reconnaissance followed by exploitation.'
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in the hour before the alert?
+  context: Tampering typically precedes payload execution. The query surfaces direct attempts to disable AV/EDR services, flip Defender flags, add broad exclusions, clear logs, or patch AMSI/ETW. Zero rows is a useful protection-looks-healthy signal; kernel-level driver tampering and in-memory patches will not appear here. Populated rows shift the disposition toward operator preparation; review the parent process and signing chain to identify the writer.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1059.001
+      name: PowerShell
+      role: primary
+    - id: T1216
+      name: System Script Proxy Execution
+      role: secondary
+    - id: T1059
+      name: Command and Scripting Interpreter
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: interpreter_invocation
+      description: An interpreter (powershell.exe/pwsh.exe or cmd.exe) is invoked with the Pester/Get-Help pattern that proxies execution through the test-runner entry point.
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: command_decode
+      description: The full command line is decoded to reveal what the Pester/Get-Help invocation actually does, including any chained statement after a semicolon.
+      mapped_to: Q3
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 3
+      label: obfuscation_unwrap
+      description: Encoded or obfuscated PowerShell arguments are decoded to readable script content (command line and script block logging).
+      mapped_to: Q4
+      source: template:powershell.encoded_command_decode
+    - stage: 4
+      label: proxied_followon_execution
+      description: The signed/legitimate script entry point spawns child processes (shells, LOLBins, side-loaded binaries) that carry the actual payload.
+      mapped_to: Q8
+      source: attack:T1216.signed_to_unsigned_child
+  dimension_coverage:
+    - dimension: command_analysis
+      technique: T1059.001
+      covered_by: Q3
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1059.001
+      covered_by: Q7
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1059.001
+      covered_by: Q16
+      source: template:cue_host_context.clustering
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1059.001
+      covered_by: Q11
+      source: template:cue_process_tool.scope
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1059
+      covered_by: Q2
+      source: template:universal.host_user_context
+      coverage_type: direct
+  mutable_dispositions:
+    - element: CommandLinePattern
+      dimension: command_analysis
+      specific_values: "-enc, -nop (encoded/hidden PowerShell arguments); rule's own Pester/Get-Help tokens"
+      disposition: query_injection
+      target_question: Q3
+      notes: "mechanism_decode (ADAPT_STRUCTURALLY) tightened with the rule's CommandLine|contains Pester/pester for Q-vs-query alignment; encoded-argument decoding handled by Q4 (encoded_command_decode)."
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "Excel, WinWord, mshta, wscript, cscript (examples, no fixed list)"
+      disposition: context
+      target_question: Q7
+      notes: "Abnormal-parent angle framed in process_chain context; example parents named in prose, not hard-coded into a query selection since the rule binds no parent."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only (off-hours / non-maintenance windows)"
+      disposition: context
+      target_question: Q16
+      notes: "No queryable threshold; host-clustering window plus baseline_deviation carry the temporal-correlation intent."
+    - element: LoadedModuleList
+      dimension: tuning_parameter
+      specific_values: "rationale only (rare/never-before-seen .NET assemblies)"
+      disposition: context
+      target_question: Q4
+      notes: "No fixed assembly list; image_load logsource declined (see hint_dispositions). The .NET-hosted execution path is surfaced qualitatively by encoded_command_decode and script_block_logging."
+    - element: ScriptBlockLengthThreshold
+      dimension: tuning_parameter
+      specific_values: "rationale only (Event ID 4104 length filter)"
+      disposition: context
+      target_question: Q5
+      notes: "No numeric threshold supplied; script_block_logging question covers the 4104 ground-truth content qualitatively."
+    - element: ChildCommandLineRegex
+      dimension: tuning_parameter
+      specific_values: "download cradle / PowerShell decode payload in child (examples)"
+      disposition: new_question
+      target_question: Q8
+      notes: "Drove attack:T1216.signed_to_unsigned_child follow-on child-process question; example child binaries named in context."
+    - element: SignedToUnsignedTransition
+      dimension: tuning_parameter
+      specific_values: "rationale only (signed parent -> unsigned/unknown child)"
+      disposition: new_question
+      target_question: Q8
+      notes: "Signed-to-unsigned proxy-exec angle carried by the child-process question's context; no GrantedAccess-style value to inject."
+  dedup_decisions:
+    - dropped: cue_process_tool.clustering
+      reason: "host-clustering coverage provided by cue_host_context.clustering (same +/-15m host-scoped Image aggregation); process_tool variant redundant"
+      kept: cue_host_context.clustering
+    - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable (subject vs. launch-mechanism pivot); both emitted"
+      kept: both
+    - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable (subject vs. launch-mechanism pivot); both emitted"
+      kept: both
+    - dropped: cue_process_tool.follow_on
+      reason: "follow-on child-process angle reauthored as attack:T1216.signed_to_unsigned_child (ChildCommandLineRegex/SignedToUnsignedTransition mutable elements) — same host+ParentImage query, technique-sourced for T1216 proxy-exec coverage"
+      kept: attack:T1216.signed_to_unsigned_child
+  skipped_templates: []
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "logsource 'file_event' (recommended by techniques: T1216) is not covered — pull in cue_artifact.* or author a custom question with `category: file_event`"
+      disposition: declined
+      reason: >-
+        Rule has applicability.has_file_reference: false and binds no file
+        path or dropped-payload artifact — it fires purely on process_creation
+        command-line tokens (Pester/Get-Help/help/semicolon). There is no
+        %file_paths% to scope a file_event query against. The load-bearing
+        T1216 proxy-execution signal here is the signed-parent-to-unsigned-child
+        spawn, which is covered in process_creation by Q8
+        (attack:T1216.signed_to_unsigned_child).
+    - hint: "logsource 'image_load' (recommended by techniques: T1059.001,T1216) is not covered — pull in cue_image_load.* or author a custom question with `category: image_load`"
+      disposition: declined
+      reason: >-
+        Rule constrains Image to powershell.exe/pwsh.exe/cmd.exe and matches on
+        command-line tokens; image_load (Sysmon EID 7) on those binaries returns
+        assembly-load volume without precision for the help/test-runner invocation
+        this rule fires on, and the rule binds no specific .NET assembly to scope.
+        The .NET-hosted / in-memory execution path is surfaced qualitatively by
+        Q4 (encoded_command_decode) and Q5 (script_block_logging via Event ID 4104)
+        using process_creation and PowerShell operational evidence sufficient for
+        triage. No compensating attack image_load question authored.
+    - hint: "logsource 'process_access' (recommended by techniques: T1216) is not covered and no template family exists — author a custom question with `category: process_access`"
+      disposition: declined
+      reason: >-
+        Rule has no process-handle-access or injection component — it detects a
+        help-text/module invocation through a batch entry point, not a
+        cross-process memory operation. process_access (Sysmon EID 10) would
+        return unrelated handle-open volume with no rule-aligned scope. T1216's
+        relevant signal for this rule is parent/child lineage, covered by Q7
+        (process_chain) and Q8 (signed_to_unsigned_child) in process_creation.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - powershell
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 17
+      attack: 1
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 2
+      context: 14
+    logsource_diversity:
+      process_creation: 16
+      powershell_script_block: 1
+      sigma_alert: 1

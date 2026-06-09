@@ -1,0 +1,479 @@
+name: PowerShell Get-Process LSASS
+id: 9dd536ce-c24b-4449-8f1d-47f45919682e
+description: |
+  Detects PowerShell commands that resolve the lsass process via the Get-Process cmdlet or its aliases (ps, gps), matching the command-line substrings 'Get-Process lsas', 'ps lsas', or 'gps lsas'. Resolving lsass with Get-Process is a common first step in credential-theft workflows: the returned process object's .id is fed to a memory-dumping routine (for example, comsvcs.dll MiniDump invoked through rundll32.exe) to write LSASS memory to disk or a remote share for offline credential extraction. Legitimate administrative or monitoring scripts rarely target lsass by name, so the investigation should confirm what the full command did, whether a dump file or remote share was produced, and what ran before and after the alert.
+type: detection
+detection_id: b2815d0d-7481-4bf0-9b6c-a4c48a94b349
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line match what this rule detects — does it reference the lsass process via Get-Process, ps, or gps?
+  context: Before investing investigation time, confirm the alert is a true positive by reviewing the exact command line against the rule's detection criteria. The rule fires when the command line contains 'Get-Process lsas', 'ps lsas', or 'gps lsas'. Confirm the full token targets lsass (not, for example, a host or variable that merely starts with those characters).
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to enumerate or query the lsass process from PowerShell?
+  context: Legitimate administrative activity can trigger many detections, but resolving lsass by name from PowerShell is uncommon outside security tooling and incident response. Knowing whether the user role and host function are consistent with the detected behavior is often the fastest path to distinguishing a true positive from routine operations.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: attack:T1552.004.process_identification
+  question: What is the full identity of the process that ran this command — its image path, signing status, and parent?
+  context: The rule matches only the command-line substring and carries no Image field, so the executing process must be identified explicitly. Confirm whether the command ran under a genuine, signed powershell.exe in System32 or under a renamed or relocated copy in a user-writable directory, and capture the parent so the launch mechanism is established. A renamed or out-of-path interpreter is itself a strong deviation worth chasing.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - ParentImage
+      - User
+- source: template:credential_access.credential_target_identification
+  question: Was lsass memory actually accessed or dumped, and by what method?
+  context: Resolving lsass with Get-Process commonly precedes a memory dump. Decode the full command to determine whether the returned process .id was passed to a dumping routine — comsvcs.dll MiniDump through rundll32.exe, procdump, direct memory reads, or a custom dumper — and whether the output was written to a local path or a mapped remote share. The method indicates attacker sophistication and what credentials may be exposed.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:powershell.encoded_command_decode
+  question: Was the command encoded or obfuscated, and what does it decode to?
+  context: PowerShell commands are frequently hidden with the -EncodedCommand (-enc) parameter, string concatenation, backtick escaping, or variable substitution. The lsass lookup may be one stage of a larger encoded script. Decode any base64 or obfuscated content to reveal the actual payload — what dumping routine is invoked, what file path or remote share receives the output, and whether the command pipes the resolved process id into a memory read.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:powershell.script_block_logging
+  question: Did PowerShell script block logging capture the full script content?
+  context: Script block logging records the deobfuscated script content that PowerShell actually executes, even when the command line is encoded or obfuscated. This provides ground truth about what ran, including any dumping logic that follows the lsass lookup. If PowerShell operational logs are not ingested in this environment, treat zero results as a visibility gap rather than evidence nothing ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- source: template:powershell.powershell_security_bypass
+  question: Were PowerShell security controls bypassed or weakened before this execution?
+  context: Operators often disable or bypass PowerShell security controls before running a credential-access payload. Common precursors include AMSI bypass (patching amsi.dll in memory), execution policy changes (Set-ExecutionPolicy or the -ep bypass flag), and PowerShell downgrade attacks (version 2, which lacks logging). Finding these precursor events strengthens the case for malicious activity.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- source: attack:T1552.004.file_path_analysis
+  question: Was a dump file or other credential artifact written to disk on this host around the time of the alert?
+  context: A successful lsass dump writes the captured memory to a file — frequently in a user-writable or temporary location, or to a mapped network drive for offline extraction. Look for newly created files with dump-like extensions or names. If the alerting command referenced a specific output path, focus there; otherwise a dump artifact appearing within the alert window corroborates an actual credential-theft attempt rather than a benign process query.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: attack:T1552.004.security
+  question: Did a Windows Security log handle-access event record a process opening the lsass process around the time of the alert?
+  context: When a process obtains a handle to lsass, the Windows Security log can record the access (handle-to-object events such as event ID 4656/4663 against the lsass process and the requested access mask). This is independent evidence of whether the resolved lsass process was actually opened for memory read, separate from the process_creation command line. If Security object-access auditing is not enabled in this environment, treat zero results as a visibility gap rather than evidence the access did not occur.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: security
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ObjectName|contains: 'lsass'
+      condition: selection
+    fields:
+      - ProcessName
+      - ObjectName
+      - AccessMask
+      - SubjectUserName
+- source: template:cue_process_tool.process_chain
+  question: What process spawned this PowerShell instance, and is that parent chain expected?
+  context: The parent process reveals how the command was invoked. Interactive administrative use typically descends from explorer.exe or a console host; unusual parents such as mshta.exe, wscript.exe, an Office application, or a remote-execution service point toward exploitation, a malicious macro, or hands-on-keyboard activity. Walk the parent chain to establish how the lsass lookup was launched.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired the rule's pattern, what parents and users normally drive that activity, and does the current alert fit that pattern?
+  context: Even routine tooling can resolve lsass occasionally. The query mirrors the rule's selection structure scoped to this host, so the resulting parent and user distribution reflects how this specific firing pattern has historically run here — not generic PowerShell usage. A new parent process, an unexpected user account, or an unusual command-line shape is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains:
+        - Get-Process lsas
+        - ps lsas
+        - gps lsas
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired the rule's pattern in the past week, and does the cross-host distribution look like consistent automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of this firing pattern rather than generic PowerShell usage. Many hosts resolving lsass the same way points to scripted deployment or a security-tool sweep; one host or a small unrelated set points to manual operator activity. Use the host distribution and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains:
+        - Get-Process lsas
+        - ps lsas
+        - gps lsas
+      condition: selection
+    fields:
+    - host.name
+- source: template:cue_user_actor.baseline
+  question: Does this user have any history of resolving the lsass process from PowerShell across the environment?
+  context: Compare this user's current action against their historical behavior. A user who has never resolved lsass by name is more suspicious than one whose role (security operations, incident response) routinely involves it. The query counts this user's prior firings of the rule's pattern across all hosts; zero or very low counts indicate first-time activity for this account.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        CommandLine|contains:
+        - Get-Process lsas
+        - ps lsas
+        - gps lsas
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is the parent-plus-PowerShell launch of the rule's pattern historically routine on this host or across the environment, or is the parent unusual?
+  context: When the alert fires under a service principal (SYSTEM, LOCAL SERVICE, NETWORK SERVICE, or a computer account), user identity does not attribute the behavior; the meaningful pivot is the launch mechanism. The query counts prior firings of the rule's pattern grouped by host so concentration stands out. A new or rare parent for this pattern is the deviation worth chasing; a pair that already accounts for many prior events is more likely automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith|expand: '%ParentImage%'
+        CommandLine|contains:
+        - Get-Process lsas
+        - ps lsas
+        - gps lsas
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints. If the same user triggered credential-access or remote-execution activity on other hosts in the same window, the scope of compromise may be larger than this single alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did the same parent-plus-PowerShell launch of this pattern fire on other hosts in the same window — a coordinated rollout, or isolated activity?
+  context: Under a service principal, asking what the user did across the network returns agent-telemetry noise, since every host runs SYSTEM-owned agents constantly. The meaningful question is whether the same launch mechanism fired on other hosts in the alert window. Multiple hosts in the same window points to scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith|expand: '%ParentImage%'
+        CommandLine|contains:
+        - Get-Process lsas
+        - ps lsas
+        - gps lsas
+      condition: selection
+    fields:
+      - host.name
+- source: template:credential_access.credential_exposure_assessment
+  question: Which accounts may be compromised if lsass was dumped, and do any have elevated privileges?
+  context: The severity of LSASS credential theft depends on which accounts had logon sessions on this host. Any cached domain credentials, service account tokens, or interactive admin sessions present in lsass memory may be exposed. Cross-reference the active sessions and the host's role against Active Directory group memberships; domain admin or service-account exposure requires incident escalation.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:credential_access.post_access_lateral_movement
+  question: Were any new logon sessions or remote connections initiated after this event?
+  context: Credential theft is typically followed by lateral movement using the stolen credentials. Look for follow-on alerts indicating remote-desktop sessions, SMB connections, remote command execution, or new authentication events on this host shortly after the lsass lookup, which would indicate active exploitation of compromised credentials.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - rule.name
+      - rule.uuid
+      - event.severity_label
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1552.004
+      name: Private Keys
+      role: primary
+    - id: T1552
+      name: Unsecured Credentials
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: credential_target_resolution
+      description: "PowerShell resolves the lsass process by name (Get-Process / ps / gps lsas), the setup step for credential extraction"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: memory_access_or_dump
+      description: "Resolved process .id is passed to a dumping routine (comsvcs MiniDump, procdump, direct memory read) accessing lsass memory"
+      mapped_to: Q4
+      source: template:credential_access.credential_target_identification
+    - stage: 3
+      label: artifact_or_handle_evidence
+      description: "Dump file written to disk / remote share, or a handle-access event recorded against lsass"
+      mapped_to: Q8
+      source: attack:T1552.004.file_path_analysis
+    - stage: 4
+      label: exfil_or_lateral_movement
+      description: "Captured credentials used for follow-on logon sessions or remote connections"
+      mapped_to: Q18
+      source: template:credential_access.post_access_lateral_movement
+  dimension_coverage:
+    - dimension: file_path_analysis
+      technique: T1552.004
+      covered_by: Q8
+      source: attack:T1552.004.file_path_analysis
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1552.004
+      covered_by: Q10
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: process_identification
+      technique: T1552.004
+      covered_by: Q3
+      source: attack:T1552.004.process_identification
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1552.004
+      covered_by: Q11
+      source: template:cue_process_tool.baseline_deviation
+      coverage_type: direct
+    - dimension: command_analysis
+      technique: T1552
+      covered_by: Q5
+      source: template:powershell.encoded_command_decode
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1552
+      covered_by: Q18
+      source: template:credential_access.post_access_lateral_movement
+      coverage_type: indirect
+    - dimension: user_context
+      technique: T1552
+      covered_by: Q13
+      source: template:cue_user_actor.baseline
+      coverage_type: direct
+  mutable_dispositions:
+    - element: FilePathRegex
+      dimension: file_path_analysis
+      specific_values: ".pem, .pfx, .ppk extensions; C:\\Users\\*\\.ssh\\ ; certificate stores"
+      disposition: context
+      target_question: Q8
+      notes: "Rule targets lsass memory (not private-key files); the generic key-file regex does not apply. Q8 instead scopes %file_paths% to dump artifacts written by the lsass lookup, which is the relevant file-path analysis for this rule."
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "benign cert tools to exclude (certutil.exe, ssh.exe)"
+      disposition: context
+      target_question: Q10
+      notes: "Exclusion list of cert-management tools is irrelevant to an lsass lookup. Parent analysis is handled by Q10 (process_chain) which inspects the actual parent without a cert-tool allowlist."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only (threshold for multi-file access indicating automation)"
+      disposition: context
+      target_question: Q18
+      notes: "Threshold is a tuning rationale without a queryable value; the post-access lateral-movement window captures the post-lookup activity timing."
+    - element: SuspiciousProcessList
+      dimension: tuning_parameter
+      specific_values: "reg.exe, cmd.exe, powershell.exe"
+      disposition: context
+      target_question: Q11
+      notes: "Rule is already constrained to the powershell lsass-lookup CommandLine pattern; the broader suspicious-process list would loosen, not tighten, scope. Baseline_deviation reflects the exact rule pattern instead."
+  dedup_decisions:
+    - dropped: cue_process_tool.clustering
+      reason: "tool-clustering on a CommandLine-only rule has no distinct Image to pivot on and would duplicate cue_user_actor.clustering (around-the-time activity)"
+      kept: cue_user_actor.clustering
+    - dropped: cue_host_context.clustering
+      reason: "redundant with cue_user_actor.clustering (network-wide around-time activity); dropped to stay within the 18-question cap without losing a distinct angle"
+      kept: cue_user_actor.clustering
+    - dropped: cue_process_tool.follow_on
+      reason: "post-lookup dumping action is already covered by credential_target_identification (the dump method) and attack:T1552.004.file_path_analysis (the dump artifact); dropped to stay within the 18-question cap"
+      kept: credential_access.credential_target_identification
+    - dropped: cue_host_context.precursor
+      reason: "post_access_lateral_movement already performs sigma-alert correlation on the host; the before/after split was the only distinction and is not worth a slot under the 18-question cap for a credential-access rule whose decisive evidence is the dump itself"
+      kept: credential_access.post_access_lateral_movement
+    - dropped: cue_process_tool.baseline
+      reason: "Image-based 90d baseline cannot run (CommandLine-only rule, no %Image%); pattern-scoped baseline coverage provided by cue_user_actor.baseline and cue_process_tool.baseline_deviation"
+      kept: cue_process_tool.baseline_deviation
+    - dropped: universal.endpoint_protection_health
+      reason: "powershell.powershell_security_bypass (Q7) already surfaces prior tamper/bypass activity on the host for this credential-access rule; the generic host-tamper sweep would duplicate that precursor coverage"
+      kept: powershell.powershell_security_bypass
+    - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable; both emitted (Q14 user-pivot, Q15 parent+pattern substitute)"
+      kept: both
+    - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable; both emitted (Q16 user-pivot, Q17 parent+pattern substitute)"
+      kept: both
+  skipped_templates:
+    - template: cue_process_tool.mechanism_decode
+      reason: "replaced_by: credential_access.credential_target_identification (Q4)"
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "powershell.encoded_command_decode replaces obfuscation.encoded_payload_decode"
+      disposition: declined
+      reason: "No obfuscation technique set is present in the brief, so there is no obfuscation.encoded_payload_decode template to supersede. The replacement target (powershell.encoded_command_decode) is included as Q5; the hint is informational with nothing to drop."
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - powershell
+    - credential_access
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 15
+      attack: 3
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 2
+      context: 14
+    logsource_diversity:
+      process_creation: 14
+      powershell_script_block: 1
+      file_event: 1
+      security: 1
+      sigma_alert: 1

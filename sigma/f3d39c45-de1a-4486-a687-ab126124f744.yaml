@@ -1,0 +1,535 @@
+name: Sdiagnhost Calling Suspicious Child Process
+id: f6ac76f3-910e-402b-a38a-85e5d1313bba
+description: |
+  Detects sdiagnhost.exe spawning a suspicious child process. The rule fires when
+  sdiagnhost.exe (the MSDT scripted-diagnostics host) is the parent AND the child's
+  Image ends in one of a fixed set of interpreters and system binaries
+  (powershell.exe, pwsh.exe, cmd.exe, mshta.exe, cscript.exe, wscript.exe,
+  taskkill.exe, regsvr32.exe, rundll32.exe, calc.exe), excluding two benign cases
+  (cmd.exe whose command line contains 'bits', and powershell.exe launched with
+  -noprofile). Legitimately, sdiagnhost.exe runs Windows troubleshooting packs and
+  does not normally launch command interpreters or proxy-execution binaries; this
+  parent-child pattern is the signature of MSDT abuse such as the ms-msdt / CVE-2022-30190
+  path, where a document or remote template drives sdiagnhost.exe to execute attacker
+  code. Confirm the child and its command line, decode what it does, trace what spawned
+  sdiagnhost.exe itself, and look for the follow-on file, DLL-load, and network activity
+  the child sets up.
+type: detection
+detection_id: f3d39c45-de1a-4486-a687-ab126124f744
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-09
+questions:
+- source: template:universal.verify_trigger_match
+  question: Was this process spawned by sdiagnhost.exe, and is the child one of the flagged interpreters or proxy-execution binaries?
+  context: Confirm the alert is a true positive before investing time. The rule requires
+    sdiagnhost.exe as the parent AND a child whose Image ends in one of powershell.exe,
+    pwsh.exe, cmd.exe, mshta.exe, cscript.exe, wscript.exe, taskkill.exe, regsvr32.exe,
+    rundll32.exe, or calc.exe, with two benign cases excluded (cmd.exe whose command line
+    contains 'bits', and powershell.exe run with -noprofile). Read the parent and child Image
+    from the triggering event to confirm the pairing matches the rule.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+- source: template:universal.host_user_context
+  question: Is this user and host expected to be running Windows troubleshooting diagnostics right now?
+  context: sdiagnhost.exe runs when a user or admin launches a Windows troubleshooter or an
+    MSDT diagnostic pack. Knowing whether someone on this host was actually using a
+    troubleshooter, and whether this user and host function are consistent with that, is often
+    the fastest way to separate genuine diagnostics from a document or remote template driving
+    sdiagnhost.exe to execute code.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:parent_child.parent_process_legitimacy
+  question: What spawned sdiagnhost.exe, and is that chain consistent with a user-launched troubleshooter?
+  context: The parent-child relationship is the core signal. sdiagnhost.exe is normally started
+    by the diagnostic service (svchost.exe / msdt.exe) when a user opens a troubleshooter.
+    Tracing sdiagnhost.exe's own origin reveals whether the chain is legitimate or whether an
+    Office application, a remote-template fetch, or msdt.exe invoked with an ms-msdt payload
+    drove it. Read the grandparent Image and its command line.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- source: template:cue_process_tool.mechanism_decode
+  question: What exactly did the child process do? Decode its full command line and arguments.
+  context: The child's full command line reveals the specific action sdiagnhost.exe was driven
+    to take. Decode every flag, parameter, encoded block, file path, or URL. For mshta.exe and
+    the script hosts (cscript.exe, wscript.exe) identify the script or remote resource invoked;
+    for regsvr32.exe and rundll32.exe identify the DLL and entry point or any remote scriptlet
+    or URL; for cmd.exe and powershell.exe identify the downstream command. The query scopes to
+    children of sdiagnhost.exe on this host so multi-step invocations stay together.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        process.parent.name|expand: '%ParentName%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - CurrentDirectory
+- source: template:powershell.encoded_command_decode
+  question: If the child was powershell.exe or pwsh.exe, was the command encoded or obfuscated, and what does it decode to?
+  context: When the spawned child is PowerShell, attackers frequently hide intent with the
+    -EncodedCommand (-enc) parameter, base64, string concatenation, backtick escaping, or
+    variable substitution. Decoding reveals the actual payload — download cradles, reverse
+    shells, or in-memory execution of .NET assemblies. The MSDT abuse path commonly hands
+    PowerShell a base64 blob, so decode it to ground truth what ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:masquerading.true_identity
+  question: Is the spawned child the genuine signed system binary, or a renamed file masquerading as it?
+  context: The rule keys on the child's name (calc.exe, regsvr32.exe, powershell.exe, and so
+    on), but a renamed dropper can carry one of those names while being something else.
+    Comparing the Image path against the embedded OriginalFileName, and checking the signing
+    chain and file hash, reveals whether this is the real Microsoft-signed binary running from
+    its expected location or a relocated or renamed file. The OriginalFileName mismatch and a
+    non-standard install path are the discriminators; the hash enables a reputation lookup.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - Hashes
+- source: attack:T1218.image_load
+  question: If the child was regsvr32.exe or rundll32.exe, what DLL or module did it load?
+  context: regsvr32.exe and rundll32.exe are trusted signed binaries used for proxy execution —
+    they load and run a DLL or scriptlet supplied on the command line. The loaded module is the
+    actual payload and is often not visible from process_creation alone. Reviewing image-load
+    events for this process surfaces the DLL path and signer; a module loaded from a
+    user-writable or temporary directory, or an unsigned module, points to proxy execution of
+    attacker code rather than a legitimate diagnostic.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+- source: attack:T1218.network_connection
+  question: Did the child process make an outbound network connection shortly after it started?
+  context: System-binary proxy execution frequently retrieves a remote payload or reaches
+    command-and-control immediately after the child runs — mshta.exe fetching a remote HTA,
+    regsvr32.exe pulling a remote scriptlet, or PowerShell running a download cradle. Reviewing
+    outbound connections initiated by this process in the surrounding window surfaces the
+    download source or C2 endpoint and ties the egress to this execution.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ProcessGuid|expand: '%ProcessGuid%'
+        Initiated: 'true'
+      condition: selection
+    fields:
+      - Image
+      - DestinationIp
+      - DestinationHostname
+      - DestinationPort
+- source: template:parent_child.sibling_processes
+  question: What other child processes did this same sdiagnhost.exe instance spawn around this time?
+  context: If sdiagnhost.exe was driven to launch one interpreter, it may have launched others
+    too. Examining the other children of the same sdiagnhost.exe instance reveals the full scope
+    of activity from that one diagnostic host — multiple interpreters or proxy binaries from the
+    same parent points to scripted abuse rather than an isolated benign troubleshooter step.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:masquerading.renamed_binary_activity
+  question: What did the child process do after it started, and did it spawn further processes?
+  context: The purpose of driving a trusted binary through sdiagnhost.exe is to perform the
+    intended action while blending in. Examining the child processes spawned by this binary
+    reveals its actual objective — additional interpreters, reconnaissance, credential access,
+    or persistence steps. A chain of further activity below the flagged child distinguishes
+    active abuse from a single benign invocation.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:powershell.script_block_logging
+  question: If PowerShell ran, did script block logging capture the full deobfuscated script content?
+  context: Script block logging records the deobfuscated script content PowerShell actually
+    executes, even when the command line is encoded or obfuscated, giving ground truth about
+    what ran. If PowerShell operational logs are not ingested in this environment, treat zero
+    results as a visibility gap rather than evidence nothing ran, and decode the command line
+    from the alerting event directly.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- source: template:cue_user_actor.baseline
+  question: Does this user normally trigger Windows troubleshooters that lead to sdiagnhost.exe spawning interpreters?
+  context: Compare the account's current action against its history. A user who has never driven
+    sdiagnhost.exe to launch a command interpreter is more suspicious than one who does so as
+    part of routine support work. Align the result with what is known about the account — a
+    help-desk or support role versus a standard user who should never produce this pattern.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this sdiagnhost.exe-and-child combination historically routine on this host or across the environment, or is it unusual?
+  context: When the alert fires under a service principal (SYSTEM, LOCAL SERVICE, NETWORK
+    SERVICE, or a computer account), user identity does not attribute the behavior. The
+    meaningful pivot is the launch mechanism — sdiagnhost.exe spawning this binary and whether
+    that pair is historically common. A new or rare pairing is the deviation worth chasing; a
+    pair that already accounts for many prior events is established troubleshooting behavior.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the environment around this time?
+  context: Tracking the account's activity across all hosts in the surrounding window reveals
+    whether the same person triggered similar activity on other endpoints. If the same user
+    shows matching execution elsewhere, the scope is larger than this one host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same sdiagnhost.exe-and-child combination fire on other hosts in the same window, or is it isolated to this host?
+  context: Under a service principal, "what else did this user do" returns agent-telemetry noise
+    because every host runs SYSTEM-owned agents constantly. The meaningful question is whether
+    the same launch mechanism — sdiagnhost.exe plus the spawned binary — fired on other hosts in
+    the alert window. Multiple hosts point to a document or template distributed to many users;
+    a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Surveying activity around the alert reveals what
+    led to the diagnostic-host execution and what followed — additional downloads, persistence,
+    or recon. Aggregating by process and parent collapses repetitive agent telemetry into
+    high-count rows while novel parent-child pairs stand out at low counts.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host — document execution, reconnaissance, or defense
+    tampering — may reveal the stages that preceded this diagnostic-host execution and help
+    reconstruct the timeline. The sequence of alerts on a host often tells the fuller story of
+    how the activity unfolded.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1218
+      name: System Binary Proxy Execution
+      role: primary
+    - id: T1036
+      name: Masquerading
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: diagnostic_host_invocation
+      description: "A document, remote template, or ms-msdt payload drives sdiagnhost.exe (the MSDT scripted-diagnostics host) to run attacker-controlled steps"
+      mapped_to: Q3
+      source: template:parent_child.parent_process_legitimacy
+    - stage: 2
+      label: trusted_binary_proxy_execution
+      description: "sdiagnhost.exe spawns a trusted interpreter or proxy binary (powershell/cmd/mshta/cscript/wscript/regsvr32/rundll32/...) carrying the payload (the detection point)"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 3
+      label: payload_decode
+      description: "The child's command line, encoded blocks, and loaded module are decoded to reveal the executed payload"
+      mapped_to: Q4
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 4
+      label: remote_retrieval
+      description: "The proxy binary loads a remote module or makes an outbound connection to fetch the next stage or reach C2"
+      mapped_to: Q8
+      source: attack:T1218.network_connection
+  dimension_coverage:
+    - dimension: command_analysis
+      technique: T1218
+      covered_by: Q4
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1218
+      covered_by: Q3
+      source: template:parent_child.parent_process_legitimacy
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1218
+      covered_by: Q6
+      source: template:masquerading.true_identity
+      coverage_type: direct
+    - dimension: execution_context
+      technique: T1036
+      covered_by: Q1
+      source: template:universal.verify_trigger_match
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1036
+      covered_by: Q9
+      source: template:parent_child.sibling_processes
+      coverage_type: direct
+  mutable_dispositions:
+    - element: CommandLineRegex
+      dimension: command_analysis
+      specific_values: "rationale only (regex matching suspicious args: URLs, script paths, DLL entry points)"
+      disposition: context
+      target_question: Q4
+      notes: "mechanism_decode (ADAPT_STRUCTURALLY) scopes to children of sdiagnhost.exe on this host; the suspicious-argument classes (URLs, script paths, DLL entry points, /i: scriptlets) are named in context as what to decode. Not query-injected because the rule's discriminator is the parent (sdiagnhost.exe), not a child command-line token, and the child binary is variable; constraining to specific arg tokens would miss other proxy variants."
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "rationale only (profile unexpected parent-child, e.g. regsvr32.exe not launched by explorer.exe)"
+      disposition: context
+      target_question: Q3
+      notes: "parent_process_legitimacy traces what spawned sdiagnhost.exe and whether the chain is consistent with a user-launched troubleshooter — the parent-child legitimacy judgment this element encodes. Parent (sdiagnhost.exe) is already fixed by the rule."
+    - element: SignedBinaryList
+      dimension: tuning_parameter
+      specific_values: "rationale only (allowlist of signed proxy binaries: msiexec.exe, regsvr32.exe, ...)"
+      disposition: context
+      target_question: Q6
+      notes: "true_identity checks OriginalFileName, signer, and hash of the spawned binary against the genuine signed system binary — the signed-binary judgment this allowlist encodes. The flagged child set is fixed by the rule selection."
+    - element: RemoteDomainAllowlist
+      dimension: tuning_parameter
+      specific_values: "rationale only (suppress legitimate enterprise domains)"
+      disposition: context
+      target_question: Q8
+      notes: "Tuning rationale to suppress benign enterprise destinations; folded into the network_connection question's triage framing of the outbound destination. Not query-injected to avoid suppressing egress to other destinations."
+    - element: OriginalFilenameMismatch
+      dimension: tuning_parameter
+      specific_values: "Compare Image file name with PE OriginalFilename"
+      disposition: query_injection
+      target_question: Q6
+      notes: "Injected into true_identity as the OriginalFileName field projection alongside Image and Hashes; the mismatch is the discriminator named in context."
+    - element: KnownSystemUtilityPaths
+      dimension: tuning_parameter
+      specific_values: "Tune on expected install directories for signed binaries"
+      disposition: context
+      target_question: Q6
+      notes: "true_identity context calls out a non-standard install path for the named system binary as a discriminator; expected-path tuning is a judgment applied to the projected Image, not a directly queryable constraint here."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "Correlation window between file creation and service/process execution"
+      disposition: context
+      target_question: Q9
+      notes: "Correlation horizon folded into the +/-15m range on sibling_processes and the +/-15m / +/-1h ranges on the clustering questions; not a directly queryable field."
+  dedup_decisions:
+    - dropped: cue_process_tool.process_chain
+      reason: "parent_process is primary (per brief hint) and parent_child technique set is active — parent_child.parent_process_legitimacy is the more specific parent lookup that supersedes it"
+      kept: parent_child.parent_process_legitimacy
+    - dropped: cue_parent_process.mechanism_decode
+      reason: "parent_child technique set active — parent_process_legitimacy supersedes the generic parent lookup (per AGENTS.md dedup rule)"
+      kept: parent_child.parent_process_legitimacy
+    - dropped: cue_parent_process.follow_on
+      reason: "near-duplicate of parent_child.sibling_processes (children of the same parent); sibling_processes scopes by exact ParentProcessGuid instance"
+      kept: parent_child.sibling_processes
+    - dropped: cue_parent_process.clustering
+      reason: "near-duplicate of cue_host_context.clustering (host-scoped surrounding activity); host_context aggregates by Image+ParentImage and is the broader of the two"
+      kept: cue_host_context.clustering
+    - dropped: cue_parent_process.scope
+      reason: "near-identical query to cue_user_actor.clustering_svc (process.parent.name + Image|endswith, cross-host aggregation by host.name); clustering_svc is a mandatory service-principal pair"
+      kept: cue_user_actor.clustering_svc
+    - dropped: cue_parent_process.baseline
+      reason: "near-identical query to cue_user_actor.baseline_svc (process.parent.name + Image|endswith, -90d aggregation); baseline_svc is a mandatory service-principal pair"
+      kept: cue_user_actor.baseline_svc
+    - dropped: cue_process_tool.baseline
+      reason: "host-runs-this-binary baseline is low value because the child binary is variable across ten interpreters/proxy binaries; user_actor baseline and baseline_svc already cover historical frequency by user and by launch mechanism"
+      kept: cue_user_actor.baseline_svc
+    - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc pair
+      reason: "user_actor pair — non-deduplicable"
+      kept: both
+    - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc pair
+      reason: "user_actor pair — non-deduplicable"
+      kept: both
+  skipped_templates:
+    - template: masquerading.binary_origin
+      reason: "binary_origin matches the child by basename in file_event over 30d to find how a dropped/renamed file arrived. The flagged children are well-known system binaries that ship with Windows, so a basename file_event search returns OS install/update noise rather than a delivery signal. true_identity already confirms whether the running child is the genuine signed binary, which is the relevant masquerading check for this rule."
+    - template: universal.endpoint_protection_health
+      reason: "RECOMMENDED-only generic host-tamper sweep. This rule fires on the parent-child relationship (sdiagnhost.exe driving a proxy binary), not on tamper-before-payload; cue_host_context.precursor already surfaces any prior tamper detections on the host in the lead-up window, and dropping this keeps the count at a clean 17 without losing prior-tamper context."
+  reflection_overrides: []
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - powershell
+    - masquerading
+    - parent_child
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 15
+      attack: 2
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 2
+      context: 13
+    logsource_diversity:
+      process_creation: 13
+      image_load: 1
+      network_connection: 1
+      powershell: 1
+      sigma_alert: 1

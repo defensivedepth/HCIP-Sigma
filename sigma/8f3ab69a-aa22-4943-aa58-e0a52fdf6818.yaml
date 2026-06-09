@@ -1,0 +1,535 @@
+name: User Shell Folders Registry Modification via CommandLine
+id: ce322a6c-f767-426b-a0d7-6a6778832e5b
+description: |
+  Detects reg.exe or PowerShell command lines that modify User Shell Folders or Shell Folders registry values referencing the Startup location. The rule fires only when all of the following match together: the binary is powershell.exe, pwsh.exe, or reg.exe; the command line contains a write verb (' add ', New-ItemProperty, Set-ItemProperty, or 'si '); the command line references the Explorer Shell Folders or User Shell Folders key; and the command line references Startup. Redirecting the Startup folder path to an attacker-controlled location causes anything dropped there to execute at logon, a common persistence and defense-evasion technique; the same command shapes also occur in legitimate profile or roaming configuration. The investigation should determine which registry value was changed, what path it now points to, whether a payload exists at that path, and whether the user, host, and timing make the change expected.
+type: detection
+detection_id: 8f3ab69a-aa22-4943-aa58-e0a52fdf6818
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line match what this rule detects — a Shell Folders or User Shell Folders Startup value being written via reg.exe or PowerShell?
+  context: Confirm the alert is a true positive before investing time. The rule requires all four conditions together, so check the triggering event for powershell.exe, pwsh.exe, or reg.exe with a write verb (' add ', New-ItemProperty, Set-ItemProperty, or 'si '), a reference to the Explorer Shell Folders or User Shell Folders key, and the Startup token. Note the value name being written and the path it is being set to.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to modify Startup-related Shell Folders registry values?
+  context: Legitimate profile setup, roaming-profile tooling, and some imaging workflows touch these keys, but routine end-user activity does not. Knowing whether the account is an administrator or service account and whether the host is a workstation, server, or build/imaging system is often the fastest way to separate expected configuration from persistence.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:organizational_context.change_ticket
+  question: Was there a change ticket, maintenance window, or documented approval for this registry change?
+  context: Redirecting the Startup folder or other Shell Folders values is the kind of system modification that change management usually covers. A corresponding ticket or deployment record points to authorized activity; its absence when policy requires one moves the disposition toward unauthorized persistence.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:parent_child.parent_process_legitimacy
+  question: Is the parent that launched this reg.exe or PowerShell expected, and what started that parent?
+  context: The parent-child relationship attributes who drove the registry change. A logon-time interactive shell or a deployment agent is a different story from mshta.exe, wscript.exe, an Office application, or an unfamiliar loader spawning the binary. Tracing the parent's own origin reveals whether the chain is a user action, automation, or an exploitation path.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- source: template:parent_child.sibling_processes
+  question: What other child processes did the same parent spawn around this time?
+  context: A parent that launched this registry change may have launched other stages. Multiple children from one parent in a short window — a download, a script host, additional registry or service tools — points to orchestrated activity rather than an isolated administrative command.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:registry.registry_key_context
+  question: What specific Shell Folders value was set, and what path or payload does it now reference?
+  context: The value name and data determine intent. Reading the registry_set event linked to this process gives the actual key path and the written value as structured fields instead of parsing them from the command line. A Startup value redirected to a user-writable or unusual directory (for example a public, temp, or downloads path) is the persistence-relevant change; confirm both the value name and the destination it now points to.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+- source: template:powershell.encoded_command_decode
+  question: If PowerShell was used, was the command encoded or obfuscated, and what does it decode to?
+  context: When the binary is powershell.exe or pwsh.exe, the registry write may be wrapped in -EncodedCommand (-enc), string concatenation, backtick escaping, or variable substitution to hide the target path. Decode any base64 or obfuscated content to recover the literal key, value, and destination path being written. If the binary is reg.exe, the command is already readable and this step is a quick confirmation.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:powershell.script_block_logging
+  question: Did PowerShell script block logging capture the full deobfuscated script content?
+  context: Script block logging records the deobfuscated script PowerShell actually executed, even when the command line is encoded, giving ground truth about the exact key and path written. If PowerShell operational logs are not ingested in this environment, treat zero results as a visibility gap rather than evidence nothing ran, and decode the registry write from the alerting command line directly.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- source: template:registry.registry_value_persistence_check
+  question: Does a payload exist at the path the redirected Startup value points to, and what is its hash?
+  context: This registry persistence is only effective if an executable or script sits at the path written into the Startup value. Checking whether a file was created at that destination and analyzing its hash determines whether the persistence is live and what would run at the next logon. Resolve the destination path from the registry value data, then look for file creations there.
+  range: +15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - Hashes
+- source: template:registry.registry_related_modifications
+  question: Were other registry modifications made on this host in the same session?
+  context: Operators who change one persistence or evasion key often change several. Finding additional reg.exe or PowerShell registry writes from the same host in a short window reveals whether multiple objectives were pursued — stacking persistence, disabling protection, or altering policy — alongside this Startup redirection.
+  range: +/-30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_reg:
+        Image|endswith:
+          - '\reg.exe'
+          - '\regedit.exe'
+          - '\powershell.exe'
+          - '\pwsh.exe'
+        CommandLine|contains:
+          - ' add '
+          - ' delete '
+          - 'New-ItemProperty'
+          - 'Set-ItemProperty'
+          - 'Remove-ItemProperty'
+      condition: selection and selection_reg
+    fields:
+      - CommandLine
+- source: attack:T1547.001.baseline_deviation
+  question: When this host previously fired this rule's pattern, what parents and users drove it, and does the current alert fit?
+  context: The query mirrors the rule's full selection scoped to this host, so the parent and user distribution reflects how this specific Startup-redirect pattern has historically run here — not generic use of the binaries. A new parent process, an unexpected account, or a first-ever appearance of the pattern is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+        - \reg.exe
+      - OriginalFileName:
+        - powershell.exe
+        - pwsh.dll
+        - reg.exe
+      selection_cli_action:
+        CommandLine|contains:
+        - ' add '
+        - New-ItemProperty
+        - Set-ItemProperty
+        - 'si '
+      selection_cli_paths_root:
+        CommandLine|contains:
+        - \Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders
+        - \Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders
+      selection_cli_paths_suffix:
+        CommandLine|contains: Startup
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_user_actor.baseline
+  question: Does this user normally modify Startup-related registry values with these tools?
+  context: Compare the account's current action against its history of running these binaries. A user who has never driven a Shell Folders write is more notable than one who does so as part of a known role. Pair the count with knowledge of whether the user's job involves profile or imaging configuration.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent and binary combination historically routine on this host or across the environment?
+  context: When the alert fires under a service principal, user identity does not attribute the behavior; the meaningful pivot is the launch mechanism. A parent and binary pair that already accounts for many prior events is likely OS or vendor automation, while a new or rare pair for these binaries is the deviation worth chasing.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the account's activity across all hosts reveals whether this registry change is isolated or part of movement across endpoints. The same user driving similar activity on multiple hosts widens the likely scope.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent and binary combination fire on other hosts in the same window?
+  context: Under a service principal, a user-pivot across the network returns mostly agent-telemetry noise. The meaningful question is whether the same launch mechanism — parent process plus spawned binary — fired on other hosts in the alert window. Multiple hosts point to scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired this rule's pattern in the past week, and does the spread look like automation or one-off activity?
+  context: The query mirrors the rule's full selection with no host scope, giving a fleet-wide count of the Startup-redirect pattern rather than generic use of the binaries. Many hosts firing the same pattern points to scripted deployment or vendor automation; one host or a small unrelated set points to manual operator activity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+        - \reg.exe
+      - OriginalFileName:
+        - powershell.exe
+        - pwsh.dll
+        - reg.exe
+      selection_cli_action:
+        CommandLine|contains:
+        - ' add '
+        - New-ItemProperty
+        - Set-ItemProperty
+        - 'si '
+      selection_cli_paths_root:
+        CommandLine|contains:
+        - \Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders
+        - \Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders
+      selection_cli_paths_suffix:
+        CommandLine|contains: Startup
+      condition: all of selection_*
+    fields:
+    - host.name
+- source: template:persistence_scope.process_based_persistence
+  question: Were other process-based persistence mechanisms installed on this host?
+  context: Operators rarely rely on a single foothold. After redirecting the Startup folder, they commonly install backups via scheduled tasks, services, or BITS jobs. Persistence-tool executions clustered in the same timeframe indicate intentional stacking rather than an isolated administrative action.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Persistence is usually one stage of a longer sequence. Earlier detections on the same host — defense tampering, reconnaissance, credential access, or a payload download — help reconstruct what preceded the registry change and whether it sits inside a multi-stage operation.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1547.001
+      name: Registry Run Keys / Startup Folder
+      role: primary
+    - id: T1112
+      name: Modify Registry
+      role: secondary
+    - id: T1547
+      name: Boot or Logon Autostart Execution
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: registry_write
+      description: "Actor writes a Startup-related Shell Folders/User Shell Folders registry value via reg.exe or PowerShell"
+      mapped_to: Q6
+      source: template:registry.registry_key_context
+    - stage: 2
+      label: payload_placement
+      description: "Executable or script placed at the path the redirected Startup value now points to"
+      mapped_to: Q9
+      source: template:registry.registry_value_persistence_check
+    - stage: 3
+      label: parent_attribution
+      description: "Abnormal parent-child lineage or outlier execution driving the registry change at logon/startup"
+      mapped_to: Q4
+      source: template:parent_child.parent_process_legitimacy
+  dimension_coverage:
+    - dimension: time_correlation
+      technique: T1547.001
+      covered_by: Q9
+      source: template:registry.registry_value_persistence_check
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1547.001
+      covered_by: Q6
+      source: template:registry.registry_key_context
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1547.001
+      covered_by: Q12
+      source: template:cue_user_actor.baseline
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1547
+      covered_by: Q4
+      source: template:parent_child.parent_process_legitimacy
+      coverage_type: direct
+  mutable_dispositions:
+    - element: RegistryKeyPath
+      dimension: tuning_parameter
+      specific_values: "Shell Folders / User Shell Folders Startup keys (from rule selection)"
+      disposition: query_injection
+      target_question: Q11
+      notes: "Rule's full key-path selection embedded verbatim in the REFLECTED baseline_deviation and scope queries"
+    - element: ImagePath
+      dimension: tuning_parameter
+      specific_values: "destination path written into the Startup value"
+      disposition: new_question
+      target_question: Q9
+      notes: "registry_value_persistence_check resolves the written path and checks for a payload + hash"
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "5-10 minutes (registry write -> process/payload correlation)"
+      disposition: context
+      target_question: Q9
+      notes: "Defaults stated as rationale; persistence check uses +15m, related-modifications uses +/-30m"
+    - element: UserContext
+      dimension: user_context
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q12
+      notes: "user baseline + service-principal substitute cover user-SID scoping"
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q4
+      notes: "parent_process_legitimacy traces parent-child lineage and grandparent"
+    - element: SignatureCheck
+      dimension: tuning_parameter
+      specific_values: "rationale only (flag unsigned binary at written path)"
+      disposition: context
+      target_question: Q9
+      notes: "persistence check pulls Hashes for the payload at the destination path"
+  dedup_decisions:
+    - dropped: cue_process_tool.process_chain
+      reason: "parent_child technique set active — parent_process_legitimacy + sibling_processes subsume the generic parent lookup"
+      kept: parent_child.parent_process_legitimacy
+    - dropped: cue_process_tool.mechanism_decode
+      reason: "replaced_by registry.registry_key_context (structured TargetObject/Details beats parsing reg.exe CommandLine); also covered for PowerShell by encoded_command_decode"
+      kept: registry.registry_key_context
+    - dropped: cue_user_actor.baseline (user-pivot) + cue_user_actor.baseline_svc (substitute)
+      reason: "user_actor pair — non-deduplicable; emitted both per AGENTS.md"
+      kept: both
+    - dropped: cue_user_actor.clustering (user-pivot) + cue_user_actor.clustering_svc (substitute)
+      reason: "user_actor pair — non-deduplicable; emitted both per AGENTS.md"
+      kept: both
+  skipped_templates:
+    - template: cue_process_tool.mechanism_decode
+      reason: "replaced_by: registry.registry_key_context"
+    - template: cue_process_tool.baseline
+      reason: "generic binary baseline (Image|endswith only) superseded by REFLECTED baseline_deviation which enforces the rule's full pattern; user/host baselines provide the actor and host frequency dimensions"
+    - template: cue_process_tool.baseline_deviation
+      reason: "REFLECTED template authored as attack:T1547.001.baseline_deviation (Q11) — same query, retitled to the rule's pattern"
+    - template: cue_process_tool.follow_on
+      reason: "child-process follow-on for these binaries duplicates sibling_processes scope; persistence_scope.process_based_persistence carries the post-write expansion more specifically for a persistence rule"
+    - template: cue_process_tool.clustering
+      reason: "host-wide tool clustering duplicates cue_host_context.clustering; dropped the cue_process_tool variant"
+    - template: cue_host_context.clustering
+      reason: "host-wide process clustering folded out in favor of registry_related_modifications (Q10) + process_based_persistence (Q17) which carry the host-context expansion with persistence/registry specificity"
+    - template: powershell.powershell_security_bypass
+      reason: "PowerShell control-bypass precursor is not the disposition driver for a registry-persistence rule; endpoint_protection_health was also dropped (see below) to keep the playbook focused on the persistence chain"
+    - template: universal.endpoint_protection_health
+      reason: "RECOMMENDED generic tamper sweep; this rule fires on persistence installation, not payload execution or credential access. precursor question (Q18) carries prior-alert tamper context, and registry_related_modifications (Q10) surfaces local Defender/policy registry tampering specifically. Dropped to stay within the question cap."
+    - template: persistence_scope.file_based_persistence
+      reason: "registry_value_persistence_check (Q9) already covers the payload-at-Startup-path file check, which is the file dimension this rule's Startup redirection points at; the generic Startup/Run file sweep would overlap without adding a distinct angle"
+    - template: organizational_context.human_recall
+      reason: "change_ticket (Q3) + host_user_context (Q2) cover the authorization/expectation dimension; kept to 18-question cap"
+    - template: organizational_context.timing_alignment
+      reason: "timing/work-hours expectation is folded into change_ticket and host_user_context; dropped to stay within the cap"
+    - template: organizational_context.procedural_consistency
+      reason: "method-consistency overlaps change_ticket and host_user_context; dropped to stay within the cap"
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "powershell.exe: too common for Image-based scoping — use CommandLine patterns for mechanism_decode"
+      disposition: acted_on
+      reason: >-
+        mechanism_decode was replaced by registry.registry_key_context (Q6, ProcessGuid-scoped, structured
+        registry fields) and powershell.encoded_command_decode (Q7, ProcessGuid-scoped). Neither uses
+        Image-based host scoping for the noisy binary, so the noise concern is structurally avoided. The
+        REFLECTED baseline_deviation (Q11) and scope (Q16) queries that do touch these binaries fleet/host-wide
+        enforce the rule's full four-clause CommandLine selection, not bare Image|endswith.
+    - hint: "registry.registry_key_context replaces cue_process_tool.mechanism_decode"
+      disposition: acted_on
+      reason: >-
+        registry.registry_key_context authored as Q6; cue_process_tool.mechanism_decode skipped
+        (see skipped_templates and dedup_decisions).
+    - hint: "powershell.encoded_command_decode replaces obfuscation.encoded_payload_decode"
+      disposition: acted_on
+      reason: >-
+        powershell.encoded_command_decode authored as Q7 covering the encoded/obfuscated PowerShell path;
+        no obfuscation.encoded_payload_decode template was present to skip.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - powershell
+    - registry
+    - organizational_context
+    - persistence_scope
+    - parent_child
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 17
+      attack: 1
+      llm_generated: 0
+    phase_distribution:
+      triage: 1
+      analysis: 2
+      context: 15
+    logsource_diversity:
+      process_creation: 14
+      registry_set: 1
+      file_event: 1
+      powershell: 1
+      sigma_alert: 1

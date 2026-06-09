@@ -1,0 +1,460 @@
+name: Suspicious Diantz Download and Compress Into a CAB File
+id: 77b5ef5b-953d-4607-bc2d-40ae90f997dc
+description: |
+  Detects diantz.exe invoked with a remote UNC source path and a .cab destination, the
+  documented pattern for pulling a file from a remote share and packaging it into a cabinet
+  archive on the local machine. diantz is a built-in Windows cabinet utility, so this command
+  shape is a living-off-the-land way to stage or retrieve content without a dedicated download
+  tool. Legitimate use is rare and usually tied to administrative packaging or deployment
+  scripting; the investigation should establish what remote file was pulled, where the .cab
+  landed, who and what launched the command, and whether the transfer actually completed.
+type: detection
+detection_id: 185d7418-f250-42d0-b72e-0c8b70661e93
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line show diantz.exe pulling from a remote UNC path into a .cab file?
+  context: Confirm the alert is a true positive by reviewing the full command line. The rule fires
+    only when the command contains diantz.exe, a UNC reference ('\\'), and the .cab extension all
+    together, which is the documented remote-download-and-compress invocation.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run diantz.exe against remote shares?
+  context: Cabinet packaging from a remote UNC source is uncommon outside of deployment or backup
+    tooling. Knowing whether this account and endpoint normally perform administrative file
+    packaging is often the fastest way to separate routine operations from operator activity.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What was the full diantz command — what remote source path and what local .cab destination?
+  context: Decode the command line to read the exact UNC source ('\\server\share\file') and the
+    destination .cab path. The source path identifies what remote system the file came from and
+    the destination shows where the packaged archive landed for follow-on file analysis.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains|all:
+        - diantz.exe
+        - ' \\'
+        - .cab
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:cue_process_tool.process_chain
+  question: What process spawned diantz.exe and is that parent chain expected?
+  context: The parent process reveals how diantz was invoked. Interactive use from explorer.exe or
+    a console differs from invocation by a script host (wscript.exe, mshta.exe), an Office
+    application, or an unfamiliar automation, which point toward scripted or operator-driven use.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously matched this diantz pattern, what parents and users drove it,
+    and does the current alert fit?
+  context: The query mirrors the rule's selection scoped to this host, so the parent and user
+    distribution reflects how this specific diantz-to-cab pattern has historically run here. A new
+    parent, an unexpected account, or a first-ever occurrence is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - diantz.exe
+        - ' \\'
+        - .cab
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.follow_on
+  question: What child processes did diantz.exe spawn afterward?
+  context: A cabinet packaging tool normally spawns nothing. Children such as cmd.exe,
+    powershell.exe, or certutil.exe following diantz indicate the staged content was unpacked or
+    executed, moving past delivery into post-exploitation.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.scope
+  question: Have other hosts matched this diantz pattern in the past week, and does the spread look
+    like automation or one-off activity?
+  context: The query mirrors the rule's selection with no host scope, giving a fleet-wide count of
+    this diantz-to-cab pattern rather than generic diantz usage. Many hosts firing the same pattern
+    suggests scripted deployment or vendor automation; a single host or small unrelated set points
+    to manual operator activity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - diantz.exe
+        - ' \\'
+        - .cab
+      condition: selection
+    fields:
+    - host.name
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run diantz.exe or similar packaging tools?
+  context: Compare this account's current action against its historical behavior. A user who has
+    never run diantz against remote shares is more notable than one who packages files routinely as
+    part of a deployment or backup role.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent+diantz.exe combination historically routine on this host or environment-wide,
+    or is the parent unusual for diantz?
+  context: When the alert fires under a service principal, user identity does not attribute the
+    behavior; the meaningful pivot is which parent process launched diantz and whether that pair is
+    common. A new or rare parent for diantz is the deviation; a pair already accounting for many
+    prior events is automation or OS activity.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the environment around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or staging across
+    multiple endpoints. If the same account triggered similar packaging or transfer activity
+    elsewhere, the scope of the operation may be larger than this one host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent+diantz.exe combination fire on other hosts in the same window — is this
+    a coordinated rollout or isolated to this host?
+  context: Under a service principal, asking what the user did network-wide returns agent-telemetry
+    noise. The meaningful question is whether the same launch mechanism — parent process plus diantz
+    — fired on other hosts in the alert window. Multiple hosts point to scheduled or pushed
+    automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: 'Alerts rarely occur in isolation. Examining activity around the event reveals the
+    immediate context: what led to the diantz invocation, what followed it, and whether it is part
+    of a larger sequence such as reconnaissance, staging, or exfiltration preparation.'
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host — reconnaissance, credential access, defense tampering
+    — may reveal the stages that preceded this transfer and help reconstruct the timeline that led to
+    the staging activity.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:download_tool.download_success_verification
+  question: Did the .cab file actually get created at the destination path?
+  context: A diantz command does not guarantee the transfer completed. Network errors, an
+    unreachable share, or security controls may have blocked it. Confirming creation of the .cab at
+    the destination path establishes whether the operation progressed past delivery.
+  range: +15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: template:download_tool.payload_analysis
+  question: Can you retrieve and analyze the staged .cab and its source file from a safe environment?
+  context: If the .cab is still on disk, submitting its hash to threat intelligence or expanding and
+    detonating its contents in a sandbox reveals whether the packaged file is a known malicious
+    payload, a legitimate tool, or something novel that needs deeper analysis.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Hashes
+- source: template:download_tool.directory_activity
+  question: What other file activity occurred in the .cab destination directory?
+  context: Operators often stage multiple files in the same directory, or the packaged archive
+    triggers further writes (extraction, additional pulls). Examining directory-level file activity
+    reveals the broader scope of the staging operation.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains|expand: '%file_dirs%'
+      filter_self:
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection and not filter_self
+    fields:
+      - TargetFilename
+      - Image
+- source: attack:T1105.network_connection
+  question: What network or SMB connections did diantz.exe make around the time of the alert?
+  context: diantz pulls its source file over a remote path, so a successful transfer leaves an
+    outbound connection — typically SMB over port 445 to the remote share, or HTTP(S) for an
+    internet source. Identifying the remote endpoint shows where the staged content originated and
+    whether the destination is internal or external.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith: \diantz.exe
+      condition: selection
+    fields:
+      - Image
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1105
+      name: Ingress Tool Transfer
+      role: primary
+  attack_chain_coverage:
+    - stage: 1
+      label: process_execution
+      description: "Uncommon process (diantz.exe) invoked to retrieve a remote file"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: network_transfer
+      description: "Process initiates a network/SMB connection to an external or remote destination to pull the file"
+      mapped_to: Q17
+      source: attack:T1105.network_connection
+    - stage: 3
+      label: file_creation
+      description: "Downloaded/packaged tool written to disk (the .cab destination)"
+      mapped_to: Q14
+      source: template:download_tool.download_success_verification
+  dimension_coverage:
+    - dimension: file_path_analysis
+      technique: T1105
+      covered_by: Q3
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1105
+      covered_by: Q4
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1105
+      covered_by: Q17
+      source: attack:T1105.network_connection
+      coverage_type: partial
+  mutable_dispositions:
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "rationale only (e.g., ChromeUpdate, OneDrive — tuning examples)"
+      disposition: context
+      target_question: Q4
+      notes: "Parent-process legitimacy investigated via process_chain and baseline_svc; no concrete
+        allowlist values to inject, so handled as context."
+    - element: DestinationIPCategory
+      dimension: tuning_parameter
+      specific_values: "rationale only (internal vs external IP blocks)"
+      disposition: context
+      target_question: Q17
+      notes: "No fixed IP block values in brief; network question projects DestinationIp/DestinationPort
+        so the analyst classifies internal vs external from results."
+    - element: FilePathRegex
+      dimension: file_path_analysis
+      specific_values: "C:\\Users\\Public\\ (example uncommon drop path)"
+      disposition: context
+      target_question: Q3
+      notes: "Destination .cab path is read from the command line in mechanism_decode rather than
+        hardcoded; rule derives file paths from CommandLine, so %file_paths% drives the file queries."
+  dedup_decisions:
+    - dropped: cue_process_tool.baseline
+      reason: "Generic binary-frequency baseline subsumed by cue_process_tool.baseline_deviation, which
+        scopes to the rule's actual diantz-to-cab pattern (more specific)."
+      kept: cue_process_tool.baseline_deviation
+    - dropped: universal.evidence_preservation
+      reason: "Both check whether the file is still on disk via TargetFilename|endswith %file_paths%;
+        download_tool.download_success_verification is the more specific must_include version."
+      kept: download_tool.download_success_verification
+    - dropped: cue_process_tool.clustering
+      reason: "Host-scoped +/-15m activity aggregation overlaps cue_host_context.clustering, which is a
+        superset (groups by Image+ParentImage rather than Image alone)."
+      kept: cue_host_context.clustering
+    - dropped: null
+      reason: "user_actor pair (baseline + baseline_svc) — non-deduplicable; emitted both per AGENTS.md."
+      kept: cue_user_actor.baseline + cue_user_actor.baseline_svc
+    - dropped: null
+      reason: "user_actor pair (clustering + clustering_svc) — non-deduplicable; emitted both per AGENTS.md."
+      kept: cue_user_actor.clustering + cue_user_actor.clustering_svc
+  skipped_templates:
+    - template: universal.endpoint_protection_health
+      reason: "RECOMMENDED, not must_include. Rule fires on a delivery/staging action (ingress tool
+        transfer), not execution, credential access, or impact where operators precede payloads with
+        AV/EDR tampering. cue_host_context.precursor already surfaces prior tamper alerts on the host,
+        and defense_tampering is not a confirmed technique set for this rule."
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - download_tool
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 16
+      attack: 1
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 14
+    logsource_diversity:
+      process_creation: 11
+      file_event: 3
+      network_connection: 1
+      sigma_alert: 1

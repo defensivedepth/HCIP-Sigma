@@ -1,0 +1,426 @@
+name: Regedit as Trusted Installer
+id: 1bcf8017-1875-4887-9301-ebc7954af9ab
+description: |
+  Detects regedit.exe spawned by either TrustedInstaller.exe or ProcessHacker.exe. Both parents are paths to launching the registry editor with a token more privileged than a standard administrator: TrustedInstaller is the most privileged service identity on Windows and ProcessHacker can impersonate or steal a TrustedInstaller token. Running regedit under such a token lets an operator read and modify protected registry hives that even local administrators cannot touch, so the investigation should confirm which parent fired, establish whether the elevation was intentional, and determine what was changed in the registry once running at that integrity level.
+type: detection
+detection_id: 883835a7-df45-43e4-bf1d-4268768afda4
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- source: template:universal.verify_trigger_match
+  question: Was regedit.exe spawned by either TrustedInstaller.exe or ProcessHacker.exe?
+  context: Confirm the alert is a true positive before investing investigation time. Review the alerting event and note which parent fired — TrustedInstaller.exe (a service-token relaunch) or ProcessHacker.exe (a tool that can steal or impersonate the TrustedInstaller token). The parent that fired changes which downstream questions carry weight. A ProcessHacker parent points to a token-manipulation tool on the host, while a TrustedInstaller parent points to a service-context relaunch.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+- source: template:universal.host_user_context
+  question: Is this user and host expected to launch regedit.exe under an elevated service token?
+  context: Launching the registry editor at TrustedInstaller integrity is not a routine end-user action. Knowing whether the user role and host function involve servicing protected components or system-integrity registry work is often the fastest way to separate sanctioned maintenance from token abuse.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:parent_child.parent_process_legitimacy
+  question: Is TrustedInstaller.exe or ProcessHacker.exe expected to spawn regedit.exe here, and what started the parent itself?
+  context: The parent-child relationship is the core signal. Tracing the parent's own origin reveals whether the elevation chain is legitimate (servicing component started by the OS) or operator-driven (a token-stealing tool launched interactively). For a ProcessHacker parent, examine its command line and grandparent to see whether a user explicitly ran it.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- source: template:parent_child.sibling_processes
+  question: What other child processes did the same parent process spawn?
+  context: If the parent spawned regedit.exe at elevated integrity, it may have spawned other processes too. Multiple children from the same TrustedInstaller- or ProcessHacker-tokened parent reveals the full scope of what was launched under that privileged token.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_parent_process.mechanism_decode
+  question: What is the full command line of the parent process and why did it spawn regedit.exe?
+  context: The parent's own command line shows how the elevated launch was initiated. For a ProcessHacker parent, the arguments may reveal token-manipulation flags or a target process to impersonate. For a TrustedInstaller parent, the command line shows whether this was a genuine servicing operation. Extend upward by checking what spawned the parent.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+- source: template:registry.registry_key_context
+  question: What registry key and value did this regedit.exe instance modify, and is it a protected or persistence location?
+  context: The registry path reveals intent. At TrustedInstaller integrity, regedit can write to protected hives a normal administrator cannot — service configurations under HKLM\SYSTEM, security-tool policy keys, or Image File Execution Options entries. The specific key and value written determine what executes or what protection was changed.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+- source: template:registry.registry_related_modifications
+  question: Were other registry modifications made on this host in the same session?
+  context: An operator who relaunches regedit at elevated integrity often makes several changes — for example disabling a security tool AND setting a persistence key. Finding clusters of registry write activity within a short window reveals the full scope of configuration changes and whether multiple objectives were pursued.
+  range: +/-30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_reg:
+        Image|endswith:
+          - '\reg.exe'
+          - '\regedit.exe'
+        CommandLine|contains:
+          - ' add '
+          - ' delete '
+          - ' import '
+          - '/s '
+      condition: selection and selection_reg
+    fields:
+      - CommandLine
+- source: attack:T1548.elevated_token_verification
+  question: Were Security log token-elevation events (4672/4673) recorded for this regedit.exe process around the alert time?
+  context: Running under a TrustedInstaller or stolen-SYSTEM token grants sensitive privileges (SeDebugPrivilege, SeTcbPrivilege, SeBackupPrivilege). Security events 4672 (special privileges assigned to new logon) and 4673 (privileged service called) confirm the process actually ran with non-standard token rights rather than as a relabeled but unprivileged process. If Security audit logs are not ingested in this environment, treat the absence of these events as a visibility gap rather than evidence the privileges were not held.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: security
+    detection:
+      selection:
+        EventID:
+          - 4672
+          - 4673
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - EventID
+      - SubjectUserName
+      - PrivilegeList
+- source: template:uac_bypass.elevated_action_after_bypass
+  question: What actions were performed at high or system integrity on this host after the elevated regedit launch?
+  context: Elevation is a means to an end. After obtaining a TrustedInstaller or SYSTEM token, an operator typically performs actions that require high integrity — installing persistence, dumping credentials, tampering with security tools, or accessing protected resources. High- and System-integrity processes spawned shortly after the launch reveal the objective.
+  range: +30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        IntegrityLevel:
+          - 'High'
+          - 'System'
+          - 'S-1-16-16384'
+          - 'S-1-16-12288'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - IntegrityLevel
+- source: template:uac_bypass.bypass_technique_registry_artifacts
+  question: Were registry-backed elevation or auto-elevate keys modified on this host before the launch?
+  context: Some elevation paths stage a payload in a registry key that an auto-elevating process reads and executes. Finding such a write shortly before the elevated regedit launch can reveal the mechanism that produced the privileged token and the exact payload run with it.
+  range: -15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - '\reg.exe'
+          - '\powershell.exe'
+          - '\cmd.exe'
+        CommandLine|contains:
+          - 'ms-settings'
+          - 'mscfile'
+          - 'Classes\exefile'
+          - 'Classes\Folder'
+          - 'Environment'
+          - 'Shell\Open\command'
+          - 'DelegateExecute'
+      condition: selection
+    fields:
+      - CommandLine
+      - Image
+- source: template:uac_bypass.other_escalation_attempts
+  question: Were other privilege escalation or token-manipulation detections recorded on this host?
+  context: Operators who pursue elevation often try multiple methods or chain token theft with other escalation tooling. Finding additional privilege-escalation or token-manipulation alerts on the same host within a short window confirms deliberate elevation activity rather than a benign servicing event.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - rule.name
+      - rule.uuid
+      - event.severity_label
+- source: template:cue_parent_process.baseline
+  question: Has TrustedInstaller.exe or ProcessHacker.exe spawned regedit.exe on this host before?
+  context: A parent-child pairing that has never occurred on a host is more suspicious than one that recurs. Zero or very low historical counts for this specific parent spawning regedit indicate a novel elevation event rather than established servicing automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:cue_parent_process.scope
+  question: Is this parent spawning regedit.exe at elevated integrity on other hosts?
+  context: The same elevated launch pattern appearing on multiple hosts points to pushed automation or a tool deployed across the environment, while a single occurrence is more likely a targeted or host-local action. Cross-host comparison helps calibrate scope.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+      - CommandLine
+- source: template:cue_user_actor.baseline
+  question: Does this user normally launch regedit.exe or run token-manipulation tooling?
+  context: Compare this user's current action against their historical behavior. A user who has never launched the registry editor under an elevated token, or never run a token-manipulation tool, is more notable than one who does so as part of a known role. User role and typical toolset should align.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent+regedit.exe combination historically routine on this host or across the environment, or is the parent unusual for this binary?
+  context: When the alert fires under a service principal, user identity does not attribute behavior. The meaningful pivot is the launch mechanism — which parent spawned regedit and whether that pair is historically common. A new or rare parent for regedit on this host or environment-wide is the deviation worth chasing; a pair that already accounts for many prior events is more likely servicing automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Elevation rarely happens in isolation. Earlier detections on the same host — defense tampering, reconnaissance, or credential access — may reveal the stages that preceded this event and help reconstruct the timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1548
+      name: Abuse Elevation Control Mechanism
+      role: primary
+  attack_chain_coverage:
+    - stage: 1
+      label: unusual_parent_child
+      description: "Unusual parent-child execution chain spawning an elevated process (TrustedInstaller/ProcessHacker spawning regedit)"
+      mapped_to: Q3
+      source: template:parent_child.parent_process_legitimacy
+    - stage: 2
+      label: elevated_process_with_nonstandard_token
+      description: "Elevated process execution with non-standard tokens / elevation flags — confirm the process actually held privileged token rights"
+      mapped_to: Q8
+      source: attack:T1548.elevated_token_verification
+    - stage: 3
+      label: registry_modifications
+      description: "Registry modifications made under the elevated context (UAC-bypass keys or protected-hive writes)"
+      mapped_to: Q6
+      source: template:registry.registry_key_context
+  dimension_coverage:
+    - dimension: parent_process_analysis
+      technique: T1548
+      covered_by: Q3
+      source: template:parent_child.parent_process_legitimacy
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1548
+      covered_by: Q9
+      source: template:uac_bypass.elevated_action_after_bypass
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1548
+      covered_by: Q8
+      source: attack:T1548.elevated_token_verification
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1548
+      covered_by: Q14
+      source: template:cue_user_actor.baseline
+      coverage_type: direct
+  mutable_dispositions:
+    - element: ElevatedProcessPath
+      dimension: tuning_parameter
+      specific_values: "rationale only (paths to monitor for unsigned/unexpected elevated binaries)"
+      disposition: context
+      target_question: Q9
+      notes: "No concrete path list in brief; the high/system-integrity sweep surfaces elevated process paths for review, and Q8 confirms the token actually carried privileges."
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "TrustedInstaller.exe, ProcessHacker.exe (from rule detection)"
+      disposition: query_injection
+      target_question: Q3
+      notes: "Parent names are in the rule detection itself; parent legitimacy and baseline questions pivot on %ParentName%/%ParentProcessGuid% from the alert."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only (time between registry modification and elevated process spawn)"
+      disposition: context
+      target_question: Q10
+      notes: "Threshold not directly queryable; the -15m bypass-artifact lookback and +30m post-elevation sweep bracket the registry-to-spawn window."
+  dedup_decisions:
+    - dropped: cue_process_tool.process_chain
+      reason: "parent_process is primary cue — parent legitimacy/origin already covered by parent_child.parent_process_legitimacy and cue_parent_process.mechanism_decode"
+      kept: template:parent_child.parent_process_legitimacy
+    - dropped: cue_parent_process.follow_on
+      reason: "subsumed by parent_child.sibling_processes (children of exact parent instance via ParentProcessGuid) — same investigative intent, more precise scoping"
+      kept: template:parent_child.sibling_processes
+    - dropped: cue_parent_process.clustering
+      reason: "around-the-time parent activity overlaps cue_host_context broad sweep and sibling_processes; dropped to stay under cap without losing coverage"
+      kept: template:parent_child.sibling_processes
+    - dropped: cue_process_tool.baseline
+      reason: "host-level regedit baseline subsumed by parent_process.baseline which is more specific (this parent spawning regedit on this host)"
+      kept: template:cue_parent_process.baseline
+    - dropped: cue_user_actor.clustering
+      reason: "user-pivot network clustering and its service-principal sibling dropped as a pair to stay under 18-question cap; user dimension carried by cue_user_actor.baseline and the launch-mechanism baseline_svc"
+      kept: template:cue_user_actor.baseline_svc
+    - dropped: cue_user_actor.clustering_svc
+      reason: "service-principal clustering sibling dropped with its user-pivot pair (non-deduplicable pair removed together) to respect cap"
+      kept: template:cue_user_actor.baseline_svc
+    - dropped: cue_host_context.clustering
+      reason: "broad host activity sweep overlaps the high/system-integrity sweep and precursor alert query; dropped to stay under cap"
+      kept: template:cue_host_context.precursor
+  skipped_templates:
+    - template: cue_process_tool.mechanism_decode
+      reason: "replaced_by: registry.registry_key_context (per brief hint and template replaced_by field)"
+    - template: universal.endpoint_protection_health
+      reason: "recommended-not-must; rule fires on token elevation, and tamper-as-precursor is surfaced by cue_host_context.precursor (prior alerts) and uac_bypass.elevated_action_after_bypass (high-integrity defense-tamper actions after elevation). Dropped to stay under 18-question cap."
+  hint_dispositions:
+    - hint: "logsource 'security' (recommended by techniques: T1548) is not covered and no template family exists — author a custom question with `category: security`"
+      disposition: acted_on
+      reason: >-
+        Authored Q8 (attack:T1548.elevated_token_verification) as a custom
+        question targeting the Windows Security log (service: security) for
+        events 4672/4673 to confirm the process actually held privileged token
+        rights — directly covering the recommended security logsource.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - registry
+    - uac_bypass
+    - parent_child
+  generation_stats:
+    total_questions: 16
+    source_counts:
+      template: 15
+      attack: 1
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 2
+      context: 12
+    logsource_diversity:
+      process_creation: 12
+      registry_set: 1
+      security: 1
+      sigma_alert: 2

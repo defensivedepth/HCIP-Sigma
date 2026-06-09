@@ -1,0 +1,408 @@
+name: File Download From IP Based URL Via CertOC.EXE
+id: d373804e-ca55-466a-a734-40a0feb56654
+description: |
+  Detects certoc.exe invoked with the -GetCACAPS flag against an IP-based URL, a documented way to use this signed system binary to download arbitrary files. The rule fires only when all of three conditions hold: the process is certoc.exe (by Image or OriginalFileName), the command line contains an IP-literal URL, and the command line contains -GetCACAPS. certoc.exe is a legitimate certificate utility, so its presence alone is benign; the IP-literal URL plus the download flag is the combination that indicates the binary is being used as a download proxy. Determine what was fetched, whether the file landed on disk, what spawned certoc.exe, and what ran before and after.
+type: detection
+detection_id: b86f6dea-0b2f-41f5-bdcc-a057bd19cd6a
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line show certoc.exe run with -GetCACAPS against an IP-based URL?
+  context: Confirm the alert is a true positive by reviewing the exact command line and process identity. The rule requires all three to be present at once -- the process resolves to certoc.exe (by Image or OriginalFileName), the command line contains an IP-literal URL, and the command line contains the -GetCACAPS download flag. Verify all three are present rather than a benign certificate operation.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to download files via command-line certificate tooling?
+  context: Legitimate administrative activity can trigger this detection. certoc.exe is a certificate utility; routine certificate work does not normally pull files from raw IP addresses with -GetCACAPS. Knowing whether the user role and host function involve certificate or download automation is often the fastest way to separate a true positive from routine operations.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What was the full certoc.exe command line, and what IP-based URL and destination did it target?
+  context: The full command line reveals the download target. Decode the IP-literal URL after -GetCACAPS to identify the remote host and any path or filename, and note any local destination path. This binary downloads text-formatted content (scripts, configuration, webshells), so the URL contents and any resulting file are the substance of the operation. The query returns every certoc.exe execution on this host within the window so sequential invocations that form one operation are visible.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: attack:T1105.network_transfer
+  question: Did certoc.exe open a network connection to the IP address in the command line?
+  context: The download flag in the command line indicates intent; a matching outbound connection from certoc.exe confirms the transfer was attempted. certoc.exe is not a routine network client, so any external connection it initiates is itself notable. Correlate the destination address and port here with the IP literal seen in the command line to confirm the fetch reached the network.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+      - Initiated
+- source: template:universal.evidence_preservation
+  question: Is the downloaded file still on disk for analysis?
+  context: certoc.exe with -GetCACAPS writes the retrieved content to disk. If that file still exists, it can be hashed, submitted for analysis, or reviewed directly. The destination path is derived from the command line, so scope file events to the paths certoc.exe touched on this host.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: template:download_tool.download_success_verification
+  question: Was the download successful? Check for file creation at the destination.
+  context: A download command does not guarantee the file was retrieved. Network errors, blocked addresses, or security controls may have prevented the transfer. Confirming file creation at the destination path established from the command line establishes whether the activity progressed past the delivery stage.
+  range: +15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: template:download_tool.payload_analysis
+  question: Can you retrieve and analyze the downloaded payload from a safe environment?
+  context: If the file fetched by certoc.exe is still on disk, submitting its hash to threat intelligence services or detonating it in an isolated environment reveals whether it is a known malicious payload, a legitimate file, or something novel that needs deeper analysis.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Hashes
+- source: template:download_tool.directory_activity
+  question: What other file activity occurred in the target directory?
+  context: Downloaded content often lands beside additional files -- further downloads, extracted archives, or staged tooling. Examining file activity in the same directory, excluding the file certoc.exe itself wrote, reveals the broader scope of the delivery operation and uncommon drop locations such as world-writable public paths.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains|expand: '%file_dirs%'
+      filter_self:
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection and not filter_self
+    fields:
+      - TargetFilename
+      - Image
+- source: template:cue_process_tool.process_chain
+  question: What process spawned certoc.exe, and is that parent chain expected?
+  context: The parent process reveals how certoc.exe was invoked. A download via this binary launched from explorer.exe or an administrative console differs from one launched by a script host, office application, or another living-off-the-land binary. An unusual parent for a certificate utility points toward scripted or hands-on misuse rather than routine certificate work.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.follow_on
+  question: What child processes did certoc.exe spawn afterward?
+  context: A downloaded file is only the delivery stage; what runs next reveals impact. Child processes of certoc.exe -- or execution of the file it just wrote -- can show the payload being launched. Unexpected children such as command interpreters or script hosts indicate the download progressed into execution.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.baseline
+  question: Does this host normally run certoc.exe?
+  context: A binary that has never run on a host is more notable than one that runs regularly. Zero or very low historical counts over the baseline window indicate first-time or rare execution of certoc.exe here, which raises the weight of this alert.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host previously fired this same certoc.exe download pattern, what parents and users drove it, and does the current alert fit?
+  context: Even legitimate tools can be abused. The query mirrors the rule's full selection -- certoc.exe with an IP-literal URL and -GetCACAPS -- scoped to this host, so the resulting parent and user distribution reflects how this specific firing pattern has run here before. A new parent process, an unexpected account, or an unusual command-line shape is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \certoc.exe
+      - OriginalFileName: CertOC.exe
+      selection_ip:
+        CommandLine|re: ://[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}
+      selection_cli:
+        CommandLine|contains: -GetCACAPS
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run certoc.exe?
+  context: Compare this user's current action against their historical behavior. A user who has never run certoc.exe is more notable than one who uses it routinely as part of certificate administration. The user's role and typical toolset should align with command-line certificate or download activity.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent and certoc.exe combination historically routine on this host or across the environment, or is the parent unusual for this binary?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior. The meaningful pivot is the launch mechanism: which parent process spawned certoc.exe, and whether that pair is historically common. A new or rare parent for this binary is the deviation worth chasing; a pair that already accounts for thousands of prior events is vendor or operating-system automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints. If the same user drove similar download or certificate-tool activity on several hosts, the scope of the activity may be larger than this one alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent and certoc.exe combination fire on other hosts in the same window, or is the activity isolated to this host?
+  context: Under a service principal, asking what else the user did across the network returns agent-telemetry noise, since every host runs system-owned services constantly. The meaningful question is whether the same launch mechanism -- the parent process spawning certoc.exe -- fired on other hosts in the alert window. Multiple hosts in the same window points to scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Activity rarely happens in isolation. Earlier detections on the same host -- defense tampering, reconnaissance, credential access -- may reveal the stages that preceded this download and help reconstruct the timeline leading up to it.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1105
+      name: Ingress Tool Transfer
+      role: primary
+  attack_chain_coverage:
+    - stage: 1
+      label: download_invocation
+      description: "certoc.exe invoked with -GetCACAPS against an IP-based URL to fetch a remote file"
+      mapped_to: Q3
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 2
+      label: network_transfer
+      description: "Process initiates a network connection to the external IP destination"
+      mapped_to: Q4
+      source: attack:T1105.network_transfer
+    - stage: 3
+      label: file_creation
+      description: "Downloaded tool written to disk at the destination path"
+      mapped_to: Q5
+      source: template:universal.evidence_preservation
+  dimension_coverage:
+    - dimension: file_path_analysis
+      technique: T1105
+      covered_by: Q8
+      source: template:download_tool.directory_activity
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1105
+      covered_by: Q9
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1105
+      covered_by: Q4
+      source: attack:T1105.network_transfer
+      coverage_type: direct
+  mutable_dispositions:
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "rationale only (tune for known-good updaters)"
+      disposition: context
+      target_question: Q9
+      notes: "Parent-chain question surfaces the spawning process; known-good-updater tuning is analyst judgment, no concrete values to inject."
+    - element: DestinationIPCategory
+      dimension: tuning_parameter
+      specific_values: "rationale only (internal vs external IP blocks)"
+      disposition: new_question
+      target_question: Q4
+      notes: "Internal-vs-external is analyst judgment; authored network_connection question surfaces DestinationIp/Port for that assessment."
+    - element: FilePathRegex
+      dimension: file_path_analysis
+      specific_values: "rationale only (uncommon drop paths e.g. C:\\Users\\Public)"
+      disposition: context
+      target_question: Q8
+      notes: "Directory-activity question covers uncommon drop paths; world-writable public paths noted in context. Path values are CommandLine-derived at runtime via %file_paths%/%file_dirs%."
+  dedup_decisions:
+    - dropped: cue_process_tool.clustering
+      reason: "Host-wide same-time clustering subsumed by cue_host_context.clustering; dropped one to stay within question cap and because cue_host_context.precursor + user clustering already provide cross-context."
+      kept: cue_host_context.precursor
+    - dropped: cue_host_context.clustering
+      reason: "Host same-time process clustering overlaps cue_process_tool.clustering and precursor; dropped to keep within 18-question cap, prior-alert precursor carries the host-context signal."
+      kept: cue_host_context.precursor
+    - dropped: cue_process_tool.scope
+      reason: "Fleet-wide reflected pattern count overlaps the parent+binary clustering_svc cross-host question; dropped to stay within cap, cross-host distribution covered by clustering_svc."
+      kept: cue_user_actor.clustering_svc
+    - dropped: none
+      reason: "cue_user_actor pair (baseline/baseline_svc and clustering/clustering_svc) emitted as separate questions — non-deduplicable per AGENTS.md service-principal handling."
+      kept: cue_user_actor.baseline + cue_user_actor.baseline_svc + cue_user_actor.clustering + cue_user_actor.clustering_svc
+  skipped_templates:
+    - template: universal.endpoint_protection_health
+      reason: "RECOMMENDED generic tamper sweep; the download/C2 nature here is delivery, not a hands-on tamper-then-execute action, and cue_host_context.precursor already surfaces prior tamper alerts on the host. Dropped to keep within the 18-question cap."
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "logsource 'network_connection' (recommended by techniques: T1105) is not covered — pull in cue_network_endpoint.* or author a custom question with `category: network_connection`"
+      disposition: acted_on
+      reason: >-
+        Acted on, not declined. Authored Q4 (attack:T1105.network_transfer) as a
+        category: network_connection question scoping certoc.exe outbound
+        connections to confirm the IP-literal transfer reached the network. This
+        is recorded here for the audit trail since the hint maps to a generated
+        question rather than a template skip.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - download_tool
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 16
+      attack: 1
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 14
+    logsource_diversity:
+      process_creation: 11
+      file_event: 4
+      network_connection: 1
+      sigma_alert: 1

@@ -1,0 +1,716 @@
+name: HackTool - CrackMapExec Execution Patterns
+id: 7b2e4c9a-1f3d-4a6e-8c10-2d9f5b6e0a47
+description: |
+  Detects command-line patterns characteristic of the CrackMapExec post-exploitation framework, which automates remote command
+  execution across Windows hosts. The rule fires when a process command line matches one of several distinct shapes: cmd.exe
+  invocations that redirect output to a remote SMB share or a local Temp path (the framework's remote-output capture method),
+  or powershell.exe invocations launched with the framework's standard non-interactive bypass and encoded-command flags. These
+  patterns are produced by the tool's command-execution and credential-gathering modules; the same flag combinations rarely
+  occur in routine administration. Investigation should confirm which command shape fired, decode the actual command or payload,
+  identify the launching parent and remote destination, and determine whether the activity is an authorized assessment or
+  hands-on-keyboard intrusion.
+type: detection
+detection_id: 058f4380-962d-40a5-afce-50207d36d7e2
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line match one of the CrackMapExec execution patterns this rule detects?
+  context: Before investing investigation time, confirm the alert is a true positive by reviewing the exact command line against
+    the rule's detection criteria. The rule fires when the command line matches any one of several distinct shapes — a cmd.exe
+    invocation redirecting output to a remote SMB share (\\host\share\file 2>&1), a cmd.exe invocation redirecting output to
+    a local Temp path, or a powershell.exe invocation carrying the framework's standard "-noni -nop -w 1" flags with either
+    "-exec bypass -C" or "-enc". Note which shape fired — the cmd-redirect shapes point to remote command capture, while the
+    powershell shapes point to encoded or in-line payload execution, and that distinction drives which downstream questions
+    carry weight.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run remote command-execution tooling of this kind?
+  context: Legitimate administrative activity can trigger many detections. Knowing whether the user role and host function
+    are consistent with running automated remote command execution — for example a security-team workstation or a sanctioned
+    administration jump host — is often the fastest path to distinguishing true positives from routine operations. CrackMapExec
+    command patterns originating from an ordinary endpoint or a non-administrative user are harder to explain as routine.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:hacking_tool.authorized_engagement
+  question: Is this CrackMapExec execution part of an authorized penetration test or red team engagement?
+  context: Offensive frameworks like CrackMapExec are routinely used in authorized security assessments. Before investing investigation
+    time, check whether a penetration test or red team exercise is currently active on this host or network segment. An authorized
+    engagement with matching tooling and timing resolves the alert without further analysis; absence of one when the patterns
+    appear shifts the disposition toward an unsanctioned intrusion.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:hacking_tool.tool_capability_used
+  question: Which CrackMapExec execution method fired, and what command was actually run?
+  context: The framework offers several execution methods, and the command shape reveals which one was used — a cmd.exe redirect
+    to a remote SMB share captures output from a command run on a remote host, a redirect to a local Temp path captures output
+    locally, and the powershell variants run encoded or in-line payloads. Parse the full command line to identify the operational
+    command behind the wrapper (the part between the interpreter flags and the output redirection), which determines the scope
+    of potential compromise and the required response.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:powershell.encoded_command_decode
+  question: If the PowerShell variant fired, what does the encoded or in-line command decode to?
+  context: The powershell patterns carry either "-enc" (a base64-encoded command) or "-exec bypass ... -C" (an in-line command
+    string). Decoding the base64 payload or reading the in-line command reveals the actual operation — download cradles, reverse
+    shells, credential harvesting, or in-memory execution of .NET assemblies. The "-noni -nop -w 1" flags suppress the profile
+    and hide the window, which is consistent with non-interactive automation rather than an admin at a console.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:cue_process_tool.process_chain
+  question: What process spawned this command interpreter, and is that parent chain expected?
+  context: The parent process reveals how the interpreter was invoked. Remote-execution frameworks frequently launch their
+    command interpreters from a service host or a remotely created service rather than from explorer.exe or a user shell. A
+    parent such as services.exe, wmiprvse.exe, or an unexpected child of a network-facing service is consistent with remote
+    command execution; a parent of explorer.exe is consistent with interactive local use.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: attack:T1047.remote_output_destination
+  question: For the cmd.exe redirect patterns, what remote SMB destination received the captured output?
+  context: The cmd.exe shapes redirect command output to a UNC path (\\host\share\file), which means the framework wrote results
+    to a remote share — the signature of capturing the output of a command executed against a remote host. Identify the destination
+    host and any network connection to that host around the alert time. A connection to a domain controller, file server,
+    or a host the source endpoint has no routine relationship with widens the scope of the investigation toward lateral movement.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        DestinationPort:
+          - 445
+          - 139
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationHostname
+      - Image
+- source: template:powershell.script_block_logging
+  question: Did PowerShell script block logging capture the full script content?
+  context: Script block logging records the deobfuscated script content that PowerShell actually executes, even when the command
+    line is encoded or obfuscated. This provides ground truth about what ran, bypassing attacker obfuscation of the "-enc"
+    payload. If PowerShell operational logs are not ingested in this environment, treat zero results as a visibility gap rather
+    than evidence nothing ran, and decode the encoded payload from the alerting command line directly.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- source: template:powershell.powershell_security_bypass
+  question: Were PowerShell security controls bypassed or weakened on this host before this execution?
+  context: Attackers often disable or bypass PowerShell and host security controls before running a payload. Common precursors
+    include AMSI bypass (patching amsi.dll in memory), execution policy changes, and PowerShell downgrade attacks using version
+    2 which lacks logging. The alerting command itself already carries an execution-policy bypass flag; finding additional weakening
+    activity in the prior hour strengthens the case for a deliberate intrusion.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in the hour before the alert?
+  context: Tampering typically precedes payload execution. The query surfaces direct attempts to disable AV/EDR services, flip
+    Defender flags, add broad exclusions, clear logs, or patch AMSI/ETW. Zero rows is a useful "protection looks healthy" signal
+    — kernel-level driver tampering and in-memory patches will not appear here. Populated rows shift the disposition toward
+    operator preparation; review the parent process and signing chain to identify the writer.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired this rule's pattern, what parents and users normally drove it, and does the
+    current alert fit that pattern?
+  context: Even common interpreters can be abused. The query mirrors the rule's selection structure scoped to this host — the
+    resulting parent/user distribution reflects how the rule's specific firing pattern (not generic cmd or PowerShell usage)
+    has historically run here. Deviations — a new parent process, an unexpected user account, an unusual command shape — are
+    the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains:
+        - cmd.exe /Q /c * 1> \\\\*\\*\\* 2>&1
+        - cmd.exe /C * > \\\\*\\*\\* 2>&1
+        - cmd.exe /C * > *\\Temp\\* 2>&1
+        - powershell.exe -exec bypass -noni -nop -w 1 -C "
+        - 'powershell.exe -noni -nop -w 1 -enc '
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired this rule's pattern in the past week, and does the cross-host distribution look like consistent
+    automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of the rule's
+    firing pattern. Many hosts firing the same pattern in a short span points to a single operator fanning out remote execution
+    across the environment; one host or a small unrelated set points to isolated activity. Use the host distribution to gauge
+    how far the activity has spread.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains:
+        - cmd.exe /Q /c * 1> \\\\*\\*\\* 2>&1
+        - cmd.exe /C * > \\\\*\\*\\* 2>&1
+        - cmd.exe /C * > *\\Temp\\* 2>&1
+        - powershell.exe -exec bypass -noni -nop -w 1 -C "
+        - 'powershell.exe -noni -nop -w 1 -enc '
+      condition: selection
+    fields:
+    - host.name
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run this CrackMapExec command pattern?
+  context: Compare this user's current action against their historical behavior. A user who has never produced these execution
+    patterns is more suspicious than one who does so regularly as part of sanctioned security work. The query counts how often
+    this user has driven the rule's pattern across all hosts over 90 days, scoped to the rule's command shapes rather than
+    generic interpreter use; zero or very low counts indicate the user does not normally perform this activity.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        CommandLine|contains:
+        - cmd.exe /Q /c * 1> \\\\*\\*\\* 2>&1
+        - cmd.exe /C * > \\\\*\\*\\* 2>&1
+        - cmd.exe /C * > *\\Temp\\* 2>&1
+        - powershell.exe -exec bypass -noni -nop -w 1 -C "
+        - 'powershell.exe -noni -nop -w 1 -enc '
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is the parent process that launched this command historically routine on this host, or is it a new launch mechanism
+    for this pattern?
+  context: When the alert fires under a service principal, user identity does not attribute behavior. The meaningful pivot is
+    the launch mechanism — which parent process spawned the interpreter producing the rule's command pattern, and whether that
+    parent has driven the pattern here before. A new or rare parent for these command shapes is the deviation worth chasing;
+    a parent that already accounts for many prior firings is more likely sanctioned automation. This pivots on launch mechanism
+    rather than user identity and is kept alongside the user-pivot view because either may degenerate depending on which account
+    fires the alert.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains:
+        - cmd.exe /Q /c * 1> \\\\*\\*\\* 2>&1
+        - cmd.exe /C * > \\\\*\\*\\* 2>&1
+        - cmd.exe /C * > *\\Temp\\* 2>&1
+        - powershell.exe -exec bypass -noni -nop -w 1 -C "
+        - 'powershell.exe -noni -nop -w 1 -enc '
+      condition: selection
+    fields:
+      - ParentImage
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints. If
+    the same user triggered command execution on multiple hosts in the alert window, the scope of activity may be larger than
+    the single triggering host. This view pivots on user identity and asks what they did right now across the network, distinct
+    from their long-term baseline.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same command pattern fire on other hosts in the same window — a coordinated rollout, or isolated to this
+    host?
+  context: Under a service principal, asking what else the user did across the network returns agent-telemetry noise. The meaningful
+    question is whether the same command pattern fired on other hosts in the alert window. Multiple hosts producing the rule's
+    pattern in the same window points to an operator fanning out remote execution; a single host points to a host-local trigger.
+    This is kept alongside the user-pivot view because either degenerates depending on which account fires the alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains:
+        - cmd.exe /Q /c * 1> \\\\*\\*\\* 2>&1
+        - cmd.exe /C * > \\\\*\\*\\* 2>&1
+        - cmd.exe /C * > *\\Temp\\* 2>&1
+        - powershell.exe -exec bypass -noni -nop -w 1 -C "
+        - 'powershell.exe -noni -nop -w 1 -enc '
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering, reconnaissance, credential
+    access — may reveal the attack stages that preceded this event and help reconstruct the timeline. Remote command-execution
+    tooling is typically deployed after an initial foothold, so prior alerts on this host are especially relevant context.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1059.003
+      name: Windows Command Shell
+      role: primary
+    - id: T1059.001
+      name: PowerShell
+      role: primary
+    - id: T1047
+      name: Windows Management Instrumentation
+      role: secondary
+    - id: T1053
+      name: Scheduled Task/Job
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: verify_pattern_fired
+      description: "Confirm which of the cmd/powershell command shapes matched the alert"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: identify_execution_method
+      description: "Identify which CrackMapExec execution method fired and the operational command behind the wrapper"
+      mapped_to: Q4
+      source: template:hacking_tool.tool_capability_used
+    - stage: 3
+      label: decode_payload
+      description: "Decode the encoded or in-line PowerShell command to reveal the actual payload"
+      mapped_to: Q5
+      source: template:powershell.encoded_command_decode
+    - stage: 4
+      label: launching_parent
+      description: "Identify the parent that launched the interpreter (local shell vs remote service)"
+      mapped_to: Q6
+      source: template:cue_process_tool.process_chain
+    - stage: 5
+      label: remote_transfer
+      description: "Identify the remote SMB destination receiving captured command output (remote execution chain)"
+      mapped_to: Q7
+      source: attack:T1047.remote_output_destination
+  dimension_coverage:
+    - dimension: time_correlation
+      technique: T1047
+      covered_by: Q15
+      source: template:cue_user_actor.clustering
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1047
+      covered_by: Q12
+      source: template:cue_process_tool.scope
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1047
+      covered_by: Q2
+      source: template:universal.host_user_context
+      coverage_type: direct
+    - dimension: command_analysis
+      technique: T1053
+      covered_by: Q4
+      source: template:hacking_tool.tool_capability_used
+      coverage_type: direct
+    - dimension: execution_context
+      technique: T1053
+      covered_by: Q3
+      source: template:hacking_tool.authorized_engagement
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1059.003
+      covered_by: Q6
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+  mutable_dispositions:
+    - element: SuspiciousCommandPatterns
+      dimension: tuning_parameter
+      specific_values: "wmic process call, powershell Invoke-WmiMethod"
+      disposition: context
+      target_question: Q4
+      notes: "Rule's detection has no WMI command strings; the rule fires on cmd/powershell shapes. Execution-method identification covered in tool_capability_used context rather than a WMI-specific query."
+    - element: RemoteDestinationThreshold
+      dimension: tuning_parameter
+      specific_values: "unique remote hosts contacted within a time window"
+      disposition: new_question
+      target_question: Q7
+      notes: "Drove the custom network_connection question for SMB output destinations from the cmd-redirect patterns."
+    - element: WMIQueryScope
+      dimension: tuning_parameter
+      specific_values: "\\root\\cimv2, \\root\\subscription"
+      disposition: context
+      target_question: Q7
+      notes: "Rule does not detect WMI namespaces directly; remote-execution context carried in network_connection question."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q15
+      notes: "Correlation window expressed via clustering question range (+/-1h)."
+    - element: UserContext
+      dimension: user_context
+      specific_values: "interactive vs SYSTEM / low-privileged"
+      disposition: context
+      target_question: Q2
+      notes: "Service-principal degeneration handled by the user_actor pair (Q13/Q14, Q15/Q16)."
+    - element: CommandLinePattern
+      dimension: command_analysis
+      specific_values: "encoded/obfuscated PowerShell args (-enc, -nop)"
+      disposition: query_injection
+      target_question: Q11
+      notes: "Rule's CommandLine patterns embedded verbatim in baseline_deviation/scope reflected queries; powershell flags decoded in Q5."
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "abnormal parents (Office, mshta, network services)"
+      disposition: new_question
+      target_question: Q6
+      notes: "Parent chain question via ParentProcessGuid lookup."
+    - element: ScriptBlockLengthThreshold
+      dimension: tuning_parameter
+      specific_values: "Event ID 4104 script block length"
+      disposition: context
+      target_question: Q8
+      notes: "Script block logging question covers 4104; length threshold is a tuning rationale, not directly queryable."
+    - element: CommandLineRegex
+      dimension: command_analysis
+      specific_values: "rationale only (suspicious scheduled-task binaries)"
+      disposition: context
+      target_question: Q4
+      notes: "T1053 scheduled-task analytic does not apply — rule has no schtasks strings."
+  dedup_decisions:
+    - dropped: cue_process_tool.baseline
+      reason: "Within-phase overlap with cue_process_tool.baseline_deviation (reflected host_pattern), which is filter-correct to the rule's pattern; kept the reflected version."
+      kept: cue_process_tool.baseline_deviation
+    - dropped: cue_process_tool.clustering
+      reason: "Host-time clustering subsumed by cue_host_context.clustering; dropped to stay within 18-question cap."
+      kept: cue_host_context.clustering
+    - dropped: cue_process_tool.follow_on
+      reason: "follow_on scopes children via ParentImage|endswith %Image%, but rule has no primary_binary; child-process context is partially carried by host clustering. Dropped under cap."
+      kept: cue_host_context.clustering
+    - dropped: cue_user_actor.baseline / baseline_svc
+      reason: "user_actor pair — non-deduplicable; both emitted (Q13/Q14)."
+      kept: both
+    - dropped: cue_user_actor.clustering / clustering_svc
+      reason: "user_actor pair — non-deduplicable; both emitted (Q15/Q16)."
+      kept: both
+  skipped_templates:
+    - template: cue_process_tool.mechanism_decode
+      reason: "replaced_by scheduled_task.task_configuration per brief; but task_configuration is schtasks-specific and does not fit a cmd/powershell rule. Phase 2 mechanism-decode coverage provided by hacking_tool.tool_capability_used (Q4) + powershell.encoded_command_decode (Q5) instead."
+    - template: scheduled_task.task_configuration
+      reason: "T1053 is tagged but the rule's detection contains no schtasks/at.exe strings — the patterns are cmd.exe and powershell.exe command shapes. task_configuration (/TN /TR /SC framing) misrepresents what the rule fires on."
+    - template: scheduled_task.task_trigger_and_timing
+      reason: "Same as above — no scheduled-task creation in this rule's detection."
+    - template: scheduled_task.task_still_present
+      reason: "Same as above — no scheduled-task creation in this rule's detection."
+    - template: hacking_tool.tool_specific_artifacts
+      reason: "Scopes file events via Image|endswith %Image%, but rule has no primary_binary (CommandLine-only); cannot bind the artifact-writer process. Dropped under 18-question cap."
+    - template: organizational_context.change_ticket
+      reason: "hktl prefix — change tickets irrelevant for offensive-tool detection per template notes."
+    - template: organizational_context.human_recall
+      reason: "Authorized-engagement question (Q3) is the more direct legitimacy check for an offensive-tool detection; dropped under cap."
+    - template: organizational_context.timing_alignment
+      reason: "Lower-value for a hktl detection where authorization status, not work-hours, is the disposition driver; dropped under cap."
+    - template: organizational_context.procedural_consistency
+      reason: "Aimed at admin-tool-vs-attacker framing (schtasks/reg/net); rule is an offensive framework, not routine admin tooling. Dropped under cap."
+    - template: persistence_scope.process_based_persistence
+      reason: "is_persistence_rule is set via T1053 tag, but the rule's detection contains no persistence-tool command shapes (schtasks/sc/reg/bitsadmin/wmic). Dropped under cap as a poor fit."
+    - template: persistence_scope.file_based_persistence
+      reason: "Same — rule fires on remote command execution, not persistence-file drops. Dropped under cap."
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "scheduled_task.task_configuration replaces cue_process_tool.mechanism_decode"
+      disposition: declined
+      reason: >-
+        Declined the named replacement: scheduled_task.task_configuration is
+        schtasks-specific and the rule's detection contains no schtasks strings —
+        only cmd.exe and powershell.exe command shapes. cue_process_tool.mechanism_decode
+        is skipped per the replacement intent (recorded in skipped_templates), and
+        Phase 2 mechanism-decode coverage is provided instead by
+        hacking_tool.tool_capability_used (identifies the execution method and
+        operational command) and powershell.encoded_command_decode (decodes the
+        -enc/-C payload).
+    - hint: "logsource 'image_load' (recommended by techniques: T1059.003,T1059.001) is not covered — pull in cue_image_load.* or author a custom question with category: image_load"
+      disposition: declined
+      reason: >-
+        The rule's detection is purely process command-line shapes for cmd.exe and
+        powershell.exe; it does not constrain on a hosting binary whose loaded
+        modules would discriminate abuse. image_load on cmd/powershell returns
+        volume without precision for these specific invocations. Script-block
+        logging (Q8) and the encoded-command decode (Q5) cover the .NET/in-memory
+        execution angle via process_creation and 4104 evidence sufficiently for
+        triage. No compensating attack:T1059.001.image_load question authored.
+    - hint: "logsource 'security' (recommended by techniques: T1053) is not covered and no template family exists — author a custom question with category: security"
+      disposition: declined
+      reason: >-
+        T1053 security logsource targets Event 4698 (scheduled-task registration),
+        but this rule's detection contains no scheduled-task creation — the command
+        shapes are cmd.exe redirects and powershell.exe invocations. A 4698 question
+        would investigate an artifact this rule never fires on. T1053 is an
+        incidental tag, not the behavior the rule detects.
+    - hint: "logsource 'wmi' (recommended by techniques: T1047) is not covered and no template family exists — author a custom question with category: wmi"
+      disposition: declined
+      reason: >-
+        The rule's detection contains no WMI operation strings (no wmic, no
+        Invoke-WmiMethod, no namespace references). T1047 is tagged because
+        CrackMapExec can use WMI as an execution transport, but the patterns this
+        rule fires on are cmd/powershell command shapes. The remote-execution
+        transport question is covered platform-appropriately by the SMB
+        network_connection question (Q7); a wmi-operation query would have nothing
+        in this rule's scope to bind to.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - powershell
+    - hacking_tool
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 16
+      attack: 1
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 2
+      context: 13
+    logsource_diversity:
+      process_creation: 14
+      powershell: 1
+      network_connection: 1
+      sigma_alert: 1

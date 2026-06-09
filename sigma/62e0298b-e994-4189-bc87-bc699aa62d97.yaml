@@ -1,0 +1,525 @@
+name: Potential Suspicious Registry File Imported Via Reg.EXE
+id: 65881d8c-cf56-4bc7-a45d-2c6c7187cba2
+description: |
+  Detects reg.exe (matched by Image or OriginalFileName) invoked with the ' import ' operation where the
+  command line references a user-writable or temporary path (under C:\Users\, %temp%, %tmp%, %appdata%,
+  \AppData\Local\Temp\, C:\Windows\Temp\, or C:\ProgramData\). The rule fires only when all three conditions
+  hold together: the binary is reg.exe, the operation is import, and the source file path is one of the
+  suspicious locations. Importing a .reg file bulk-writes exported subkeys, values, and data into the registry
+  in one operation, which an operator can use to install persistence (Run/RunOnce, Services, IFEO) or weaken
+  security settings without typing each key individually. Legitimate software deployment and backup restores
+  also import .reg files, so the investigation should read the imported file's actual content, identify which
+  registry keys it writes, confirm the parent process and user are expected to perform bulk registry imports,
+  and determine whether any referenced payload exists on disk.
+type: detection
+detection_id: 62e0298b-e994-4189-bc87-bc699aa62d97
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line match what this rule detects, with reg.exe running an import from a user-writable or temporary path?
+  context: Before investing investigation time, confirm the alert is a true positive by reviewing the exact command line and process details. The rule fires only when all three conditions hold together, the binary is reg.exe (by Image or OriginalFileName) AND the command line contains the import operation AND the source file path lives under a user-writable or temporary location such as C:\Users\, %temp%, %appdata%, \AppData\Local\Temp\, C:\Windows\Temp\, or C:\ProgramData\. Confirm all three are present in the actual event and note the full path of the imported .reg file.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to import registry files in bulk from temporary or user-writable locations?
+  context: Legitimate software installs, configuration deployments, and backup restores do import .reg files, but doing so from a temp or profile directory rather than a packaged installer is less common on general-purpose endpoints. Knowing whether the user role and host function involve bulk registry imports is often the fastest path to distinguishing routine deployment from operator-driven configuration change.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:parent_child.parent_process_legitimacy
+  question: Is the parent expected to launch reg.exe for a bulk import, and what started that parent?
+  context: The parent process reveals how the import was invoked. Installer and deployment tooling (msiexec.exe, packaged setup utilities) or an interactive admin shell are expected drivers; parents like winword.exe, mshta.exe, wscript.exe, or an archive extractor point to macro-driven or staged execution rather than legitimate configuration management. Walk up the tree to see what spawned the parent and whether the lineage matches an allowlist of legitimate registry tools.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- source: template:parent_child.sibling_processes
+  question: What other child processes did the same parent spawn?
+  context: If a suspicious parent spawned this reg.exe import, it likely spawned other processes too. Examining sibling processes reveals the full scope of activity from that parent, multiple registry tools, downloaders, or shells from the same parent within a short window suggests orchestrated configuration change rather than an isolated import.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:registry.registry_key_context
+  question: Which registry keys and values did this import write, and are any of them known persistence or evasion locations?
+  context: An import bulk-writes every subkey, value name, and data entry contained in the .reg file, so the registry events linked to this process show what actually changed. Run/RunOnce keys (HKCU or HKLM\Software\Microsoft\Windows\CurrentVersion\Run) indicate persistence; keys under HKLM\SOFTWARE\Policies\Microsoft\Windows Defender or firewall policy paths indicate security tampering; Image File Execution Options (IFEO) keys indicate debugger-based hijacking; Services keys can register or alter a service. The set of monitored or critical keys (Run, Services, security settings, LSASS) is environment-specific, so compare the written paths against the keys your environment treats as sensitive.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+- source: template:cue_artifact.mechanism_decode
+  question: What is in the imported .reg file? Read its key paths, value names, and data, and check for obfuscation or encoded payloads.
+  context: 'The .reg file is the payload of this operation, the command line only names its path. Retrieve the file and read its contents: enumerate every key path and value it writes, and inspect value data for encoded blobs, base64 strings, embedded executable paths, scripts, or URLs. A value that registers an executable under a Run key, points an IFEO Debugger at a security tool, or stores an encoded command is what determines intent. Compare suspicious strings against threat intelligence.'
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+        CommandLine|contains: ' import '
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:cue_artifact.artifact_verification
+  question: What is the hash of the imported .reg file, and does it have known threat intel detections?
+  context: A file hash provides a unique identifier for reputation lookup. Submit the .reg file's hash to threat intelligence platforms to determine whether it is a known-malicious configuration artifact, a known-benign deployment file, or previously unseen. A novel file written to a temp directory minutes before the import raises the priority of the content review.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Hashes
+- source: template:universal.evidence_preservation
+  question: Is the imported .reg file still on disk for analysis?
+  context: The .reg file path is derived from the import command line. Checking whether it still exists on disk enables deeper analysis, hash lookups, sandbox submission, or direct content review. Operators frequently delete the .reg file immediately after import, so its absence is itself informative and the registry events become the primary record of what was written.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: template:registry.registry_related_modifications
+  question: Were other registry modifications made on this host in the same session and window?
+  context: An operator who imports one registry file often makes several related changes, setting a Run key for persistence while also disabling a security setting or altering a service, and the registry change correlates in time with nearby process or service execution. Finding clusters of reg.exe or regedit.exe write operations (add, delete, import, /s) from the same host within a short window reveals the full scope of the configuration change and whether multiple objectives were pursued together.
+  range: +/-30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_reg:
+        Image|endswith:
+          - '\reg.exe'
+          - '\regedit.exe'
+        CommandLine|contains:
+          - ' add '
+          - ' delete '
+          - ' import '
+          - '/s '
+      condition: selection and selection_reg
+    fields:
+      - CommandLine
+- source: template:registry.registry_value_persistence_check
+  question: Does any value written by the import reference an executable or script on disk, and does that payload survive reboot?
+  context: A registry persistence entry is only effective if the executable or script it points to exists at the referenced path. If the imported file wrote a Run key or Service ImagePath pointing to, for example, C:\Users\Public\backdoor.exe, checking whether that file exists and analyzing its hash determines whether the persistence mechanism is armed and what would execute on next logon or service start. Extract the referenced path from the registry value data, then verify whether it is present on disk.
+  range: +15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - Hashes
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired the rule's import pattern, what parents and users normally drive it, and does the current alert fit that pattern?
+  context: Even routine deployment can use reg.exe import. The query mirrors the rule's selection structure scoped to this host, so the resulting parent and user distribution reflects how this specific import-from-suspicious-path pattern has historically run here, not generic reg.exe usage. A new parent process, an unexpected user account, or an unfamiliar imported-file path is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \reg.exe
+      - OriginalFileName: reg.exe
+      selection_cli:
+        CommandLine|contains: ' import '
+      selection_paths:
+        CommandLine|contains:
+        - C:\Users\
+        - '%temp%'
+        - '%tmp%'
+        - '%appdata%'
+        - \AppData\Local\Temp\
+        - C:\Windows\Temp\
+        - C:\ProgramData\
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.follow_on
+  question: What processes ran or services restarted on this host shortly after the import?
+  context: Registry changes often take effect only after a process or service is restarted, and bulk imports that install persistence or weaken protection are commonly followed by execution of the newly registered payload. Examining what reg.exe and its parent led to, and what services or processes started in the hours after, reveals whether the configuration change was activated. Unexpected children such as cmd.exe, powershell.exe, or certutil.exe point to post-import staging.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_user_actor.baseline
+  question: Does this user normally import registry files with reg.exe across the environment?
+  context: Compare this user's current action against their historical behavior. A user who has never run reg.exe is more suspicious than one who does so regularly as part of a deployment or administrative role. User role and typical toolset should align with performing bulk registry imports.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent and reg.exe combination historically routine on this host or across the environment, or is the parent unusual for the binary?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior. The meaningful pivot is the launch mechanism: which parent process spawned reg.exe, and is that pair historically common. A new or rare parent for reg.exe on this host or environment-wide is the deviation worth chasing; a pair that already accounts for thousands of prior events is vendor or deployment automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity across multiple endpoints. If the same user triggered similar registry imports or other administrative actions on multiple hosts, the scope of the activity may be larger than a single endpoint.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent and reg.exe combination fire on other hosts in the same window, indicating a coordinated automation rollout rather than isolated activity?
+  context: Under a service principal, asking what else this user did across the network returns agent-telemetry noise, since every host runs SYSTEM-owned agents constantly. The meaningful question is whether the same launch mechanism, parent process plus reg.exe, fired on other hosts in the alert window. Multiple hosts in the same window points to scheduled or pushed deployment; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:lolbin.renamed_binary_check
+  question: Was reg.exe executed from its expected system path?
+  context: reg.exe executed from outside System32 or SysWOW64 may indicate the binary was copied or renamed to evade path-based allowlists, or that a different binary is impersonating it. Confirm the Image path and compare OriginalFileName against the on-disk name, a reg.exe running from a user's temp or profile directory is more suspicious than one in System32.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- source: template:lolbin.technique_class_lateral
+  question: Were any other persistence or registry-tampering LOLBins used on this host recently?
+  context: Operators who use reg.exe to alter the registry often reach for other native tools toward the same objective. Check whether schtasks.exe, sc.exe, at.exe, bitsadmin.exe, or wmic.exe were also used on this host to install persistence or change configuration. Finding multiple persistence-capable binaries performing related actions strengthens the case for deliberate, multi-mechanism activity over an isolated import.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_img:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+          - '\netsh.exe'
+          - '\wevtutil.exe'
+          - '\bcdedit.exe'
+          - '\vssadmin.exe'
+      condition: selection and selection_img
+    fields:
+      - Image
+      - CommandLine
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1112
+      name: Modify Registry
+      role: primary
+  attack_chain_coverage:
+    - stage: 1
+      label: registry_import_execution
+      description: reg.exe imports a .reg file from a user-writable or temporary path, bulk-writing registry keys.
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: registry_key_decode
+      description: The import writes specific keys/values; identify whether they are persistence or evasion locations.
+      mapped_to: Q5
+      source: template:registry.registry_key_context
+    - stage: 3
+      label: imported_file_content
+      description: Read the .reg file's actual key paths, value names, and data for encoded or persistence payloads.
+      mapped_to: Q6
+      source: template:cue_artifact.mechanism_decode
+    - stage: 4
+      label: related_registry_changes
+      description: Correlate other registry modifications made on the host in the same time window.
+      mapped_to: Q9
+      source: template:registry.registry_related_modifications
+    - stage: 5
+      label: follow_on_execution
+      description: A service restart or process execution activates the newly written registry change.
+      mapped_to: Q12
+      source: template:cue_process_tool.follow_on
+  dimension_coverage:
+    - dimension: parent_process_analysis
+      technique: T1112
+      covered_by: Q3
+      source: template:parent_child.parent_process_legitimacy
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1112
+      covered_by: Q9
+      source: template:registry.registry_related_modifications
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1112
+      covered_by: Q5
+      source: template:registry.registry_key_context
+      coverage_type: direct
+  mutable_dispositions:
+    - element: RegistryKeyPathPatterns
+      dimension: tuning_parameter
+      specific_values: "Run, Services, Security Settings, LSASS (environment-specific key list)"
+      disposition: context
+      target_question: Q5
+      notes: "Named critical-key categories surfaced in registry_key_context context; the imported keys are read from the linked registry_set events (TargetObject/Details) rather than hard-coded into a query selection, since the rule fires on the import operation not a fixed key path."
+    - element: ParentProcessAllowList
+      dimension: parent_process_analysis
+      specific_values: "regedit.exe, msiexec.exe (examples of legitimate registry tools)"
+      disposition: context
+      target_question: Q3
+      notes: "Allowlist framing carried in parent_process_legitimacy context; analyst compares the actual parent against legitimate registry-tooling lineage."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only (correlate registry change with nearby process/service execution)"
+      disposition: context
+      target_question: Q9
+      notes: "No numeric threshold supplied; registry_related_modifications (+/-30m) and follow_on (+4h) carry the temporal-correlation intent."
+    - element: SignatureCheck
+      dimension: tuning_parameter
+      specific_values: "rationale only (flag unsigned executables / abnormal parent-child lineage)"
+      disposition: context
+      target_question: Q17
+      notes: "No queryable value; renamed_binary_check (Image vs OriginalFileName / path) and parent_process_legitimacy together cover the unsigned/abnormal-lineage check."
+  dedup_decisions:
+    - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable (subject vs. launch-mechanism pivot); both emitted"
+      kept: both
+    - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable (subject vs. launch-mechanism pivot); both emitted"
+      kept: both
+    - dropped: cue_process_tool.process_chain
+      reason: "parent_child technique set active — parent_process_legitimacy + sibling_processes are more specific and subsume the generic process_chain parent lookup"
+      kept: parent_child.parent_process_legitimacy
+    - dropped: cue_process_tool.baseline
+      reason: "host-frequency coverage provided by cue_process_tool.baseline_deviation (rule-pattern host history, more specific than generic reg.exe count); user-frequency by cue_user_actor.baseline"
+      kept: cue_process_tool.baseline_deviation
+    - dropped: cue_artifact.baseline
+      reason: "first-seen file coverage subsumed by cue_artifact.artifact_verification (hash/reputation) plus evidence_preservation (on-disk check) for the imported .reg artifact"
+      kept: cue_artifact.artifact_verification
+  skipped_templates:
+    - template: cue_process_tool.mechanism_decode
+      reason: "replaced_by: registry.registry_key_context — the registry_set event gives TargetObject/Details directly instead of parsing reg.exe CommandLine; cue_artifact.mechanism_decode covers the .reg file content separately"
+    - template: cue_process_tool.clustering
+      reason: "not included to stay within the 18-question cap; host time-window context carried by registry_related_modifications and follow_on"
+    - template: cue_host_context.clustering
+      reason: "not included to stay within the 18-question cap; same +/-15m host-scoped aggregation intent covered by registry_related_modifications for the registry-specific case"
+    - template: cue_host_context.precursor
+      reason: "not included to stay within the 18-question cap; prior-alert timeline is lower priority than the persistence/registry-content questions for this import rule"
+    - template: cue_process_tool.scope
+      reason: "not included to stay within the 18-question cap; fleet-wide rule-pattern distribution is lower priority than the user_actor pair and registry-content coverage retained"
+    - template: lolbin.historical_lolbin_baseline
+      reason: "not included to stay within the 18-question cap; host rule-pattern history already covered by cue_process_tool.baseline_deviation over -14d"
+    - template: universal.endpoint_protection_health
+      reason: "RECOMMENDED generic tamper sweep dropped — registry_key_context already surfaces Defender-policy key writes (the import's tamper vector), and the rule is registry-config not execution/credential-centric"
+    - template: persistence_scope.process_based_persistence
+      reason: "not included to stay within the 18-question cap; multi-mechanism persistence coverage provided by lolbin.technique_class_lateral (schtasks/sc/at/bitsadmin/wmic on host)"
+    - template: persistence_scope.file_based_persistence
+      reason: "not included to stay within the 18-question cap; Startup-folder/Run-path file drops are a secondary vector for an import-based registry rule"
+    - template: organizational_context.change_ticket
+      reason: "not included to stay within the 18-question cap; change-approval intent partially carried by host_user_context expectation question"
+    - template: organizational_context.human_recall
+      reason: "not included to stay within the 18-question cap"
+    - template: organizational_context.timing_alignment
+      reason: "not included to stay within the 18-question cap"
+    - template: organizational_context.procedural_consistency
+      reason: "not included to stay within the 18-question cap; reg.exe-vs-GPO procedural angle partially carried by host_user_context"
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "cue_artifact: derived: [A-Za-z]:\\ in CommandLine"
+      disposition: acted_on
+      reason: >-
+        Acted on. cue_artifact patterns drove Q6 (cue_artifact.mechanism_decode —
+        read the imported .reg file content), Q7 (cue_artifact.artifact_verification —
+        hash/reputation of the .reg file), and Q8 (universal.evidence_preservation —
+        is the .reg file still on disk). File paths use the %file_paths% placeholder
+        derived from the CommandLine path.
+    - hint: "registry.registry_key_context replaces cue_process_tool.mechanism_decode"
+      disposition: acted_on
+      reason: >-
+        Acted on. cue_process_tool.mechanism_decode skipped (see skipped_templates);
+        Q5 (registry.registry_key_context) is the Phase-2 mechanism-decode for this
+        rule, reading the written keys/values from the linked registry_set event.
+    - hint: "LOLBin rule — check for renamed binary and other LOLBins achieving same objective"
+      disposition: acted_on
+      reason: >-
+        Acted on. Q17 (lolbin.renamed_binary_check) confirms reg.exe ran from its
+        expected System32 path (Image vs OriginalFileName). Q18
+        (lolbin.technique_class_lateral) checks for other persistence/tamper LOLBins
+        (schtasks, sc, at, bitsadmin, wmic, netsh, wevtutil, bcdedit, vssadmin) on
+        the host, with reg.exe excluded from the list as redundant.
+    - hint: "File paths derived from CommandLine — use %file_paths% placeholder"
+      disposition: acted_on
+      reason: >-
+        Acted on. Q7 (artifact_verification), Q8 (evidence_preservation), and Q10
+        (registry_value_persistence_check) all scope file_event queries with
+        TargetFilename|endswith|expand: '%file_paths%' derived from the import
+        command line.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - registry
+    - parent_child
+    - lolbin
+    - cue_artifact
+    - cue_process_tool
+    - cue_user_actor
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 18
+      attack: 0
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 3
+      context: 13
+    logsource_diversity:
+      process_creation: 14
+      registry_set: 1
+      file_event: 3

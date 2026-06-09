@@ -1,0 +1,526 @@
+name: Potential Crypto Mining Activity
+id: 5b4f7aed-401b-463c-ae87-1de29ed2c997
+description: |
+  Detects command lines carrying strings characteristic of cryptocurrency miners: pool and proxy
+  switches (--cpu-priority=, -o pool., --nicehash, --algo=rx/0), stratum URLs (stratum+tcp:// and
+  stratum+udp://), and base64 fragments of those same tokens used to obfuscate the configuration.
+  The rule fires when any of these mining markers appears in a command line and the line does not
+  also match a build-toolchain filter (pool.c, pool.o, gcc -), which suppresses legitimate compiler
+  invocations. Mining tools consume host CPU/GPU for an operator's profit and beacon to mining pools
+  or proxy endpoints over stratum; benign hits come from developers compiling pool-related source or
+  from sanctioned mining on lab hardware. The investigation should decode the full configuration,
+  confirm whether the user and host are expected to run this, identify the pool or proxy endpoint the
+  process connected to, and determine how long the activity has been sustained.
+type: detection
+detection_id: 66c3b204-9f88-4d0a-a7f7-8a57d521ca55
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line carry a mining marker (pool switch, stratum URL, or its base64 form) and not also a build-toolchain string?
+  context: Before investing investigation time, confirm the alert is a true positive by reviewing the exact command line. The rule fires when the line contains a mining token (such as --cpu-priority=, -o pool., --nicehash, --algo=rx/0, stratum+tcp://, stratum+udp://, or a base64 fragment of those) AND does not also contain a compiler string (pool.c, pool.o, gcc -). Confirm the mining marker is present and that this is not a build-toolchain command that happened to match.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run cryptocurrency mining tools?
+  context: Sanctioned mining on dedicated lab or test hardware, or a developer compiling mining-pool source, can trigger this rule. Knowing whether the user role and host function legitimately involve mining software or build toolchains is often the fastest path to distinguishing approved use from resource hijacking on a production endpoint.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: Decode the full mining configuration on the command line. What pool or proxy, algorithm, and wallet or worker is configured?
+  context: 'The command line is the miner''s configuration. Read the pool or proxy endpoint (-o pool. / stratum+tcp:// / stratum+udp://), the algorithm (--algo=rx/0 indicates Monero RandomX), CPU-priority and nicehash flags, and any wallet or worker identifier. Several markers are base64 fragments (for example LS1kb25hdGUtbGV2ZWw9 decodes toward --donate-level=); decode them to recover the real switches the operator hid. The decoded endpoint and wallet are the pivot for the rest of the investigation.'
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains:
+        - ' --cpu-priority='
+        - --donate-level=0
+        - ' -o pool.'
+        - ' --nicehash'
+        - ' --algo=rx/0 '
+        - stratum+tcp://
+        - stratum+udp://
+        - LS1kb25hdGUtbGV2ZWw9
+        - 0tZG9uYXRlLWxldmVsP
+        - tLWRvbmF0ZS1sZXZlbD
+        - c3RyYXR1bSt0Y3A6Ly
+        - N0cmF0dW0rdGNwOi8v
+        - zdHJhdHVtK3RjcDovL
+        - c3RyYXR1bSt1ZHA6Ly
+        - N0cmF0dW0rdWRwOi8v
+        - zdHJhdHVtK3VkcDovL
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:cue_process_tool.process_chain
+  question: What process spawned this miner, and is that parent chain expected?
+  context: The parent process reveals how the miner was launched. Sanctioned mining usually descends from explorer.exe or a service manager; resource hijacking often descends from a script host, a scheduled-task handler, an exploited service, or a dropper. An unusual parent for a CPU-intensive process points to an unsanctioned install. Walk up the tree to see what spawned the parent.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: attack:T1496.network_connection
+  question: What outbound connections did this process make, and do any destinations resolve to mining pools or proxy endpoints?
+  context: Miners beacon to a pool or to a stratum proxy, frequently on non-standard high ports or common alternates (3333, 4444, 5555, 7777, 8080, 14444 are typical stratum ports). Correlate the alerting process to its network connections and compare the destination IP, port, and any resolved hostname against the pool or proxy endpoint recovered from the command line. A connection to the configured endpoint confirms active mining; connections to an unexpected endpoint may indicate a proxy or a different operator. If a destination matches a known mining-pool or proxy IP, treat it as a strong confirmation.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+      - Image
+- source: attack:T1496.time_correlation
+  question: How long has this mining pattern been running on this host, and is it sustained or recurring rather than a one-off?
+  context: Resource hijacking is defined by sustained consumption. A genuine miner runs continuously or restarts on a schedule to keep the CPU busy, so the firing pattern recurs over hours or days rather than appearing once; a single short-lived hit is more consistent with an accidental match or a test. Sustained high CPU by one process over a long window (commonly a threshold such as more than 15 minutes) is the resource-hijacking signature. Use the count and time spread to gauge whether mining has been ongoing and to bound when it started.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains:
+        - ' --cpu-priority='
+        - --donate-level=0
+        - ' -o pool.'
+        - ' --nicehash'
+        - ' --algo=rx/0 '
+        - stratum+tcp://
+        - stratum+udp://
+        - LS1kb25hdGUtbGV2ZWw9
+        - 0tZG9uYXRlLWxldmVsP
+        - tLWRvbmF0ZS1sZXZlbD
+        - c3RyYXR1bSt0Y3A6Ly
+        - N0cmF0dW0rdGNwOi8v
+        - zdHJhdHVtK3RjcDovL
+        - c3RyYXR1bSt1ZHA6Ly
+        - N0cmF0dW0rdWRwOi8v
+        - zdHJhdHVtK3VkcDovL
+      condition: selection
+    fields:
+      - Image
+- source: template:cue_process_tool.baseline
+  question: Has this mining command-line pattern ever run on this host before?
+  context: A mining pattern that has never been seen on a host is more suspicious than one that recurs as part of a sanctioned workload. Because the rule matches a command-line pattern rather than a fixed binary, the baseline is scoped to the mining markers themselves. Zero or very low historical counts indicate first-time activity and raise the priority of the decode and network results.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains:
+        - ' --cpu-priority='
+        - --donate-level=0
+        - ' -o pool.'
+        - ' --nicehash'
+        - ' --algo=rx/0 '
+        - stratum+tcp://
+        - stratum+udp://
+        - LS1kb25hdGUtbGV2ZWw9
+        - 0tZG9uYXRlLWxldmVsP
+        - tLWRvbmF0ZS1sZXZlbD
+        - c3RyYXR1bSt0Y3A6Ly
+        - N0cmF0dW0rdGNwOi8v
+        - zdHJhdHVtK3RjcDovL
+        - c3RyYXR1bSt1ZHA6Ly
+        - N0cmF0dW0rdWRwOi8v
+        - zdHJhdHVtK3VkcDovL
+      condition: selection
+    fields:
+      - User
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired the rule's pattern, what parents and users normally drive that activity, and does the current alert fit that pattern?
+  context: Even sanctioned mining or build activity can be abused. The query mirrors the rule's selection structure scoped to this host, so the resulting parent and user distribution reflects how this specific mining firing pattern (not generic process usage) has historically run here. A new parent process, an unexpected user account, or an unusual command-line shape is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains:
+        - ' --cpu-priority='
+        - --donate-level=0
+        - ' -o pool.'
+        - ' --nicehash'
+        - ' --algo=rx/0 '
+        - stratum+tcp://
+        - stratum+udp://
+        - LS1kb25hdGUtbGV2ZWw9
+        - 0tZG9uYXRlLWxldmVsP
+        - tLWRvbmF0ZS1sZXZlbD
+        - c3RyYXR1bSt0Y3A6Ly
+        - N0cmF0dW0rdGNwOi8v
+        - zdHJhdHVtK3RjcDovL
+        - c3RyYXR1bSt1ZHA6Ly
+        - N0cmF0dW0rdWRwOi8v
+        - zdHJhdHVtK3VkcDovL
+      filter:
+        CommandLine|contains:
+        - ' pool.c '
+        - ' pool.o '
+        - gcc -
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection and not filter) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_user_actor.baseline
+  question: Has this user ever run this mining command-line pattern across the environment?
+  context: Compare this user's current action against their historical behavior. A user who has never run a mining pattern is more suspicious than one who does so regularly as part of an approved role. Because the rule matches a command-line pattern rather than a fixed binary, the user baseline is scoped to the mining markers across all hosts. User role and typical toolset should align with running mining software.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        CommandLine|contains:
+        - ' --cpu-priority='
+        - --donate-level=0
+        - ' -o pool.'
+        - ' --nicehash'
+        - ' --algo=rx/0 '
+        - stratum+tcp://
+        - stratum+udp://
+        - LS1kb25hdGUtbGV2ZWw9
+        - 0tZG9uYXRlLWxldmVsP
+        - tLWRvbmF0ZS1sZXZlbD
+        - c3RyYXR1bSt0Y3A6Ly
+        - N0cmF0dW0rdGNwOi8v
+        - zdHJhdHVtK3RjcDovL
+        - c3RyYXR1bSt1ZHA6Ly
+        - N0cmF0dW0rdWRwOi8v
+        - zdHJhdHVtK3VkcDovL
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent and miner-binary combination historically routine on this host or across the environment, or is the parent unusual for this binary?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior. The meaningful pivot is the launch mechanism: which parent process spawned the binary that carried the mining command line, and is that pair historically common. A new or rare parent for this binary on this host or environment-wide is the deviation worth chasing; a pair that already accounts for thousands of prior events is sanctioned automation or a vendor agent.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals whether the mining was isolated or part of broader activity. If the same user triggered similar activity on multiple hosts, the scope of the resource hijacking may be larger than a single endpoint.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent and miner-binary combination fire on other hosts in the same window, indicating a coordinated rollout rather than isolated activity?
+  context: Under a service principal, asking what else this user did across the network returns agent-telemetry noise, since every host runs SYSTEM-owned agents constantly. The meaningful question is whether the same launch mechanism, parent process plus spawned binary, fired on other hosts in the alert window. Multiple hosts in the same window points to a worm-like or pushed mining deployment; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: 'Alerts rarely occur in isolation. Examining activity around the alert reveals the immediate context: what led to this event, what happened after, and whether it is part of a larger sequence. Look for the dropper or installer that placed the miner, scheduled-task creation that persists it, or reconnaissance and privilege escalation.'
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired the rule's mining pattern in the past week, and does the cross-host distribution look like a coordinated deployment or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of this mining firing pattern, not generic process usage. Many hosts firing the same pattern points to a scripted or worm-driven mining deployment; one host or a small unrelated set points to a manual or host-local install. Use the host distribution and parent consistency to calibrate severity and containment scope.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains:
+        - ' --cpu-priority='
+        - --donate-level=0
+        - ' -o pool.'
+        - ' --nicehash'
+        - ' --algo=rx/0 '
+        - stratum+tcp://
+        - stratum+udp://
+        - LS1kb25hdGUtbGV2ZWw9
+        - 0tZG9uYXRlLWxldmVsP
+        - tLWRvbmF0ZS1sZXZlbD
+        - c3RyYXR1bSt0Y3A6Ly
+        - N0cmF0dW0rdGNwOi8v
+        - zdHJhdHVtK3RjcDovL
+        - c3RyYXR1bSt1ZHA6Ly
+        - N0cmF0dW0rdWRwOi8v
+        - zdHJhdHVtK3VkcDovL
+      filter:
+        CommandLine|contains:
+        - ' pool.c '
+        - ' pool.o '
+        - gcc -
+      condition: selection and not filter
+    fields:
+    - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: 'Alerts rarely happen in isolation. Earlier detections on the same host, such as an initial-access exploit, a dropper, defense tampering, or persistence creation, may reveal how the miner was installed and help reconstruct the timeline. Look for patterns: exploitation or download followed by the mining execution.'
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:network_scope.same_action_other_hosts
+  question: Is this same mining command-line pattern running on other hosts?
+  context: Automated or worm-driven mining deployments execute the same configuration across many systems in a short timeframe. Because the rule matches a command-line pattern rather than a fixed binary, this looks for the same mining markers on other hosts. Finding identical patterns on multiple endpoints shows the activity is not isolated and helps determine the scope for containment.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains:
+        - ' --cpu-priority='
+        - --donate-level=0
+        - ' -o pool.'
+        - ' --nicehash'
+        - ' --algo=rx/0 '
+        - stratum+tcp://
+        - stratum+udp://
+        - LS1kb25hdGUtbGV2ZWw9
+        - 0tZG9uYXRlLWxldmVsP
+        - tLWRvbmF0ZS1sZXZlbD
+        - c3RyYXR1bSt0Y3A6Ly
+        - N0cmF0dW0rdGNwOi8v
+        - zdHJhdHVtK3RjcDovL
+        - c3RyYXR1bSt1ZHA6Ly
+        - N0cmF0dW0rdWRwOi8v
+        - zdHJhdHVtK3VkcDovL
+      filter_self:
+        host.name|expand: '%hostname%'
+      condition: selection and not filter_self
+    fields:
+      - host.name
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1496
+      name: Resource Hijacking
+      role: primary
+  attack_chain_coverage:
+    - stage: 1
+      label: mining_command_execution
+      description: A process is executed with a mining configuration command line (pool/proxy switches, stratum URLs, or their base64 forms).
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: configuration_decode
+      description: The full mining configuration (pool/proxy endpoint, algorithm, wallet/worker, base64-hidden switches) is decoded to establish intent.
+      mapped_to: Q3
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 3
+      label: pool_proxy_connection
+      description: The miner makes outbound connections to a mining pool or stratum proxy endpoint.
+      mapped_to: Q5
+      source: attack:T1496.network_connection
+    - stage: 4
+      label: sustained_consumption
+      description: The mining process sustains or recurs over time to keep host resources occupied for the operator.
+      mapped_to: Q6
+      source: attack:T1496.time_correlation
+  dimension_coverage:
+    - dimension: time_correlation
+      technique: T1496
+      covered_by: Q6
+      source: attack:T1496.time_correlation
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1496
+      covered_by: Q5
+      source: attack:T1496.network_connection
+      coverage_type: direct
+  mutable_dispositions:
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only (e.g., >15 minutes sustained CPU)"
+      disposition: new_question
+      target_question: Q6
+      notes: "No queryable CPU metric in process_creation/network logs; the >15-minute sustained-CPU threshold is named in Q6 context and the recurrence/duration intent is carried by the -7d host-scoped mining-pattern aggregation."
+    - element: DestinationIPList
+      dimension: tuning_parameter
+      specific_values: "known mining-pool IPs / proxy endpoints (no fixed list supplied)"
+      disposition: new_question
+      target_question: Q5
+      notes: "Drove attack:T1496.network_connection; the network query returns DestinationIp/DestinationPort/DestinationHostname scoped to the alerting ProcessGuid so the analyst can compare the actual endpoint against the pool recovered from the command line. Typical stratum ports named in context."
+    - element: ExecutableNamePatterns
+      dimension: tuning_parameter
+      specific_values: "rationale only (regex of known mining tools; rule is CommandLine-only with no binary list)"
+      disposition: context
+      target_question: Q3
+      notes: "Rule constrains CommandLine, not Image (primary_binary null, all_binaries empty). The miner is identified by its configuration markers, which are injected into the mechanism_decode / baseline / scope / same_action queries; no fixed executable-name list exists to query."
+  dedup_decisions:
+    - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable (subject identity vs. launch-mechanism pivot); both emitted"
+      kept: both
+    - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable (subject identity vs. launch-mechanism pivot); both emitted"
+      kept: both
+    - dropped: cue_process_tool.clustering
+      reason: "same +/-15m host-scoped process aggregation as cue_host_context.clustering; host_context variant (Image+ParentImage) is the broader of the two"
+      kept: cue_host_context.clustering
+    - dropped: cue_process_tool.follow_on
+      reason: "rule is CommandLine-only with no fixed binary; the miner's meaningful follow-on is its outbound pool/proxy traffic, covered by attack:T1496.network_connection (ProcessGuid-scoped network_connection). Child-process spawning is not the resource-hijacking signature here"
+      kept: attack:T1496.network_connection
+    - dropped: network_scope.actor_activity_network_wide
+      reason: "duplicates cue_user_actor.clustering (same User-scoped, host-omitted, +/-1h network-wide aggregation by host+Image)"
+      kept: cue_user_actor.clustering
+  skipped_templates:
+    - template: network_scope.actor_authentication_trail
+      reason: "Authentication-trail (4624/4625) lateral-movement question adds no signal for a CPU-resource-hijacking rule; mining does not pivot on logon activity, and host/fleet scope is already covered by precursor, scope, and same_action questions. Dropped to stay within the 14-18 target."
+    - template: universal.endpoint_protection_health
+      reason: "RECOMMENDED, not must_include. Tamper-as-precursor is a secondary question for an impact/resource-hijacking rule (not an execution or credential-access rule where disposition turns on protection being weakened first). Prior-tamper context is already carried by cue_host_context.precursor (-6h sigma-alert sweep including defense-tampering detections). Dropped to stay within the 14-18 target."
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "CommandLine-only detection — no Image field in rule. Use CommandLine pattern matching for scoping, not Image-based queries"
+      disposition: acted-on
+      reason: >-
+        Acted on. mechanism_decode (Q3), cue_process_tool.baseline (Q7),
+        cue_user_actor.baseline (Q9), and network_scope.same_action_other_hosts (Q16)
+        were all re-scoped from Image|endswith|expand to the rule's mining
+        CommandLine|contains marker list. The two REFLECTED templates (Q8
+        baseline_deviation, Q14 scope) and Q6 (time_correlation) already scope on
+        the CommandLine pattern. Only the service-principal launch-mechanism
+        questions (Q10, Q12) retain Image, intentionally: they pivot on the
+        alerting event's actual miner binary + parent to attribute the launch
+        mechanism, which is the correct dimension under a service principal.
+    - hint: "logsource 'network_connection' (recommended by techniques: T1496) is not covered — pull in cue_network_endpoint.* or author a custom question with `category: network_connection`"
+      disposition: acted-on
+      reason: >-
+        Acted on. Authored attack:T1496.network_connection (Q5) with
+        category: network_connection, scoped to the alerting ProcessGuid, returning
+        DestinationIp/DestinationPort/DestinationHostname so the analyst can confirm
+        the miner's outbound pool/proxy connection — the network half of the
+        T1496 detection strategy (process execution + outbound mining traffic).
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - network_scope
+  generation_stats:
+    total_questions: 16
+    source_counts:
+      template: 14
+      attack: 2
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 13
+    logsource_diversity:
+      process_creation: 14
+      network_connection: 1
+      sigma_alert: 1

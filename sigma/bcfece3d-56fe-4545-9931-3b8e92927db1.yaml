@@ -1,0 +1,681 @@
+name: Winrs Local Command Execution
+id: af60cae0-fdc3-4e36-b5d0-e5e34904a826
+description: |
+  Detects winrs.exe used to run commands locally rather than against a remote endpoint. The rule fires when the
+  winrs.exe binary (matched by Image or OriginalFileName) is invoked either with an explicit local target
+  (/r:localhost, /r:127.0.0.1, /r:[::1], or the /remote: equivalents) or with no remote-target flag at all, in
+  which case winrs defaults to localhost. Commands launched this way execute under winrshost.exe as children of a
+  Microsoft-signed binary, a form of system binary proxy execution used to evade defenses or to stage local
+  command execution. Legitimate winrs use is almost always remote and administrative; local invocation is unusual
+  and the investigation should determine what command was run, who ran it, and whether it fits expected
+  administrative activity on the host.
+type: detection
+detection_id: bcfece3d-56fe-4545-9931-3b8e92927db1
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: '2026-06-08'
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the alerting event show winrs.exe invoked for local execution, either targeting localhost/loopback or with no remote-target flag?
+  context: >-
+    Confirm the alert is a true positive before investing further time. The rule fires on winrs.exe (by Image or
+    OriginalFileName) in one of two branches: an explicit local target (/r:localhost, /r:127.0.0.1, /r:[::1], or
+    the /remote: forms), or any winrs invocation that carries no /r: or /remote: flag at all, which defaults to
+    localhost. Note which branch fired — an explicit loopback target is a deliberate local invocation, while the
+    no-flag branch can also catch winrs used with other parameters but no target, so read the full command line to
+    confirm it is genuinely local rather than a mistargeted remote call.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run winrs.exe for local command execution?
+  context: >-
+    Legitimate winrs use is overwhelmingly remote and performed by administrators or deployment tooling. Local
+    winrs execution is uncommon, so determine whether the user role and host function make hands-on local use
+    plausible — for example an administrator testing a command, or an automation framework — versus an account or
+    endpoint with no business reason to proxy commands through winrs.exe.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What exactly did this winrs.exe invocation run? Decode every flag and the command it executed locally.
+  context: >-
+    The full command line reveals the operational purpose. Decode the winrs parameters (/r: or /remote: target,
+    /u: and /p: credentials, /env:, /unencrypted) and, critically, the trailing command winrs was asked to run
+    locally — a built-in interpreter, a reconnaissance binary, or a script. Inline credentials or an encoded
+    interpreter command escalate priority. This view scopes to all winrs.exe executions on the host in the window
+    so sequential invocations that form one logical operation are visible together.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:cue_process_tool.follow_on
+  question: What child processes did winrshost.exe spawn on this host after the alert?
+  context: >-
+    Commands run locally through winrs execute as children of winrshost.exe, so the spawned processes reveal the
+    actual impact. Look for interpreters (cmd.exe, powershell.exe), reconnaissance utilities, or download tooling
+    launched under winrshost.exe shortly after the alert — these are the post-execution actions the proxy was used
+    to stage.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith: \winrshost.exe
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: attack:T1218.parent_process_analysis
+  question: What process spawned this winrs.exe, and is that parent chain expected?
+  context: >-
+    Because winrs.exe is a Microsoft-signed binary, the parent that launched it indicates how the proxy execution
+    was initiated. An interactive shell, a remote-access tool, a script host (wscript.exe, mshta.exe), or an Office
+    application as the parent points to operator-driven or scripted abuse, whereas a routine administrative parent
+    is more consistent with expected use.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in the hour before the alert?
+  context: >-
+    System binary proxy execution is frequently used to stage hands-on-keyboard actions, and operators often weaken
+    protection first. This query surfaces direct attempts to disable AV/EDR services, flip Defender flags, add broad
+    exclusions, clear logs, or patch AMSI/ETW. Zero rows is a useful "protection looks healthy" signal — kernel-level
+    driver tampering and in-memory patches will not appear here. Populated rows shift the disposition toward operator
+    preparation; review the parent process and signing chain to identify the writer.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+- source: attack:T1021.006.user_context
+  question: What user account and logon backed this winrs invocation, and is that account expected to run it?
+  context: >-
+    WinRM activity is most suspicious when driven by an unexpected account — a non-administrator, a service account,
+    or an account that does not normally administer this host. The command line may also carry inline credentials
+    (/u: and /p:), which indicate explicit credential supply rather than the current session's identity. Correlate
+    the account against expected administrators and against any inline credentials in the command.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - User
+      - CommandLine
+- source: attack:T1021.006.security_logon_trail
+  question: What WinRM-related logon events occurred on this host around the alert?
+  context: >-
+    WinRM-backed execution generates logon events even for local invocation, and the logon type and source address
+    distinguish a genuinely local session from one that arrived over the network. Correlate logon success and
+    failure events for the alerting account in the window to confirm whether the session was local, and to see
+    whether the same account also authenticated from elsewhere. If Windows Security logs are not ingested in this
+    environment, treat zero results as a visibility gap rather than evidence nothing occurred.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: security
+    detection:
+      selection:
+        EventID:
+          - 4624
+          - 4625
+          - 4648
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - TargetUserName
+      - IpAddress
+      - LogonType
+      - EventID
+- source: template:cue_process_tool.baseline
+  question: Does this host normally run winrs.exe at all?
+  context: >-
+    A binary that rarely or never runs on a host is more suspicious than one that runs routinely. Because legitimate
+    winrs use is normally remote and may be uncommon on any given endpoint, a zero or very low historical count here
+    strengthens the case that the local invocation is anomalous.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired this winrs local-execution pattern, what parents and users drove it, and does the current alert fit?
+  context: >-
+    Even Microsoft-signed binaries can be abused. This query mirrors the rule's exact selection structure scoped to
+    this host, so the resulting parent and user distribution reflects how this specific local-winrs pattern has run
+    here historically — not generic winrs usage. A new parent process, an unexpected account, or an unusual
+    command-line shape relative to that baseline is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \winrs.exe
+      - OriginalFileName: winrs.exe
+      selection_local_ip:
+        CommandLine|contains|windash:
+        - /r:localhost
+        - /r:127.0.0.1
+        - /r:[::1]
+        - /remote:localhost
+        - /remote:127.0.0.1
+        - /remote:[::1]
+      filter_main_remote:
+        CommandLine|contains|windash:
+        - '/r:'
+        - '/remote:'
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_* or (selection_img and not 1 of filter_main_*)) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run winrs.exe?
+  context: >-
+    Compare this user's current action against their historical behavior. A user who has never run winrs.exe, or
+    who has only ever run it remotely, is more notable than one who uses it routinely. The user's role and typical
+    toolset should align with proxying commands through winrs.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is the parent+winrs.exe launch combination historically routine on this host or environment-wide, or is the parent unusual for winrs.exe?
+  context: >-
+    When the alert fires under a service principal, user identity does not attribute behavior; the meaningful pivot
+    is the launch mechanism — which parent process spawned winrs.exe, and whether that pair is historically common.
+    A new or rare parent for winrs.exe is the deviation worth chasing; a pair that already accounts for many prior
+    events is more likely automation or tooling.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: >-
+    Tracking the user's activity across all hosts reveals whether the local winrs execution is isolated or part of
+    broader hands-on activity. The same user driving similar activity on multiple endpoints widens the potential
+    scope of compromise.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent+winrs.exe combination fire on other hosts in the same window, indicating coordinated automation rather than isolated activity?
+  context: >-
+    Under a service principal, asking what else the user did network-wide returns agent-telemetry noise. The
+    meaningful question is whether the same launch mechanism — parent process plus winrs.exe — fired on other hosts
+    in the alert window. Multiple hosts in the same window points to scheduled or pushed automation; a single host
+    points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering, reconnaissance, or
+    credential access — may reveal the attack stages that preceded the local winrs execution and help reconstruct
+    the timeline that led to it.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:network_scope.same_action_other_hosts
+  question: Is winrs.exe being used for local execution on other hosts in the same window?
+  context: >-
+    The same proxy-execution pattern run across many systems in a short window suggests scripted deployment or a
+    coordinated operation rather than a one-off. This query mirrors the rule's local-winrs selection across the
+    fleet, excluding the alerting host, to surface other endpoints exhibiting the same pattern and help scope
+    containment.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \winrs.exe
+      - OriginalFileName: winrs.exe
+      selection_local_ip:
+        CommandLine|contains|windash:
+        - /r:localhost
+        - /r:127.0.0.1
+        - /r:[::1]
+        - /remote:localhost
+        - /remote:127.0.0.1
+        - /remote:[::1]
+      filter_main_remote:
+        CommandLine|contains|windash:
+        - '/r:'
+        - '/remote:'
+      filter_self:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_* or (selection_img and not 1 of filter_main_*)) and not filter_self
+    fields:
+      - host.name
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1021.006
+      name: Windows Remote Management
+      role: primary
+    - id: T1218
+      name: System Binary Proxy Execution
+      role: secondary
+    - id: T1021
+      name: Remote Services
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: proxy_execution_invocation
+      description: "winrs.exe invoked for local execution (Microsoft-signed binary proxy)"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: command_decode
+      description: "The local command winrs was asked to run, with all flags decoded"
+      mapped_to: Q3
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 3
+      label: child_execution
+      description: "Commands run locally execute as children of winrshost.exe"
+      mapped_to: Q4
+      source: template:cue_process_tool.follow_on
+    - stage: 4
+      label: session_logon
+      description: "WinRM-backed local session generates logon events (4624/4648)"
+      mapped_to: Q8
+      source: attack:T1021.006.security_logon_trail
+  dimension_coverage:
+    - dimension: time_correlation
+      technique: T1021.006
+      covered_by: Q8
+      source: attack:T1021.006.security_logon_trail
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1021.006
+      covered_by: Q10
+      source: template:cue_process_tool.baseline_deviation
+      coverage_type: indirect
+    - dimension: user_context
+      technique: T1021.006
+      covered_by: Q7
+      source: attack:T1021.006.user_context
+      coverage_type: direct
+    - dimension: command_analysis
+      technique: T1021
+      covered_by: Q3
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1218
+      covered_by: Q5
+      source: attack:T1218.parent_process_analysis
+      coverage_type: direct
+  mutable_dispositions:
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only (e.g., 60 seconds between shell and child)"
+      disposition: context
+      target_question: Q4
+      notes: "Chain-stage timing expressed via the +4h winrshost.exe child window; no queryable value."
+    - element: UserContext
+      dimension: user_context
+      specific_values: "rationale only (non-admins, service accounts)"
+      disposition: new_question
+      target_question: Q7
+      notes: "Drove attack:T1021.006.user_context question scoping account + inline /u:/p: credentials."
+    - element: CommandLineAnomalyScore
+      dimension: tuning_parameter
+      specific_values: "rationale only (e.g., encoded PowerShell)"
+      disposition: context
+      target_question: Q3
+      notes: "Encoded/interpreter command emphasis folded into mechanism_decode context; score is not queryable."
+    - element: KnownAdminHosts
+      dimension: tuning_parameter
+      specific_values: "rationale only (trusted systems allowed to use WinRM)"
+      disposition: context
+      target_question: Q10
+      notes: "Allowlisting rationale expressed as the host baseline-deviation comparison; no fixed value list."
+    - element: LogonUser
+      dimension: tuning_parameter
+      specific_values: "rationale only (service/privileged accounts)"
+      disposition: context
+      target_question: Q7
+      notes: "Account-fidelity rationale folded into user_context question."
+    - element: RemoteHostList
+      dimension: tuning_parameter
+      specific_values: "rationale only (admin jumpboxes / deployment tools)"
+      disposition: context
+      target_question: Q11
+      notes: "Allowlisting rationale expressed via user-baseline; rule is local-only so no remote-host list applies."
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "rationale only (unexpected parent-child relationships)"
+      disposition: new_question
+      target_question: Q5
+      notes: "Drove the T1218 parent-chain question."
+    - element: SignedBinaryList
+      dimension: tuning_parameter
+      specific_values: "rationale only (signed binaries allowed)"
+      disposition: context
+      target_question: Q5
+      notes: "winrs.exe is the signed binary in scope; signing-chain note folded into parent-chain context."
+    - element: CommandLineRegex
+      dimension: command_analysis
+      specific_values: "rationale only (URLs, script paths, DLL entrypoints)"
+      disposition: context
+      target_question: Q3
+      notes: "Suspicious-argument analysis is the core task of mechanism_decode."
+    - element: RemoteDomainAllowlist
+      dimension: tuning_parameter
+      specific_values: "rationale only (legitimate enterprise domains)"
+      disposition: context
+      target_question: Q16
+      notes: "No external destination in this local-only rule; allowlisting rationale not applicable, fleet-scope question covers spread."
+  dedup_decisions:
+    - dropped: cue_process_tool.process_chain
+      reason: "parent-chain coverage authored as attack:T1218.parent_process_analysis (Q5) with the same ParentProcessGuid lookup; more specific to the signed-binary proxy framing"
+      kept: attack:T1218.parent_process_analysis
+    - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable; both emitted (Q11 user-pivot, Q12 parent+binary substitute)"
+      kept: both
+    - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable; both emitted (Q13 user-pivot, Q14 parent+binary substitute)"
+      kept: both
+  skipped_templates:
+    - template: cue_process_tool.clustering
+      reason: "host-wide what-else-ran coverage overlaps cue_host_context.precursor (prior-alert timeline) and the cross-host scope question; dropped to stay within 18 and favor more specific framings"
+    - template: cue_host_context.clustering
+      reason: "near-duplicate of cue_process_tool.clustering host-wide aggregation; precursor (Q15) carries the on-host timeline signal more selectively"
+    - template: cue_process_tool.scope
+      reason: "fleet-wide rule-pattern count is delivered by network_scope.same_action_other_hosts (Q16), which mirrors the same reflected detection block and excludes the alerting host"
+    - template: lateral_movement.source_host_identification
+      reason: "rule detects LOCAL winrs execution (localhost/loopback or no-remote-flag); there is no inbound remote connection to identify"
+    - template: lateral_movement.authentication_method
+      reason: "pass-the-hash/ticket framing assumes a remote logon; local winrs execution does not arrive over the network — account/logon coverage handled by attack:T1021.006.security_logon_trail (Q8) and user_context (Q7)"
+    - template: lateral_movement.target_activity_after_access
+      reason: "post-access child activity on this host is covered more precisely by cue_process_tool.follow_on (Q4) scoped to winrshost.exe children"
+    - template: lateral_movement.lateral_movement_scope
+      reason: "scans for remote-movement tools (psexec/mstsc/ssh) by the user; this rule is local-only so cross-host movement is not the live question — user-wide activity covered by cue_user_actor.clustering (Q13)"
+    - template: network_scope.actor_activity_network_wide
+      reason: "duplicates cue_user_actor.clustering (Q13) user-across-hosts aggregation; kept the cue version"
+    - template: network_scope.actor_authentication_trail
+      reason: "user authentication trail is covered by attack:T1021.006.security_logon_trail (Q8) which already queries 4624/4625/4648 for the relevant account on this host"
+    - template: cue_network_endpoint.mechanism_decode
+      reason: "the only IPs in the detection are loopback (127.0.0.1/[::1]); there is no external destination to resolve or reputation-check"
+    - template: cue_network_endpoint.baseline
+      reason: "no external destination — loopback-only; a destination baseline is meaningless for local execution"
+  hint_dispositions:
+    - hint: "cue_network_endpoint: derived: \\b\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\b in CommandLine"
+      disposition: declined
+      reason: >-
+        The IP-literal regex matched only the loopback addresses 127.0.0.1 and [::1] that the rule keys on for
+        local execution. There is no external endpoint to investigate, so both cue_network_endpoint templates
+        (mechanism_decode, baseline) were dropped. Destination decoding is replaced by command decoding in
+        cue_process_tool.mechanism_decode (Q3), which reads the actual local command rather than a non-existent
+        remote target.
+    - hint: "logsource 'image_load' (recommended by techniques: T1218) is not covered — pull in cue_image_load.* or author a custom question with `category: image_load`"
+      disposition: declined
+      reason: >-
+        The rule's detection constrains the proxy mechanism to winrs.exe spawning a local command under
+        winrshost.exe; the T1218 abuse here is child-process execution, not in-process DLL loading. Image-load
+        telemetry on winrs.exe/winrshost.exe returns the binary's own routine module set without isolating the
+        proxy behavior, which is fully captured at the process_creation layer by mechanism_decode (Q3),
+        follow_on/winrshost children (Q4), and the parent-chain question (Q5). No compensating
+        attack:T1218.image_load question authored.
+    - hint: "logsource 'security' (recommended by techniques: T1021.006) is not covered and no template family exists — author a custom question with `category: security`"
+      disposition: acted_on
+      reason: >-
+        Acted on — authored attack:T1021.006.security_logon_trail (Q8) with a security-logsource query over
+        EventID 4624/4625/4648 scoped to the alerting host, covering the WinRM session logon trail.
+    - hint: "Condition has nested structure that the topology decomposer could not fully flatten. Read rule.detection.condition by hand and verify Q1 framing reflects the actual logical shape — see rule.condition_topology.raw."
+      disposition: acted_on
+      reason: >-
+        Acted on — read the raw condition 'all of selection_* or (selection_img and not 1 of filter_main_*)'. Q1
+        and the description frame the two firing branches disjunctively (explicit localhost/loopback target OR
+        winrs.exe with no /r:/remote: flag, defaulting to localhost) and instruct the analyst to note which branch
+        fired.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - lateral_movement
+    - network_scope
+  generation_stats:
+    total_questions: 16
+    source_counts:
+      template: 13
+      attack: 3
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 13
+    logsource_diversity:
+      process_creation: 14
+      security: 1
+      sigma_alert: 1

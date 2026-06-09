@@ -1,0 +1,732 @@
+name: Webshell Hacking Activity Patterns
+id: 5d355b77-aa8c-46dd-b216-fdb720426b9e
+description: |
+  Fires when a web server process spawns a child process that runs a recognized post-exploitation command. The rule matches when EITHER the parent is a known web server binary (caddy.exe, httpd.exe, nginx.exe, php-cgi.exe, w3wp.exe, ws_tomcatservice.exe) OR a Java/Tomcat process identified by its path or catalina arguments; AND EITHER the child runs one of the recognized post-exploitation patterns -- credential dumping via rundll32+comsvcs or procdump/nanodump/ntdsutil/vssadmin, password-protected archiving, net user/localgroup account manipulation, AD enumeration via ldifde/adfind, or encoded download and reconnaissance command lines.
+  A web server spawning command shells, enumeration tools, or credential-access utilities is the canonical web-shell execution chain: a planted server-side script translates an HTTP request into local command execution. Note which webserver branch and which child branch fired, because the child branch determines whether the investigation centers on credential access, account manipulation, discovery, or staged download. Legitimate web applications occasionally shell out, so confirm the specific command and the requesting context before escalating.
+type: detection
+detection_id: 4ebc877f-4612-45cb-b3a5-8e3834db36c9
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- source: template:universal.verify_trigger_match
+  question: Did a web server process spawn a child that ran one of the recognized post-exploitation command patterns?
+  context: >-
+    Confirm the alert is a true positive before investing time. The rule requires
+    EITHER a known web server parent (caddy, httpd, nginx, php-cgi, w3wp, a Tomcat
+    service, or a Java process identified by a tomcat path or catalina argument) OR a
+    Tomcat-characteristic Java parent; AND EITHER a child whose command line matches a
+    post-exploitation pattern (rundll32+comsvcs credential dump, password-protected
+    archiving, net user/localgroup account changes, AD enumeration, encoded download,
+    or recon) OR a child binary in the credential/exfil tool list (ntdsutil, ldifde,
+    adfind, procdump, nanodump, vssadmin, fsutil). Read the parent, image, and full
+    command line in the event and note which webserver branch and which child branch
+    matched -- the child branch sets the investigation focus.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this host expected to run a public-facing web server, and is this user expected to perform this operation?
+  context: >-
+    A web server spawning command-line tools is expected on some application or build
+    servers and never on a workstation. Confirm whether this host legitimately runs the
+    web server in the parent field, and whether the account that executed the child is
+    consistent with the operation detected. Server worker processes normally run under a
+    service account; an interactive or unexpected user running these commands shifts the
+    disposition toward compromise.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What exactly did the spawned child command do? Decode every flag, argument, encoded string, and file path.
+  context: >-
+    The child command line is the operational payload of the web-shell request. Parse it
+    fully -- a rundll32 comsvcs MiniDump call names the target process and dump path; a
+    net user /add or net localgroup administrators /add names the account being created or
+    elevated; an archiver with -hp or -p header-encrypts staged data; ntdsutil, ldifde, or
+    adfind enumerate or extract directory data; FromBase64String, DownloadFile, or
+    DownloadString carry an encoded or remote payload. Decode any base64 or concatenated
+    string and state the concrete action and its target.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:cue_parent_process.mechanism_decode
+  question: What is the web server parent process, and what request or worker context spawned this child?
+  context: >-
+    Retrieving the parent's own process event shows the web server worker that translated
+    an inbound request into local execution. The parent command line and working directory
+    can reveal the site root, the application pool or virtual host, and whether the worker
+    was a long-running service. For a w3wp or php-cgi parent, correlate the spawn time with
+    web access logs to find the request that drove it.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+- source: template:parent_child.parent_process_legitimacy
+  question: Is this web server expected to spawn this child, and what started the web server itself?
+  context: >-
+    A web server process directly spawning command interpreters, enumeration tools, or
+    credential-access utilities is the core signal here -- properly configured web
+    applications rarely shell out to these binaries. Tracing the parent's own origin
+    (what launched the web server or Java host) confirms whether this is the normal
+    service startup chain or an injected execution path. A worker spawning these children
+    under a non-interactive context is consistent with web-shell command execution.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- source: template:parent_child.sibling_processes
+  question: What other child processes did this same web server worker spawn?
+  context: >-
+    If the web server worker spawned the detected child through a planted server-side
+    script, it likely spawned others in the same session -- reconnaissance, credential
+    access, archiving, and download steps frequently chain from a single web-shell request.
+    Listing the siblings of the same parent instance reveals the full scope of commands
+    driven through that worker and distinguishes a single shell-out from an active
+    hands-on-keyboard session.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_parent_process.baseline
+  question: Does this web server normally spawn this type of child process on this host?
+  context: >-
+    Some web servers legitimately invoke helper binaries during deployment or scheduled
+    maintenance, so historical frequency of this specific parent-and-child pairing
+    distinguishes routine automation from a novel spawning relationship. Zero or very low
+    counts for a web server parent launching a credential-access or enumeration tool point
+    to a first-time, anomalous execution worth treating as compromise until explained.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:obfuscation.encoded_payload_decode
+  question: Is the child command line encoded or obfuscated, and what does the decoded content do?
+  context: >-
+    Web-shell operators commonly pass encoded payloads to evade casual inspection. Look for
+    base64 markers (FromBase64String, -decode, /decode), PowerShell flags (-NoP, -W Hidden),
+    download cradles (DownloadFile, DownloadString), and WMI process-call-create invocations
+    in the alerting command line. Decode each layer and state the resulting operation --
+    download-and-execute cradle, in-memory loader, credential theft, or remote command
+    execution. Multi-layer encoding may require iterating until the payload is readable.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:cue_artifact.mechanism_decode
+  question: If the child command referenced or downloaded a file, what is that file's content?
+  context: >-
+    When the child command line contains a DownloadFile, DownloadString, decode, or archive
+    path, the referenced file is the staged artifact -- a dropped script, an encoded payload,
+    a collected archive, or a credential dump. Retrieve it from the endpoint and read its
+    content: check for base64 or otherwise obfuscated strings, embedded URLs or addresses,
+    and known malicious string patterns. For binaries, inspect imports, embedded strings, and
+    signing status. This content analysis answers what is in the file, distinct from a
+    reputation lookup.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: template:cue_artifact.artifact_verification
+  question: What is the hash of the referenced or dropped file, and does it have known threat intel detections?
+  context: >-
+    A file hash is a unique identifier for reputation lookup. Submit the hash of any file
+    the child command downloaded, decoded, or wrote to threat intelligence sources to
+    determine whether it is known malicious, known benign, or previously unseen. This
+    reputation check answers whether the file is known, which is distinct from reading what
+    the file contains.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Hashes
+- source: template:cue_user_target.artifact_verification
+  question: If the child created or modified an account, did the change succeed in the Security event log?
+  context: >-
+    The net user /add and net localgroup administrators /add branches of this rule fire on
+    the command, but the Windows Security log confirms whether the change completed. Event
+    4720 (account created), 4732 or 4756 (member added to an administrative group), and 4724
+    (password reset) confirm the result. A successful local administrator addition originating
+    from a web server worker is a direct privilege-establishment step.
+  range: +15m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: security
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID:
+          - 4720
+          - 4722
+          - 4724
+          - 4728
+          - 4732
+          - 4756
+      condition: selection
+    fields:
+      - EventID
+      - TargetUserName
+      - SubjectUserName
+- source: template:discovery_recon.discovery_burst_detection
+  question: Did other reconnaissance or enumeration commands run on this host around the same time?
+  context: >-
+    A single enumeration command may be troubleshooting, but several reconnaissance commands
+    in rapid succession -- whoami, net user, nltest, adfind, ldifde, ipconfig -- is the
+    signature of post-compromise enumeration driven through a web shell. Attackers map the
+    host, domain accounts, and trust relationships before moving to credential access or
+    lateral movement. Three or more distinct recon binaries in a tight window typically
+    indicates automated discovery.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_recon:
+        Image|endswith:
+          - '\whoami.exe'
+          - '\systeminfo.exe'
+          - '\ipconfig.exe'
+          - '\net.exe'
+          - '\net1.exe'
+          - '\nltest.exe'
+          - '\dsquery.exe'
+          - '\nbtstat.exe'
+          - '\arp.exe'
+          - '\netstat.exe'
+          - '\tasklist.exe'
+          - '\qprocess.exe'
+          - '\query.exe'
+          - '\quser.exe'
+          - '\hostname.exe'
+          - '\nslookup.exe'
+          - '\adfind.exe'
+          - '\csvde.exe'
+          - '\ldifde.exe'
+          - '\dnscmd.exe'
+          - '\cmdkey.exe'
+          - '\setspn.exe'
+      condition: selection and selection_recon
+    fields:
+      - Image
+      - User
+- source: attack:T1018.network_indicators
+  question: Did the web server host make outbound network connections to internal systems or external addresses right after the child ran?
+  context: >-
+    Remote system discovery and the staged-download branches of this rule pivot from local
+    command execution to the network -- enumeration tools probe other hosts, and download
+    cradles reach out to retrieve a payload. Outbound connections from the web server host in
+    the minutes after the child executed reveal whether the activity progressed to lateral
+    movement or to retrieving a second stage. Exclude known service and update endpoints when
+    triaging the destinations.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Initiated: 'true'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Image
+- source: template:initial_access.delivery_vector
+  question: What web request drove this execution?
+  context: >-
+    Web-shell command execution begins with an inbound HTTP request that the planted
+    server-side script translates into a local command. Correlate the spawn time of the
+    web server worker with web server access logs to find the originating request, the
+    requested URL or script path, the source address, and the user agent. Identifying the
+    request and the web-shell file enables removing the shell, blocking the source, and
+    searching for other hosts hit by the same request pattern.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+- source: template:cue_user_actor.baseline
+  question: Does the account that ran the child command normally perform this kind of activity?
+  context: >-
+    Compare the executing account's current action against its historical behavior. A web
+    server service account that has never run credential-access, archiving, or enumeration
+    tools is more suspicious than one that does so as part of documented maintenance. Combine
+    the historical count with knowledge of the account's role -- a worker identity is not
+    expected to issue these commands.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this web-server-parent and child-binary combination historically routine on this host or across the environment?
+  context: >-
+    When the alert fires under a service account, user identity does not attribute behavior,
+    so the meaningful pivot is the launch mechanism -- which web server parent spawned this
+    child binary, and whether that pairing is historically common. A new or rare web server
+    parent for this child on this host or environment-wide is the deviation worth chasing; a
+    pairing that already accounts for many prior events is more likely application or OS
+    automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Web-shell command execution rarely happens in isolation. Earlier detections on the same
+    host -- the initial exploitation of the web application, prior reconnaissance, or defense
+    tampering -- may reveal the attack stages that preceded this child execution and help
+    reconstruct the timeline from initial access to hands-on-keyboard activity.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1505.003
+      name: Web Shell
+      role: primary
+    - id: T1018
+      name: Remote System Discovery
+      role: secondary
+    - id: T1033
+      name: System Owner/User Discovery
+      role: secondary
+    - id: T1087
+      name: Account Discovery
+      role: secondary
+    - id: T1505
+      name: Server Software Component
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: web_request_to_execution
+      description: "Inbound web request to a planted server-side script translates into local command execution under a web server worker"
+      mapped_to: Q14
+      source: template:initial_access.delivery_vector
+    - stage: 2
+      label: web_server_spawns_child
+      description: "Web server process (w3wp, php-cgi, nginx, httpd, caddy, Tomcat/Java) spawns a command interpreter or post-exploitation binary"
+      mapped_to: Q5
+      source: template:parent_child.parent_process_legitimacy
+    - stage: 3
+      label: child_operation
+      description: "Child runs the post-exploitation operation: credential dump, account manipulation, archiving, enumeration, or encoded download"
+      mapped_to: Q3
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 4
+      label: enumeration_burst
+      description: "Remote-system and account enumeration utilities run in short succession after the web shell foothold"
+      mapped_to: Q12
+      source: template:discovery_recon.discovery_burst_detection
+    - stage: 5
+      label: network_pivot
+      description: "Discovery or download branch pivots to outbound network connections (lateral probing or second-stage retrieval)"
+      mapped_to: Q13
+      source: attack:T1018.network_indicators
+  dimension_coverage:
+    - dimension: obfuscation_check
+      technique: T1505.003
+      covered_by: Q8
+      source: template:obfuscation.encoded_payload_decode
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1505.003
+      covered_by: Q5
+      source: template:parent_child.parent_process_legitimacy
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1505.003
+      covered_by: Q6
+      source: template:parent_child.sibling_processes
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1505.003
+      covered_by: Q7
+      source: template:cue_parent_process.baseline
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1505
+      covered_by: Q4
+      source: template:cue_parent_process.mechanism_decode
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1505
+      covered_by: Q17
+      source: template:cue_host_context.precursor
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1505
+      covered_by: Q7
+      source: template:cue_parent_process.baseline
+      coverage_type: direct
+    - dimension: command_analysis
+      technique: T1018
+      covered_by: Q12
+      source: template:discovery_recon.discovery_burst_detection
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1018
+      covered_by: Q5
+      source: template:parent_child.parent_process_legitimacy
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1018
+      covered_by: Q13
+      source: attack:T1018.network_indicators
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1018
+      covered_by: Q7
+      source: template:cue_parent_process.baseline
+      coverage_type: indirect
+    - dimension: command_analysis
+      technique: T1033
+      covered_by: Q3
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1033
+      covered_by: Q12
+      source: template:discovery_recon.discovery_burst_detection
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1033
+      covered_by: Q7
+      source: template:cue_parent_process.baseline
+      coverage_type: indirect
+    - dimension: user_context
+      technique: T1033
+      covered_by: Q2
+      source: template:universal.host_user_context
+      coverage_type: direct
+    - dimension: command_analysis
+      technique: T1087
+      covered_by: Q3
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: direct
+    - dimension: execution_context
+      technique: T1087
+      covered_by: Q5
+      source: template:parent_child.parent_process_legitimacy
+      coverage_type: direct
+    - dimension: network_indicators
+      technique: T1087
+      covered_by: Q13
+      source: attack:T1018.network_indicators
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1087
+      covered_by: Q4
+      source: template:cue_parent_process.mechanism_decode
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1087
+      covered_by: Q6
+      source: template:parent_child.sibling_processes
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1087
+      covered_by: Q15
+      source: template:cue_user_actor.baseline
+      coverage_type: indirect
+    - dimension: user_context
+      technique: T1087
+      covered_by: Q11
+      source: template:cue_user_target.artifact_verification
+      coverage_type: direct
+  mutable_dispositions:
+    - element: WebRootPath
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q4
+      notes: "Custom web root varies by host; surfaced as context in the parent web server event question rather than a hard query value"
+    - element: ParentProcess
+      dimension: parent_process_analysis
+      specific_values: "php-cgi.exe, w3wp.exe, nginx.exe, httpd.exe, caddy.exe, java.exe, javaw.exe"
+      disposition: query_injection
+      target_question: Q7
+      notes: "Web server parent set baselined via process.parent.name in cue_parent_process.baseline; parent binaries named in description and Q1"
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only (bursty <30s enumeration)"
+      disposition: context
+      target_question: Q12
+      notes: "Burst timing described in discovery_burst_detection context; +/-15m window captures the burst"
+    - element: CommandLinePattern
+      dimension: command_analysis
+      specific_values: "net user, net localgroup, ldifde, adfind, rundll32+comsvcs, FromBase64String"
+      disposition: query_injection
+      target_question: Q12
+      notes: "Recon/enumeration binaries enumerated in discovery_burst selection_recon; account-manipulation commands decoded in Q3"
+    - element: UserContext
+      dimension: user_context
+      specific_values: "rationale only (service vs interactive account)"
+      disposition: context
+      target_question: Q2
+      notes: "Service-account-vs-user framing carried in host_user_context and account-change confirmation"
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "renamed or wrapper web server processes"
+      disposition: context
+      target_question: Q5
+      notes: "Tomcat/Java parent detected by path and catalina argument; legitimacy question covers wrapper/renamed parents"
+    - element: ParentProcessContext
+      dimension: tuning_parameter
+      specific_values: "rationale only (non-interactive shell vs system service)"
+      disposition: context
+      target_question: Q5
+      notes: "Non-interactive web server worker context is the core legitimacy signal"
+  dedup_decisions:
+    - dropped: discovery_recon.discovery_user_context
+      reason: "overlaps universal.host_user_context — notes_to_llm prefers dropping this when both present"
+      kept: universal.host_user_context
+    - dropped: discovery_recon.discovery_parent_chain
+      reason: "parent chain of the discovery command is the same web-server-worker chain covered by parent_child.parent_process_legitimacy"
+      kept: parent_child.parent_process_legitimacy
+    - dropped: cue_process_tool.process_chain
+      reason: "parent_process is primary cue and parent_child set active — parent legitimacy subsumes process_chain (brief hint)"
+      kept: parent_child.parent_process_legitimacy
+    - dropped: cue_user_actor.baseline pair
+      reason: "user_actor baseline pair (user-pivot + service-principal substitute) — non-deduplicable, both emitted as Q15 and Q16"
+      kept: cue_user_actor.baseline + cue_user_actor.baseline_svc
+  skipped_templates:
+    - template: cue_process_tool.mechanism_decode
+      reason: "brief sets replaced_by defense_tampering.what_was_disabled, but that replacement was declined (see hint_dispositions) — generic mechanism_decode retained as Phase 2 to cover all six child branches"
+    - template: cue_process_tool.baseline
+      reason: "host-binary baseline subsumed by cue_parent_process.baseline (parent+child pairing is the discriminator) and discovery_burst frequency"
+    - template: cue_parent_process.follow_on
+      reason: "follow-on children of the parent are covered more precisely by parent_child.sibling_processes (ParentProcessGuid-scoped)"
+    - template: cue_parent_process.clustering
+      reason: "around-the-time parent activity covered by sibling_processes and cue_host_context.precursor"
+    - template: cue_parent_process.scope
+      reason: "cross-host occurrence of the same web-server-parent/child pairing covered by cue_user_actor.baseline_svc env-wide aggregation"
+    - template: cue_user_target.baseline
+      reason: "target-account logon baseline is secondary to confirming the account change succeeded (cue_user_target.artifact_verification kept)"
+    - template: cue_user_actor.clustering
+      reason: "host/network-wide user clustering subsumed by precursor (prior alerts) and network_indicators outbound-connection question for this host"
+    - template: cue_user_actor.clustering_svc
+      reason: "service-principal clustering substitute subsumed alongside its user-pivot sibling by precursor and network_indicators coverage"
+    - template: cue_host_context.clustering
+      reason: "broad host process activity overlaps sibling_processes and discovery_burst; precursor carries the prior-alert timeline"
+    - template: universal.evidence_preservation
+      reason: "file-on-disk preservation folded into cue_artifact.mechanism_decode and artifact_verification, which already retrieve and analyze the referenced file"
+    - template: universal.endpoint_protection_health
+      reason: "generic tamper-precursor sweep — rule is not execution/credential-centric across all branches and prior-tamper context is carried by cue_host_context.precursor"
+    - template: defense_tampering.what_was_disabled
+      reason: "scoped to security-control tampering; only the vssadmin/reg-save sub-branch touches tamper. Phase-2 decode handled by generic mechanism_decode instead"
+    - template: defense_tampering.protection_status
+      reason: "control-restoration question applies only to the tamper sub-branch, not the credential/account/discovery branches this rule predominantly fires on"
+    - template: defense_tampering.activity_after_tampering
+      reason: "post-tamper activity overlaps sibling_processes and precursor for the non-tamper branches that dominate this rule"
+    - template: defense_tampering.other_tampering_activity
+      reason: "other-tamper sweep is off-target for a web-shell rule whose child set is mostly credential/account/discovery, not defense evasion"
+    - template: initial_access.campaign_scope
+      reason: "same-rule cross-host scope partly covered by cue_user_actor.baseline_svc env-wide pairing; delivery_vector kept as the more actionable initial-access question"
+    - template: initial_access.application_patch_status
+      reason: "web server CVE patch status is a useful manual check but lower priority than identifying the request and decoding the child; dropped to hold question count"
+    - template: organizational_context.change_ticket
+      reason: "web server spawning credential/enumeration tools is not change-ticketed routine activity; organizational checks deprioritized for this high-confidence chain"
+    - template: organizational_context.human_recall
+      reason: "service-account-driven web-shell execution has no human actor to recall it; baseline and delivery-vector questions are more diagnostic"
+    - template: organizational_context.timing_alignment
+      reason: "timing-vs-maintenance check is lower yield than the request-correlation and burst-detection questions already included"
+    - template: organizational_context.procedural_consistency
+      reason: "procedural-norms check deprioritized — web server shelling out to these tools is anomalous by construction regardless of org procedure"
+    - template: data_staging_exfil.data_scope
+      reason: "archiving branch (-hp/-m) is one of six child branches; file content/destination covered by cue_artifact.mechanism_decode and network_indicators"
+    - template: data_staging_exfil.archive_destination
+      reason: "archive destination and outbound transfer covered by attack:T1018.network_indicators outbound-connection question"
+    - template: data_staging_exfil.encryption_password
+      reason: "archive password flags (-hp) decoded within the general child mechanism_decode (Q3); separate question not needed for one sub-branch"
+    - template: persistence_scope.process_based_persistence
+      reason: "this rule detects web-shell command execution, not persistence-tool installation; persistence sweep is off the primary chain"
+    - template: persistence_scope.file_based_persistence
+      reason: "Startup/Run-key file drops are off the web-shell execution chain; the web shell itself is the persistence artifact, covered by delivery_vector"
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "defense_tampering.what_was_disabled replaces cue_process_tool.mechanism_decode"
+      disposition: declined
+      reason: >-
+        what_was_disabled is scoped to identifying which security control or log was
+        targeted, which only fits the vssadmin / reg-save sub-branch (selection_child_5/6).
+        Five of the six child selections are credential dump, account creation, AD
+        enumeration, archiving, and encoded download — none are defense-control tampering.
+        The generic cue_process_tool.mechanism_decode (Q3) is retained as Phase 2 so the
+        decode covers all six branches; defense_tampering questions were skipped as
+        off-target (see skipped_templates).
+  contextual_sets:
+    included:
+      - id: credential_access
+        reason: "rundll32+comsvcs MiniDump, procdump, nanodump, ntdsutil child branch is credential dumping — folded into mechanism_decode and burst questions"
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - parent_child
+    - discovery_recon
+    - initial_access
+    - obfuscation
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 16
+      attack: 1
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 14
+    logsource_diversity:
+      process_creation: 13
+      file_event: 2
+      security: 1
+      network_connection: 1
+      sigma_alert: 0

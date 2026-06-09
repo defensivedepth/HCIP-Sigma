@@ -1,0 +1,540 @@
+name: Potential Manage-bde.wsf Abuse To Proxy Execution
+id: 86c1b5b3-23d4-4e52-83bc-2d9ed9b03965
+description: |
+  Detects potential abuse of the Microsoft-signed BitLocker script manage-bde.wsf to proxy execution of arbitrary code. The rule fires when either wscript.exe (by Image or OriginalFileName) runs with manage-bde.wsf on its command line, OR a cscript.exe/wscript.exe parent that ran manage-bde.wsf spawns a non-cmd.exe child. The script honors the ComSpec environment variable and is invoked without a fully-qualified path, so an operator can repoint ComSpec at an arbitrary executable or drop a manage-bde.exe payload in the current directory to have a signed, trusted script launch it. Determine what the script actually executed, whether the spawned child is a known-good binary, and whether the invocation fits this user and host.
+type: detection
+detection_id: c363385c-f75d-4753-a108-c1a8e28bdbda
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-09
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the alerting event match either branch this rule detects — wscript running manage-bde.wsf, or a script-host parent that ran manage-bde.wsf spawning a non-cmd.exe child?
+  context: Confirm the alert is a true match before investing time. The rule fires on either of two independent branches, so note which one fired. The first branch matches wscript.exe (by Image or OriginalFileName) with manage-bde.wsf on the command line. The second matches a cscript.exe or wscript.exe parent whose command line contained manage-bde.wsf spawning any child other than cmd.exe. Which branch fired determines whether the child binary itself is the proxied payload.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+      - Image
+      - OriginalFileName
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run the BitLocker management script via wscript/cscript?
+  context: Legitimate manage-bde.wsf usage is rare and typically tied to BitLocker administration on managed endpoints. Knowing whether this user's role and the host's function involve script-driven BitLocker management is often the fastest way to separate a routine administrative action from proxied execution.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What exactly did the script host execute — decode the full command line and any ComSpec or path-search redirection.
+  context: The full command line reveals how the script was invoked and what it was steered to run. manage-bde.wsf launches whatever ComSpec points to and resolves manage-bde.exe by search order rather than absolute path, so look for a ComSpec value pointing at a non-cmd executable, a manage-bde.exe in the current directory, or redirection and conditional operators chaining additional commands. The scope covers all wscript.exe executions on this host within a few minutes so a multi-step invocation is visible as a whole.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:parent_child.parent_process_legitimacy
+  question: Is this parent expected to spawn this child, and what started the parent itself?
+  context: The parent-child relationship is the core signal here. When a cscript.exe or wscript.exe parent that ran manage-bde.wsf spawns a non-cmd child, that child is the proxied payload. Tracing the parent's own origin shows whether the chain began with a legitimate administrative action or with something that should not be invoking BitLocker scripts — a document macro, a downloaded script, or a remote shell.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- source: template:parent_child.sibling_processes
+  question: What other child processes did the same parent spawn?
+  context: If the script-host parent proxied one payload it may have launched others. Examining sibling processes of the same parent instance reveals the full scope of what the manage-bde.wsf invocation set in motion — multiple unexpected children from one script-host parent points to deliberate orchestration rather than a single administrative call.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: attack:T1216.child_payload
+  question: Was a manage-bde.exe or other executable written into a user-writable directory around the time of the alert?
+  context: One proxy-execution path drops a payload named manage-bde.exe into the current directory (for example C:\Users\Public) so that the unqualified call inside the script resolves to it via search order rather than the System32 binary. A recently written executable in a user-writable location that matches the script's working directory is the dropped payload; correlate its write time against the script execution to establish the sequence.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith:
+          - '\manage-bde.exe'
+          - '.exe'
+      filter_system_dirs:
+        TargetFilename|contains:
+          - '\Windows\System32\'
+          - '\Windows\SysWOW64\'
+      condition: selection and not filter_system_dirs
+    fields:
+      - TargetFilename
+      - Image
+      - User
+- source: attack:T1216.signed_to_unsigned
+  question: Is the child binary spawned through the script signed and from an expected location, or unsigned and from a user-writable path?
+  context: The technique's signal is a signed, trusted Microsoft script proxying an untrusted child. The script host and manage-bde.wsf are Microsoft-signed; the meaningful transition is to a child that is unsigned, signed by an unrelated publisher, or running from a user-writable directory. A System32 child with a valid Microsoft signature is routine; an unsigned executable from a temp, profile, or public directory is the proxied payload.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+      - CurrentDirectory
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in the hour before the alert?
+  context: Proxy execution through a signed script is often chosen to evade defenses, and operators frequently weaken protection before running a payload. The query surfaces direct attempts to disable AV/EDR services, flip Defender flags, add broad exclusions, clear logs, or patch AMSI/ETW. Zero rows is a useful "protection looks healthy" signal — kernel-level driver tampering and in-memory patches will not appear here. Populated rows shift the disposition toward operator preparation; review the parent process and signing chain to identify the writer.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run script-host BitLocker management on any host?
+  context: Compare this user's current action against their historical behavior. A user who has never driven manage-bde.wsf through wscript or cscript is more suspicious than one who does so as part of a routine administrative role. Zero or very low counts over the baseline window indicate this is not part of their normal toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent-and-binary combination historically routine on this host or across the environment, or is the parent unusual for this binary?
+  context: When the alert fires under a service principal rather than an interactive user, user identity does not attribute behavior. The meaningful pivot is the launch mechanism — which parent process spawned this binary, and whether that pairing is historically common. A new or rare parent for this binary on this host or environment-wide is the deviation worth chasing; a pairing that already accounts for thousands of prior events is vendor or operating-system automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts in the alert window reveals lateral movement or coordinated activity across multiple endpoints. If the same user triggered similar script-host execution on multiple hosts, the scope of activity may be larger than the single alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent-and-binary combination fire on other hosts in the same window — a coordinated automation rollout, or activity isolated to this host?
+  context: Under a service principal, asking what else the user did across the network returns agent-telemetry noise, because every host runs system-owned agents constantly. The meaningful question is whether the same launch mechanism — parent process plus spawned binary — fired on other hosts in the alert window. Multiple hosts in the same window points to scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Proxy execution through a signed script is usually one step in a longer sequence. Earlier detections on the same host — defense tampering, reconnaissance, credential access — may reveal the stages that preceded this event and help reconstruct the timeline that led to the script-host invocation.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:lolbin.renamed_binary_check
+  question: Was wscript.exe executed from its expected System32 or SysWOW64 path?
+  context: wscript.exe running from a non-standard path (outside System32 or SysWOW64) may indicate the interpreter was copied or renamed to evade path-based allowlists. A script host launched from a user temp or profile directory is more suspicious than one in its expected system location; compare the Image path against OriginalFileName.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- source: template:lolbin.historical_lolbin_baseline
+  question: How often has this host fired the manage-bde.wsf pattern over the past 90 days, and what command-line shapes are typical?
+  context: A LOLBin pattern with no prior history on a host is more suspicious than one used regularly under stable parents. The query mirrors the rule's selection structure scoped to this host, so the resulting count reflects the rule's specific firing pattern rather than generic script-host usage. The command-line projection lets the analyst compare typical invocation shapes against the alerting one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_wscript_img:
+      - Image|endswith: \wscript.exe
+      - OriginalFileName: wscript.exe
+      selection_wscript_cli:
+        CommandLine|contains: manage-bde.wsf
+      selection_parent:
+        ParentImage|endswith:
+        - \cscript.exe
+        - \wscript.exe
+        ParentCommandLine|contains: manage-bde.wsf
+      selection_filter_cmd:
+        Image|endswith: \cmd.exe
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_wscript_* or (selection_parent and not selection_filter_cmd)) and _pb_scope
+    fields:
+    - CommandLine
+- source: template:lolbin.technique_class_lateral
+  question: Were any other proxy-execution LOLBins used on this host recently?
+  context: Operators who use one signed binary to proxy execution often reach for several. If manage-bde.wsf was used to launch a payload, check whether other proxy-execution LOLBins — rundll32, regsvr32, mshta, installutil, msiexec, and similar — were also invoked on this host. Finding multiple proxy-execution LOLBins in the same window strengthens the case for deliberate code execution under cover of trusted binaries.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_img:
+        Image|endswith:
+          - '\rundll32.exe'
+          - '\regsvr32.exe'
+          - '\mshta.exe'
+          - '\msbuild.exe'
+          - '\cmstp.exe'
+          - '\installutil.exe'
+          - '\msiexec.exe'
+          - '\forfiles.exe'
+          - '\pcalua.exe'
+          - '\presentationhost.exe'
+          - '\control.exe'
+          - '\infdefaultinstall.exe'
+          - '\msdt.exe'
+          - '\mavinject.exe'
+          - '\wmic.exe'
+          - '\xwizard.exe'
+          - '\ie4uinit.exe'
+      condition: selection and selection_img
+    fields:
+      - Image
+      - CommandLine
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1216
+      name: System Script Proxy Execution
+      role: primary
+  attack_chain_coverage:
+    - stage: 1
+      label: signed_script_invocation
+      description: "Microsoft-signed script (manage-bde.wsf via wscript/cscript) is invoked, optionally with ComSpec redirection or current-directory payload resolution"
+      mapped_to: Q3
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 2
+      label: proxied_child_execution
+      description: "The signed script proxies execution of an untrusted child process (signed-to-unsigned transition); payload may be dropped to a user-writable directory first"
+      mapped_to: Q6
+      source: attack:T1216.child_payload
+    - stage: 3
+      label: child_provenance
+      description: "The proxied child binary's signature and origin distinguish routine System32 children from untrusted payloads"
+      mapped_to: Q7
+      source: attack:T1216.signed_to_unsigned
+  dimension_coverage:
+    - dimension: parent_process_analysis
+      technique: T1216
+      covered_by: Q4
+      source: template:parent_child.parent_process_legitimacy
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1216
+      covered_by: Q6
+      source: attack:T1216.child_payload
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1216
+      covered_by: Q3
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: direct
+  mutable_dispositions:
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "wscript.exe, cscript.exe (script interpreters in detection)"
+      disposition: context
+      target_question: Q4
+      notes: "Parent identity is already a detection field; parent legitimacy question reasons over the cscript/wscript parent directly"
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only — delta between script execution and child creation"
+      disposition: context
+      target_question: Q6
+      notes: "Payload-write and child-spawn questions are scoped to +/-15m and +/-5m so the script-to-child delta is observable"
+    - element: ChildCommandLineRegex
+      dimension: tuning_parameter
+      specific_values: "rationale only — payload-execution regex (download cradle, decode)"
+      disposition: context
+      target_question: Q3
+      notes: "mechanism_decode directs the analyst to decode ComSpec redirection and chained commands; no fixed regex in the source rule to inject"
+    - element: SignedToUnsignedTransition
+      dimension: tuning_parameter
+      specific_values: "rationale only — signed Microsoft parent, unsigned/unknown child"
+      disposition: new_question
+      target_question: Q7
+      notes: "Authored attack:T1216.signed_to_unsigned to investigate child signature and origin"
+  dedup_decisions:
+    - dropped: cue_parent_process.mechanism_decode
+      reason: "parent_child set active — parent_process_legitimacy (Q4) is the more specific parent-origin lookup and uses the same ParentProcessGuid pivot"
+      kept: parent_child.parent_process_legitimacy
+    - dropped: cue_parent_process.follow_on
+      reason: "sibling_processes (Q5) enumerates other children of the same parent instance with finer ParentProcessGuid scope"
+      kept: parent_child.sibling_processes
+    - dropped: cue_user_actor.baseline + cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable; both emitted (Q9 user-pivot, Q10 service-principal substitute)"
+      kept: both
+    - dropped: cue_user_actor.clustering + cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable; both emitted (Q11 user-pivot, Q12 service-principal substitute)"
+      kept: both
+  skipped_templates:
+    - template: cue_process_tool.process_chain
+      reason: "hint: parent_process is primary — process_chain dropped; parent origin covered by parent_process_legitimacy (Q4)"
+    - template: cue_parent_process.clustering
+      reason: "cross-logsource parent activity overlaps cue_host_context.precursor (Q13) and the child-payload file_event question (Q6); dropped to stay within the 18-question cap without splitting the user_actor pairs"
+    - template: cue_process_tool.baseline
+      reason: "host historical frequency covered more precisely by lolbin.historical_lolbin_baseline (Q15), which mirrors the rule's full selection rather than a generic Image|endswith count"
+    - template: cue_host_context.clustering
+      reason: "broad host activity overlaps the precursor alert sweep (Q13) and sibling-process enumeration (Q5); dropped to respect the question cap"
+    - template: cue_parent_process.baseline
+      reason: "parent-child historical frequency covered by the service-principal baseline substitute (Q10), which aggregates the same parent+binary pairing"
+  hint_dispositions:
+    - hint: "logsource 'image_load' (recommended by techniques: T1216) is not covered — pull in cue_image_load.* or author a custom question with `category: image_load`"
+      disposition: declined
+      reason: >-
+        This rule's proxy-execution mechanism is ComSpec redirection and
+        current-directory payload resolution that spawns a distinct child
+        process, not in-process DLL loading. image_load events on wscript.exe
+        return high-volume script-host module loads without precision for the
+        proxied-child pattern the rule fires on. Child provenance is covered by
+        Q7 (attack:T1216.signed_to_unsigned) via process_creation evidence. No
+        compensating attack:T1216.image_load question authored.
+    - hint: "logsource 'process_access' (recommended by techniques: T1216) is not covered and no template family exists — author a custom question with `category: process_access`"
+      disposition: declined
+      reason: >-
+        process_access (cross-process handle open / injection) is not part of
+        this script-proxy-execution pattern, which launches a separate child
+        process via the script interpreter rather than injecting into a running
+        process. The rule's detection has no GrantedAccess or target-process
+        element. No compensating attack:T1216.process_access question authored.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - parent_child
+    - lolbin
+  generation_stats:
+    total_questions: 16
+    source_counts:
+      template: 14
+      attack: 2
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 13
+    logsource_diversity:
+      process_creation: 14
+      file_event: 1
+      sigma_alert: 1

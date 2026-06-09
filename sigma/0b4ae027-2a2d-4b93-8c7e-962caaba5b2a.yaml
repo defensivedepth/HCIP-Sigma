@@ -1,0 +1,605 @@
+name: Time Travel Debugging Utility Usage
+id: 8b53b550-335a-4e67-ae07-d4f087c06a5e
+description: |
+  Detects any process whose parent is tttracer.exe, the Windows Time Travel Debugging utility. tttracer.exe is a signed, system-resident binary that can proxy-execute an arbitrary executable as a child process or dump the memory of a target process (for example lsass.exe via the -dumpFull -attach syntax). Legitimate use comes from software developers and testers recording execution traces; malicious use abuses the trusted binary to run payloads or scrape credentials from LSASS. Investigation should establish what child tttracer.exe launched, whether the launch resembles credential dumping, and whether the launch is consistent with developer activity on this host.
+type: detection
+detection_id: 0b4ae027-2a2d-4b93-8c7e-962caaba5b2a
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- source: template:universal.verify_trigger_match
+  question: Did this process get spawned by tttracer.exe?
+  context: Confirm the alert is a true positive by reviewing the triggering event. The rule fires whenever a process has a parent whose image path ends in tttracer.exe. Verify the ParentImage value and note the child Image and its command line, since the child identity drives the rest of the investigation.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run the Time Travel Debugging utility?
+  context: tttracer.exe is a developer and tester tool for recording execution traces. On a developer workstation it can be routine; on a server, a domain controller, or a general-purpose endpoint it is unexpected and weighs toward abuse of a trusted binary.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in the hour before the alert?
+  context: Tampering typically precedes credential access. The query surfaces direct attempts to disable AV/EDR services, flip Defender flags, add broad exclusions, clear logs, or patch AMSI/ETW. Zero rows is a useful "protection looks healthy" signal — kernel-level driver tampering and in-memory patches will not appear here. Populated rows shift the disposition toward operator preparation for an LSASS dump; review the parent process and signing chain to identify the writer.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+- source: template:credential_access.credential_target_identification
+  question: Did this tttracer.exe invocation proxy-execute a payload or dump process memory, and was LSASS the target?
+  context: tttracer.exe supports two abuse modes — spawning an arbitrary executable as a child, and dumping a target process by PID with the -dumpFull -attach syntax. Inspect the triggering command line and the child image to determine which mode this is. An LSASS PID as the dump target, or a credential-tool child, points to credential scraping; an unrelated executable points to proxy execution of a payload.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:cue_parent_process.mechanism_decode
+  question: What command line did tttracer.exe itself run with, and what launched tttracer.exe?
+  context: The parent's own process_creation event carries the tttracer.exe command line, where the operational intent lives — a target path for proxy execution or -dumpFull -attach with a PID for memory dumping. The grandparent (what spawned tttracer.exe) shows whether this came from an interactive developer shell or from an unexpected launcher such as a script host or remote-execution tool.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+- source: attack:T1003.001.access_verification
+  question: Did any process open a full-access handle to lsass.exe on this host around the time of the alert?
+  context: Credential scraping from LSASS opens a handle with full access rights (0x1F0FFF) before reading or dumping memory. A handle to lsass.exe at that access mask from a process other than a known security tool corroborates that the tttracer.exe activity is a memory dump rather than benign tracing. Allowlist legitimate AV/EDR processes when reviewing results.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_access
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetImage|endswith: '\lsass.exe'
+        GrantedAccess: '0x1F0FFF'
+      condition: selection
+    fields:
+      - SourceImage
+      - GrantedAccess
+      - CallTrace
+- source: attack:T1003.001.dump_artifact
+  question: Were any process memory dump files written on this host around the time of the alert?
+  context: A successful LSASS dump leaves a file on disk, commonly under %TEMP%, C:\Windows\Temp, or another user-writable location. Correlating a new dump-style file written shortly after the tttracer.exe execution confirms the credential-theft chain and identifies where the captured memory image was staged for exfiltration or offline parsing.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains:
+          - '\Temp\'
+          - '\Users\Public\'
+          - '\AppData\'
+      filter_ext:
+        TargetFilename|endswith:
+          - '.dmp'
+          - '.dump'
+          - '.bin'
+      condition: selection and filter_ext
+    fields:
+      - Image
+      - TargetFilename
+- source: template:cue_parent_process.follow_on
+  question: What other child processes did tttracer.exe spawn on this host?
+  context: tttracer.exe used for proxy execution may launch more than the one child that triggered the alert. Enumerating every child of tttracer.exe on this host reveals the full set of binaries it ran in sequence — reconnaissance, credential tools, or additional payloads — and the scope of activity initiated through the trusted binary.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith: '\tttracer.exe'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_parent_process.baseline
+  question: Has tttracer.exe historically spawned this child binary on this host?
+  context: A parent-child pairing that has never been seen before is more suspicious than one that recurs. Zero or very low historical counts for tttracer.exe launching this specific child indicate a novel spawning relationship; a long-standing pairing is more consistent with routine developer tracing on this host.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith: '\tttracer.exe'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run the Time Travel Debugging utility?
+  context: Compare this user's current action against their historical behavior. A user who has never launched tttracer.exe is more suspicious than one who does so regularly as part of development or testing work. User role and typical toolset should align with debugging activity.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith: '\tttracer.exe'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is the tttracer.exe launch mechanism — its parent process spawning this child binary — historically routine on this host or across the environment?
+  context: When the alert fires under a service principal, user identity does not attribute behavior; the meaningful pivot is the launch mechanism. A new or rare parent spawning this child binary on this host or environment-wide is the deviation worth chasing, while a pairing that already accounts for thousands of prior events is vendor or OS automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: '\tttracer.exe'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around the time of the alert?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints. If the same user triggered similar activity on other hosts, the scope of compromise may be larger than this single detection.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent and child binary combination fire on other hosts in the same window?
+  context: Under a service principal, asking what else the user did across the network returns agent-telemetry noise. The meaningful question is whether the same launch mechanism — parent process plus spawned binary — fired on other hosts in the alert window. Multiple hosts in the same window points to scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: '\tttracer.exe'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:credential_access.post_access_lateral_movement
+  question: Were any new logon sessions or remote connections initiated after this event?
+  context: Credential theft is typically followed by lateral movement, where the actor uses stolen credentials to access other systems. New logon events or outbound remote connections shortly after an LSASS dump indicate active exploitation of the compromised credentials. Look for RDP, SMB, WinRM, or remote-execution alerts on this host after the event.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - rule.name
+      - rule.uuid
+      - event.severity_label
+- source: template:credential_access.credential_exposure_assessment
+  question: Which accounts may be compromised, and do any have elevated privileges?
+  context: If LSASS memory was dumped, every credential cached in that process is potentially exposed. The severity depends on what was logged on to the host — domain admin or service-account credentials require incident escalation, while a standard user account may only need monitoring. Cross-reference the accounts active on this host with directory group memberships.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering, reconnaissance, or privilege escalation — may reveal the attack stages that preceded the use of tttracer.exe and help reconstruct the full timeline leading to credential access.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1003.001
+      name: LSASS Memory
+      role: primary
+    - id: T1218
+      name: System Binary Proxy Execution
+      role: secondary
+    - id: T1003
+      name: OS Credential Dumping
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: trusted_binary_launch
+      description: "tttracer.exe (signed, system-resident) is invoked to proxy-execute a payload or attach to a target process"
+      mapped_to: Q5
+      source: template:cue_parent_process.mechanism_decode
+    - stage: 2
+      label: lsass_full_access
+      description: "A process opens a full-access (0x1F0FFF) handle to lsass.exe to read its memory"
+      mapped_to: Q6
+      source: attack:T1003.001.access_verification
+    - stage: 3
+      label: dump_or_proxy_execution
+      description: "tttracer dumps the target process memory to a file, or proxy-executes the spawned child payload"
+      mapped_to: Q4
+      source: template:credential_access.credential_target_identification
+    - stage: 4
+      label: dump_file_staged
+      description: "Memory dump written to a user-writable path (%TEMP%, C:\\Windows\\Temp, Public) for offline parsing"
+      mapped_to: Q7
+      source: attack:T1003.001.dump_artifact
+    - stage: 5
+      label: credential_reuse
+      description: "Stolen credentials used for follow-on logons or lateral movement"
+      mapped_to: Q14
+      source: template:credential_access.post_access_lateral_movement
+  dimension_coverage:
+    - dimension: command_analysis
+      technique: T1218
+      covered_by: Q5
+      source: template:cue_parent_process.mechanism_decode
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1218
+      covered_by: Q9
+      source: template:cue_parent_process.baseline
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1218
+      covered_by: Q7
+      source: attack:T1003.001.dump_artifact
+      coverage_type: partial
+    - dimension: access_verification
+      technique: T1003.001
+      covered_by: Q6
+      source: attack:T1003.001.access_verification
+      coverage_type: direct
+    - dimension: command_analysis
+      technique: T1003.001
+      covered_by: Q4
+      source: template:credential_access.credential_target_identification
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1003.001
+      covered_by: Q9
+      source: template:cue_parent_process.baseline
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1003.001
+      covered_by: Q7
+      source: attack:T1003.001.dump_artifact
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1003.001
+      covered_by: Q7
+      source: attack:T1003.001.dump_artifact
+      coverage_type: direct
+    - dimension: access_verification
+      technique: T1003
+      covered_by: Q6
+      source: attack:T1003.001.access_verification
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1003
+      covered_by: Q9
+      source: template:cue_parent_process.baseline
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1003
+      covered_by: Q14
+      source: template:credential_access.post_access_lateral_movement
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1003
+      covered_by: Q7
+      source: attack:T1003.001.dump_artifact
+      coverage_type: direct
+  mutable_dispositions:
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "tttracer.exe (the rule's detection field)"
+      disposition: query_injection
+      target_question: Q9
+      notes: "ParentImage|endswith \\tttracer.exe is the rule's selection; carried into baseline / follow_on / svc-substitute queries"
+    - element: SignedBinaryList
+      dimension: tuning_parameter
+      specific_values: "tttracer.exe (msiexec/regsvr32 examples not applicable)"
+      disposition: context
+      target_question: Q2
+      notes: "tttracer.exe is the signed trusted binary in scope; named in description and host_user_context"
+    - element: CommandLineRegex
+      dimension: command_analysis
+      specific_values: "rationale only (no concrete regex in brief)"
+      disposition: context
+      target_question: Q4
+      notes: "credential_target_identification is KEEP_EXACT; -dumpFull -attach PID syntax described in context, not injected"
+    - element: RemoteDomainAllowlist
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q5
+      notes: "tttracer abuse here is local proxy-exec / LSASS dump, not network retrieval; no network query authored"
+    - element: AccessMask
+      dimension: access_verification
+      specific_values: "0x1F0FFF"
+      disposition: query_injection
+      target_question: Q6
+      notes: "Injected as GrantedAccess: '0x1F0FFF' into the process_access question"
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "5 minutes (LSASS access to dump-file creation)"
+      disposition: query_injection
+      target_question: Q7
+      notes: "Realized as +/-15m correlation windows on the process_access and file_event questions"
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "allowlist AV/EDR accessing lsass.exe"
+      disposition: context
+      target_question: Q6
+      notes: "Process_access question context tells analyst to allowlist known security tools"
+    - element: DumpFilePath
+      dimension: tuning_parameter
+      specific_values: "%TEMP%, C:\\Windows\\Temp"
+      disposition: query_injection
+      target_question: Q7
+      notes: "Injected as TargetFilename|contains \\Temp\\, \\Users\\Public\\, \\AppData\\ with .dmp/.dump/.bin filter"
+    - element: CommandLinePattern
+      dimension: command_analysis
+      specific_values: "rundll32, procdump, comsvcs.dll, Invoke-Mimikatz"
+      disposition: context
+      target_question: Q4
+      notes: "credential_target_identification KEEP_EXACT; child-tool methods described in context; tttracer is the dumper here"
+    - element: ParentProcessFilter
+      dimension: parent_process_analysis
+      specific_values: "allowlist security tools / system processes accessing LSASS"
+      disposition: context
+      target_question: Q6
+      notes: "Same allowlist guidance folded into process_access context (T1003)"
+  dedup_decisions:
+    - dropped: cue_process_tool.process_chain
+      reason: "parent_process is primary cue (ParentImage in detection) — subsumes process_chain; parent identity is the rule's selection"
+      kept: template:cue_parent_process.mechanism_decode
+    - dropped: cue_process_tool.baseline
+      reason: "tttracer.exe IS the parent; 'does this host run tttracer' is subsumed by cue_parent_process.baseline (parent+child historical) and cue_process_tool host-presence adds no unique scope"
+      kept: template:cue_parent_process.baseline
+    - dropped: cue_parent_process.clustering
+      reason: "host-around-time parent activity overlaps cue_parent_process.follow_on (children of tttracer) plus the +/-15m process_access and file_event correlation questions"
+      kept: template:cue_parent_process.follow_on
+    - dropped: cue_parent_process.scope
+      reason: "cross-host parent+child distribution already covered by cue_user_actor.clustering_svc and baseline_svc (both parent+child fleet-scoped)"
+      kept: template:cue_user_actor.clustering_svc
+    - dropped: cue_host_context.clustering
+      reason: "host-around-time activity overlaps cue_parent_process.follow_on plus the +/-15m correlation questions; precursor question retained for prior-alert context"
+      kept: template:cue_host_context.precursor
+    - dropped: cue_user_actor.baseline + cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable; both emitted (Q10 user-pivot, Q11 launch-mechanism substitute)"
+      kept: both
+    - dropped: cue_user_actor.clustering + cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable; both emitted (Q12 user-pivot, Q13 launch-mechanism substitute)"
+      kept: both
+  skipped_templates:
+    - template: cue_process_tool.mechanism_decode
+      reason: "replaced_by: credential_access.credential_target_identification (per hint and template replaced_by field)"
+  hint_dispositions:
+    - hint: "logsource 'image_load' (recommended by techniques: T1218) is not covered — pull in cue_image_load.* or author a custom question with category: image_load"
+      disposition: declined
+      reason: >-
+        This rule's detection is a parent-child process_creation relationship (ParentImage ends in tttracer.exe), not module loading. The image_load analytic for T1218 targets DLL-side-loading style proxy execution (rundll32/regsvr32 loading attacker modules), which is a different abuse path than tttracer.exe spawning a child or dumping memory. The proxy-execution and credential-dump chain is fully covered by the process_creation, process_access (Q6), and file_event (Q7) questions; an image_load sweep of tttracer.exe modules would return load volume without precision for this rule's parent-spawn behavior.
+    - hint: "logsource 'network_connection' (recommended by techniques: T1218) is not covered — pull in cue_network_endpoint.* or author a custom question with category: network_connection"
+      disposition: declined
+      reason: >-
+        The network_connection analytic for T1218 targets trusted binaries retrieving remotely hosted payloads. tttracer.exe abuse in this rule is local — proxy-executing an on-disk child or dumping lsass.exe to a local file — and the binary has no documented network-retrieval mode. No remote-fetch step exists to query; post_access_lateral_movement (Q14) already covers outbound follow-on connections via alert correlation.
+    - hint: "logsource 'registry_set' (recommended by techniques: T1003.001) is not covered — pull in cue_registry_key.* or author a custom question with category: registry_set"
+      disposition: declined
+      reason: >-
+        tttracer.exe credential theft is memory-based (full-access handle to lsass.exe followed by a memory dump file), not registry-hive based. The registry_set dimension of T1003.001 applies to SAM/SECURITY hive credential operations, which this LOLBIN does not perform. The access and dump artifacts are covered by the process_access (Q6) and file_event (Q7) questions.
+    - hint: "logsource 'security' (recommended by techniques: T1003.001) is not covered and no template family exists — author a custom question with category: security"
+      disposition: declined
+      reason: >-
+        The Security-log analytic for T1003.001 (4673 sensitive-privilege use, 4663/4656 object access on lsass) measures the same LSASS-access event surfaced by the Sysmon process_access question (Q6, GrantedAccess 0x1F0FFF to lsass.exe). Authoring a parallel Security-channel question would duplicate the access_verification coverage on a log source that is less reliably enabled; Q6 covers the dimension.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - credential_access
+    - cue_parent_process
+    - cue_user_actor
+    - cue_host_context
+  generation_stats:
+    total_questions: 16
+    source_counts:
+      template: 14
+      attack: 2
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 2
+      context: 12
+    logsource_diversity:
+      process_creation: 11
+      process_access: 1
+      file_event: 1
+      sigma_alert: 3

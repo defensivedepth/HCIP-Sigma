@@ -1,0 +1,473 @@
+name: PUA - TruffleHog Execution
+id: c4e9e974-87c7-424c-9f3c-5f9388004bbf
+description: |
+  Detects execution of TruffleHog, an open-source tool that searches and verifies secrets across Git, GitHub, Jira, Slack, Confluence, SharePoint, S3, GCS, Docker images, and the local filesystem. The rule fires when EITHER the process image ends in trufflehog.exe, OR the command line names one of the scanned platforms, OR the command line carries the --results=verified flag — any one branch is enough. TruffleHog is legitimate in CI pipelines and security assessments, so the investigation should determine whether this run was an authorized scan or an operator harvesting and live-verifying credentials from accessible files and repositories.
+type: detection
+detection_id: 44030449-b0df-4c94-aae1-502359ab28ee
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does this execution match the rule's pattern — either trufflehog.exe by image, or a command line naming a scanned platform, or the --results=verified flag?
+  context: Confirm the alert is a true positive before investing further time. The rule fires on any one of three branches, so check the exact image and command line and note which branch matched. The image-name branch fires regardless of arguments; the command-line branches can fire even when the binary was renamed, so the matched branch tells you how much the arguments narrow the activity.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run a secret-scanning tool against repositories or cloud storage?
+  context: Secret scanning is routine for developers, CI runners, and security teams but unusual on a general-purpose workstation or server. Knowing whether the user role and host function include credential discovery work is often the fastest way to separate an authorized scan from an operator harvesting secrets.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:remote_access_tool.tool_authorization
+  question: Is TruffleHog on the organization's approved software list for this host?
+  context: Organizations that use secret scanning typically run it from sanctioned CI infrastructure or designated assessment hosts, not arbitrary endpoints. TruffleHog appearing on a host where it is not authorized may represent shadow IT or an operator who staged the tool to harvest credentials, and should be checked regardless of the tool's legitimate reputation.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+- source: template:credential_access.credential_target_identification
+  question: Which platforms and credential sources did this run target, and was live verification requested?
+  context: The command line names the scan target — git, github, jira, slack, confluence, sharepoint, s3, gcs, docker, or filesystem — and the --results=verified flag means the tool actively authenticated detected credentials against their APIs rather than just flagging them. Verified results mean any secrets found are confirmed live, which raises the urgency of rotating them. Decode the full command line to identify the targeted store and whether verification ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: attack:T1552.001.tuning_parameter
+  question: Did this run target local filesystem paths or credential-bearing files rather than a remote repository or cloud bucket?
+  context: A filesystem scan points TruffleHog at local directories and files — configuration files, environment files, scripts, and key material on the host itself — which is the on-host credential-harvesting variant rather than a remote repo audit. The presence of a filesystem subcommand or a local path argument, especially over sensitive directories, distinguishes harvesting accessible host credentials from auditing a code repository.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith|expand: '%Image%'
+        CommandLine|contains:
+          - ' filesystem '
+          - ' git file://'
+      condition: selection
+    fields:
+      - host.name
+      - CommandLine
+      - CurrentDirectory
+- source: attack:T1083.command_analysis
+  question: What other file and directory enumeration commands ran on this host around the same time?
+  context: Credential search is often paired with broader file and directory discovery as an operator maps accessible content. Multiple enumeration binaries in a tight window — directory listing, recursive search, or file-find utilities — alongside the secret scan points to hands-on enumeration rather than a single scheduled audit.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_enum:
+        Image|endswith:
+          - '\where.exe'
+          - '\findstr.exe'
+          - '\tree.com'
+          - '\dir.exe'
+          - '\robocopy.exe'
+          - '\xcopy.exe'
+          - '\fsutil.exe'
+      condition: selection and selection_enum
+    fields:
+      - Image
+      - User
+- source: attack:T1552.001.credential_use_followup
+  question: Were any new logon or authentication events recorded on this host shortly after the scan?
+  context: If verified credentials were recovered, the next step is typically to use them. New interactive, network, or explicit-credential logons on this host in the hours after the scan can indicate that harvested credentials were exercised. Correlate the timing of the scan with subsequent authentication activity to see whether recovered secrets were put to use.
+  range: +4h
+  query: |
+    aggregation: true
+    logsource:
+      category: security
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID:
+          - 4624
+          - 4648
+      condition: selection
+    fields:
+      - TargetUserName
+      - LogonType
+      - IpAddress
+- source: template:cue_process_tool.process_chain
+  question: What process spawned TruffleHog, and is that parent chain expected?
+  context: The parent process shows how the scan was launched. A CI agent, a packaging or installer process, or an interactive shell each imply different intent. Unusual parents — a script interpreter, an office application, or an unexpected automation runner — suggest the tool was dropped and run as part of an intrusion rather than a sanctioned pipeline.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.follow_on
+  question: What child processes did TruffleHog spawn afterward?
+  context: A secret-scanning run that spawns command interpreters, archive utilities, or network transfer tools afterward suggests the operator moved from discovery to staging or exfiltration of the recovered secrets. Legitimate scans usually terminate without spawning further activity.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.baseline
+  question: Does this host normally run TruffleHog?
+  context: A binary that has never run on this host is more suspicious than one that runs regularly as part of a pipeline. Zero or very low historical counts over the baseline window indicate first-time or rare execution and weigh against an authorized recurring scan.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired the rule's pattern, what parents and users normally drive that activity, and does the current alert fit that pattern?
+  context: Even a sanctioned scanner can be abused. The query mirrors the rule's selection structure scoped to this host, so the resulting parent and user distribution reflects how this specific firing pattern has historically run here. A new parent process, an unexpected account, or an unusual command-line shape is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+        Image|endswith: \trufflehog.exe
+      selection_cli_platform:
+        CommandLine|contains:
+        - ' docker --image '
+        - ' Git '
+        - ' GitHub '
+        - ' Jira '
+        - ' Slack '
+        - ' Confluence '
+        - ' SharePoint '
+        - ' s3 '
+        - ' gcs '
+      selection_cli_verified:
+        CommandLine|contains: ' --results=verified'
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection_img or all of selection_cli_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run secret-scanning tools?
+  context: Compare this user's current action against their historical behavior. A user who has never run this tool is more suspicious than a developer or assessor who runs it routinely. The user's role and typical toolset should align with credential-discovery activity.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent and binary combination historically routine on this host or across the environment, or is the parent unusual for this binary?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior. The meaningful pivot is the launch mechanism: which parent process spawned this binary, and whether that pair is historically common. A new or rare parent for this binary is the deviation worth chasing; a pair that already accounts for thousands of prior events is pipeline or vendor automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals whether the secret scan was an isolated action or part of broader movement. If the same user triggered similar activity on multiple endpoints, the scope of credential exposure may be larger than this single host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent and binary combination fire on other hosts in the same window — is this a coordinated automation rollout, or isolated to this host?
+  context: Under a service principal, asking what else the user did returns agent-telemetry noise because every host runs SYSTEM-owned agents constantly. The meaningful question is whether the same launch mechanism — parent process plus spawned binary — fired on other hosts in the alert window. Multiple hosts in the same window points to scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired the rule's pattern in the past week, and does the cross-host distribution look like consistent automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of the rule's firing pattern rather than generic usage of the binary. Many hosts firing the same pattern points to scripted deployment or pipeline automation; one host or a small unrelated set points to manual operator activity. Use the host distribution and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+        Image|endswith: \trufflehog.exe
+      selection_cli_platform:
+        CommandLine|contains:
+        - ' docker --image '
+        - ' Git '
+        - ' GitHub '
+        - ' Jira '
+        - ' Slack '
+        - ' Confluence '
+        - ' SharePoint '
+        - ' s3 '
+        - ' gcs '
+      selection_cli_verified:
+        CommandLine|contains: ' --results=verified'
+      condition: selection_img or all of selection_cli_*
+    fields:
+    - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — reconnaissance, defense tampering, or initial access — may reveal the attack stages that preceded a credential-harvesting run and help reconstruct the full timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1552.001
+      name: Credentials In Files
+      role: primary
+    - id: T1083
+      name: File and Directory Discovery
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: credential_file_access
+      description: Tool reads or scans files and repositories for credential material
+      mapped_to: Q4
+      source: template:credential_access.credential_target_identification
+    - stage: 2
+      label: local_filesystem_target
+      description: Scan points at local filesystem paths / credential-bearing files rather than a remote repo
+      mapped_to: Q5
+      source: attack:T1552.001.tuning_parameter
+    - stage: 3
+      label: recursive_file_enumeration
+      description: Recursive directory traversal / file enumeration around the scan
+      mapped_to: Q6
+      source: attack:T1083.command_analysis
+    - stage: 4
+      label: credential_use
+      description: Retrieved credentials used in subsequent authentication
+      mapped_to: Q7
+      source: attack:T1552.001.credential_use_followup
+  dimension_coverage:
+    - dimension: process_identification
+      technique: T1552
+      covered_by: Q1
+      source: template:universal.verify_trigger_match
+      coverage_type: indirect
+    - dimension: command_analysis
+      technique: T1083
+      covered_by: Q6
+      source: attack:T1083.command_analysis
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1083
+      covered_by: Q7
+      source: attack:T1552.001.credential_use_followup
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1083
+      covered_by: Q5
+      source: attack:T1552.001.tuning_parameter
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1083
+      covered_by: Q2
+      source: template:universal.host_user_context
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1552.001
+      covered_by: Q7
+      source: attack:T1552.001.credential_use_followup
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1552.001
+      covered_by: Q5
+      source: attack:T1552.001.tuning_parameter
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1552.001
+      covered_by: Q12
+      source: template:cue_user_actor.baseline
+      coverage_type: direct
+  mutable_dispositions:
+    - element: CommandLineRegex
+      dimension: command_analysis
+      specific_values: "tree, dir /s /b (enumeration utilities)"
+      disposition: query_injection
+      target_question: Q6
+      notes: "Injected an enumeration-binary list (where, findstr, tree, dir, robocopy, xcopy, fsutil) into the recon-burst query"
+    - element: UserContext
+      dimension: user_context
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q2
+      notes: "Standard vs service/elevated account scoping handled in host_user_context and user_actor baseline"
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only (burst / access-to-use delta)"
+      disposition: context
+      target_question: Q7
+      notes: "Time delta between credential file access and credential use framed in credential_use_followup; burst framing in Q6"
+    - element: FileNamePattern
+      dimension: tuning_parameter
+      specific_values: "*.env, *credential* (rationale)"
+      disposition: context
+      target_question: Q5
+      notes: "Filesystem-target question describes credential-bearing file scope; rule itself does not filter on file name patterns"
+    - element: ProcessAccessScope
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q8
+      notes: "Untrusted parent scoping covered by process_chain question"
+  dedup_decisions:
+    - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable (subject vs. launch-mechanism pivot)"
+      kept: both
+    - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable (subject vs. launch-mechanism pivot)"
+      kept: both
+  skipped_templates:
+    - template: cue_process_tool.mechanism_decode
+      reason: "replaced_by: credential_access.credential_target_identification (hint)"
+    - template: cue_process_tool.clustering
+      reason: "host-wide clustering subsumed by cue_host_context activity context and discovery-burst enumeration query; avoids near-duplicate host.name-only aggregation"
+    - template: cue_host_context.clustering
+      reason: "host.name-only Image+ParentImage aggregation duplicates cue_process_tool.clustering shape; host context already carried by precursor; dropped to stay within 18 and avoid duplicate host-wide aggregations"
+    - template: universal.evidence_preservation
+      reason: "rule fires on process_creation command-line patterns; no file artifact is written by the detection, file paths are only derived from the scan target argument and are covered by the filesystem-target question's CurrentDirectory/CommandLine projection"
+    - template: universal.endpoint_protection_health
+      reason: "cue_host_context.precursor present and carries prior-alert tamper signal; rule is credential-discovery not payload-execution, so generic tamper sweep is recommended-only and dropped to stay within 18"
+  reflection_overrides: []
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - credential_access
+    - discovery_recon
+    - remote_access_tool
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 14
+      attack: 3
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 14
+    logsource_diversity:
+      process_creation: 14
+      security: 1
+      sigma_alert: 2

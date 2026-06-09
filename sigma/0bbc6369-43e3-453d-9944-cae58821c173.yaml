@@ -1,0 +1,584 @@
+name: Execution via WorkFolders.exe
+id: ba56972e-161c-4119-bb85-be5edac8af21
+description: |
+  Detects WorkFolders.exe spawning a child process named control.exe that does not resolve to the legitimate
+  C:\Windows\System32\control.exe. WorkFolders.exe is a Microsoft-signed binary that, when launched, runs a file named
+  control.exe from its current working directory — a proxy-execution trick that lets a planted, unsigned payload run under
+  the trust of a signed parent. Legitimate use is the uncommon Windows Work Folders feature, which would resolve control.exe
+  from System32. Investigation should confirm the spawned control.exe path, establish where that binary came from and whether
+  it is signed, and determine what it executed.
+type: detection
+detection_id: 0bbc6369-43e3-453d-9944-cae58821c173
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- source: template:universal.verify_trigger_match
+  question: Was the child control.exe launched by WorkFolders.exe a copy outside System32, not the legitimate control panel?
+  context: Confirm the alert by reviewing the triggering event. The rule fires when WorkFolders.exe spawns a process whose
+    image ends in control.exe AND that image is not C:\Windows\System32\control.exe. Verify the parent is WorkFolders.exe and
+    that the child control.exe resolves to a path other than System32 — that mismatch is the proxy-execution signal.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+- source: template:universal.host_user_context
+  question: Is this user and host expected to use the Windows Work Folders feature?
+  context: Work Folders is an uncommon Windows file-sync feature, and WorkFolders.exe spawning control.exe from a non-standard
+    path is not part of its normal operation. Knowing whether this host or user has any legitimate reason to run Work Folders
+    is often the fastest way to separate a genuine deployment from proxy execution under a signed binary.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:parent_child.parent_process_legitimacy
+  question: Is WorkFolders.exe expected to spawn control.exe here, and what started WorkFolders.exe itself?
+  context: The parent-child relationship is the core signal. Tracing the origin of WorkFolders.exe (its own parent and command
+    line) shows whether it was launched by a legitimate Work Folders deployment or invoked deliberately to proxy-execute a
+    planted control.exe. A WorkFolders.exe started from a user-writable directory or by a script interpreter is more suspicious
+    than one launched by normal system activity.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- source: template:cue_process_tool.mechanism_decode
+  question: What did the spawned control.exe do? Decode its command line and identify the executable's real purpose.
+  context: Because the child is a control.exe outside System32, it is an arbitrary executable running under the WorkFolders.exe
+    trust chain rather than the genuine control panel. Read the full command line and current directory to determine what code
+    ran — the file name control.exe is only the proxy mechanism, not the payload's function.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:lolbin.renamed_binary_check
+  question: What is the full path of the spawned control.exe, and is the binary signed?
+  context: The rule excludes C:\Windows\System32\control.exe, so any match is a control.exe living elsewhere — typically the
+    working directory of WorkFolders.exe. A control.exe in a user profile, temp, or download directory was placed there to
+    be proxy-executed. The path and signing status of that binary are the strongest indicators of whether this is a planted
+    payload or an unusual but legitimate file.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- source: attack:T1218.command_analysis
+  question: Where did this control.exe come from — was it written to the working directory shortly before execution?
+  context: Proxy execution via WorkFolders.exe depends on a file named control.exe sitting in the working directory. Look for
+    a recent file-write of control.exe to the directory the process ran from; a payload dropped minutes before execution,
+    or written by a download tool or archive extractor, points to deliberate staging rather than a pre-existing legitimate
+    file.
+  range: -24h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith: \control.exe
+      filter:
+        TargetFilename|startswith: 'C:\Windows\'
+      condition: selection and not filter
+    fields:
+      - TargetFilename
+      - Image
+      - User
+- source: template:parent_child.sibling_processes
+  question: What other child processes did this WorkFolders.exe instance spawn?
+  context: If WorkFolders.exe was used to proxy-execute a payload, the same parent instance may have spawned additional
+    processes. Examining all children of this exact WorkFolders.exe reveals whether the control.exe execution was a single
+    action or part of a sequence of tooling launched through the signed parent.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_parent_process.baseline
+  question: Has WorkFolders.exe ever spawned control.exe on this host before?
+  context: This specific parent-child pairing is the discriminator. WorkFolders.exe spawning control.exe is not part of routine
+    operation, so zero or very low historical counts indicate a novel spawning relationship and raise the likelihood of proxy
+    execution rather than legitimate Work Folders activity.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run Work Folders or proxy-execution tooling?
+  context: Compare this user's current action against their historical pattern across the environment. A user who has never
+    triggered WorkFolders.exe spawning control.exe is more notable than one who does so regularly. User role and typical
+    toolset should align with the detected activity.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is the WorkFolders.exe to control.exe launch mechanism historically routine on this host or across the environment?
+  context: When the alert fires under a service principal, user identity does not attribute behavior; the meaningful pivot is
+    the launch mechanism. A new or rare WorkFolders.exe parent spawning control.exe is the deviation worth chasing, whereas a
+    pair already accounting for many prior events would point to some unusual but recurring automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity across multiple endpoints. If
+    the same user triggered similar activity on multiple hosts, the scope of the activity may be larger than a single
+    endpoint.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same WorkFolders.exe to control.exe launch fire on other hosts in the same window?
+  context: Under a service principal, asking what else the user did returns agent-telemetry noise. The meaningful question is
+    whether the same launch mechanism — WorkFolders.exe spawning control.exe — fired on other hosts in the alert window.
+    Multiple hosts in the same window points to pushed or scheduled automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in the hour before the alert?
+  context: Proxy execution under a signed binary is often used to run a payload that operators prefer to launch after weakening
+    defenses. The query surfaces direct attempts to disable AV/EDR services, flip Defender flags, add broad exclusions, clear
+    logs, or patch AMSI/ETW. Zero rows is a useful protection-looks-healthy signal; populated rows shift the disposition toward
+    operator preparation, so review the parent process and signing chain to identify the writer.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining activity around the alert reveals what led to this event and what
+    happened after, and whether it is part of a larger sequence. Look for reconnaissance, privilege escalation, or persistence
+    mechanisms surrounding the proxy execution.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host — defense tampering, reconnaissance, or initial access — may reveal the stages
+    that preceded this proxy execution and help reconstruct the timeline leading to the WorkFolders.exe activity.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:lolbin.technique_class_lateral
+  question: Were any other proxy-execution LOLBins used on this host recently?
+  context: Operators who use one signed-binary proxy often use several. If WorkFolders.exe was used to run control.exe, check
+    whether rundll32, regsvr32, mshta, msbuild, or similar binaries were also used to execute arbitrary code. Finding multiple
+    proxy-execution LOLBins on the same host strengthens the case for deliberate misuse.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_img:
+        Image|endswith:
+          - '\rundll32.exe'
+          - '\regsvr32.exe'
+          - '\mshta.exe'
+          - '\msbuild.exe'
+          - '\cmstp.exe'
+          - '\msiexec.exe'
+          - '\forfiles.exe'
+          - '\pcalua.exe'
+          - '\presentationhost.exe'
+          - '\installutil.exe'
+          - '\infdefaultinstall.exe'
+          - '\msdt.exe'
+          - '\mavinject.exe'
+          - '\wmic.exe'
+          - '\xwizard.exe'
+          - '\ie4uinit.exe'
+      condition: selection and selection_img
+    fields:
+      - Image
+      - CommandLine
+- source: template:lolbin.historical_lolbin_baseline
+  question: How often has this host fired the WorkFolders.exe to control.exe pattern over the past 90 days, and what command
+    shapes are typical?
+  context: A proxy-execution pattern with no prior history on a host is more notable than one seen routinely. The query mirrors
+    the rule's selection structure scoped to this host, so the count reflects this specific firing pattern — WorkFolders.exe
+    spawning a non-System32 control.exe — not generic control.exe usage. The command-line projection lets the analyst compare
+    typical invocation shapes against the alerting one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \control.exe
+        ParentImage|endswith: \WorkFolders.exe
+      filter:
+        Image: C:\Windows\System32\control.exe
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection and not filter) and _pb_scope
+    fields:
+    - CommandLine
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1218
+      name: System Binary Proxy Execution
+      role: primary
+  attack_chain_coverage:
+    - stage: 1
+      label: signed_parent_invocation
+      description: "WorkFolders.exe (Microsoft-signed) is launched so it will run control.exe from its working directory"
+      mapped_to: Q3
+      source: template:parent_child.parent_process_legitimacy
+    - stage: 2
+      label: payload_staging
+      description: "An arbitrary executable named control.exe is placed in the working directory to be proxy-executed"
+      mapped_to: Q6
+      source: attack:T1218.command_analysis
+    - stage: 3
+      label: proxy_execution
+      description: "control.exe (outside System32) runs under the signed parent's trust; its real purpose is decoded"
+      mapped_to: Q4
+      source: template:cue_process_tool.mechanism_decode
+  dimension_coverage:
+    - dimension: command_analysis
+      technique: T1218
+      covered_by: Q6
+      source: attack:T1218.command_analysis
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1218
+      covered_by: Q3
+      source: template:parent_child.parent_process_legitimacy
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1218
+      covered_by: Q5
+      source: template:lolbin.renamed_binary_check
+      coverage_type: partial
+  mutable_dispositions:
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "rationale only (WorkFolders.exe is the fixed parent in the rule)"
+      disposition: context
+      target_question: Q3
+      notes: "Parent is fixed by the rule; legitimacy framed in parent_process_legitimacy and baseline questions"
+    - element: SignedBinaryList
+      dimension: tuning_parameter
+      specific_values: "msiexec.exe, regsvr32.exe (example proxy-exec binaries)"
+      disposition: context
+      target_question: Q16
+      notes: "Used to populate the other-proxy-LOLBin sweep image list (Q16) and the renamed/path check (Q5)"
+    - element: CommandLineRegex
+      dimension: command_analysis
+      specific_values: "rationale only (rule has no CommandLine selection; commandline_values empty)"
+      disposition: context
+      target_question: Q4
+      notes: "Rule fires on file-name proxy trick, not CLI args; command analysis directed via mechanism_decode and payload-origin question"
+    - element: RemoteDomainAllowlist
+      dimension: tuning_parameter
+      specific_values: "rationale only (network-retrieval tuning filter)"
+      disposition: context
+      target_question: Q6
+      notes: "Rule's detection is local file-name proxy; no network field. Payload-origin question covers staging instead"
+  dedup_decisions:
+    - dropped: cue_parent_process.mechanism_decode
+      reason: "parent_child technique set active — parent_process_legitimacy is more specific for the parent-origin pivot"
+      kept: parent_child.parent_process_legitimacy
+    - dropped: cue_parent_process.follow_on
+      reason: "overlaps parent_child.sibling_processes (children of the same parent instance) — sibling version is ParentProcessGuid-precise"
+      kept: parent_child.sibling_processes
+    - dropped: cue_parent_process.clustering
+      reason: "host-around-time context covered by cue_host_context.clustering; parent-instance children covered by sibling_processes"
+      kept: cue_host_context.clustering
+    - dropped: cue_parent_process.scope
+      reason: "cross-host parent-child scope covered by cue_user_actor.clustering_svc (same parent+binary across hosts in window)"
+      kept: cue_user_actor.clustering_svc
+    - dropped: cue_process_tool.baseline
+      reason: "host-frequency of the parent-child pair covered by cue_parent_process.baseline — more specific than binary-only frequency"
+      kept: cue_parent_process.baseline
+    - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable; both emitted (Q9 user-pivot, Q10 launch-mechanism substitute)"
+      kept: both
+    - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable; both emitted (Q11 user-pivot, Q12 launch-mechanism substitute)"
+      kept: both
+  skipped_templates:
+    - template: cue_process_tool.process_chain
+      reason: "hint: parent_process is primary — drop cue_process_tool:process_chain; parent-origin covered by parent_process_legitimacy"
+  hint_dispositions:
+    - hint: "logsource 'image_load' (recommended by techniques: T1218) is not covered — pull in cue_image_load.* or author a custom question with `category: image_load`"
+      disposition: declined
+      reason: >-
+        This rule's detection logic is a local file-name proxy trick — WorkFolders.exe spawning a control.exe outside
+        System32 — with no DLL-side-loading element. T1218 image_load analytics target DLL-based proxy binaries
+        (rundll32/regsvr32 loading an entrypoint), which is not what this rule fires on. The proxy payload here is the
+        spawned executable itself; its identity and origin are covered by the path/signature question (renamed_binary_check)
+        and the payload-staging file_event question (attack:T1218.command_analysis). No compensating image_load question
+        authored because the loaded-module dimension is not load-bearing for a process-spawn proxy.
+    - hint: "logsource 'network_connection' (recommended by techniques: T1218) is not covered — pull in cue_network_endpoint.* or author a custom question with `category: network_connection`"
+      disposition: declined
+      reason: >-
+        The rule detects local proxy execution of a control.exe that is already present in the working directory; the
+        detection has no network field and the abuse does not require network retrieval. The payload-staging question
+        (attack:T1218.command_analysis) covers how control.exe arrived on disk, which is the relevant pivot for this rule.
+        A generic network_connection sweep on the host would return unscoped connection noise without precision for this
+        specific proxy pattern, so no network_connection question was authored.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - parent_child
+    - lolbin
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 16
+      attack: 1
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 14
+    logsource_diversity:
+      process_creation: 14
+      file_event: 1
+      sigma_alert: 1

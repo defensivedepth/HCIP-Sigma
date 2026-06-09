@@ -1,0 +1,813 @@
+name: DSInternals Suspicious PowerShell Cmdlets
+id: 59c22f56-c954-414e-bf0b-19c87702c475
+description: |
+  Detects execution of DSInternals PowerShell cmdlets, which expose internal Active Directory and Azure AD
+  features such as DPAPI backup key extraction, offline ntds.dit manipulation, password hash calculation, and
+  credential auditing. The rule fires when a command line contains any of the module's cmdlet names. Legitimate
+  usage is limited to directory administration, recovery, or scheduled auditing by a small set of privileged
+  operators, so the investigation centers on identifying which cmdlet ran, what it operated against, who and
+  what launched it, and whether the activity fits an approved administrative pattern or looks like credential
+  access and offline directory tampering.
+type: detection
+detection_id: 43d91656-a9b2-4541-b7e2-6a9bd3a13f4e
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line contain a DSInternals cmdlet matching what this rule detects?
+  context: Before investing investigation time, confirm the alert is a true positive by reading the exact command
+    line and identifying which DSInternals cmdlet fired. Note whether it is a read/audit cmdlet (Get-/Test-) or
+    a write/extract cmdlet (Set-/Add-/Get-ADReplBackupKey/Get-ADDBAccount/Save-DPAPIBlob), since that distinction
+    drives how the rest of the investigation is weighted.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run Active Directory internals and credential-auditing tooling?
+  context: DSInternals is used for directory recovery, password auditing, and AD/Azure AD internals work that
+    typically belongs to a small set of identity administrators on domain controllers or admin workstations. If
+    the user role and host function are not consistent with directory administration, the activity is harder to
+    explain as routine.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: Which DSInternals cmdlet ran and what did it operate against? Decode the full command line.
+  context: The full command line reveals the specific action taken. Identify the cmdlet and its arguments — which
+    domain, account, database file (ntds.dit), backup key, or output path it targeted. Read/audit cmdlets describe
+    what was inspected; write/extract cmdlets (account dumps, hash sets, DPAPI blobs, SID history, password sets)
+    describe what was changed or exfiltrated. This query scopes to the rule's cmdlet pattern on this host within
+    a few minutes, so a multi-step operation spanning several invocations is captured together.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains:
+        - Add-ADDBSidHistory
+        - Add-ADNgcKey
+        - Add-ADReplNgcKey
+        - ConvertFrom-ADManagedPasswordBlob
+        - ConvertFrom-GPPrefPassword
+        - ConvertFrom-ManagedPasswordBlob
+        - ConvertFrom-UnattendXmlPassword
+        - ConvertFrom-UnicodePassword
+        - ConvertTo-AADHash
+        - ConvertTo-GPPrefPassword
+        - ConvertTo-KerberosKey
+        - ConvertTo-LMHash
+        - ConvertTo-MsoPasswordHash
+        - ConvertTo-NTHash
+        - ConvertTo-OrgIdHash
+        - ConvertTo-UnicodePassword
+        - Disable-ADDBAccount
+        - Enable-ADDBAccount
+        - Get-ADDBAccount
+        - Get-ADDBBackupKey
+        - Get-ADDBDomainController
+        - Get-ADDBGroupManagedServiceAccount
+        - Get-ADDBKdsRootKey
+        - Get-ADDBSchemaAttribute
+        - Get-ADDBServiceAccount
+        - Get-ADDefaultPasswordPolicy
+        - Get-ADKeyCredential
+        - Get-ADPasswordPolicy
+        - Get-ADReplAccount
+        - Get-ADReplBackupKey
+        - Get-ADReplicationAccount
+        - Get-ADSIAccount
+        - Get-AzureADUserEx
+        - Get-BootKey
+        - Get-KeyCredential
+        - Get-LsaBackupKey
+        - Get-LsaPolicy
+        - Get-SamPasswordPolicy
+        - Get-SysKey
+        - Get-SystemKey
+        - New-ADDBRestoreFromMediaScript
+        - New-ADKeyCredential
+        - New-ADNgcKey
+        - New-NTHashSet
+        - Remove-ADDBObject
+        - Save-DPAPIBlob
+        - Set-ADAccountPasswordHash
+        - Set-ADDBAccountPassword
+        - Set-ADDBBootKey
+        - Set-ADDBDomainController
+        - Set-ADDBPrimaryGroup
+        - Set-ADDBSysKey
+        - Set-AzureADUserEx
+        - Set-LsaPolicy
+        - Set-SamAccountPasswordHash
+        - Set-WinUserPasswordHash
+        - Test-ADDBPasswordQuality
+        - Test-ADPasswordQuality
+        - Test-ADReplPasswordQuality
+        - Test-PasswordQuality
+        - Unlock-ADDBAccount
+        - Write-ADNgcKey
+        - Write-ADReplNgcKey
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:powershell.encoded_command_decode
+  question: Was the command encoded or obfuscated? What does it decode to?
+  context: DSInternals cmdlet names can be hidden behind base64 -EncodedCommand payloads, backtick escaping, string
+    concatenation, or variable substitution to evade name-based detection. If the alerting command line carries an
+    encoded blob, decode it to confirm which cmdlet ran and what target, key, or hash material it handled.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:cue_process_tool.process_chain
+  question: What process spawned this PowerShell session and is that parent chain expected?
+  context: The parent process reveals how the cmdlet was invoked. Interactive administration from explorer.exe or
+    a console is consistent with routine directory work; parents such as Office applications, mshta.exe, wscript.exe,
+    or a remote-execution service point toward macro-driven or hands-on-keyboard intrusion. Walk up the tree to see
+    what spawned the parent if the immediate parent is itself a shell.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.baseline
+  question: Has this host run DSInternals cmdlets before?
+  context: A host that has never executed DSInternals cmdlets is more suspicious than one where directory auditing
+    or recovery runs on a schedule. Zero or very low historical counts indicate first-time or rare execution of the
+    module on this host.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains:
+        - Get-ADReplAccount
+        - Get-ADReplBackupKey
+        - Get-ADDBAccount
+        - Get-ADDBBackupKey
+        - Save-DPAPIBlob
+        - Set-SamAccountPasswordHash
+        - Set-ADDBAccountPassword
+        - Add-ADDBSidHistory
+        - Test-PasswordQuality
+        - ConvertTo-NTHash
+      condition: selection
+    fields:
+      - User
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously run DSInternals cmdlets, what parents and users normally drive that activity,
+    and does the current alert fit that pattern?
+  context: Even sanctioned directory tooling has a normal shape. The query mirrors the rule's cmdlet selection scoped
+    to this host, so the parent and user distribution reflects how DSInternals has historically run here rather than
+    generic PowerShell usage. A new parent process, an unexpected account, or an unusual command-line shape is the
+    deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection:
+        CommandLine|contains:
+        - Add-ADDBSidHistory
+        - Add-ADNgcKey
+        - Add-ADReplNgcKey
+        - ConvertFrom-ADManagedPasswordBlob
+        - ConvertFrom-GPPrefPassword
+        - ConvertFrom-ManagedPasswordBlob
+        - ConvertFrom-UnattendXmlPassword
+        - ConvertFrom-UnicodePassword
+        - ConvertTo-AADHash
+        - ConvertTo-GPPrefPassword
+        - ConvertTo-KerberosKey
+        - ConvertTo-LMHash
+        - ConvertTo-MsoPasswordHash
+        - ConvertTo-NTHash
+        - ConvertTo-OrgIdHash
+        - ConvertTo-UnicodePassword
+        - Disable-ADDBAccount
+        - Enable-ADDBAccount
+        - Get-ADDBAccount
+        - Get-ADDBBackupKey
+        - Get-ADDBDomainController
+        - Get-ADDBGroupManagedServiceAccount
+        - Get-ADDBKdsRootKey
+        - Get-ADDBSchemaAttribute
+        - Get-ADDBServiceAccount
+        - Get-ADDefaultPasswordPolicy
+        - Get-ADKeyCredential
+        - Get-ADPasswordPolicy
+        - Get-ADReplAccount
+        - Get-ADReplBackupKey
+        - Get-ADReplicationAccount
+        - Get-ADSIAccount
+        - Get-AzureADUserEx
+        - Get-BootKey
+        - Get-KeyCredential
+        - Get-LsaBackupKey
+        - Get-LsaPolicy
+        - Get-SamPasswordPolicy
+        - Get-SysKey
+        - Get-SystemKey
+        - New-ADDBRestoreFromMediaScript
+        - New-ADKeyCredential
+        - New-ADNgcKey
+        - New-NTHashSet
+        - Remove-ADDBObject
+        - Save-DPAPIBlob
+        - Set-ADAccountPasswordHash
+        - Set-ADDBAccountPassword
+        - Set-ADDBBootKey
+        - Set-ADDBDomainController
+        - Set-ADDBPrimaryGroup
+        - Set-ADDBSysKey
+        - Set-AzureADUserEx
+        - Set-LsaPolicy
+        - Set-SamAccountPasswordHash
+        - Set-WinUserPasswordHash
+        - Test-ADDBPasswordQuality
+        - Test-ADPasswordQuality
+        - Test-ADReplPasswordQuality
+        - Test-PasswordQuality
+        - Unlock-ADDBAccount
+        - Write-ADNgcKey
+        - Write-ADReplNgcKey
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.follow_on
+  question: What child processes did this PowerShell session spawn afterward?
+  context: The processes spawned after the cmdlet ran reveal its actual impact. Follow-on cmd.exe, powershell.exe,
+    certutil.exe, or archive utilities can indicate staging of dumped credential material, transfer of an extracted
+    ntds.dit, or escalation steps that build on the directory access just obtained.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.scope
+  question: Have other hosts run DSInternals cmdlets in the past week, and does the cross-host distribution look
+    like consistent automation or one-off activity?
+  context: The query mirrors the rule's cmdlet selection with no host scope, so the result is a fleet-wide count
+    of DSInternals usage rather than generic PowerShell footprint. Many hosts running the same cmdlets points to a
+    scheduled audit or recovery rollout; one host or a small unrelated set points to manual operator activity worth
+    closer review.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection:
+        CommandLine|contains:
+        - Add-ADDBSidHistory
+        - Add-ADNgcKey
+        - Add-ADReplNgcKey
+        - ConvertFrom-ADManagedPasswordBlob
+        - ConvertFrom-GPPrefPassword
+        - ConvertFrom-ManagedPasswordBlob
+        - ConvertFrom-UnattendXmlPassword
+        - ConvertFrom-UnicodePassword
+        - ConvertTo-AADHash
+        - ConvertTo-GPPrefPassword
+        - ConvertTo-KerberosKey
+        - ConvertTo-LMHash
+        - ConvertTo-MsoPasswordHash
+        - ConvertTo-NTHash
+        - ConvertTo-OrgIdHash
+        - ConvertTo-UnicodePassword
+        - Disable-ADDBAccount
+        - Enable-ADDBAccount
+        - Get-ADDBAccount
+        - Get-ADDBBackupKey
+        - Get-ADDBDomainController
+        - Get-ADDBGroupManagedServiceAccount
+        - Get-ADDBKdsRootKey
+        - Get-ADDBSchemaAttribute
+        - Get-ADDBServiceAccount
+        - Get-ADDefaultPasswordPolicy
+        - Get-ADKeyCredential
+        - Get-ADPasswordPolicy
+        - Get-ADReplAccount
+        - Get-ADReplBackupKey
+        - Get-ADReplicationAccount
+        - Get-ADSIAccount
+        - Get-AzureADUserEx
+        - Get-BootKey
+        - Get-KeyCredential
+        - Get-LsaBackupKey
+        - Get-LsaPolicy
+        - Get-SamPasswordPolicy
+        - Get-SysKey
+        - Get-SystemKey
+        - New-ADDBRestoreFromMediaScript
+        - New-ADKeyCredential
+        - New-ADNgcKey
+        - New-NTHashSet
+        - Remove-ADDBObject
+        - Save-DPAPIBlob
+        - Set-ADAccountPasswordHash
+        - Set-ADDBAccountPassword
+        - Set-ADDBBootKey
+        - Set-ADDBDomainController
+        - Set-ADDBPrimaryGroup
+        - Set-ADDBSysKey
+        - Set-AzureADUserEx
+        - Set-LsaPolicy
+        - Set-SamAccountPasswordHash
+        - Set-WinUserPasswordHash
+        - Test-ADDBPasswordQuality
+        - Test-ADPasswordQuality
+        - Test-ADReplPasswordQuality
+        - Test-PasswordQuality
+        - Unlock-ADDBAccount
+        - Write-ADNgcKey
+        - Write-ADReplNgcKey
+      condition: selection
+    fields:
+    - host.name
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run DSInternals cmdlets?
+  context: Compare this user's current action against their historical behavior. A user who has never run DSInternals
+    cmdlets is more suspicious than an identity administrator who runs scheduled password-quality audits or recovery
+    tasks. The user's role should align with directory-internals access.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        CommandLine|contains:
+        - Get-ADReplAccount
+        - Get-ADReplBackupKey
+        - Get-ADDBAccount
+        - Get-ADDBBackupKey
+        - Save-DPAPIBlob
+        - Set-SamAccountPasswordHash
+        - Set-ADDBAccountPassword
+        - Add-ADDBSidHistory
+        - Test-PasswordQuality
+        - ConvertTo-NTHash
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent and PowerShell combination historically routine on this host or across the environment,
+    or is the parent unusual?
+  context: When the alert fires under a service principal, user identity does not attribute the behavior. The
+    meaningful pivot is the launch mechanism — which parent process spawned this PowerShell session, and whether
+    that pair is historically common. A new or rare parent for PowerShell on this host or environment-wide is the
+    deviation worth chasing; a pair that already accounts for thousands of prior events is scheduled or vendor
+    automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or directory operations spanning
+    multiple endpoints. If the same user touched multiple domain controllers or admin hosts in the same window, the
+    scope of the directory activity may be larger than the single alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent and PowerShell combination fire on other hosts in the same window, indicating a
+    coordinated automation rollout rather than isolated activity?
+  context: Under a service principal, asking what else the user did across the network returns agent-telemetry noise.
+    The meaningful question is whether the same launch mechanism — parent process plus PowerShell — fired on other
+    hosts in the alert window. Multiple hosts in the same window points to scheduled or pushed automation; a single
+    host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining activity around the alert reveals the immediate context —
+    what led to the cmdlet execution and what followed. Look for reconnaissance, privilege escalation, credential
+    access, or staging that surrounds the directory operation.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host — defense tampering, reconnaissance, credential access, or privilege
+    escalation — may reveal the attack stages that preceded the directory operation and help reconstruct the full
+    timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:powershell.script_block_logging
+  question: Did PowerShell script block logging capture the full script content?
+  context: Script block logging records the deobfuscated script content PowerShell actually executed, even when the
+    command line is encoded or obfuscated. This provides ground truth about which DSInternals cmdlets ran and their
+    arguments. If PowerShell operational logs are not ingested in this environment, treat zero results as a
+    visibility gap rather than evidence nothing ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- source: template:powershell.powershell_security_bypass
+  question: Were PowerShell security controls bypassed or weakened before this execution?
+  context: Operators frequently disable or bypass PowerShell security controls before running credential or directory
+    tooling. Common precursors include AMSI bypass (patching amsi.dll in memory), execution policy changes, constrained
+    language mode escape, and PowerShell v2 downgrade attacks that strip logging. Finding these precursor events on the
+    host strengthens the case for malicious activity.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in the hour before the alert?
+  context: Tampering typically precedes hands-on credential access. The query surfaces direct attempts to disable
+    AV/EDR services, flip Defender flags, add broad exclusions, clear logs, or patch AMSI/ETW. Zero rows is a useful
+    signal that protection looks healthy, though kernel-level driver tampering and in-memory patches will not appear
+    here. Populated rows shift the disposition toward operator preparation; review the parent process and signing
+    chain to identify the writer.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1059.001
+      name: PowerShell
+      role: primary
+    - id: T1059
+      name: Command and Scripting Interpreter
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: powershell_invocation
+      description: PowerShell is launched (directly or via .NET automation) to run a DSInternals cmdlet
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: command_decode
+      description: The cmdlet and its arguments are parsed; encoded/obfuscated payloads are decoded
+      mapped_to: Q3
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 3
+      label: parent_context
+      description: Unusual parent process spawning PowerShell is assessed
+      mapped_to: Q5
+      source: template:cue_process_tool.process_chain
+    - stage: 4
+      label: follow_on_execution
+      description: Child processes / secondary execution events following the cmdlet
+      mapped_to: Q8
+      source: template:cue_process_tool.follow_on
+  dimension_coverage:
+    - dimension: command_analysis
+      technique: T1059.001
+      covered_by: Q3
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1059.001
+      covered_by: Q5
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1059.001
+      covered_by: Q13
+      source: template:cue_host_context.clustering
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1059.001
+      covered_by: Q15
+      source: template:powershell.script_block_logging
+      coverage_type: partial
+    - dimension: user_context
+      technique: T1059
+      covered_by: Q2
+      source: template:universal.host_user_context
+      coverage_type: direct
+  mutable_dispositions:
+    - element: CommandLinePattern
+      dimension: command_analysis
+      specific_values: "-enc, -nop (encoded/obfuscated PowerShell argument patterns)"
+      disposition: query_injection
+      target_question: Q4
+      notes: "Encoded/obfuscated command decoding handled by powershell.encoded_command_decode; DSInternals cmdlet
+        pattern itself injected into mechanism_decode/baseline/scope CommandLine|contains selections."
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "abnormal parents (Excel, WinWord, mshta) spawning PowerShell"
+      disposition: context
+      target_question: Q5
+      notes: "Parent legitimacy assessed via process_chain ParentProcessGuid lookup; abnormal-parent examples named
+        in context rather than hard-coded into a selection."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "off-hours / non-maintenance windows (rationale only)"
+      disposition: context
+      target_question: Q13
+      notes: "No fixed values to query; clustering and precursor questions surface surrounding-window activity."
+    - element: LoadedModuleList
+      dimension: tuning_parameter
+      specific_values: "rare/never-before-seen .NET assemblies (rationale only)"
+      disposition: context
+      target_question: Q15
+      notes: "image_load assembly tracking declined (see hint_dispositions); script-block logging provides the
+        deobfuscated-content tuning surface instead."
+    - element: ScriptBlockLengthThreshold
+      dimension: tuning_parameter
+      specific_values: "Event ID 4104 script block length (rationale only)"
+      disposition: context
+      target_question: Q15
+      notes: "Script block logging question retrieves 4104 ScriptBlockText; threshold is a tuning rationale, not a
+        queryable value."
+  dedup_decisions:
+    - dropped: cue_process_tool.clustering
+      reason: "host-scoped 'what else ran on this host around the same time' aggregated by Image overlaps
+        cue_host_context.clustering; kept the host_context version"
+      kept: cue_host_context.clustering
+    - dropped: null
+      reason: "user_actor user-pivot and service-principal substitute pairs (baseline/baseline_svc and
+        clustering/clustering_svc) emitted as separate questions — non-deduplicable per AGENTS.md"
+      kept: cue_user_actor.baseline + cue_user_actor.baseline_svc + cue_user_actor.clustering + cue_user_actor.clustering_svc
+  skipped_templates: []
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "logsource 'image_load' (recommended by techniques: T1059.001) is not covered — pull in cue_image_load.* or author a custom question with `category: image_load`"
+      disposition: declined
+      reason: >-
+        The rule fires purely on DSInternals cmdlet names appearing in the command line, and DSInternals is a
+        managed PowerShell module whose abuse is fully described by which cmdlet ran and against what target —
+        evidence carried by process_creation command lines and 4104 script-block content. An image_load sweep of
+        amsi.dll / .NET assemblies on the launching process returns volume without isolating the cmdlet-level
+        action this rule detects, and the LoadedModuleList tuning angle is already addressed by the script-block
+        logging question (Q15) which surfaces the deobfuscated assembly/cmdlet content directly. No compensating
+        attack:T1059.001.image_load question authored.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - powershell
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 18
+      attack: 0
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 2
+      context: 14
+    logsource_diversity:
+      process_creation: 16
+      powershell: 1
+      sigma_alert: 1

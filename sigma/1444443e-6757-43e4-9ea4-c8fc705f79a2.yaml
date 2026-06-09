@@ -1,0 +1,490 @@
+name: Boot Configuration Tampering Via Bcdedit.EXE
+id: 4b7f6fa0-7153-4007-955b-3ff195ea3119
+description: |
+  Detects bcdedit.exe being used to modify boot configuration data in a way that suppresses
+  Windows automatic recovery — fires when the command line contains 'set' AND either
+  'bootstatuspolicy ignoreallfailures' or 'recoveryenabled no'. These flags stop Windows
+  from offering the recovery environment or repair prompts after repeated boot failures.
+  Legitimate use is rare (some imaging or kiosk-build scripts), but the same change is a
+  common pre-encryption step for ransomware to keep a victim from booting into recovery.
+  Determine who ran it, what spawned bcdedit, whether other recovery-inhibiting or destructive
+  actions accompanied it, and whether the same pattern is firing on other hosts.
+type: detection
+detection_id: 1444443e-6757-43e4-9ea4-c8fc705f79a2
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the bcdedit command line match what this rule detects — 'set' plus 'bootstatuspolicy ignoreallfailures' or 'recoveryenabled no'?
+  context: Before investing investigation time, confirm the alert is a true positive. The rule fires only when bcdedit.exe (by image name or original filename) is invoked with 'set' AND one of the two recovery-suppressing argument pairs. Read the full command line and confirm both halves are present rather than an unrelated bcdedit query or enumeration.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to modify boot configuration data with bcdedit?
+  context: Boot configuration changes are normally made during OS imaging, repair, or by a small set of administrators. A workstation or server outside a build/imaging context, or a user with no administrative role, running bcdedit to disable recovery is unusual and shifts the disposition toward malicious or scripted impact.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:defense_tampering.what_was_disabled
+  question: Which recovery setting did bcdedit change — was automatic recovery (recoveryenabled No) or the boot status policy (bootstatuspolicy ignoreallfailures) the target?
+  context: The two argument pairs have distinct effects. 'recoveryenabled No' disables the Windows Recovery Environment so the machine will not boot into repair. 'bootstatuspolicy ignoreallfailures' tells Windows to ignore boot failures and skip the recovery prompt. Read the exact flags to determine which protection was removed and how completely recovery was suppressed.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:ransomware_impact.recovery_options_assessment
+  question: What recovery-inhibiting commands were executed on this host?
+  context: 'Operators preparing for encryption typically chain several recovery-inhibiting commands: deleting shadow copies (vssadmin, wmic), disabling boot recovery (bcdedit), deleting backups (wbadmin), and disabling the Recovery Environment (reagentc). This query surfaces all such commands on the host so the full scope of recovery destruction is visible. Verify whether each action succeeded by checking system state (vssadmin list shadows, bcdedit /enum, reagentc /info).'
+  range: +24h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_recovery:
+        Image|endswith:
+          - '\vssadmin.exe'
+          - '\wmic.exe'
+          - '\bcdedit.exe'
+          - '\wbadmin.exe'
+          - '\reagentc.exe'
+          - '\diskshadow.exe'
+      selection_cmdline:
+        CommandLine|contains:
+          - 'delete shadows'
+          - 'shadowcopy delete'
+          - 'recoveryenabled'
+          - 'bootstatuspolicy'
+          - 'delete catalog'
+          - 'delete systemstatebackup'
+          - 'boot.ini'
+          - 'winre.wim'
+          - '/disable'
+      condition: selection and (selection_recovery or selection_cmdline)
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.process_chain
+  question: What process spawned bcdedit.exe, and is that parent chain expected?
+  context: The parent process reveals how bcdedit was invoked. Administrative or imaging use generally launches it from an interactive shell or a known deployment agent. A parent such as a scripting host, an Office application, or an unknown binary dropped from a user-writable path points to scripted impact rather than maintenance. Walk up the tree to see what spawned the parent and what else the parent launched.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired this bcdedit recovery-tampering pattern, what parents and users normally drive it, and does the current alert fit?
+  context: Even legitimate imaging hosts may run bcdedit recovery changes on a schedule. The query mirrors the rule's selection scoped to this host, so the resulting parent/user distribution reflects how this specific recovery-suppression pattern has run here before. A new parent process, an unexpected user account, or a first-ever occurrence is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \bcdedit.exe
+      - OriginalFileName: bcdedit.exe
+      selection_set:
+        CommandLine|contains: set
+      selection_cli:
+      - CommandLine|contains|all:
+        - bootstatuspolicy
+        - ignoreallfailures
+      - CommandLine|contains|all:
+        - recoveryenabled
+        - 'no'
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.follow_on
+  question: What child processes did bcdedit.exe spawn afterward?
+  context: bcdedit itself does not normally launch other processes, so any children are notable. Children such as cmd.exe, powershell.exe, or an unknown executable suggest the bcdedit call was one step in a scripted sequence rather than a standalone administrative action.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:defense_tampering.protection_status
+  question: Is automatic recovery currently restored, or is the host still configured to skip recovery?
+  context: The bcdedit change persists until explicitly reverted. Checking the current boot configuration state shows whether the host remains unable to enter recovery. If recoveryenabled is still No or the boot status policy still ignores all failures, the setting should be restored before the host is returned to service.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:defense_tampering.activity_after_tampering
+  question: What activity occurred on this host after the boot recovery setting was disabled?
+  context: Disabling recovery is typically a precursor to a destructive action it is meant to make irreversible. Examining process creation in the window immediately after the bcdedit change reveals what the tampering was meant to enable — encryption, mass file operations, or further recovery destruction. A burst of unfamiliar processes shortly after points to the payload phase.
+  range: +1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - User
+- source: template:ransomware_impact.encryption_or_ransom_indicators
+  question: Are there signs of file encryption, ransom notes, or unknown binary execution on this host after the bcdedit change?
+  context: Recovery-inhibiting actions usually precede file encryption by minutes. This query surfaces processes running from outside standard system locations after the bcdedit call — the kind of unknown binary an encryption stage uses. Also check for ransom notes (README.txt, HOW_TO_DECRYPT) and mass file renames via file event monitoring to determine whether encryption has started.
+  range: +30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      filter_known:
+        Image|startswith:
+          - 'C:\Program Files'
+          - 'C:\Windows\System32\svchost'
+          - 'C:\Windows\System32\wbem'
+      condition: selection and not filter_known
+    fields:
+      - Image
+      - CommandLine
+      - CurrentDirectory
+- source: template:ransomware_impact.network_wide_impact
+  question: Is this same boot-tampering alert firing on other hosts in the environment?
+  context: Impact operations often run the same recovery-suppression command across many hosts in rapid succession. Correlating this rule's firings across the fleet shows whether the activity is isolated or network-wide, which determines containment scope. Multiple hosts firing the same pattern in a short window points to scripted or pushed execution.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        rule.uuid|expand: '%rule.uuid%'
+      condition: selection
+    fields:
+      - host.name
+      - rule.name
+      - event.severity_label
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired this bcdedit recovery-tampering pattern in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: The query mirrors the rule's selection with no host scope, giving a fleet-wide count of this specific recovery-suppression pattern rather than generic bcdedit usage. Many hosts firing the identical pattern points to scripted deployment or imaging automation; one host or a small unrelated set points to manual operator activity. Use the host distribution to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \bcdedit.exe
+      - OriginalFileName: bcdedit.exe
+      selection_set:
+        CommandLine|contains: set
+      selection_cli:
+      - CommandLine|contains|all:
+        - bootstatuspolicy
+        - ignoreallfailures
+      - CommandLine|contains|all:
+        - recoveryenabled
+        - 'no'
+      condition: all of selection_*
+    fields:
+    - host.name
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run bcdedit or other boot/recovery administration?
+  context: Compare this user's current action against their historical pattern across the environment. A user who has never run bcdedit is more suspicious than an administrator who does so during routine imaging. Zero or very low historical counts indicate first-time use; align the result with the user's expected role.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent+binary combination historically routine on this host or environment-wide, or is the parent unusual for bcdedit?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior. The meaningful pivot is the launch mechanism: which parent process spawned bcdedit, and whether that pair is historically common. A new or rare parent for bcdedit on this host (or environment-wide) is the deviation worth chasing; a pair already responsible for thousands of prior events is imaging or OS automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals whether this is isolated or part of a wider push. The same user driving recovery-tampering or other destructive commands on multiple endpoints in the same window enlarges the scope of the incident.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent+binary combination fire on other hosts in the same window — a coordinated rollout, or isolated to this host?
+  context: Under a service principal, asking what else the user did across the network returns agent-telemetry noise, because every host runs SYSTEM-owned agents constantly. The meaningful question is whether the same launch mechanism — parent process plus bcdedit — fired on other hosts in the alert window. Multiple hosts points to scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:persistence_scope.process_based_persistence
+  question: Were other process-based persistence mechanisms installed on this host?
+  context: Defense and recovery tampering frequently accompanies persistence stacking. After suppressing recovery, operators commonly install backup footholds using scheduled tasks, services, registry Run keys, or BITS jobs. Multiple persistence installations in the same timeframe indicate intentional stacking rather than isolated boot-configuration maintenance.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1490
+      name: Inhibit System Recovery
+      role: primary
+  attack_chain_coverage:
+    - stage: 1
+      label: native_recovery_inhibit_command
+      description: "Native utility (bcdedit) run with arguments that disable recovery / ignore boot failures"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: recovery_target_decode
+      description: "Identify which recovery feature was disabled (recoveryenabled vs bootstatuspolicy)"
+      mapped_to: Q3
+      source: template:defense_tampering.what_was_disabled
+    - stage: 3
+      label: full_recovery_destruction_scope
+      description: "Other recovery-inhibiting commands (vssadmin, wbadmin, reagentc, diskshadow) chained on the host"
+      mapped_to: Q4
+      source: template:ransomware_impact.recovery_options_assessment
+    - stage: 4
+      label: post_inhibit_payload
+      description: "Activity after recovery suppression — encryption / destructive payload the tampering enables"
+      mapped_to: Q10
+      source: template:ransomware_impact.encryption_or_ransom_indicators
+  dimension_coverage:
+    - dimension: command_analysis
+      technique: T1490
+      covered_by: Q3
+      source: template:defense_tampering.what_was_disabled
+      coverage_type: direct
+    - dimension: network_indicators
+      technique: T1490
+      covered_by: Q11
+      source: template:ransomware_impact.network_wide_impact
+      coverage_type: partial
+    - dimension: time_correlation
+      technique: T1490
+      covered_by: Q9
+      source: template:defense_tampering.activity_after_tampering
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1490
+      covered_by: Q5
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+  mutable_dispositions:
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q9
+      notes: "Rapid-change tracking is a tuning rationale, not a queryable value; reflected via the forward post-tampering window and the +24h recovery-options sweep."
+    - element: CommandLinePattern
+      dimension: command_analysis
+      specific_values: "/all, /quiet, -delete (variation examples)"
+      disposition: context
+      target_question: Q3
+      notes: "Listed values are tuning examples for the broader T1490 family, not flags this bcdedit rule fires on; the rule's actual flags (recoveryenabled No, bootstatuspolicy ignoreallfailures) are decoded in the what_was_disabled question."
+    - element: ParentProcessContext
+      dimension: tuning_parameter
+      specific_values: "rationale only (e.g., powershell -> diskshadow)"
+      disposition: query_injection
+      target_question: Q5
+      notes: "Parent-child chain analysis driven by process_chain question (ParentProcessGuid lookup) plus the baseline_deviation parent/user distribution."
+  dedup_decisions:
+    - dropped: cue_process_tool.baseline
+      reason: "Generic -90d host frequency of bcdedit subsumed by cue_process_tool.baseline_deviation, which scopes to the rule's specific recovery-tampering pattern on this host."
+      kept: cue_process_tool.baseline_deviation
+    - dropped: ransomware_impact.destruction_scope_on_host
+      reason: "Broad destructive-tool sweep on host overlaps recovery_options_assessment; the recovery-specific sweep is more on-point for a bcdedit recovery-disable rule."
+      kept: ransomware_impact.recovery_options_assessment
+    - dropped: defense_tampering.other_tampering_activity
+      reason: "Other-tamper-on-host coverage overlaps recovery_options_assessment and process_based_persistence; both more specific to this impact/persistence context."
+      kept: ransomware_impact.recovery_options_assessment
+    - dropped: network_scope.same_action_other_hosts
+      reason: "Generic Image-only fleet count subsumed by cue_process_tool.scope, which enforces the rule's full selection pattern across hosts."
+      kept: cue_process_tool.scope
+    - dropped: network_scope.actor_activity_network_wide
+      reason: "User-across-network coverage duplicated by cue_user_actor.clustering."
+      kept: cue_user_actor.clustering
+    - dropped: cue_process_tool.clustering
+      reason: "Same-time tool clustering on host duplicates cue_host_context.clustering's host-wide activity view; neither retained to stay within the question budget — clustering need met by user-actor clustering pair."
+      kept: cue_user_actor.clustering
+    - dropped: none
+      reason: "user_actor pair — non-deduplicable: emitted BOTH cue_user_actor.baseline (user pivot) AND cue_user_actor.baseline_svc (parent+binary substitute)"
+      kept: cue_user_actor.baseline + cue_user_actor.baseline_svc
+    - dropped: none
+      reason: "user_actor pair — non-deduplicable: emitted BOTH cue_user_actor.clustering (user pivot) AND cue_user_actor.clustering_svc (parent+binary substitute)"
+      kept: cue_user_actor.clustering + cue_user_actor.clustering_svc
+  skipped_templates:
+    - template: cue_process_tool.mechanism_decode
+      reason: "replaced_by: defense_tampering.what_was_disabled"
+    - template: cue_host_context.clustering
+      reason: "Host-wide same-time activity view not needed alongside the recovery-options sweep, post-tampering activity, and user-actor clustering pair; dropped to stay within the 18-question cap."
+    - template: cue_host_context.precursor
+      reason: "Prior-alert host timeline largely covered by network_wide_impact (cross-host firings) and the recovery/destruction sweeps; dropped to stay within the question budget."
+    - template: universal.endpoint_protection_health
+      reason: "defense_tampering technique set is confirmed for this rule; its what_was_disabled / activity_after_tampering questions are more specific than the generic host-tamper sweep (per template notes_to_llm drop condition a)."
+    - template: defense_tampering.protection_status
+      reason: ""
+    - template: network_scope.actor_authentication_trail
+      reason: "Security-log auth trail is a lateral-movement angle weakly relevant to a local boot-configuration impact action; dropped to stay within the question budget."
+    - template: persistence_scope.file_based_persistence
+      reason: "One persistence-scope question (process_based_persistence) honors the defense_tampering -> persistence_scope cascade; the file_event variant added without a strong file-drop signal in this impact rule, dropped to stay within the cap."
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "logsource 'registry_set' (recommended by techniques: T1490) is not covered — pull in cue_registry_key.* or author a custom question with `category: registry_set`"
+      disposition: declined
+      reason: >-
+        This rule's detection is locked to bcdedit.exe process_creation with
+        specific command-line argument pairs (recoveryenabled no /
+        bootstatuspolicy ignoreallfailures). The registry_set recovery path
+        T1490 references (RecoveryDisabled / REAgentC-set keys) is a parallel
+        technique the rule does not fire on; adding a registry_set query would
+        investigate a different recovery-disable mechanism than the one that
+        triggered this alert. The recovery-suppression actually performed is
+        decoded by the what_was_disabled question and the recovery_options_assessment
+        sweep covers cross-tool recovery destruction. No compensating
+        attack:T1490.registry_set question authored.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - defense_tampering
+    - ransomware_impact
+    - persistence_scope
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 17
+      attack: 0
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 14
+    logsource_diversity:
+      process_creation: 16
+      sigma_alert: 1

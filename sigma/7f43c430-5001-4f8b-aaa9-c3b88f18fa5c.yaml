@@ -1,0 +1,468 @@
+name: Execute From Alternate Data Streams
+id: 6922c83a-a19a-45e0-bb63-db34e84e37d1
+description: |
+  Detects command lines that reference an NTFS Alternate Data Stream (ADS) using colon syntax (txt:) together with a
+  staging or extraction utility — type with redirection, makecab, reg export, regedit /E, or esentutl with /y /d /o. The
+  rule fires when the ADS-stream pattern matches AND any one of those tool patterns matches, so the alert reflects data
+  being written into or read out of a hidden stream rather than a normal file. Legitimately this is rare; ADS is used by
+  some installers and a few utilities, but operators use it to hide payloads and exfiltration staging from tools that only
+  inspect the visible file body. Determine which utility branch fired, decode what data moved into or out of the stream,
+  and confirm whether the host and user routinely perform this kind of operation.
+type: detection
+detection_id: 7f43c430-5001-4f8b-aaa9-c3b88f18fa5c
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line reference an ADS stream and use one of the staging utilities this rule watches for?
+  context: Confirm the alert is a true positive by reviewing the exact command line. The rule fires when a colon-stream
+    reference (txt:) appears together with EITHER a type redirection (type ... > ...), OR makecab writing a .cab, OR reg
+    export, OR regedit /E, OR esentutl with /y /d /o. Note which utility branch fired — that branch determines which
+    decode and follow-on questions carry the most weight.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to write into or read from NTFS alternate data streams?
+  context: Legitimate ADS usage is uncommon outside a few installers and admin utilities. Knowing whether the user role and
+    host function involve packaging, registry export, or database utilities is often the fastest way to separate a routine
+    administrative task from data being deliberately hidden in a stream.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What data was moved into or out of the alternate data stream, and which file and stream were named?
+  context: The full command line reveals the operation. Identify the host file the colon-stream attaches to (file.ext:stream),
+    the direction of the transfer (write into the stream vs. read it back out), and which utility carried it. type with
+    redirection and esentutl /y read or copy a stream; makecab and reg/regedit export stage content that can be redirected
+    into one. Decode any paths so you know what was hidden and where.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_pattern:
+        CommandLine|contains: 'txt:'
+      condition: selection_host and selection_pattern
+    fields:
+      - CommandLine
+      - CurrentDirectory
+      - Image
+- source: template:cue_process_tool.process_chain
+  question: What process spawned this command and is that parent chain expected?
+  context: The parent process reveals how the ADS operation was invoked. A command interpreter launched by explorer.exe for
+    an interactive admin task reads differently from one spawned by a script host, an Office application, or a remote-execution
+    service, which point to scripted or operator-driven staging.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: attack:T1564.004.stream_creation
+  question: Was an alternate data stream actually created on this host around the alert time?
+  context: Process command lines show intent to use a stream; the stream-creation event confirms one was written. Correlating
+    a created stream with the alerting command line strengthens the case that data was hidden rather than the colon syntax
+    appearing incidentally. Absence of a matching stream-creation event suggests the command may not have produced a stream.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: create_stream_hash
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - Contents
+- source: attack:T1564.004.file_artifact
+  question: What files were written on this host around the alert time that could be the stream's host file or staged output?
+  context: makecab, reg export, regedit /E, and type redirection all produce a file or stream artifact. Reviewing file
+    creations in the same window helps locate the .cab, .reg, or stream-bearing file the command produced and shows where it
+    landed (user-writable temp paths versus normal application directories).
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - User
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host previously fired this ADS-plus-utility pattern, what parents and users drove it, and does the
+    current alert fit that pattern?
+  context: Even common utilities can be abused. This query mirrors the rule's selection structure scoped to this host, so the
+    resulting parent/user distribution reflects how this specific firing pattern has historically run here. A new parent
+    process, an unexpected user, or an unusual command shape is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_stream:
+        CommandLine|contains: 'txt:'
+      selection_tools_type:
+        CommandLine|contains|all:
+        - 'type '
+        - ' > '
+      selection_tools_makecab:
+        CommandLine|contains|all:
+        - 'makecab '
+        - .cab
+      selection_tools_reg:
+        CommandLine|contains|all:
+        - 'reg '
+        - ' export '
+      selection_tools_regedit:
+        CommandLine|contains|all:
+        - 'regedit '
+        - ' /E '
+      selection_tools_esentutl:
+        CommandLine|contains|all:
+        - 'esentutl '
+        - ' /y '
+        - ' /d '
+        - ' /o '
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection_stream and (1 of selection_tools_*)) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.follow_on
+  question: What child processes did this command spawn afterward?
+  context: The processes spawned after the ADS operation reveal its actual impact. Staging data into a stream is often
+    followed by execution of the hidden content or by further packaging and exfiltration utilities; unexpected children
+    such as script hosts or download tools point to post-staging activity.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run command-line staging or extraction utilities?
+  context: Compare this user's current action against their historical behavior. A user who has never invoked these
+    packaging, registry-export, or database utilities is more notable than one who does so regularly as part of their role.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent and binary combination historically routine on this host or across the environment, or is the
+    parent unusual for this binary?
+  context: When the alert fires under a service principal, user identity does not attribute behavior. The meaningful pivot is
+    the launch mechanism — which parent spawned this binary, and whether that pair is historically common. A new or rare
+    parent for this binary is the deviation worth chasing; a pair already accounting for thousands of prior events is
+    automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or staging across multiple endpoints. If
+    the same user triggered similar activity elsewhere, the scope may be larger than this one host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent and binary combination fire on other hosts in the same window — is this a coordinated
+    automation rollout or isolated to this host?
+  context: Under a service principal, user-pivoted activity returns agent-telemetry noise. The meaningful question is whether
+    the same launch mechanism — parent process plus spawned binary — fired on other hosts in the alert window. Multiple
+    hosts point to scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired this ADS-plus-utility pattern in the past week, and does the cross-host distribution look
+    like consistent automation or one-off activity?
+  context: This query mirrors the rule's selection structure with no host scope, giving a fleet-wide count of this firing
+    pattern rather than generic utility usage. Many hosts firing the same pattern points to scripted deployment or vendor
+    automation; one host or a small unrelated set points to manual operator activity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_stream:
+        CommandLine|contains: 'txt:'
+      selection_tools_type:
+        CommandLine|contains|all:
+        - 'type '
+        - ' > '
+      selection_tools_makecab:
+        CommandLine|contains|all:
+        - 'makecab '
+        - .cab
+      selection_tools_reg:
+        CommandLine|contains|all:
+        - 'reg '
+        - ' export '
+      selection_tools_regedit:
+        CommandLine|contains|all:
+        - 'regedit '
+        - ' /E '
+      selection_tools_esentutl:
+        CommandLine|contains|all:
+        - 'esentutl '
+        - ' /y '
+        - ' /d '
+        - ' /o '
+      condition: selection_stream and (1 of selection_tools_*)
+    fields:
+    - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining activity around the alert reveals what led to this event and what
+    happened after. Look for reconnaissance, privilege escalation, or additional staging that provides broader context.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host — defense tampering, reconnaissance, credential access — may reveal the attack
+    stages that preceded ADS staging and help reconstruct the full timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1564.004
+      name: NTFS File Attributes
+      role: primary
+    - id: T1564
+      name: Hide Artifacts
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: stream_write_or_read
+      description: "Command-line utility writes data into or reads data out of an NTFS alternate data stream (colon syntax)"
+      mapped_to: Q3
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 2
+      label: stream_creation_artifact
+      description: "An alternate data stream is created on disk as a result of the staging operation"
+      mapped_to: Q5
+      source: attack:T1564.004.stream_creation
+    - stage: 3
+      label: file_artifact
+      description: "Supporting file artifacts (.cab, .reg, redirected output) are written that house or accompany the hidden stream"
+      mapped_to: Q6
+      source: attack:T1564.004.file_artifact
+  dimension_coverage:
+    - dimension: time_correlation
+      technique: T1564.004
+      covered_by: Q5
+      source: attack:T1564.004.stream_creation
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1564.004
+      covered_by: Q3
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: direct
+  mutable_dispositions:
+    - element: ADSPathWhitelist
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q6
+      notes: "No concrete whitelist values given; file_artifact question's context directs the analyst to distinguish user-writable temp paths from normal application directories."
+    - element: ProcessScope
+      dimension: tuning_parameter
+      specific_values: "powershell.exe, cmd.exe, wscript.exe"
+      disposition: context
+      target_question: Q4
+      notes: "Suspicious-parent guidance surfaced in process_chain context (script host / Office / remote-exec parents); rule's primary_binary is cmd.exe, so query is not narrowed to these parents to avoid missing other launchers."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only"
+      disposition: new_question
+      target_question: Q5
+      notes: "Drove the create_stream_hash question correlating stream creation with the alerting command in a +/-15m window."
+    - element: FileExtensions
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q6
+      notes: "T1564 secondary; sensitive-file-type focus reflected in file_artifact context (.cab/.reg/output)."
+    - element: ADSDetection
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q5
+      notes: "T1564 secondary; ADS-detection toggle is a deployment decision, surfaced as the stream-creation correlation question rather than a query value."
+  dedup_decisions:
+    - dropped: cue_process_tool.baseline
+      reason: "cue_process_tool.baseline_deviation (REFLECTED, rule-pattern scoped) and cue_user_actor.baseline cover historical frequency more precisely; generic Image baseline on cmd.exe is too noisy per cmd.exe hint"
+      kept: cue_process_tool.baseline_deviation
+  skipped_templates:
+    - template: universal.endpoint_protection_health
+      reason: "Rule fires on defense-evasion staging, not payload execution or credential access; cue_host_context.precursor already surfaces prior tamper alerts on the host, and the generic tamper sweep does not turn the disposition for an ADS-staging alert (notes_to_llm drop condition b)."
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "cmd.exe: too common for Image-based scoping — use CommandLine patterns for mechanism_decode"
+      disposition: acted_on
+      reason: >-
+        mechanism_decode (Q3) is scoped by host.name plus CommandLine|contains 'txt:'
+        rather than Image|endswith cmd.exe, so the result is narrowed to ADS-stream
+        commands instead of all cmd.exe executions.
+    - hint: "CommandLine-only detection — no Image field in rule. Use CommandLine pattern matching for scoping, not Image-based queries"
+      disposition: acted_on
+      reason: >-
+        Scoping queries (Q3 mechanism_decode, Q7 baseline_deviation, Q13 scope) use the
+        rule's CommandLine patterns rather than Image-based scoping. Image|endswith is
+        retained only where the rule's primary_binary (cmd.exe) is the right pivot
+        (follow_on, user baselines).
+    - hint: "logsource 'create_stream_hash' (recommended by techniques: T1564.004) is not covered and no template family exists — author a custom question with `category: create_stream_hash`"
+      disposition: acted_on
+      reason: >-
+        Authored Q5 (attack:T1564.004.stream_creation) with category: create_stream_hash,
+        correlating actual stream creation on the host with the alerting command line.
+    - hint: "logsource 'file_event' (recommended by techniques: T1564.004) is not covered — pull in cue_artifact.* or author a custom question with `category: file_event`"
+      disposition: acted_on
+      reason: >-
+        Authored Q6 (attack:T1564.004.file_artifact) with category: file_event to locate
+        the .cab/.reg/redirected-output artifacts the staging utilities produce.
+    - hint: "Condition uses OR among selection groups: (selection_tools_type OR selection_tools_makecab OR selection_tools_reg OR selection_tools_regedit OR selection_tools_esentutl). Q1 (verify_trigger_match) and the playbook description must frame this as 'EITHER ... OR ...', not 'X AND Y AND Z'. Use condition_topology.prose for an LLM-ready summary."
+      disposition: acted_on
+      reason: >-
+        Q1 and the description use disjunctive framing — colon-stream reference AND
+        EITHER type-redirection OR makecab OR reg export OR regedit /E OR esentutl
+        /y /d /o. Q1 context tells the analyst to note which utility branch fired.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+  generation_stats:
+    total_questions: 15
+    source_counts:
+      template: 13
+      attack: 2
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 12
+    logsource_diversity:
+      process_creation: 12
+      create_stream_hash: 1
+      file_event: 1
+      sigma_alert: 1

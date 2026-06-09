@@ -1,0 +1,499 @@
+name: UtilityFunctions.ps1 Proxy Dll
+id: 2d3bb564-5ee1-469d-a438-c4bc166e02ef
+description: |
+  Detects PowerShell command lines that reference the Microsoft-signed diagnostic script UtilityFunctions.ps1 or its RegSnapin helper. The rule fires when a command line contains the string 'UtilityFunctions.ps1' or 'RegSnapin '. The script is a signed living-off-the-land file: its RegSnapin function loads and executes an arbitrary managed (.NET) DLL, so an attacker can proxy execution of an unsigned payload through a Microsoft-signed parent. Legitimate use is rare outside genuine diagnostics; investigation should determine which DLL was loaded, whether it was signed and where it came from, and what the loaded code went on to do.
+type: detection
+detection_id: 0403d67d-6227-4ea8-8145-4e72db7da120
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: '2026-06-08'
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line contain 'UtilityFunctions.ps1' or 'RegSnapin ' as the rule detects?
+  context: Confirm the alert is a true positive by reviewing the exact command line of the triggering event. The rule fires on either string; note which one is present and whether the line names a DLL path or a [Class]::Method to invoke, since that distinguishes script setup from active payload proxying.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run PowerShell diagnostic scripts that load managed DLLs?
+  context: Legitimate use of UtilityFunctions.ps1 is largely confined to genuine networking diagnostics, often run by IT or support staff. A user or host with no diagnostic or administrative role invoking this script, especially RegSnapin loading a DLL from a temp or user-writable path, is harder to explain as routine.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What DLL did RegSnapin load and what method was invoked? Decode the full command line.
+  context: The full command line reveals the payload. Identify the DLL path passed to RegSnapin (relative paths like ..\..\..\temp\unsigned.dll resolve against the script's working directory), any [Namespace.Class]::Method call that runs the loaded code, and the execution-policy bypass flag. A DLL outside the Windows diagnostics tree, or one in a temp or user-writable location, is the indicator worth following.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:cue_process_tool.process_chain
+  question: What process spawned this PowerShell instance and is that parent chain expected?
+  context: The parent reveals how the script was invoked. A diagnostic run typically descends from an interactive shell or a support tool. Parents such as mshta.exe, wscript.exe, an Office application, or a browser-spawned process suggest the proxy execution was driven by a lure or an earlier stage rather than hands-on diagnostics.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired the rule's pattern, what parents and users normally drive that activity, and does the current alert fit that pattern?
+  context: The query mirrors the rule's command-line selection scoped to this host, so the parent and user distribution reflects how this specific proxy-execution pattern has run here before, not generic PowerShell usage. A new parent process, an unexpected user, or a first-ever appearance of the pattern on this host is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains:
+        - UtilityFunctions.ps1
+        - 'RegSnapin '
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.follow_on
+  question: What child processes did this PowerShell instance spawn afterward?
+  context: Proxied DLL code commonly hands off to follow-on execution. Child processes such as cmd.exe, additional powershell.exe instances, certutil.exe, rundll32.exe, or network utilities point to post-exploitation actions the loaded payload carried out. The query is scoped to children of the alerting process for precision.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired the rule's pattern in the past week, and does the cross-host distribution look like consistent automation or one-off activity?
+  context: The query mirrors the rule's command-line selection with no host scope, giving a fleet-wide count of this proxy-execution pattern rather than generic PowerShell footprint. Many hosts firing the same pattern points to scripted deployment or vendor automation; one host or a small unrelated set points to manual operator activity. Use the host spread and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains:
+        - UtilityFunctions.ps1
+        - 'RegSnapin '
+      condition: selection
+    fields:
+    - host.name
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run this proxy-execution pattern across the environment?
+  context: Compare this user's current action against their history. The query counts how often this user has run the rule's command-line pattern across all hosts. Zero or very low counts indicate the user does not normally invoke UtilityFunctions.ps1 or RegSnapin; combine with the user's role to judge whether diagnostic-script use is expected.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        CommandLine|contains:
+        - UtilityFunctions.ps1
+        - 'RegSnapin '
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent and command-line pattern historically routine on this host or across the environment, or is the parent unusual for this activity?
+  context: When the alert fires under a service principal, user identity does not attribute behavior; the meaningful pivot is the launch mechanism. The query counts the rule's command-line pattern by parent process. A new or rare parent for this pattern is the deviation worth chasing; a parent that already accounts for many prior events is more consistent with automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains:
+        - UtilityFunctions.ps1
+        - 'RegSnapin '
+      condition: selection
+    fields:
+      - host.name
+      - ParentImage
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts in the alert window reveals lateral movement or parallel activity on multiple endpoints. If the same user drove similar activity elsewhere at the same time, the scope of the incident may be larger than the single alerting host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent and command-line pattern fire on other hosts in the same window, or is the activity isolated to this host?
+  context: Under a service principal, asking what else the user did returns agent-telemetry noise. The meaningful question is whether the same launch mechanism fired elsewhere in the alert window. Multiple hosts running the rule's pattern in the same window points to scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains:
+        - UtilityFunctions.ps1
+        - 'RegSnapin '
+      condition: selection
+    fields:
+      - host.name
+      - ParentImage
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: 'Alerts rarely occur in isolation. Examining activity around the alert reveals the immediate context: what led to this event, what happened after, and whether it is part of a larger sequence. Look for reconnaissance, privilege escalation, persistence installation, or staging that surrounds the proxy execution.'
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host such as defense tampering, reconnaissance, or credential access may reveal the stages that preceded the proxy execution and help reconstruct the timeline. The alert sequence often tells the story of how the host reached this point.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in the hour before the alert?
+  context: Operators frequently weaken protection before running a payload through a signed proxy. The query surfaces direct attempts to disable AV/EDR services, flip Defender flags, add broad exclusions, clear logs, or patch AMSI/ETW. Zero rows is a useful protection-looks-healthy signal; kernel-level driver tampering and in-memory patches will not appear here. Populated rows shift the disposition toward operator preparation, so review the parent process and signing chain to identify the writer.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+- source: attack:T1216.image_load
+  question: Was an unsigned or non-Microsoft managed DLL loaded into a PowerShell process on this host around the alert time?
+  context: The proxy-execution effect of this rule is RegSnapin loading a managed DLL into the signed PowerShell process. The decisive signal is a signed-to-unsigned transition, a Microsoft-signed host loading a module whose signer is unknown, unsigned, or unrelated. Review the loaded module path and signature; a DLL from a temp or user-writable directory loaded into powershell.exe is the payload to triage. If image-load events are not collected in this environment, treat zero results as a visibility gap rather than evidence nothing loaded.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith: '\powershell.exe'
+      filter_signed:
+        Signed: 'true'
+      condition: selection and not filter_signed
+    fields:
+      - ImageLoaded
+      - Signature
+      - SignatureStatus
+      - Signed
+- source: attack:T1216.file_event
+  question: Was a DLL written to a temp or user-writable directory on this host shortly before the proxy execution?
+  context: Before RegSnapin can load a payload, the DLL is typically dropped to disk. A managed DLL written to a temp, public, or user-profile path shortly before the alert, especially one named to look benign, is the staged payload. Correlate the written file path with the DLL path decoded from the alerting command line to confirm whether the dropped file is what was loaded.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith: '.dll'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - User
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1216
+      name: System Script Proxy Execution
+      role: primary
+  attack_chain_coverage:
+    - stage: 1
+      label: signed_script_invocation
+      description: "A Microsoft-signed PowerShell diagnostic script (UtilityFunctions.ps1) is invoked, optionally with an execution-policy bypass"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: proxy_dll_load
+      description: "RegSnapin loads an arbitrary managed DLL into the signed PowerShell process (signed-to-unsigned transition)"
+      mapped_to: Q15
+      source: attack:T1216.image_load
+    - stage: 3
+      label: payload_staging
+      description: "The unsigned payload DLL is dropped to disk before being loaded"
+      mapped_to: Q16
+      source: attack:T1216.file_event
+    - stage: 4
+      label: payload_execution
+      description: "The loaded DLL's code runs (e.g. [Class]::Main()) and may spawn follow-on processes"
+      mapped_to: Q6
+      source: template:cue_process_tool.follow_on
+  dimension_coverage:
+    - dimension: parent_process_analysis
+      technique: T1216
+      covered_by: Q4
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1216
+      covered_by: Q12
+      source: template:cue_host_context.clustering
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1216
+      covered_by: Q3
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: direct
+  mutable_dispositions:
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "wscript.exe, cscript.exe, pubprn.vbs, installutil.exe (rationale only — environment-specific interpreter paths)"
+      disposition: context
+      target_question: Q4
+      notes: "process_chain question surfaces the parent via ParentProcessGuid lookup; unusual-parent rationale folded into context"
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only — time delta between signed script and child process"
+      disposition: context
+      target_question: Q6
+      notes: "follow_on (+4h) and clustering (+/-15m) windows carry the time-correlation intent"
+    - element: ChildCommandLineRegex
+      dimension: tuning_parameter
+      specific_values: "rationale only — DLL path / download-cradle / decode patterns"
+      disposition: context
+      target_question: Q3
+      notes: "mechanism_decode directs analyst to decode the RegSnapin DLL path and invoked method from the command line"
+    - element: SignedToUnsignedTransition
+      dimension: tuning_parameter
+      specific_values: "signed Microsoft parent loading unsigned/unknown child module"
+      disposition: new_question
+      target_question: Q15
+      notes: "attack:T1216.image_load question filters to unsigned modules loaded into powershell.exe (not filter_signed)"
+  dedup_decisions:
+    - dropped: cue_process_tool.clustering
+      reason: "host-scoped +/-15m process aggregation duplicates cue_host_context.clustering, which projects the broader Image+ParentImage pair on the same scope/window"
+      kept: cue_host_context.clustering
+    - dropped: cue_process_tool.baseline
+      reason: "Image-based -90d frequency count would near-duplicate the host-scoped rule-pattern count in cue_process_tool.baseline_deviation (REFLECTED), which is more specific to the rule's firing pattern; the brief hint also warns against Image-based scoping for this CommandLine-only rule"
+      kept: cue_process_tool.baseline_deviation
+    - dropped: none_user_actor_pair_baseline
+      reason: "user_actor pair — non-deduplicable"
+      kept: cue_user_actor.baseline + cue_user_actor.baseline_svc
+    - dropped: none_user_actor_pair_clustering
+      reason: "user_actor pair — non-deduplicable"
+      kept: cue_user_actor.clustering + cue_user_actor.clustering_svc
+  skipped_templates: []
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "logsource 'process_access' (recommended by techniques: T1216) is not covered and no template family exists — author a custom question with `category: process_access`"
+      disposition: declined
+      reason: >-
+        This rule's proxy mechanism is RegSnapin loading a managed DLL into the
+        SAME PowerShell process (in-process module load), not a cross-process
+        handle open. process_access (EventCode 10) detects one process opening a
+        handle into another; that is not the artifact this specific
+        UtilityFunctions.ps1 / RegSnapin pattern produces. The in-process DLL
+        load is covered directly by Q15 (attack:T1216.image_load) and the
+        on-disk payload by Q16 (attack:T1216.file_event), which together capture
+        the signed-to-unsigned transition this technique implies for this rule.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+  generation_stats:
+    total_questions: 16
+    source_counts:
+      template: 14
+      attack: 2
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 13
+    logsource_diversity:
+      process_creation: 13
+      sigma_alert: 1
+      image_load: 1
+      file_event: 1

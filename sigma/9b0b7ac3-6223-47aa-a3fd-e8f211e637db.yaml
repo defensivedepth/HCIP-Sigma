@@ -1,0 +1,508 @@
+name: Changing Existing Service ImagePath Value Via Reg.EXE
+id: 5c25c873-2d61-412d-9972-53f9699b16e0
+description: |
+  Detects reg.exe adding or overwriting the ImagePath value of a service key under HKLM\SYSTEM\CurrentControlSet\Services
+  using a REG_EXPAND_SZ or REG_SZ data value (add ... ImagePath ... -d). Redirecting a service's ImagePath to an
+  attacker-controlled executable causes that code to run at service start, often under SYSTEM, which supports persistence,
+  privilege escalation, and defense evasion. Legitimate installers and administrators occasionally reconfigure service
+  binaries this way, so the investigation should determine which service was changed, what executable the new path points
+  to, who made the change, and whether it correlates with other persistence or tampering activity on the host.
+type: detection
+detection_id: 9b0b7ac3-6223-47aa-a3fd-e8f211e637db
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line match what this rule detects — a reg.exe add of a Services ImagePath value with a -d data argument?
+  context: Before investing investigation time, confirm the alert is a true positive. The rule fires when reg.exe runs with
+    'add', the path SYSTEM\CurrentControlSet\Services\, ' ImagePath ', and a ' -d ' data switch all present in one command
+    line. Read the full command and confirm which service key and which new executable path were supplied.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to reconfigure service ImagePath values from the command line?
+  context: Service ImagePath changes are usually performed by installers or service-control tooling, not by an interactive
+    user running reg.exe directly. Knowing whether this account and host routinely perform service configuration helps
+    separate routine administration or software deployment from an operator hijacking a service for code execution.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:organizational_context.change_ticket
+  question: Was there a change ticket, maintenance window, or documented approval for reconfiguring this service?
+  context: Reconfiguring a service binary path is a significant change that mature environments typically document. A
+    corresponding ticket or deployment record suggests authorized activity; absence of one when policy requires it shifts
+    the disposition toward unauthorized modification.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:organizational_context.timing_alignment
+  question: Does the timing of this service change align with normal work hours and maintenance windows?
+  context: Legitimate service reconfiguration usually happens during business hours or a scheduled maintenance window. A
+    service ImagePath change outside those windows is more suspicious than the same action during documented maintenance.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:registry.registry_key_context
+  question: Which service key was modified and what executable path was written to its ImagePath value?
+  context: The service name and the new ImagePath data determine intent. A path pointing into System32 to a signed service
+    binary is consistent with normal configuration; a path into a user-writable or temporary directory, or to an unsigned or
+    unexpected executable, indicates the service was redirected to attacker-controlled code that will run at service start.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+- source: template:cue_process_tool.process_chain
+  question: What process spawned this reg.exe and is that parent chain expected?
+  context: The parent process reveals how the service change was invoked. Installers and service-control tooling have
+    predictable parents; reg.exe spawned by a script host, an Office application, or an unexpected interactive shell points
+    to a parent chain worth tracing further up the tree.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:registry.registry_value_persistence_check
+  question: Does the executable referenced by the new ImagePath exist on disk, and what is its signing and hash status?
+  context: Service-path persistence is only effective if the executable named in the new ImagePath exists at that location.
+    Examine the path written in the ImagePath data, verify whether that file is present, and check its signature and hash to
+    determine what would execute the next time the service starts.
+  range: +15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - Hashes
+- source: template:registry.registry_related_modifications
+  question: Were other registry modifications made on this host in the same session?
+  context: Operators who redirect a service path often make several registry changes — adjusting service start type or
+    failure actions, adding a Run key, or disabling protection. Clustering reg.exe write operations from the same host within
+    a short window reveals whether the service change was isolated or part of a broader configuration tampering effort.
+  range: +/-30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_reg:
+        Image|endswith:
+          - '\reg.exe'
+          - '\regedit.exe'
+        CommandLine|contains:
+          - ' add '
+          - ' delete '
+          - ' import '
+          - '/s '
+      condition: selection and selection_reg
+    fields:
+      - CommandLine
+- source: attack:T1574.011.time_correlation
+  question: Did the targeted service start or restart shortly after its ImagePath was changed?
+  context: The payload of a redirected service only executes when the service starts. Correlating the ImagePath change with a
+    subsequent start or restart of the same service within the surrounding window distinguishes a configuration change that
+    has already executed attacker code from one that is staged but dormant. Service start and stop are recorded in the System
+    event log; if that channel is not collected here, treat absent results as a visibility gap.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith: '\services.exe'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run reg.exe to reconfigure services?
+  context: Compare this account's current action against its historical behavior. A user that has never modified a service
+    ImagePath value is more suspicious than one that does so as part of a known administrative or deployment role. User role
+    and typical toolset should align with command-line service reconfiguration.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent+reg.exe combination historically routine on this host or across the environment, or is the parent unusual for reg.exe?
+  context: When the alert fires under a service principal, user identity does not attribute the behavior; the meaningful
+    pivot is which parent process spawned reg.exe and whether that pair is historically common. A new or rare parent for
+    reg.exe is the deviation worth chasing; a pair that already accounts for many prior events is more likely deployment or
+    OS automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the account's activity across all hosts reveals whether the service change is isolated or part of
+    activity spanning multiple endpoints. The same user reconfiguring services or running tooling on several hosts widens the
+    likely scope.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent+reg.exe combination fire on other hosts in the same window, or is the activity isolated to this host?
+  context: Under a service principal, user-pivoted network activity returns mostly agent-telemetry noise. The meaningful
+    question is whether the same launch mechanism — the parent process spawning reg.exe — fired on other hosts in the alert
+    window. Multiple hosts in the same window points to scheduled or pushed automation; a single host points to a host-local
+    trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired this rule's ImagePath-change pattern, what parents and users normally drive it, and does the current alert fit?
+  context: Even legitimate service reconfiguration can recur on a host. The query mirrors the rule's selection structure
+    scoped to this host, so the resulting parent and user distribution reflects how this specific firing pattern has
+    historically run here. A new parent, an unexpected account, or an unusual command shape is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \reg.exe
+        CommandLine|contains|all:
+        - 'add '
+        - SYSTEM\CurrentControlSet\Services\
+        - ' ImagePath '
+      selection_value:
+        CommandLine|contains|windash: ' -d '
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:lolbin.renamed_binary_check
+  question: Was reg.exe executed from its expected System32 path?
+  context: reg.exe run from outside System32 or SysWOW64 may have been copied or renamed to evade path-based allowlists.
+    Comparing the executable path and OriginalFileName against the expected system location indicates whether the binary
+    itself was relocated in addition to the service change it performed.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- source: template:persistence_scope.process_based_persistence
+  question: Were other process-based persistence mechanisms installed on this host?
+  context: Operators rarely rely on a single persistence mechanism. After redirecting a service path, they commonly add
+    backups using different techniques — scheduled tasks, additional services, registry Run keys, BITS jobs, or WMI
+    subscriptions. Multiple persistence installations in the same timeframe indicate intentional stacking rather than an
+    isolated administrative action.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine
+- source: template:lolbin.historical_lolbin_baseline
+  question: How often has this host fired this reg.exe ImagePath-change pattern over the past 90 days, and what command-line shapes are typical?
+  context: A service ImagePath change with no prior history on a host is more suspicious than one that recurs under stable
+    parents. The query mirrors the rule's selection structure scoped to this host, so the count reflects this specific firing
+    pattern rather than generic reg.exe usage. The command-line projection lets the analyst compare typical invocations
+    against the alerting one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \reg.exe
+        CommandLine|contains|all:
+        - 'add '
+        - SYSTEM\CurrentControlSet\Services\
+        - ' ImagePath '
+      selection_value:
+        CommandLine|contains|windash: ' -d '
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection*) and _pb_scope
+    fields:
+    - CommandLine
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering, reconnaissance, or
+    credential access — may reveal the attack stages that preceded the service change and help reconstruct the timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1574.011
+      name: Services Registry Permissions Weakness
+      role: primary
+    - id: T1574
+      name: Hijack Execution Flow
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: registry_modification
+      description: "reg.exe modifies a service ImagePath value under HKLM\\SYSTEM\\CurrentControlSet\\Services"
+      mapped_to: Q5
+      source: template:registry.registry_key_context
+    - stage: 2
+      label: payload_on_disk
+      description: "The executable referenced by the new ImagePath is staged on disk"
+      mapped_to: Q7
+      source: template:registry.registry_value_persistence_check
+    - stage: 3
+      label: service_execution
+      description: "The modified service starts/restarts, executing the redirected binary (deviation from baseline config)"
+      mapped_to: Q9
+      source: attack:T1574.011.time_correlation
+  dimension_coverage:
+    - dimension: time_correlation
+      technique: T1574.011
+      covered_by: Q9
+      source: attack:T1574.011.time_correlation
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1574.011
+      covered_by: Q5
+      source: template:registry.registry_key_context
+      coverage_type: direct
+    - dimension: file_path_analysis
+      technique: T1574
+      covered_by: Q7
+      source: template:registry.registry_value_persistence_check
+      coverage_type: direct
+  mutable_dispositions:
+    - element: MonitoredServiceKeys
+      dimension: tuning_parameter
+      specific_values: "ImagePath, ServiceDll, FailureCommand, Parameters"
+      disposition: context
+      target_question: Q5
+      notes: "Rule's detection already constrains to ImagePath under Services; registry_key_context surfaces TargetObject/Details so the analyst sees the exact key/value. Sibling keys named in context."
+    - element: BaselineServiceConfig
+      dimension: tuning_parameter
+      specific_values: rationale only
+      disposition: context
+      target_question: Q14
+      notes: "Baseline-deviation question compares current parents/users against this host's historical firing of the same pattern."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: rationale only
+      disposition: new_question
+      target_question: Q9
+      notes: "Correlation interval between registry/service modification and service execution realized as the +/-1h service-start question."
+    - element: PrivilegedAccounts
+      dimension: tuning_parameter
+      specific_values: rationale only
+      disposition: context
+      target_question: Q2
+      notes: "Whether the acting account is permitted to modify service config covered by host_user_context and user baseline."
+    - element: ServiceBaseline
+      dimension: tuning_parameter
+      specific_values: rationale only
+      disposition: context
+      target_question: Q14
+      notes: "T1574 secondary; same baseline-deviation question covers expected service config comparison."
+    - element: AllowedDllPaths
+      dimension: tuning_parameter
+      specific_values: rationale only
+      disposition: context
+      target_question: Q7
+      notes: "T1574 DLL-path angle is incidental here; rule writes ImagePath (executable path), covered by the on-disk path/signature check."
+  dedup_decisions:
+    - dropped: cue_process_tool.mechanism_decode
+      reason: "replaced_by registry.registry_key_context — registry event surfaces TargetObject/Details directly instead of parsing reg.exe CommandLine"
+      kept: registry.registry_key_context
+    - dropped: universal.endpoint_protection_health
+      reason: "Rule is persistence-centric (service path redirect), not execution/credential-access; cue_host_context.precursor present and carries prior-tamper signal. Per template notes, safe to drop when precursor present and rule is not execution/credential-centric."
+      kept: cue_host_context.precursor
+  skipped_templates:
+    - template: cue_process_tool.baseline
+      reason: "Superseded by lolbin.historical_lolbin_baseline (rule-pattern-scoped 90d count) and cue_user_actor.baseline; generic host+binary count adds no unique coverage."
+    - template: cue_process_tool.follow_on
+      reason: "Children of reg.exe are not the impact vector here; the service's own subsequent execution is the follow-on, covered by the service-start time-correlation question (Q9)."
+    - template: cue_process_tool.clustering
+      reason: "Overlaps cue_host_context.clustering / registry_related_modifications; host-wide tool clustering adds no unique angle for a registry-write rule."
+    - template: cue_host_context.clustering
+      reason: "registry_related_modifications and the user clustering questions already cover same-host concurrent activity with more specificity for this registry-write rule."
+    - template: cue_user_actor.clustering_svc
+      reason: "Not skipped — included as Q13 (service-principal substitute pair)."
+    - template: organizational_context.human_recall
+      reason: "change_ticket + timing_alignment already cover the organizational legitimacy dimension; under the 18-question cap, human_recall adds the least unique coverage."
+    - template: organizational_context.procedural_consistency
+      reason: "change_ticket covers the deployment/approval angle; dropped to stay within the 18-question cap."
+    - template: persistence_scope.file_based_persistence
+      reason: "registry_value_persistence_check already pivots to file_event for the ImagePath payload; Startup/Run-key file drops are a distinct mechanism not implicated by a service-path redirect; dropped under cap."
+    - template: lolbin.technique_class_lateral
+      reason: "reg.exe's objective here is persistence/config-change, not download or proxy-execute; the other-LOLBins-same-objective sweep is covered more precisely by persistence_scope.process_based_persistence (schtasks/sc/reg/at/bitsadmin/wmic)."
+  reflection_overrides: []
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - registry
+    - organizational_context
+    - persistence_scope
+    - lolbin
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 17
+      attack: 1
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 15
+    logsource_diversity:
+      process_creation: 15
+      registry_set: 1
+      file_event: 1
+      sigma_alert: 1

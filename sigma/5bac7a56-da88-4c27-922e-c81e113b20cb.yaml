@@ -1,0 +1,464 @@
+name: Github Self-Hosted Runner Execution
+id: 418eda5b-c7d4-4b90-8738-314edb393d74
+description: |
+  Detects a GitHub Actions self-hosted runner executing on local infrastructure, identified by the Runner.Worker or Runner.Listener binaries (by Image or OriginalFileName) or by their command-line verbs (spawnclient for the worker; run or configure for the listener). The rule fires when EITHER the worker conditions match (worker image or DLL together with a spawnclient command line) OR the listener conditions match (listener image or DLL together with a run or configure command line), so note which branch fired. Self-hosted runners are a legitimate CI/CD building block, but they also give an attacker durable code execution and standing access to repository secrets and internal networks, and have been installed on compromised hosts to maintain access after credential theft. The investigation should confirm the runner is an authorized, change-managed deployment, identify who installed it and which repository or organization it is registered to, and determine whether it is reaching out to web-service infrastructure for bidirectional command and control.
+type: detection
+detection_id: 5bac7a56-da88-4c27-922e-c81e113b20cb
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does this event match what the rule detects — either a runner worker process with a spawnclient command line, or a runner listener process running configure or run?
+  context: Before investing investigation time, confirm the alert is a true positive by reviewing the exact Image, OriginalFileName, and command line. The rule fires on EITHER of two branches, so note which one matched. The worker branch requires Runner.Worker.exe (or OriginalFileName Runner.Worker.dll) together with spawnclient on the command line; the listener branch requires Runner.Listener.exe (or OriginalFileName Runner.Listener.dll) together with run or configure. The listener configure verb means a runner is being registered or re-registered, which is the install moment; run means an already-registered runner is starting; spawnclient on the worker means it is executing a job. Which branch fired shapes what the rest of the investigation should weigh.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run a GitHub self-hosted runner?
+  context: A self-hosted runner belongs on designated CI/CD build infrastructure deployed and change-managed by a DevOps or platform team. Knowing whether this host is a sanctioned build agent, and whether the account running the runner is the expected service or deployment identity, is often the fastest way to separate an authorized installation from a runner an attacker stood up on a workstation or server it does not belong on.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What is the full runner command line, and which repository, organization, and registration token does it reference?
+  context: The full command line of the worker or listener reveals what the runner is bound to. A listener configure invocation carries the target repository or organization URL, the runner name, and registration flags; an unattended or run-as-root style configuration with a freshly minted registration token is the pattern seen when a runner is installed for unauthorized persistence rather than through a managed deployment. Read the URL, the runner name, and any --unattended or token arguments, and compare the named repository or organization against ones your environment is expected to build for.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:cue_process_tool.process_chain
+  question: What process spawned this runner, and is that parent chain expected for a managed deployment?
+  context: The parent process reveals how the runner was installed or started. A change-managed runner is typically launched by a service control manager, a configuration-management agent, or an installer the platform team uses, and false positives for this rule are largely reflected in the parent process name. A runner spawned from a shell, a script interpreter, a package-manager or developer-tool process, or an archive utility points to ad hoc or staged installation rather than a sanctioned build agent. Walk up the tree to see what spawned the parent.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: attack:T1102.002.bidirectional_c2
+  question: After the runner started, did its process initiate outbound encrypted connections to web-service infrastructure?
+  context: A self-hosted runner reaches a web-service endpoint to receive jobs and report results, so outbound HTTPS from the runner process is expected. The investigative angle is whether the destinations and the volume look like normal runner-to-platform traffic or like bidirectional command and control, meaning connections to web-service domains that this environment does not otherwise use, sustained automated polling, or asymmetric outbound data volume. Review the runner process network connections for the destinations contacted and whether the traffic pattern fits a legitimate build agent.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationHostname
+      - DestinationPort
+      - Initiated
+- source: attack:T1071.protocol_endpoint_baseline
+  question: Does this host normally communicate with the web-service destinations the runner is contacting, or are these new endpoints?
+  context: First-time outbound connections to a destination are more telling than routine traffic. A legitimate runner repeatedly reaches the same platform endpoints; connections to a web-service host this system has never contacted before, or to an endpoint that does not match the repository or organization the runner claims to serve, point to attacker-controlled infrastructure reached over an application-layer protocol. Establish whether the destinations are new for this host before treating them as benign build traffic.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - DestinationHostname
+      - DestinationPort
+- source: template:cue_process_tool.follow_on
+  question: What child processes did the runner spawn afterward?
+  context: A runner worker exists to execute jobs, so it legitimately spawns shells, build tools, and interpreters as defined by a workflow. The processes spawned reveal what the runner actually ran. Job-driven children that pull credentials from the environment, search the user profile for tokens, launch download cradles, or stand up further tooling indicate the runner is executing attacker-supplied workflow steps rather than a sanctioned build. Review the children and their command lines for credential access and follow-on staging.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.baseline
+  question: Does this host normally run the GitHub runner binaries?
+  context: A runner binary that has never been seen on a host is more suspicious than one that runs regularly. Zero or very low historical counts indicate a first-time installation, which on a host that is not a designated build agent raises the priority of confirming who deployed it and what repository it serves.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired the runner pattern, what parents and users normally drive it, and does the current alert fit?
+  context: Even a legitimate build agent has a consistent footprint. The query mirrors the rule's selection structure scoped to this host, so the resulting parent and user distribution reflects how this specific runner firing pattern has historically run here, not generic process activity. A new parent process, an unexpected account, or an unusual command shape relative to the established pattern is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_worker_img:
+      - Image|endswith: \Runner.Worker.exe
+      - OriginalFileName: Runner.Worker.dll
+      selection_worker_cli:
+        CommandLine|contains: spawnclient
+      selection_listener_img:
+      - Image|endswith: \Runner.Listener.exe
+      - OriginalFileName: Runner.Listener.dll
+      selection_listener_cli:
+        CommandLine|contains:
+        - run
+        - configure
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_worker_* or all of selection_listener_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run the GitHub runner binaries across the environment?
+  context: Compare this user's current action against their historical behavior. A deployment or service account that routinely manages build agents is expected to run these binaries; a developer or general-purpose account that has never done so is more suspicious, and the user role should align with operating CI/CD infrastructure.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent and runner binary combination historically routine on this host or across the environment, or is the parent unusual for the runner?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior. The meaningful pivot is the launch mechanism: which parent process spawned the runner, and is that pair historically common. A new or rare parent for the runner on this host or environment-wide is the deviation worth chasing; a pair that already accounts for thousands of prior events is the established deployment or service automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals whether runner installation is isolated or part of broader hands-on activity. If the same account stood up runners or ran related tooling on multiple endpoints in the same window, the scope of the operation may be larger than a single host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent and runner binary combination fire on other hosts in the same window, indicating a coordinated rollout rather than isolated activity?
+  context: Under a service principal, asking what else this user did across the network returns agent-telemetry noise, since every host runs SYSTEM-owned agents constantly. The meaningful question is whether the same launch mechanism, parent process plus spawned runner, fired on other hosts in the alert window. Multiple hosts in the same window points to scripted or pushed deployment, whether a sanctioned rollout or a worm-like spread across CI/CD hosts; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: 'Alerts rarely occur in isolation. Examining activity around the runner execution reveals the immediate context: what led to it, what happened after, and whether it is part of a larger sequence. Look for credential harvesting, token theft from developer tooling, reconnaissance, or download cradles that commonly accompany a runner stood up for unauthorized access.'
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired the runner pattern in the past week, and does the cross-host distribution look like managed deployment or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of the runner firing pattern, not generic process activity. Many hosts firing the same pattern points to a managed deployment or, in a supply-chain compromise, a self-propagating spread across build hosts; one host or a small unrelated set points to a manual or targeted installation. Use the host distribution and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_worker_img:
+      - Image|endswith: \Runner.Worker.exe
+      - OriginalFileName: Runner.Worker.dll
+      selection_worker_cli:
+        CommandLine|contains: spawnclient
+      selection_listener_img:
+      - Image|endswith: \Runner.Listener.exe
+      - OriginalFileName: Runner.Listener.dll
+      selection_listener_cli:
+        CommandLine|contains:
+        - run
+        - configure
+      condition: all of selection_worker_* or all of selection_listener_*
+    fields:
+    - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: 'Alerts rarely happen in isolation. Earlier detections on the same host, credential access, reconnaissance, or download activity, may reveal the stages that preceded the runner installation and help reconstruct the timeline. Look for patterns: token or credential theft followed by runner registration, or a download cradle followed by runner execution.'
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1102.002
+      name: Bidirectional Communication
+      role: primary
+    - id: T1071
+      name: Application Layer Protocol
+      role: secondary
+    - id: T1102
+      name: Web Service
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: runner_execution
+      description: Runner worker or listener process executes on the host (worker spawnclient, or listener run/configure).
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: runner_registration_decode
+      description: Decode the runner command line to recover the bound repository/organization, runner name, and registration token.
+      mapped_to: Q3
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 3
+      label: bidirectional_web_service_c2
+      description: Runner process initiates outbound encrypted connections to web-service infrastructure for bidirectional job/result (or C2) traffic.
+      mapped_to: Q5
+      source: attack:T1102.002.bidirectional_c2
+    - stage: 4
+      label: protocol_endpoint_evaluation
+      description: Evaluate whether the application-layer destinations are routine for this host or newly appearing C2 endpoints.
+      mapped_to: Q6
+      source: attack:T1071.protocol_endpoint_baseline
+    - stage: 5
+      label: follow_on_execution
+      description: Runner worker spawns job-driven children (shells, download cradles, credential-access tooling).
+      mapped_to: Q7
+      source: template:cue_process_tool.follow_on
+  dimension_coverage:
+    - dimension: time_correlation
+      technique: T1102.002
+      covered_by: Q5
+      source: attack:T1102.002.bidirectional_c2
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1102.002
+      covered_by: Q6
+      source: attack:T1071.protocol_endpoint_baseline
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1102
+      covered_by: Q4
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: process_identification
+      technique: T1102
+      covered_by: Q1
+      source: template:universal.verify_trigger_match
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1102
+      covered_by: Q14
+      source: template:cue_host_context.clustering
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1102
+      covered_by: Q6
+      source: attack:T1071.protocol_endpoint_baseline
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1071
+      covered_by: Q5
+      source: attack:T1102.002.bidirectional_c2
+      coverage_type: direct
+  mutable_dispositions:
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only (window for correlating multiple connections to the same process; off-hours persistence)"
+      disposition: context
+      target_question: Q5
+      notes: "No queryable threshold; the +/-1h runner-network correlation window plus the host-clustering window carry the temporal-correlation intent."
+    - element: DomainPattern
+      dimension: tuning_parameter
+      specific_values: "web-service infrastructure patterns (e.g. *.googleapis.com) — rationale only, no fixed list for this rule"
+      disposition: context
+      target_question: Q6
+      notes: "Rule supplies no destination values; framed as new-vs-known web-service endpoint analysis in the protocol-endpoint baseline question."
+    - element: PayloadSizeThreshold
+      dimension: tuning_parameter
+      specific_values: "rationale only (minimum upload size; asymmetric >90% outbound)"
+      disposition: context
+      target_question: Q5
+      notes: "No numeric threshold supplied; asymmetric/automated upload pattern described qualitatively in the bidirectional-C2 question."
+    - element: ProcessNameExclusionList
+      dimension: tuning_parameter
+      specific_values: "known benign updaters/service processes (rationale only)"
+      disposition: context
+      target_question: Q6
+      notes: "Tuning rationale; the network questions already scope to the runner Image so benign-process exclusion is implicit."
+    - element: ProcessName
+      dimension: process_identification
+      specific_values: "Runner.Worker.exe / Runner.Listener.exe (uncommon executable initiating network connections)"
+      disposition: context
+      target_question: Q5
+      notes: "The runner binary IS the uncommon process; network questions scope on Image|endswith %Image% (the runner), satisfying process-identification."
+    - element: DataTransferThreshold
+      dimension: tuning_parameter
+      specific_values: "rationale only (>1MB in <5min outbound volume)"
+      disposition: context
+      target_question: Q5
+      notes: "No queryable value at generation time; outbound-volume anomaly described in context."
+    - element: ProtocolList
+      dimension: tuning_parameter
+      specific_values: "HTTP, HTTPS, DNS, SMB, RDP (app-layer protocols of interest)"
+      disposition: context
+      target_question: Q6
+      notes: "Runner C2 is HTTPS to web services; network questions use category network_connection without a hard protocol filter to avoid missing the channel."
+    - element: DataVolumeThreshold
+      dimension: tuning_parameter
+      specific_values: "rationale only (>90% outbound asymmetric)"
+      disposition: context
+      target_question: Q5
+      notes: "No queryable threshold; asymmetric volume framed in the bidirectional-C2 question."
+    - element: UnusualProcessList
+      dimension: tuning_parameter
+      specific_values: "processes not normally associated with network activity (rationale only)"
+      disposition: context
+      target_question: Q6
+      notes: "Covered by the protocol-endpoint baseline scoping outbound traffic to the runner Image specifically."
+  dedup_decisions:
+    - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable (subject vs. launch-mechanism pivot); both emitted"
+      kept: both
+    - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable (subject vs. launch-mechanism pivot); both emitted"
+      kept: both
+    - dropped: cue_process_tool.clustering
+      reason: "host-clustering coverage provided by cue_host_context.clustering (same +/-15m host-scoped Image aggregation); process_tool variant redundant"
+      kept: cue_host_context.clustering
+  skipped_templates:
+    - template: universal.endpoint_protection_health
+      reason: "Rule fires on CI/CD-runner installation/execution, not payload execution or credential access that an operator would precede by disabling AV/EDR; the cross-host and precursor questions already carry prior-activity context. Generic host-tamper sweep does not earn a slot here."
+  reflection_overrides: []
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded:
+      - id: network_scope
+        confidence: medium
+        reason: "Network-wide spread is investigated via the user_actor clustering pair and cue_process_tool.scope fleet-pattern question; network_scope's same-action-other-hosts query duplicates the reflected fleet scope, and its authentication-trail query targets Security 4624/4625 which is out of scope for this process_creation runner rule. The worm/spread concern is covered by the fleet-pattern scope question instead."
+  technique_sets_applied:
+    - universal
+  generation_stats:
+    total_questions: 16
+    source_counts:
+      template: 14
+      attack: 2
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 13
+    logsource_diversity:
+      process_creation: 13
+      network_connection: 2
+      sigma_alert: 1

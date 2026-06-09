@@ -1,0 +1,543 @@
+name: New ActiveScriptEventConsumer Created Via Wmic.EXE
+id: f9013836-69f0-41ca-ac7e-514eb217595c
+description: |
+  Detects wmic.exe invoked with a command line that both names ActiveScriptEventConsumer and carries the CREATE verb,
+  which registers a permanent WMI event consumer that runs VBScript or JScript when its bound event filter fires. WMI
+  event subscriptions are a SYSTEM-context persistence mechanism that survives reboots and leaves no file on disk, so the
+  triggered script executes under WmiPrvSE.exe rather than the creating process. Some backup, monitoring, and management
+  software legitimately registers script consumers, so the investigation should decode the full subscription the command
+  defines, confirm who and what launched wmic, and determine whether a triggered execution has already run from the new
+  consumer.
+type: detection
+detection_id: ebef4391-1a81-4761-a40a-1db446c0e625
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-09
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line both name ActiveScriptEventConsumer and carry the CREATE verb that this rule detects?
+  context: >-
+    The rule fires when a single command line contains both ActiveScriptEventConsumer and CREATE, indicating wmic is
+    registering a new permanent script event consumer. Confirm the alert is a true positive by reading the exact command
+    line and process details and verifying both tokens are present in a create operation rather than a query or delete.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to register WMI event consumers?
+  context: >-
+    Registering a permanent WMI event consumer is an uncommon administrative action normally tied to specific management,
+    backup, or monitoring tooling. Knowing whether the acting user's role and the host's function are consistent with WMI
+    subscription management is often the fastest path to separating sanctioned automation from operator-installed
+    persistence.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What WMI subscription does this command define? Decode the consumer name, the script it runs, and the bound event filter.
+  context: >-
+    The full command line defines the persistence. Read the consumer Name, the ScriptingEngine (VBScript or JScript), and
+    the ScriptText or ScriptFileName the consumer will run, along with any namespace argument. A subscription becomes active
+    only when an EventFilter is bound to the consumer via a FilterToConsumerBinding, so note whether this command also
+    creates a filter and binding or whether those were registered separately. The script body is the payload that executes
+    under WmiPrvSE.exe when the filter condition is met.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - ActiveScriptEventConsumer
+        - ' CREATE '
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+      - CommandLine
+      - User
+- source: template:parent_child.parent_process_legitimacy
+  question: What process spawned wmic.exe, and what started that parent?
+  context: >-
+    The parent process reveals how the subscription registration was driven. Legitimate WMI consumer creation usually
+    descends from an interactive shell, a deployment agent, or a known management console. Unusual parents — Office
+    applications, mshta.exe, wscript.exe, a web-server worker, or an unexpected service — point to the persistence being
+    installed by another stage of an intrusion. Tracing the parent's own origin shows whether the chain began with a user
+    action or with an automated trigger.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- source: template:parent_child.sibling_processes
+  question: What other child processes did the same parent spawn around this time?
+  context: >-
+    If the parent that launched wmic also launched other processes, examining the siblings reveals the full scope of
+    activity from that parent. Multiple tooling invocations from the same parent in the alert window — reconnaissance,
+    credential access, or additional persistence — point to coordinated operator activity rather than an isolated
+    administrative command.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: attack:T1546.003.consumer_triggered_execution
+  question: Did WmiPrvSE.exe spawn any child processes on this host after the consumer was created, indicating the subscription fired?
+  context: >-
+    A permanent script consumer runs under WmiPrvSE.exe when its bound filter condition is met, so triggered execution
+    appears as a child process of WmiPrvSE.exe rather than of the creating wmic process. scrcons.exe hosting the script,
+    or an anomalous child such as cmd.exe, powershell.exe, or a script host descending from WmiPrvSE.exe, indicates the new
+    consumer has already executed. The timing between the consumer creation and any such child execution shows whether the
+    persistence is dormant or already active.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith:
+          - '\WmiPrvSE.exe'
+          - '\scrcons.exe'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+- source: attack:T1546.003.wmi_subscription
+  question: Do the WMI activity logs show creation of the event filter, consumer, and filter-to-consumer binding for this subscription?
+  context: >-
+    WMI persistence requires three objects — an __EventFilter, an ActiveScriptEventConsumer, and a
+    __FilterToConsumerBinding that links them. The WMI activity channel records these object operations independently of
+    the process command line, so the logs confirm whether the command line observed in the alert produced a complete,
+    armed subscription or only one piece of it. Correlate the recorded namespace, consumer name, and filter query with the
+    decoded command line. If WMI activity logging is not collected in this environment, treat the absence as a visibility
+    gap rather than evidence the subscription was incomplete.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: wmi
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - EventID
+      - User
+      - Operation
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired this rule's pattern, what parents and users drove it, and does the current alert fit?
+  context: >-
+    Even legitimate tooling registers WMI consumers on occasion. This query mirrors the rule's selection structure scoped
+    to this host, so the resulting parent and user distribution reflects how this specific subscription-creation pattern —
+    not generic wmic usage — has historically run here. A new parent process, an unexpected user account, or an unusual
+    command-line shape is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - ActiveScriptEventConsumer
+        - ' CREATE '
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired this rule's pattern in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: >-
+    This query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of this
+    subscription-creation pattern rather than generic wmic usage. Many hosts registering the same consumer pattern points
+    to scripted deployment or vendor automation; one host or a small unrelated set points to manual operator activity. Use
+    the host distribution and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - ActiveScriptEventConsumer
+        - ' CREATE '
+      condition: selection
+    fields:
+    - host.name
+- source: template:cue_user_actor.baseline
+  question: Does this user normally register WMI event consumers?
+  context: >-
+    Compare this user's current action against their historical behavior. A user who has never registered a WMI consumer
+    is more suspicious than one whose role routinely involves WMI subscription management. This pivots on user identity; the
+    parent-and-binary view answers the same baseline question when the alert fires under a service principal.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent-and-binary combination historically routine on this host or across the environment, or is the parent unusual for wmic?
+  context: >-
+    When the alert fires under SYSTEM, LOCAL SERVICE, NETWORK SERVICE, or a computer account, user identity does not
+    attribute the behavior. The meaningful pivot is the launch mechanism: which parent process spawned wmic, and whether
+    that pair is historically common. A new or rare parent for wmic on this host or environment-wide is the deviation worth
+    chasing; a pair that already accounts for many prior events is vendor or OS automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: >-
+    Tracking the user's activity across all hosts reveals lateral movement or coordinated action across multiple
+    endpoints. If the same user registered consumers or ran other tooling on several hosts in the same window, the scope of
+    the operation may be larger than this single alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent-and-binary combination fire on other hosts in the alert window, indicating a coordinated rollout?
+  context: >-
+    Under a service principal, asking what else the user did network-wide returns agent-telemetry noise, because every host
+    runs SYSTEM-owned agents constantly. The meaningful question is whether the same launch mechanism — parent process plus
+    spawned wmic — fired on other hosts in the alert window. Multiple hosts in the same window points to scheduled or pushed
+    automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Alerts rarely happen in isolation. Earlier detections on the same host — reconnaissance, credential access, or defense
+    tampering — may reveal the attack stages that preceded the persistence installation and help reconstruct the full
+    timeline leading up to the consumer creation.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:persistence_scope.process_based_persistence
+  question: Were other process-based persistence mechanisms installed on this host around the same time?
+  context: >-
+    Attackers rarely rely on a single persistence mechanism. After registering a WMI consumer, they commonly install backup
+    footholds using different techniques — scheduled tasks, services, registry Run keys, or BITS jobs. Multiple persistence
+    installations from the same timeframe indicate intentional stacking rather than an isolated administrative action.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine
+- source: template:lolbin.technique_class_lateral
+  question: Were any other proxy-execution or persistence LOLBins used on this host recently?
+  context: >-
+    Operators who use one LOLBin often use several. wmic registering a script consumer is a proxy-execution and persistence
+    route; check whether rundll32, regsvr32, mshta, schtasks, reg, or sc were also used in the surrounding window. Finding
+    multiple LOLBins performing execution or persistence actions strengthens the case for an operator-driven sequence over a
+    single administrative command.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_img:
+        Image|endswith:
+          - '\rundll32.exe'
+          - '\regsvr32.exe'
+          - '\mshta.exe'
+          - '\msbuild.exe'
+          - '\cmstp.exe'
+          - '\installutil.exe'
+          - '\msiexec.exe'
+          - '\schtasks.exe'
+          - '\reg.exe'
+          - '\sc.exe'
+          - '\at.exe'
+          - '\bitsadmin.exe'
+      condition: selection and selection_img
+    fields:
+      - Image
+      - CommandLine
+- source: template:lolbin.historical_lolbin_baseline
+  question: How often has this host fired the rule's wmic subscription pattern over the past 90 days, and what command-line shapes are typical?
+  context: >-
+    A subscription-creation pattern with no prior history on a host is more suspicious than one used regularly under stable
+    parents. This query mirrors the rule's selection structure scoped to this host, so the resulting count reflects the
+    rule's specific firing pattern rather than generic wmic usage. The command-line projection lets the analyst compare
+    typical consumer-registration shapes against the alerting one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains|all:
+        - ActiveScriptEventConsumer
+        - ' CREATE '
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - CommandLine
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1546.003
+      name: Windows Management Instrumentation Event Subscription
+      role: primary
+    - id: T1546
+      name: Event Triggered Execution
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: subscription_registration
+      description: "Actor invokes wmic to CREATE an ActiveScriptEventConsumer, defining a script that runs when a bound event filter fires"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: subscription_decode
+      description: "Decode the consumer name, scripting engine, script body, and whether the filter and binding were also created"
+      mapped_to: Q3
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 3
+      label: object_creation_logs
+      description: "WMI activity logs record the __EventFilter, ActiveScriptEventConsumer, and __FilterToConsumerBinding object operations that make the subscription armed"
+      mapped_to: Q7
+      source: attack:T1546.003.wmi_subscription
+    - stage: 4
+      label: triggered_execution
+      description: "When the bound filter fires, the consumer's script runs as a child of WmiPrvSE.exe / scrcons.exe"
+      mapped_to: Q6
+      source: attack:T1546.003.consumer_triggered_execution
+  dimension_coverage:
+    - dimension: parent_process_analysis
+      technique: T1546.003
+      covered_by: Q4
+      source: template:parent_child.parent_process_legitimacy
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1546.003
+      covered_by: Q6
+      source: attack:T1546.003.consumer_triggered_execution
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1546.003
+      covered_by: Q8
+      source: template:cue_process_tool.baseline_deviation
+      coverage_type: indirect
+    - dimension: user_context
+      technique: T1546.003
+      covered_by: Q2
+      source: template:universal.host_user_context
+      coverage_type: direct
+  mutable_dispositions:
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only (correlation window between WMI creation and child process execution; e.g., within 5 minutes)"
+      disposition: new_question
+      target_question: Q6
+      notes: "Realized as the +4h WmiPrvSE/scrcons child-process question that correlates consumer creation with triggered execution timing."
+    - element: UserContext
+      dimension: user_context
+      specific_values: "SYSTEM, LOCAL SERVICE, or attacker-controlled users"
+      disposition: context
+      target_question: Q2
+      notes: "User-role expectation surfaced in Q2; service-principal degeneration handled by the user_actor substitute pair (Q11/Q13)."
+    - element: ProcessNameAllowlist
+      dimension: tuning_parameter
+      specific_values: "rationale only (known benign consumers triggered via WMI, e.g., backup tools)"
+      disposition: context
+      target_question: Q8
+      notes: "Benign-consumer baseline framing carried in the reflected baseline_deviation (Q8) and scope (Q9) host/fleet distributions."
+    - element: ParentProcessAnomalyThreshold
+      dimension: parent_process_analysis
+      specific_values: "rationale only (anomalous spawning from WmiPrvSE.exe)"
+      disposition: context
+      target_question: Q6
+      notes: "Anomalous-child-of-WmiPrvSE framing carried in Q6 context and query (ParentImage WmiPrvSE.exe/scrcons.exe)."
+    - element: PathAnomalyThreshold
+      dimension: tuning_parameter
+      specific_values: "rationale only (process or binary path deviation scoring; T1546 parent technique)"
+      disposition: context
+      target_question: Q12
+      notes: "Path / lineage deviation surfaced via parent legitimacy (Q4) and LOLBin baseline (Q12); no concrete threshold to query."
+  dedup_decisions:
+    - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable (subject identity vs. launch-mechanism pivot)"
+      kept: both (Q10 user-pivot + Q11 service-principal substitute)
+    - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable (subject identity vs. launch-mechanism pivot)"
+      kept: both (Q12 user-pivot + Q13 service-principal substitute)
+  skipped_templates:
+    - template: cue_process_tool.process_chain
+      reason: "parent_child technique set active — parent_child.parent_process_legitimacy (Q4) subsumes the process_chain parent lookup per the parent-active dedup rule."
+    - template: cue_process_tool.baseline
+      reason: "Generic host+binary wmic baseline is subsumed by the reflected baseline_deviation (Q8), which counts the rule's specific subscription-creation pattern on this host rather than all wmic usage. Per the CommandLine-only hint, the Image-only baseline would count unrelated wmic invocations."
+    - template: cue_process_tool.follow_on
+      reason: "Subsumed by the consumer-triggered-execution question (Q6), which scopes follow-on processes to WmiPrvSE.exe/scrcons.exe children — the meaningful execution route for a WMI consumer — instead of children of the short-lived wmic process, which exits before the consumer ever fires."
+    - template: cue_process_tool.clustering
+      reason: "Surrounding-tool context is covered by the sibling-process question (Q5, same-parent children) and the LOLBin sweep (Q16); a generic host-wide tool clustering question would duplicate that view without subscription focus, and the slot is spent on the WMI-log and triggered-execution angles."
+    - template: cue_host_context.clustering
+      reason: "Surrounding-host activity is covered by sibling processes (Q5), the LOLBin sweep (Q16), and process-based persistence (Q15); a generic host-clustering aggregation would duplicate that context. The cue_host_context.precursor question (Q14) is retained as the prior-alert timeline view for this host."
+    - template: universal.endpoint_protection_health
+      reason: "RECOMMENDED, not must_include. This rule fires on a persistence-install action, not payload execution or credential access; tamper-as-precursor is not the live triage question, and prior-tamper-on-host signal is already carried by the host-context precursor question (Q14, prior sigma alerts incl. defense tampering). Dropped to keep the count within range without displacing the WMI-specific questions."
+    - template: lolbin.renamed_binary_check
+      reason: "This is a CommandLine-only rule — Image is not a detection field and the rule fires on any binary whose command line matches the tokens, but in practice the binary is wmic.exe. A renamed-path / OriginalFileName check adds little: the persistence signal is the subscription command line, not wmic's path, and the slot is better spent on the WMI-log and triggered-execution questions. Dropped to keep the count within the 14-18 range."
+    - template: persistence_scope.file_based_persistence
+      reason: "WMI event subscriptions are stored in the CIM repository, not on the filesystem; Startup-folder / Run-key file drops are a different, unrelated persistence mechanism. The file/registry layer that matters for this technique is the WMI object store, surfaced via the WMI activity-log question (Q7), so the cross-logsource slot is spent there instead."
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "logsource 'image_load' (recommended by techniques: T1546.003) is not covered — pull in cue_image_load.* or author a custom question with `category: image_load`"
+      disposition: declined
+      reason: >-
+        image_load (EventCode 7) is recommended to catch mofcomp.exe compiling a MOF or .NET hosting of the subscription
+        runtime. This rule's detection is the wmic CREATE command line, and the triggered script runs through the WMI
+        scripting host (scrcons.exe) under WmiPrvSE.exe rather than via a distinctive image_load on the creating process.
+        The triggered-execution route is covered with process_creation precision by the WmiPrvSE/scrcons child-process
+        question (Q6), and the subscription objects themselves by the WMI activity-log question (Q7), so an image_load
+        sweep would return module-load volume without precision for this consumer-based pattern. No compensating
+        attack:T1546.003.image_load question authored.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - parent_child
+    - persistence_scope
+    - lolbin
+    - cue_process_tool
+    - cue_user_actor
+    - cue_host_context
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 15
+      attack: 2
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 14
+    logsource_diversity:
+      process_creation: 15
+      wmi: 1
+      sigma_alert: 1

@@ -1,0 +1,541 @@
+name: Suspicious Explorer Process with Whitespace Padding - ClickFix/FileFix
+id: c4067995-8d3f-4234-bb5d-1739d7e11208
+description: |
+  Detects a process spawned by explorer.exe whose command line contains a '#' character together with long runs of
+  whitespace, a pattern consistent with the ClickFix and FileFix social-engineering techniques. In these techniques a
+  user is lured into pasting a clipboard payload into the Run dialog or the File Explorer address bar; the visible portion
+  is a benign-looking file path or comment, while extensive whitespace padding pushes the actual command (often a
+  PowerShell one-liner) out of view to the right.
+  Investigation should decode the full command line past the padding, confirm whether explorer.exe is the true parent
+  and trace what launched it, identify any first-stage file drops or outbound connections, and determine whether the
+  same user or host shows other signs of pasted-command execution.
+type: detection
+detection_id: 3ae9974a-eb09-4044-8e70-8980a50c12c8
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the alerting command line show explorer.exe as the parent and contain a '#' followed by long whitespace padding?
+  context: Confirm the alert is a true positive by reviewing the exact command line and parent process. The rule fires only
+    when the parent ends in explorer.exe AND the command line contains both a '#' character and an extended run of whitespace.
+    Verify the padding is present and read what sits to the right of it, since that is where the real command is hidden.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - CommandLine
+- source: template:cue_process_tool.mechanism_decode
+  question: What is the full command hidden past the '#' and whitespace padding, and what operation does it perform?
+  context: The visible left portion of the command line is a decoy file path or comment; the operational payload is pushed
+    far to the right by the padding. Read the entire command line, decode any base64 or character-concatenation obfuscation,
+    and identify what it does -- a download cradle, an in-memory loader, a file copy, or a local script. Resolve any URLs,
+    file paths, or markers it references.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:obfuscation.encoded_payload_decode
+  question: Is the command line, script, or payload encoded or obfuscated? What does it decode to, and what operation does the decoded content perform?
+  context: 'Beyond the whitespace padding, pasted one-liners frequently layer additional concealment. Common encodings: base64
+    (-enc / -EncodedCommand, FromBase64String), character concatenation, environment-variable substitution, and double-encoding.
+    Decoding reveals the actual intent -- download cradles, reverse shells, credential theft, or in-memory loaders. Iterate
+    decoding until the payload is readable.'
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: attack:T1027.010.obfuscation_check
+  question: Do other commands run on this host carry the same concealment markers -- a '#' followed by large whitespace runs?
+  context: The whitespace-and-comment padding is a reusable concealment trick. Other processes on this host launched with the
+    same '#'-plus-padding shape point to repeated pasted-command execution rather than a single one-off, which raises the
+    likelihood of an ongoing social-engineering chain.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains:
+          - '#         '
+          - '#       '
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to paste and run command-line one-liners from the File Explorer address bar or Run dialog?
+  context: Pasting commands into the Explorer address bar or Run dialog is uncommon for most users and is the core delivery
+    surface for these techniques. Knowing whether this user routinely performs such actions, and whether the host belongs to
+    a role that would, is often the fastest way to separate a true positive from unusual but benign behavior.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:parent_child.parent_process_legitimacy
+  question: Is explorer.exe the genuine parent here, and what spawned explorer.exe itself?
+  context: The rule keys on explorer.exe as the parent, but in the address-bar variant a browser file-upload dialog can present
+    as an Explorer-hosted window, and conhost.exe may sit between the address bar and the interpreter. Trace the parent's own
+    origin to confirm this is an interactive Explorer session rather than a browser- or script-driven chain masquerading as one.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- source: template:parent_child.sibling_processes
+  question: What other child processes did the same explorer.exe instance spawn around this time?
+  context: If the Explorer session that launched this command also spawned other interpreters or helpers, the same parent
+    instance reveals the full scope of pasted activity. Multiple suspicious children from one Explorer instance points to a
+    multi-step pasted chain rather than a single command.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_parent_process.baseline
+  question: Does explorer.exe normally spawn this child binary on this host?
+  context: explorer.exe legitimately launches many user-initiated applications, so the child binary is the discriminator. A
+    command interpreter or script host spawned by explorer.exe with no prior history on this host is a stronger signal than a
+    routinely launched application.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:initial_access.delivery_vector
+  question: What web page, document, or message led the user to paste this command?
+  context: These techniques begin with a lure -- a phishing page, shared document, or message instructing the user to open
+    the Run dialog or File Explorer address bar and paste a "file path" that is actually a command. Identifying the originating
+    page or message enables blocking it and finding other recipients who may have followed the same instructions. The browsing
+    or mail activity immediately preceding the paste is the place to look.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - ParentCommandLine
+- source: attack:T1204.004.network_connection
+  question: Did this process or its children make outbound connections shortly after execution?
+  context: A pasted one-liner commonly fetches a follow-on stage from an external host or copies it from a local cache before
+    egress. Outbound connections from this process or its descendants in the minutes after execution indicate a first-run
+    egress and identify the remote infrastructure to block. Absence of egress fits the cache-smuggling variant, where the
+    payload is read from an existing browser cache rather than downloaded.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+      - Image
+- source: template:universal.evidence_preservation
+  question: Did the pasted command drop or stage a file, and is it still on disk for analysis?
+  context: The decoded command often writes a first-stage artifact into a user-writable path such as the user profile,
+    %TEMP%, %APPDATA%, or %PUBLIC%, or assembles one from cached data (for example a staged archive or executable). Checking
+    whether those files still exist on disk enables hashing, reputation lookup, and content review.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run this child binary anywhere in the environment?
+  context: Compare the user's current action against their historical pattern. A user who has never launched this interpreter
+    or helper is more suspicious than one who runs it regularly. The user's role and typical toolset should align with what
+    was executed.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this explorer.exe-plus-child-binary combination historically routine on this host or across the environment, or is the pairing unusual?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior. The meaningful pivot is
+    the launch mechanism: explorer.exe spawning this specific binary, and whether that pair is historically common. A new or
+    rare pairing on this host or across the environment is the deviation worth chasing; a pair that already accounts for many
+    prior events is routine automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the environment around the time of this alert?
+  context: Tracking the user's activity across all hosts in a tight window reveals whether the pasted command was an isolated
+    event or part of broader activity spanning multiple endpoints. Repeated similar activity under the same user widens the
+    likely scope.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did the same explorer.exe-plus-child-binary combination fire on other hosts in the same window, indicating a coordinated lure, or is it isolated to this host?
+  context: Under a service principal, asking what else the user did returns agent-telemetry noise. The meaningful question is
+    whether the same launch mechanism -- explorer.exe spawning this binary -- fired on other hosts in the alert window.
+    Multiple hosts in the same window points to a phishing wave reaching several users; a single host points to a host-local
+    event.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:initial_access.campaign_scope
+  question: Did this same detection fire for other users or hosts, indicating a phishing wave?
+  context: These social-engineering campaigns rarely target a single user. Correlating the same detection across the
+    environment reveals how many users were lured into pasting the command and identifies additional systems that need
+    investigation.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        rule.uuid|expand: '%rule.uuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host -- reconnaissance, defense tampering, or
+    other execution events -- may reveal the stages that preceded this paste and help reconstruct the timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1204.004
+      name: Malicious Copy and Paste
+      role: primary
+    - id: T1027.010
+      name: Command Obfuscation
+      role: secondary
+    - id: T1204
+      name: User Execution
+      role: secondary
+    - id: T1027
+      name: Obfuscated Files or Information
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: user_paste_context
+      description: "User is socially engineered to paste a command into Run dialog or File Explorer address bar (browser/page/message context)"
+      mapped_to: Q9
+      source: template:initial_access.delivery_vector
+    - stage: 2
+      label: interpreter_spawn
+      description: "Command interpreter spawned with obfuscated/padded arguments under explorer.exe"
+      mapped_to: Q2
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 3
+      label: file_drop
+      description: "Optional first-stage file drop in user-writable path (%TEMP%/%APPDATA%/%PUBLIC%) or staged from cache"
+      mapped_to: Q11
+      source: template:universal.evidence_preservation
+    - stage: 4
+      label: outbound_egress
+      description: "Outbound network connection to external host (or cache-smuggling variant with no egress)"
+      mapped_to: Q10
+      source: attack:T1204.004.network_connection
+  dimension_coverage:
+    - dimension: parent_process_analysis
+      technique: T1204.004
+      covered_by: Q6
+      source: template:parent_child.parent_process_legitimacy
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1204.004
+      covered_by: Q10
+      source: attack:T1204.004.network_connection
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1204.004
+      covered_by: Q2
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: direct
+    - dimension: file_path_analysis
+      technique: T1204
+      covered_by: Q11
+      source: template:universal.evidence_preservation
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1204
+      covered_by: Q5
+      source: template:universal.host_user_context
+      coverage_type: direct
+    - dimension: obfuscation_check
+      technique: T1027.010
+      covered_by: Q4
+      source: attack:T1027.010.obfuscation_check
+      coverage_type: direct
+  mutable_dispositions:
+    - element: SuspiciousArgPatterns
+      dimension: tuning_parameter
+      specific_values: "-enc, FromBase64String, IEX(, DownloadString, Invoke-WebRequest"
+      disposition: context
+      target_question: Q3
+      notes: "Named in encoded_payload_decode context as the obfuscation shapes to decode; query stays ProcessGuid-scoped per KEEP_EXACT so no flag-filter injection"
+    - element: WritePaths
+      dimension: tuning_parameter
+      specific_values: "%TEMP%, %APPDATA%, %PUBLIC%, user profile"
+      disposition: context
+      target_question: Q11
+      notes: "Named as risky first-stage drop directories in evidence_preservation context; scoping uses %file_paths% from CommandLine-derived paths"
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "~15 minutes from paste to interpreter/egress"
+      disposition: query_injection
+      target_question: Q10
+      notes: "network_connection question uses +/-15m window; campaign/precursor windows also bound correlation horizon"
+    - element: ParentProcessAllowList
+      dimension: parent_process_analysis
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q6
+      notes: "parent_process_legitimacy traces explorer.exe origin to distinguish genuine interactive Explorer from browser/script-hosted address-bar window"
+    - element: OutboundCIDRBlockList
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q10
+      notes: "First-run egress framing in network_connection context; no static CIDR list injected (environment-specific)"
+    - element: HighRiskChildren
+      dimension: tuning_parameter
+      specific_values: "powershell.exe, cmd.exe, wscript.exe, mshta.exe, rundll32.exe, msiexec.exe, curl.exe, bitsadmin.exe"
+      disposition: context
+      target_question: Q8
+      notes: "LOLBIN child list referenced via cue_parent_process.baseline (explorer.exe child discriminator); query keys on %Image% from alert"
+    - element: HighRiskParents
+      dimension: tuning_parameter
+      specific_values: "explorer.exe (matches this rule's parent)"
+      disposition: context
+      target_question: Q6
+      notes: "explorer.exe is the rule's fixed parent; parent legitimacy question centers on whether it is genuine Explorer"
+    - element: CommandLineEntropyThreshold
+      dimension: obfuscation_check
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q3
+      notes: "Entropy/base64 token signal described in encoded_payload_decode context; threshold not directly queryable"
+    - element: SuspiciousCharacterCount
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q4
+      notes: "The '#'-plus-whitespace concealment shape is the character-frequency signal this rule keys on; Q4 hunts the same shape host-wide"
+    - element: PayloadEntropyThreshold
+      dimension: obfuscation_check
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q11
+      notes: "Encoded/compressed staged artifacts covered by evidence_preservation; entropy tuning is a detection-side parameter"
+    - element: SuspiciousParentProcessList
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q8
+      notes: "explorer.exe is the fixed suspicious parent for this rule; baseline question scopes to it"
+    - element: UserPaths
+      dimension: file_path_analysis
+      specific_values: "%USERPROFILE%\\Downloads, %TEMP%, %APPDATA%"
+      disposition: context
+      target_question: Q11
+      notes: "Writable watch paths named in evidence_preservation context"
+    - element: EgressAllowList
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q10
+      notes: "Corporate CDN/proxy suppression is a detection-side tuning concern; egress question surfaces all outbound for analyst review"
+  dedup_decisions:
+    - dropped: cue_process_tool.process_chain
+      reason: "parent_process is primary cue (explorer.exe in detection) — parent legitimacy/origin covered by parent_child.parent_process_legitimacy; per brief hint"
+      kept: parent_child.parent_process_legitimacy
+    - dropped: cue_parent_process.mechanism_decode
+      reason: "parent ProcessGuid lookup duplicates parent_child.parent_process_legitimacy (same ParentProcessGuid scope, richer fields)"
+      kept: parent_child.parent_process_legitimacy
+    - dropped: cue_user_actor.baseline / baseline_svc pair
+      reason: "user_actor pair — non-deduplicable; both emitted"
+      kept: cue_user_actor.baseline + cue_user_actor.baseline_svc
+    - dropped: cue_user_actor.clustering / clustering_svc pair
+      reason: "user_actor pair — non-deduplicable; both emitted"
+      kept: cue_user_actor.clustering + cue_user_actor.clustering_svc
+  skipped_templates:
+    - template: cue_parent_process.follow_on
+      reason: "sibling/follow-on children covered by parent_child.sibling_processes (ParentProcessGuid-scoped, more precise than ParentName)"
+    - template: cue_parent_process.clustering
+      reason: "around-the-same-time parent activity covered by cue_host_context coverage and sibling_processes; would duplicate ParentName-scoped process listing"
+    - template: cue_parent_process.scope
+      reason: "cross-host parent-child spread covered by cue_user_actor.clustering_svc (same parent+binary across hosts in window) and initial_access.campaign_scope"
+    - template: cue_process_tool.baseline
+      reason: "host-baseline of binary covered by cue_parent_process.baseline (parent+child pairing is the sharper discriminator for an explorer.exe-parented rule)"
+    - template: cue_host_context.clustering
+      reason: "host-wide activity window largely covered by sibling_processes + precursor; dropped to stay within 18-question cap while keeping the two non-deduplicable user_actor pairs"
+    - template: universal.endpoint_protection_health
+      reason: "generic host-tamper sweep; this rule fires on a social-engineering paste, not hands-on-keyboard payload execution where AV/EDR tamper is a live precursor — cue_host_context.precursor already surfaces prior tamper alerts on the host"
+    - template: initial_access.application_patch_status
+      reason: "delivery is social-engineering paste into Explorer/Run, not exploitation of an unpatched application — patch status is not a relevant disposition input for this technique"
+  reflection_overrides: []
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - initial_access
+    - obfuscation
+    - parent_child
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 15
+      attack: 2
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 14
+    logsource_diversity:
+      process_creation: 13
+      network_connection: 1
+      file_event: 1
+      sigma_alert: 2

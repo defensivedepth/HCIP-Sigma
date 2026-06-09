@@ -1,0 +1,412 @@
+name: Suspicious WindowsTerminal Child Processes
+id: 0378391a-7da3-4b3a-8fba-31db0ee96117
+description: |
+  Detects the Windows Terminal application (WindowsTerminal.exe or wt.exe) spawning a child process that
+  matches at least one suspicious indicator: a child binary commonly abused for proxy execution or
+  download (rundll32.exe, regsvr32.exe, certutil.exe, cscript.exe, wscript.exe, csc.exe), a child image
+  running from a user-writable directory (Public, Downloads, Desktop, AppData\Local\Temp, Windows\TEMP),
+  or a command line containing script-execution patterns (iex, icm, Invoke-, Import-Module/ipmo,
+  DownloadString(, or cmd /c /k /r). Built-in Visual Studio developer shell launches, opening the
+  Terminal settings.json, and VsDevCmd.bat invocations are filtered out. Windows Terminal profiles can be
+  modified to launch an arbitrary payload at user logon, so an unexpected suspicious child of Windows
+  Terminal may indicate persistence via a tampered profile or a launcher delivered through the terminal.
+  Determine whether the child execution is a legitimate developer or administrator workflow or an
+  attacker-controlled launcher, and whether the Terminal profile or related persistence was modified.
+type: detection
+detection_id: 8de89e52-f6e1-4b5b-afd1-41ecfa300d48
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does this event match the rule — a Windows Terminal parent spawning a suspicious child by binary name, user-writable path, or command-line pattern?
+  context: Confirm the alert is a true positive before investing time. Verify the parent is WindowsTerminal.exe or wt.exe and check which branch fired — a known proxy-execution or download binary (rundll32, regsvr32, certutil, cscript, wscript, csc), a child image under a user-writable directory, or a command line containing script-execution patterns (iex, icm, Invoke-, Import-Module, DownloadString, or cmd /c /k /r). The branch that fired points to which downstream questions carry the most weight.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to launch these tools or scripts from Windows Terminal?
+  context: Developers and administrators routinely run command interpreters and scripts from Windows Terminal, so legitimate use is common on workstations and engineering hosts. Knowing whether this user's role and this host's function fit interactive script or LOLBin execution is often the fastest way to separate routine work from a tampered profile or delivered launcher.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:parent_child.parent_process_legitimacy
+  question: Is Windows Terminal expected to spawn this child, and what started Windows Terminal itself?
+  context: The Windows-Terminal-to-child relationship is the core signal. Tracing the parent's own origin shows whether the chain is an interactive user session (explorer.exe or a shell the user launched) or something unexpected that launched the terminal automatically, such as a logon-triggered profile. An automated launch at logon is consistent with profile-based persistence.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- source: template:cue_parent_process.mechanism_decode
+  question: What was the full command line of the child process, and what operation does it perform?
+  context: The child's full command line reveals the specific action taken. Decode any flags, encoded content, file paths, or URLs — for certutil look for -decode/-encode and the source and output files; for script hosts identify the script being run; for cmd identify what /c, /k, or /r executes. This determines whether the activity is a benign developer command or a download or proxy-execution step.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+- source: template:obfuscation.encoded_payload_decode
+  question: Is the child command line encoded or obfuscated, and what does it decode to?
+  context: 'Encoded content hides the operator''s payload from casual inspection. Common encodings here: base64 (certutil -decode, encoded script arguments), hex, character concatenation, and download cradles invoked through iex or DownloadString(. Decoding reveals the actual intent — download cradle, in-memory loader, reverse shell, or credential theft. For certutil-encoded content, look for -decode/-decodehex and the named source and output files; for script hosts, reconstruct any concatenated or character-encoded string.'
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:lolbin.renamed_binary_check
+  question: Was the child binary executed from its expected system path?
+  context: The named LOLBins in this rule (rundll32.exe, regsvr32.exe, certutil.exe, cscript.exe, wscript.exe, csc.exe) normally live in System32 or SysWOW64. One running from a user-writable directory such as Downloads, Desktop, AppData\Local\Temp, or Public is more suspicious — it may be a copied or renamed binary placed to evade path-based allowlists, and it also corresponds to the rule's user-writable-path branch.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- source: template:parent_child.sibling_processes
+  question: What other child processes did this same Windows Terminal instance spawn?
+  context: If the terminal instance spawned the detected child, it likely spawned others. Examining sibling processes from the same parent reveals the full scope of activity from that terminal session — multiple suspicious children from one terminal instance suggests orchestrated activity rather than a single interactive command.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_parent_process.clustering
+  question: What file and network activity occurred around this Windows Terminal child execution?
+  context: Beyond child processes, the execution may be accompanied by file writes or network connections that reveal its purpose. A download cradle in the child command line would produce an outbound connection; a dropped payload would produce a file write. Correlating activity in the same window helps establish whether this is a download, a loader, or benign tooling.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        process.parent.name|expand: '%ParentName%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run this binary from Windows Terminal across the environment?
+  context: Compare this user's current action against their historical pattern. A user who has never run this binary is more suspicious than one who does so regularly, and the user's role should align with running proxy-execution or download tools from an interactive terminal.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this Windows-Terminal-to-binary launch combination historically routine on this host or across the environment?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior; the meaningful pivot is the launch mechanism. A new or rare Windows-Terminal-spawning-this-binary pairing on this host or environment-wide is the deviation worth chasing, while a pairing already accounting for thousands of prior events is developer or automation activity.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the environment around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints. If the same user triggered similar terminal-spawned activity on several hosts, the scope is larger than a single workstation.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same Windows-Terminal-to-binary combination fire on other hosts in the same window?
+  context: Under a service principal, asking what else the user did returns agent-telemetry noise. The meaningful question is whether the same launch mechanism — Windows Terminal spawning this binary — fired on other hosts in the alert window. Multiple hosts in the same window points to pushed or scheduled automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:lolbin.historical_lolbin_baseline
+  question: How often has this host fired this Windows Terminal child-process pattern over the past 90 days, and what command-line shapes are typical?
+  context: A pattern with no prior history on a host is more suspicious than one seen regularly under stable conditions. This query mirrors the rule's full selection structure scoped to this host, so the count reflects the rule's specific firing pattern rather than generic binary usage, and the command-line projection lets you compare typical invocation shapes against the alerting one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_parent:
+        ParentImage|endswith:
+        - \WindowsTerminal.exe
+        - \wt.exe
+      selection_susp:
+      - Image|endswith:
+        - \rundll32.exe
+        - \regsvr32.exe
+        - \certutil.exe
+        - \cscript.exe
+        - \wscript.exe
+        - \csc.exe
+      - Image|contains:
+        - C:\Users\Public\
+        - \Downloads\
+        - \Desktop\
+        - \AppData\Local\Temp\
+        - \Windows\TEMP\
+      - CommandLine|contains:
+        - ' iex '
+        - ' icm'
+        - Invoke-
+        - 'Import-Module '
+        - 'ipmo '
+        - DownloadString(
+        - ' /c '
+        - ' /k '
+        - ' /r '
+      filter_builtin_visual_studio_shell:
+        CommandLine|contains|all:
+        - Import-Module
+        - Microsoft.VisualStudio.DevShell.dll
+        - Enter-VsDevShell
+      filter_open_settings:
+        CommandLine|contains|all:
+        - \AppData\Local\Packages\Microsoft.WindowsTerminal_
+        - \LocalState\settings.json
+      filter_vsdevcmd:
+        CommandLine|contains|all:
+        - C:\Program Files\Microsoft Visual Studio\
+        - \Common7\Tools\VsDevCmd.bat
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_* and not 1 of filter_*) and _pb_scope
+    fields:
+    - CommandLine
+- source: template:lolbin.technique_class_lateral
+  question: Were any other download or proxy-execution LOLBins used on this host recently?
+  context: Operators who use one LOLBin often use several. If certutil or rundll32 was launched here, check whether other download or proxy-execution binaries (mshta, regsvr32, bitsadmin, curl, msiexec, installutil) ran on the host within the same day. Finding multiple LOLBins working toward the same objective strengthens the case for malicious activity.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_img:
+        Image|endswith:
+          - '\bitsadmin.exe'
+          - '\curl.exe'
+          - '\mshta.exe'
+          - '\msbuild.exe'
+          - '\cmstp.exe'
+          - '\msiexec.exe'
+          - '\wmic.exe'
+          - '\installutil.exe'
+          - '\msdt.exe'
+          - '\esentutl.exe'
+          - '\expand.exe'
+          - '\extrac32.exe'
+      condition: selection and selection_img
+    fields:
+      - Image
+      - CommandLine
+- source: template:persistence_scope.file_based_persistence
+  question: Was the Windows Terminal profile settings.json or a Startup/Run persistence location modified on this host?
+  context: Windows Terminal persistence works by editing the profile settings.json under the user's AppData to launch a payload at logon, which leaves a file write rather than a persistence-tool command line. Checking writes to the Terminal settings.json path, the Startup folder, and registry Run/RunOnce paths captures profile tampering and parallel file-based persistence that bypass command-line detection.
+  range: +/-4h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist_paths:
+        TargetFilename|contains:
+          - '\Microsoft.WindowsTerminal_'
+          - '\LocalState\settings.json'
+          - '\Start Menu\Programs\Startup\'
+          - '\CurrentVersion\Run'
+          - '\CurrentVersion\RunOnce'
+      condition: selection and selection_persist_paths
+    fields:
+      - TargetFilename
+      - Image
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering, reconnaissance, or credential access — may reveal the stages that preceded this execution and help reconstruct the timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: false
+  techniques: []
+  attack_chain_coverage: []
+  dimension_coverage: []
+  mutable_dispositions: []
+  dedup_decisions:
+    - dropped: cue_process_tool.process_chain
+      reason: "parent_process is primary cue — parent_child.parent_process_legitimacy and cue_parent_process.mechanism_decode subsume the process-chain question (hint 1)"
+      kept: parent_child.parent_process_legitimacy
+    - dropped: cue_process_tool.mechanism_decode
+      reason: "within-phase analysis dedup — cue_parent_process.mechanism_decode (child decode) plus obfuscation.encoded_payload_decode cover the child command-line decode for this parent-primary rule"
+      kept: cue_parent_process.mechanism_decode
+    - dropped: cue_user_actor.baseline / baseline_svc pair counted as two
+      reason: "user_actor pair — non-deduplicable (subject vs. launch-mechanism pivot)"
+      kept: cue_user_actor.baseline
+    - dropped: cue_user_actor.clustering / clustering_svc pair counted as two
+      reason: "user_actor pair — non-deduplicable (subject vs. launch-mechanism pivot)"
+      kept: cue_user_actor.clustering
+  skipped_templates:
+    - template: cue_parent_process.baseline
+      reason: "superseded by lolbin.historical_lolbin_baseline (rule-pattern scoped count) and cue_user_actor.baseline_svc (parent+binary frequency) — both more specific to the firing pattern"
+    - template: cue_parent_process.follow_on
+      reason: "subsumed by parent_child.sibling_processes (same-instance children) — follow_on uses parent-name scoping which is broader and overlaps"
+    - template: cue_parent_process.scope
+      reason: "superseded by cue_user_actor.clustering_svc (parent+binary cross-host in window) which answers the same multi-host scope question more precisely"
+    - template: cue_process_tool.baseline
+      reason: "host-level binary frequency covered by lolbin.historical_lolbin_baseline scoped to the rule pattern; generic binary count would be noisier"
+    - template: cue_host_context.clustering
+      reason: "host-wide activity around the alert overlaps cue_parent_process.clustering (parent-scoped) which is more targeted for this parent-primary rule"
+    - template: universal.endpoint_protection_health
+      reason: "recommended generic tamper sweep; cue_host_context.precursor already surfaces prior tamper alerts on the host and this rule is persistence/launcher-focused rather than a hands-on-keyboard payload-execution rule where tamper-as-precursor is the pivot"
+    - template: organizational_context.change_ticket
+      reason: "recommended; coverage trimmed to stay within 14-18 — human_recall/timing/procedural questions add marginal value for an interactive-terminal launcher where the user pivot (baseline) already addresses expected behavior"
+    - template: organizational_context.human_recall
+      reason: "recommended; trimmed for question budget — host_user_context already asks whether the user/host is expected to run these tools"
+    - template: organizational_context.timing_alignment
+      reason: "recommended; trimmed for question budget"
+    - template: organizational_context.procedural_consistency
+      reason: "recommended; trimmed for question budget"
+    - template: persistence_scope.process_based_persistence
+      reason: "trimmed for budget; file_based_persistence is the more relevant persistence mechanism here (Windows Terminal profile persistence is a file write, not a persistence-tool invocation)"
+  reflection_overrides: []
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - parent_child
+    - lolbin
+    - obfuscation
+    - persistence_scope
+  generation_stats:
+    total_questions: 16
+    source_counts:
+      template: 16
+      attack: 0
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 13
+    logsource_diversity:
+      process_creation: 14
+      file_event: 1
+      sigma_alert: 1

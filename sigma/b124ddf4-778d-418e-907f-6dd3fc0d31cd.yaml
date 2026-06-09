@@ -1,0 +1,625 @@
+name: Arbitrary File Download Via PresentationHost.EXE
+id: 964f0cfc-ef46-4ed0-a047-53f9c1f20cf0
+description: |
+  Detects presentationhost.exe (the .NET XAML Browser Application host) running with an HTTP, HTTPS, or
+  FTP URL on its command line. presentationhost.exe is a Microsoft-signed binary, so it can proxy a
+  network download past path- and signature-based controls; the URL on its command line is the staged
+  payload location. The rule fires only when both conditions hold: the process is presentationhost.exe
+  (by Image path or OriginalFileName) AND its command line contains a URL scheme. Legitimate use is rare
+  outside developer or XBAP-application contexts; investigation should confirm the destination, the
+  parent that launched it, and what the host did before and after the download.
+type: detection
+detection_id: b124ddf4-778d-418e-907f-6dd3fc0d31cd
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- source: template:universal.verify_trigger_match
+  question: Is the alerting process presentationhost.exe running with an http, https, or ftp URL on its command line?
+  context: Confirm the alert is a true positive before investing investigation time. The rule fires only
+    when the process is presentationhost.exe (by Image path ending in presentationhost.exe or by
+    OriginalFileName) AND the command line carries a URL scheme. Read the exact command line, note the
+    full URL, and confirm the OriginalFileName resolves to PresentationHost.exe rather than a renamed copy.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to download files via presentationhost.exe or run XBAP applications?
+  context: Legitimate use of presentationhost.exe to fetch remote content is rare and usually tied to
+    developer workstations or specific line-of-business XAML browser applications. If the user role and
+    host function have no .NET XBAP or developer context, the proxy-download behavior is harder to explain
+    as routine.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What exactly did presentationhost.exe do? Decode the full command line and the URL it was pointed at.
+  context: The full command line reveals the staged payload location and any switches passed to the XBAP
+    host. Decode the URL (scheme, host, path, and any file extension), note whether it points at an
+    executable, script, or .xbap/.xaml resource, and capture the working directory so the downloaded
+    artifact can be located on disk.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:cue_network_endpoint.mechanism_decode
+  question: What is the download destination, and what do DNS, WHOIS, and threat intel reveal about it?
+  context: Investigate the URL host extracted from the command line — DNS resolution history,
+    registration age, TLS certificate details, and known threat intelligence hits. Recently registered
+    domains, raw IP literals, self-signed certificates, or known staging infrastructure point to an
+    attacker-controlled endpoint rather than a trusted update or content source.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - DestinationHostname
+      - DestinationIp
+      - DestinationPort
+- source: template:cue_process_tool.process_chain
+  question: What process spawned presentationhost.exe, and is that parent chain expected?
+  context: The parent reveals how the proxy download was invoked. A browser, an Office application,
+    mshta.exe, wscript.exe, or a command interpreter spawning presentationhost.exe with a URL is a
+    different story than explorer.exe launching it from a user double-click. Walk the parent up its own
+    ParentProcessGuid if the immediate parent is itself a script host or shell.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: attack:T1218.image_load
+  question: What DLLs did presentationhost.exe load after launch, and were any loaded from a user-writable path?
+  context: Proxy-execution via a signed .NET host often surfaces as the host loading additional managed
+    or unmanaged modules to carry out the staged payload. Modules loaded from user-writable locations
+    (user profile, temp, public, or AppData directories) rather than from the framework or system
+    directories indicate the binary was steered toward attacker-supplied code rather than its normal
+    XBAP runtime. If image_load events are not ingested in this environment, treat zero results as a
+    visibility gap rather than evidence nothing loaded.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in the hour before the alert?
+  context: Tampering often precedes payload execution. The query surfaces direct attempts to disable
+    AV/EDR services, flip Defender flags, add broad exclusions, clear logs, or patch AMSI/ETW in the hour
+    before this download. Zero rows is a useful "protection looks healthy" signal — kernel-level driver
+    tampering and in-memory patches will not appear here. Populated rows shift the disposition toward
+    operator preparation; review the parent process and signing chain to identify the writer.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+- source: template:cue_process_tool.follow_on
+  question: What child processes did presentationhost.exe spawn after the download?
+  context: The processes spawned afterward reveal the download's actual impact. A proxy download followed
+    by cmd.exe, powershell.exe, certutil.exe, or an unsigned binary executing from a user-writable path
+    indicates the fetched payload was run. Predictable .NET runtime children are expected; post-execution
+    interpreters or droppers are not.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_network_endpoint.baseline
+  question: Does this host normally communicate with this download destination?
+  context: First-time connections to the URL host are more suspicious than routine communication.
+    A baseline distinguishes new staging infrastructure from a destination the host already contacts as
+    part of normal business or update traffic.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        DestinationIp|expand: '%dst_ip%'
+      condition: selection
+    fields:
+      - DestinationPort
+      - Image
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously run presentationhost.exe with a URL, what parents and users drove it, and does this alert fit that pattern?
+  context: Even a signed binary can be abused. The query mirrors the rule's selection — presentationhost.exe
+    with an http, https, or ftp URL — scoped to this host, so the parent and user distribution reflects how
+    this specific firing pattern has historically run here, not generic binary usage. A new parent process,
+    an unexpected user account, or an unusual command-line shape is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \presentationhost.exe
+      - OriginalFileName: PresentationHost.exe
+      selection_cli:
+        CommandLine|contains:
+        - http://
+        - https://
+        - ftp://
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run presentationhost.exe?
+  context: Compare this user's current action against their historical behavior. A user who has never run
+    presentationhost.exe is more suspicious than one who does so regularly as part of a known XBAP or
+    developer workflow. User role and typical toolset should align with proxy-download behavior.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent and presentationhost.exe combination historically routine on this host or across the environment, or is the parent unusual for this binary?
+  context: When the alert fires under a service principal, user identity does not attribute behavior. The
+    meaningful pivot is the launch mechanism — which parent process spawned presentationhost.exe, and
+    whether that pair is historically common. A new or rare parent for this binary is the deviation worth
+    chasing; a pair that already accounts for thousands of prior events is vendor or OS automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning
+    multiple endpoints. If the same user triggered similar download or proxy-execution activity on
+    multiple hosts, the scope of the activity may be larger than this single alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent and presentationhost.exe combination fire on other hosts in the same window — a coordinated automation rollout, or isolated to this host?
+  context: Under a service principal, asking what else the user did across the network returns
+    agent-telemetry noise, since every host runs service-owned processes constantly. The meaningful
+    question is whether the same launch mechanism — parent process plus presentationhost.exe — fired on
+    other hosts in the alert window. Multiple hosts in the same window points to scheduled or pushed
+    automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering,
+    reconnaissance, credential access — may reveal the attack stages that preceded this download and help
+    reconstruct the full timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:lolbin.technique_class_lateral
+  question: Were any other proxy-execution or download LOLBins used on this host recently?
+  context: Attackers who use one signed binary to proxy execution often use several. If presentationhost.exe
+    fetched a payload, check whether rundll32, regsvr32, mshta, installutil, msiexec, certutil, bitsadmin,
+    or curl were also used to download or proxy-execute around the same time. Multiple LOLBins performing
+    the same objective strengthens the case for deliberate evasion.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_img:
+        Image|endswith:
+          - '\certutil.exe'
+          - '\bitsadmin.exe'
+          - '\curl.exe'
+          - '\rundll32.exe'
+          - '\regsvr32.exe'
+          - '\mshta.exe'
+          - '\msbuild.exe'
+          - '\cmstp.exe'
+          - '\msiexec.exe'
+          - '\installutil.exe'
+          - '\forfiles.exe'
+          - '\pcalua.exe'
+          - '\control.exe'
+          - '\infdefaultinstall.exe'
+          - '\msdt.exe'
+          - '\mavinject.exe'
+          - '\wmic.exe'
+          - '\xwizard.exe'
+          - '\hh.exe'
+      condition: selection and selection_img
+    fields:
+      - Image
+      - CommandLine
+- source: template:lolbin.renamed_binary_check
+  question: Was presentationhost.exe executed from its expected System path?
+  context: presentationhost.exe normally lives under the Windows .NET framework directories. A copy
+    running from a user profile, temp, public, or other user-writable path may have been relocated or
+    renamed to evade path-based allowlists — more suspicious than execution from its standard location.
+    Compare the Image path against OriginalFileName to spot a renamed copy.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- source: template:lolbin.historical_lolbin_baseline
+  question: How often has this host fired the presentationhost.exe URL pattern over the past 90 days, and what command-line shapes are typical?
+  context: A proxy-download pattern with no prior history on a host is more suspicious than one used
+    regularly under stable parents. The query mirrors the rule's selection — presentationhost.exe with an
+    http, https, or ftp URL — scoped to this host, so the count reflects this specific firing pattern, not
+    generic use of the binary. The command-line projection lets the analyst compare typical invocation
+    shapes against the alerting one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith: \presentationhost.exe
+      - OriginalFileName: PresentationHost.exe
+      selection_cli:
+        CommandLine|contains:
+        - http://
+        - https://
+        - ftp://
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - CommandLine
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1218
+      name: System Binary Proxy Execution
+      role: primary
+  attack_chain_coverage:
+    - stage: 1
+      label: signed_binary_invocation
+      description: "Trusted Microsoft-signed binary (presentationhost.exe) is invoked with attacker-controlled parameters"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: command_line_payload_reference
+      description: "Command line carries a URL referencing the externally hosted payload"
+      mapped_to: Q3
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 3
+      label: network_retrieval
+      description: "Binary retrieves the externally hosted payload over HTTP/HTTPS/FTP"
+      mapped_to: Q4
+      source: template:cue_network_endpoint.mechanism_decode
+    - stage: 4
+      label: module_load_execution
+      description: "Proxy host loads modules / executes the retrieved payload"
+      mapped_to: Q6
+      source: attack:T1218.image_load
+  dimension_coverage:
+    - dimension: command_analysis
+      technique: T1218
+      covered_by: Q3
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1218
+      covered_by: Q5
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1218
+      covered_by: Q4
+      source: template:cue_network_endpoint.mechanism_decode
+      coverage_type: direct
+  mutable_dispositions:
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "rationale only (profile unexpected parent-child relationships)"
+      disposition: context
+      target_question: Q5
+      notes: "process_chain question profiles the parent that spawned presentationhost.exe; no specific parent values to inject."
+    - element: SignedBinaryList
+      dimension: tuning_parameter
+      specific_values: "presentationhost.exe (this rule's binary)"
+      disposition: query_injection
+      target_question: Q1
+      notes: "The signed binary itself is the rule's selection_img (Image|endswith presentationhost.exe / OriginalFileName); verify and renamed-path questions confirm it."
+    - element: CommandLineRegex
+      dimension: command_analysis
+      specific_values: "http://, https://, ftp:// (URL schemes in CommandLine)"
+      disposition: query_injection
+      target_question: Q10
+      notes: "URL-scheme contains values are embedded in the reflected baseline_deviation and historical_lolbin_baseline queries; decoded in mechanism_decode (Q3)."
+    - element: RemoteDomainAllowlist
+      dimension: tuning_parameter
+      specific_values: "rationale only (suppress legitimate enterprise domains)"
+      disposition: context
+      target_question: Q4
+      notes: "Destination-reputation question (Q4) and destination-baseline question (Q9) carry the allowlist rationale; no enterprise domain values available at generation time."
+  dedup_decisions:
+    - dropped: cue_process_tool.baseline
+      reason: "lolbin.historical_lolbin_baseline (REFLECTED, rule-pattern scoped) is more specific than the generic host+binary 90d baseline — kept the reflected version."
+      kept: lolbin.historical_lolbin_baseline
+    - dropped: cue_process_tool.clustering
+      reason: "cue_host_context.precursor and cue_user_actor.clustering already cover surrounding activity; host-wide tool clustering would duplicate without the dropped cue_host_context.clustering."
+      kept: cue_user_actor.clustering
+    - dropped: cue_process_tool.scope
+      reason: "fleet-pattern scope overlaps lolbin.historical_lolbin_baseline (host-pattern history) plus user_actor clustering_svc (cross-host parent+binary in window); kept the host-history and in-window cross-host views to stay under the 18-question cap."
+      kept: lolbin.historical_lolbin_baseline
+    - dropped: cue_host_context.clustering
+      reason: "Surrounding-host context already provided by precursor (prior alerts) and follow_on (children); host-wide process clustering would duplicate at the 18-question cap."
+      kept: cue_host_context.precursor
+    - dropped: null
+      reason: "user_actor pair — non-deduplicable: cue_user_actor.baseline + baseline_svc and cue_user_actor.clustering + clustering_svc each emitted as BOTH variants per AGENTS.md (subject vs. mechanism pivots)."
+      kept: cue_user_actor.baseline_svc, cue_user_actor.clustering_svc
+  skipped_templates: []
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "cue_network_endpoint: derived: https?:// in CommandLine"
+      disposition: acted-on
+      reason: >-
+        Acted on — cue_network_endpoint.mechanism_decode (Q4, destination reputation) and
+        cue_network_endpoint.baseline (Q9, destination history) were both authored from the derived
+        network endpoint. Listed here for completeness; acted-on hints normally manifest as questions.
+    - hint: "LOLBin rule — check for renamed binary and other LOLBins achieving same objective"
+      disposition: acted-on
+      reason: >-
+        Acted on — lolbin.renamed_binary_check (Q17) checks for a relocated/renamed presentationhost.exe
+        and lolbin.technique_class_lateral (Q16) sweeps for other proxy-execution / download LOLBins on
+        the host. Listed for completeness.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - download_tool
+    - lolbin
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 17
+      attack: 1
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 2
+      context: 14
+    logsource_diversity:
+      process_creation: 14
+      network_connection: 2
+      image_load: 1
+      sigma_alert: 1

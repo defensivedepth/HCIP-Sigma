@@ -1,0 +1,456 @@
+name: Suspicious Control Panel DLL Load
+id: 93c2e09c-a898-4474-ac87-6366430734e4
+description: |
+  Detects rundll32.exe spawned by control.exe (the Control Panel host in System32) when the command line does not reference Shell32.dll. The rule fires only when all of these hold together: the parent process ends in \System32\control.exe, the child is rundll32.exe (by Image or OriginalFileName), AND the command line does not contain Shell32.dll. Control Panel applets are .cpl files that control.exe normally hands to rundll32 via Shell32.dll; an invocation that bypasses Shell32.dll is the abuse pattern, where a non-applet DLL or script payload is proxy-executed through a trusted signed binary. Determine which module or entry point rundll32 was told to run, where that module came from (local disk or network), and whether the control.exe-to-rundll32 chain reflects a legitimate Control Panel action or proxy execution of an attacker-supplied payload.
+type: detection
+detection_id: d7eb979b-c2b5-4a6f-a3a7-c87ce6763819
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-09
+questions:
+- source: template:universal.verify_trigger_match
+  question: Was rundll32.exe spawned by control.exe in the pattern this rule detects?
+  context: Before investing investigation time, confirm the alert is a true positive. The rule requires all three conditions together — the parent ends in \System32\control.exe, the child is rundll32.exe (matched by Image or OriginalFileName), and the command line does not contain Shell32.dll. Confirm the parent, child, and OriginalFileName match; the command line itself is decoded in the mechanism-decode question.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - OriginalFileName
+- source: template:universal.host_user_context
+  question: Is this user and host expected to open Control Panel applets that load custom DLLs?
+  context: Legitimate Control Panel use normally routes applet loads through Shell32.dll, which this rule excludes. A user or host that has a routine reason to launch Control Panel items that hand a non-standard DLL to rundll32 (some third-party hardware or driver control panels do this) is a weaker signal than an account with no such workflow. Knowing the user role and host function is often the fastest path to separating a true positive from a vendor control panel.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:parent_child.parent_process_legitimacy
+  question: Is control.exe expected to spawn rundll32.exe here, and what started control.exe itself?
+  context: The control.exe-to-rundll32 parent-child relationship is the core signal for this detection. Control.exe is normally launched by a user opening the Control Panel from explorer.exe or a shortcut. Tracing what started control.exe reveals whether the chain is user-driven or whether control.exe was itself spawned by a script host, Office application, or other unexpected parent, which would point to scripted proxy execution rather than an interactive Control Panel action.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- source: template:parent_child.sibling_processes
+  question: What other child processes did the same control.exe instance spawn?
+  context: If this control.exe instance was used to proxy-execute a payload, it may have spawned other processes besides the alerting rundll32. Examining the siblings of the exact parent instance reveals the full scope of activity launched through this Control Panel invocation — multiple unexpected children from one control.exe strongly suggests scripted orchestration rather than a single applet open.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.mechanism_decode
+  question: What exactly was rundll32 told to run? Decode the command-line module, entry point, and any script or URL.
+  context: The full command line reveals which module rundll32 was directed to load and which exported function it called (the "DLL,EntryPoint" form), or whether a script handler such as a javascript or vbscript URI prefix or mshtml RunHTMLApplication was invoked instead of a DLL. Decode the target path and entry point — a .cpl or .dll outside System32, a path in a user-writable directory, or a script-URI prefix indicates proxy execution rather than a standard applet load.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: attack:T1218.011.dll_load
+  question: Which non-standard modules did this rundll32 process map into memory?
+  context: Beyond the command line, the modules rundll32 actually loaded confirm what was proxy-executed. A DLL or .cpl mapped from a user-writable or temporary directory, or a module with no signature, is the payload the technique loads through the trusted binary. Correlating the loads with the alerting rundll32 within the same short window distinguishes the payload module from the normal Windows DLLs every rundll32 process maps. If image-load telemetry is not collected in this environment, treat zero results as a visibility gap rather than evidence nothing loaded.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+- source: attack:T1218.011.payload_on_disk
+  question: Was the DLL, CPL, or script that rundll32 loaded recently written to disk, and from where?
+  context: A module proxy-executed through rundll32 is often staged on disk shortly before execution. Locating the target module on disk and checking when and by what process it was created reveals whether it is a resident system component or an attacker-dropped payload. Drops into user-writable staging directories such as Temp, Public, AppData, or ProgramData are common landing spots for the DLL or .cpl that this technique loads.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_ext:
+        TargetFilename|endswith:
+          - '.dll'
+          - '.cpl'
+          - '.sct'
+          - '.hta'
+      condition: selection and selection_ext
+    fields:
+      - TargetFilename
+      - Image
+      - Hashes
+- source: attack:T1218.011.external_retrieval
+  question: Did this rundll32 process make any network connections, and to what destinations?
+  context: Rundll32 abuse sometimes fetches the payload or a follow-on script (such as a .sct or .hta) directly from a remote host, or the loaded module establishes command-and-control. Rundll32 making outbound connections — especially to an external address or an unfamiliar domain — is anomalous for a Control Panel action and indicates retrieval or beaconing rather than a local applet load. If network telemetry for this process is not collected, treat zero results as a visibility gap.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - DestinationHostname
+      - Initiated
+- source: template:cue_parent_process.baseline
+  question: Does control.exe normally spawn rundll32 in this non-Shell32.dll pattern on this host?
+  context: Some third-party Control Panel applets legitimately drive rundll32 without Shell32.dll, and on a host where that is routine the pairing will have prior history. Zero or very low historical counts for control.exe spawning rundll32 indicate a novel parent-child relationship on this host and raise the weight of the alert; a recurring count points to an installed vendor control panel.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:cue_user_actor.baseline
+  question: Does this user normally launch rundll32 through Control Panel?
+  context: Compare this user's current action against their historical pattern. A user who has never driven rundll32 from a Control Panel applet is more suspicious than one who does so regularly as part of a known administrative or hardware-management workflow. User role and typical toolset should align with this activity.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is the control.exe-to-rundll32 combination historically routine on this host or across the environment, or is control.exe an unusual parent for rundll32?
+  context: When the alert fires under a service principal, user identity does not attribute behavior; the meaningful pivot is which parent spawned rundll32 and whether that pair is historically common. A new or rare control.exe parent for rundll32 on this host or environment-wide is the deviation worth chasing; a pair already accounting for many prior events is vendor or operating-system automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints. If the same user triggered similar proxy-execution activity on several hosts, the scope may be larger than this single alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did the control.exe-to-rundll32 combination fire on other hosts in the same window, indicating coordinated automation rather than isolated activity?
+  context: Under a service principal, asking what else the user did across the network returns agent-telemetry noise because every host runs system-owned agents constantly. The meaningful question is whether the same launch mechanism — control.exe spawning rundll32 — fired on other hosts in the alert window. Multiple hosts point to scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:lolbin.technique_class_lateral
+  question: Were any other proxy-execution LOLBins used on this host recently?
+  context: Operators who use one proxy-execution LOLBin often use several. If rundll32 was used to run a payload through a trusted binary, check whether regsvr32, mshta, msbuild, installutil, msiexec, or similar binaries were also used on this host to achieve the same objective. Multiple proxy-execution utilities in the same timeframe strengthen the case for deliberate defense evasion rather than incidental use.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_img:
+        Image|endswith:
+          - '\regsvr32.exe'
+          - '\mshta.exe'
+          - '\msbuild.exe'
+          - '\cmstp.exe'
+          - '\msiexec.exe'
+          - '\installutil.exe'
+          - '\forfiles.exe'
+          - '\pcalua.exe'
+          - '\presentationhost.exe'
+          - '\infdefaultinstall.exe'
+          - '\msdt.exe'
+          - '\mavinject.exe'
+          - '\wmic.exe'
+          - '\xwizard.exe'
+          - '\ie4uinit.exe'
+      condition: selection and selection_img
+    fields:
+      - Image
+      - CommandLine
+- source: template:lolbin.renamed_binary_check
+  question: Was rundll32.exe executed from its expected System32 or SysWOW64 path?
+  context: A rundll32 executed from outside System32 or SysWOW64 may have been copied or renamed to evade path-based allowlists. A rundll32.exe running from a user's temp or Downloads directory is more suspicious than one in System32. Compare the Image path against OriginalFileName to spot a renamed copy of the binary.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- source: template:lolbin.historical_lolbin_baseline
+  question: How often has this host fired the rule's control.exe-to-rundll32 pattern over the past 90 days, and what command-line shapes are typical?
+  context: A control.exe-to-rundll32 pattern with no prior history on a host is more suspicious than one used regularly under stable parents. The query mirrors the rule's selection structure scoped to this host, so the count reflects the rule's specific firing pattern rather than generic use of rundll32. The command-line projection lets the typical invocation shapes be compared against the alerting one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_parent:
+        ParentImage|endswith: \System32\control.exe
+      selection_img:
+      - Image|endswith: \rundll32.exe
+      - OriginalFileName: RUNDLL32.EXE
+      filter:
+        CommandLine|contains: Shell32.dll
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_* and not filter) and _pb_scope
+    fields:
+    - CommandLine
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1218.011
+      name: Rundll32
+      role: primary
+    - id: T1218
+      name: System Binary Proxy Execution
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: rundll32_atypical_invocation
+      description: "rundll32.exe invoked by control.exe with atypical arguments (non-Shell32 module, .cpl/.dll entry point, or javascript:/mshtml script handler)"
+      mapped_to: Q5
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 2
+      label: module_mapped_into_memory
+      description: "A DLL/CPL/script not normally loaded by rundll32 is mapped into the process"
+      mapped_to: Q6
+      source: attack:T1218.011.dll_load
+    - stage: 3
+      label: payload_accessed_from_disk
+      description: "Suspicious DLL/CPL/script accessed from or written to disk"
+      mapped_to: Q7
+      source: attack:T1218.011.payload_on_disk
+    - stage: 4
+      label: external_retrieval_or_c2
+      description: "rundll32 reaches out to an external destination to fetch a payload or beacon"
+      mapped_to: Q8
+      source: attack:T1218.011.external_retrieval
+  dimension_coverage:
+    - dimension: parent_process_analysis
+      technique: T1218.011
+      covered_by: Q3
+      source: template:parent_child.parent_process_legitimacy
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1218.011
+      covered_by: Q6
+      source: attack:T1218.011.dll_load
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1218.011
+      covered_by: Q8
+      source: attack:T1218.011.external_retrieval
+      coverage_type: partial
+    - dimension: command_analysis
+      technique: T1218
+      covered_by: Q5
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: direct
+  mutable_dispositions:
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only (correlate rundll32 invocation with DLL load / network activity within X seconds)"
+      disposition: query_injection
+      target_question: Q6
+      notes: "image_load and network questions are scoped +/-5m around the alerting ProcessGuid, realizing the time-correlation window between the rundll32 invocation and its module load / network activity"
+    - element: ParentProcessFilter
+      dimension: parent_process_analysis
+      specific_values: "rationale only (limit to suspicious parents vs. trusted installers)"
+      disposition: context
+      target_question: Q3
+      notes: "parent_process_legitimacy traces what started control.exe and asks whether the parent chain is expected; the suspicious-vs-trusted-parent judgment is what the question prompts"
+    - element: AllowedDLLs
+      dimension: tuning_parameter
+      specific_values: "rationale only (baseline of legitimate DLLs run by rundll32)"
+      disposition: context
+      target_question: Q6
+      notes: "dll_load question surfaces the modules mapped and calls out user-writable / unsigned modules as the discriminator against the normal Windows DLLs every rundll32 maps"
+    - element: ExternalIPRange
+      dimension: tuning_parameter
+      specific_values: "rationale only (external IP ranges anomalous for rundll32)"
+      disposition: context
+      target_question: Q8
+      notes: "external_retrieval question projects destination IP/port/hostname and frames external destinations as anomalous for a Control Panel action"
+    - element: CommandLineRegex
+      dimension: command_analysis
+      specific_values: "rationale only (URLs, script paths, DLL entrypoints)"
+      disposition: context
+      target_question: Q5
+      notes: "mechanism_decode question directs the analyst to decode the module, entry point, script: handlers, and URLs in the command line"
+    - element: SignedBinaryList
+      dimension: tuning_parameter
+      specific_values: "rationale only (signed binaries allowed for execution)"
+      disposition: context
+      target_question: Q15
+      notes: "renamed_binary_check confirms rundll32 ran from its signed System32/SysWOW64 location; the LOLBin allowlist judgment is the analyst task the question prompts"
+  dedup_decisions:
+    - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable; emitted both per AGENTS.md"
+      kept: both (Q10, Q11)
+    - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable; emitted both per AGENTS.md"
+      kept: both (Q12, Q13)
+    - dropped: cue_process_tool.process_chain
+      reason: "parent_process is primary cue (hint 1) — parent_child.parent_process_legitimacy (Q3) traces the parent chain more specifically; process_chain subsumed"
+      kept: parent_child.parent_process_legitimacy (Q3)
+    - dropped: cue_parent_process.mechanism_decode
+      reason: "parent_child technique set active — parent_child.parent_process_legitimacy (Q3) is the more specific parent-origin question; cue parent mechanism_decode subsumed"
+      kept: parent_child.parent_process_legitimacy (Q3)
+    - dropped: cue_process_tool.baseline
+      reason: "generic per-binary host baseline of rundll32 subsumed by lolbin.historical_lolbin_baseline (Q16), which counts only the rule's control.exe-to-rundll32 pattern rather than all rundll32 use"
+      kept: lolbin.historical_lolbin_baseline (Q16)
+    - dropped: cue_parent_process.follow_on
+      reason: "child-processes-of-parent angle covered by parent_child.sibling_processes (Q4), which scopes to the exact parent instance via ParentProcessGuid"
+      kept: parent_child.sibling_processes (Q4)
+    - dropped: cue_parent_process.clustering
+      reason: "around-the-alert parent activity overlaps parent_child.sibling_processes (Q4) and the +/-5m image_load/network questions (Q6, Q8) that capture this parent instance's related activity"
+      kept: parent_child.sibling_processes (Q4)
+    - dropped: cue_parent_process.scope
+      reason: "cross-host parent-child distribution overlaps cue_user_actor.clustering_svc (Q13), which already answers whether the control.exe-to-rundll32 mechanism fired on other hosts in the window"
+      kept: cue_user_actor.clustering_svc (Q13)
+    - dropped: cue_host_context.clustering
+      reason: "broad around-the-alert host process clustering overlaps parent_child.sibling_processes (Q4, siblings on host) and lolbin.technique_class_lateral (Q14, other proxy-exec LOLBins on host); dropped to stay within the question budget"
+      kept: lolbin.technique_class_lateral (Q14)
+  skipped_templates:
+    - template: cue_host_context.precursor
+      reason: "prior-sigma-alerts question dropped to stay within budget; the cross-logsource chain questions (Q6 image_load, Q7 file_event, Q8 network) and sibling/LOLBin questions already reconstruct the immediate proxy-execution context"
+    - template: universal.endpoint_protection_health
+      reason: "recommended (not must_include) generic tamper sweep; this rule fires on proxy execution of a module via a trusted binary, not on AV/EDR tampering, and defense_tampering is not a confirmed technique set, so tamper-as-precursor is not the live disposition question. Dropped to stay within budget"
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - parent_child
+    - lolbin
+    - cue_parent_process
+    - cue_process_tool
+    - cue_user_actor
+  generation_stats:
+    total_questions: 16
+    source_counts:
+      template: 13
+      attack: 3
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 13
+    logsource_diversity:
+      process_creation: 13
+      image_load: 1
+      file_event: 1
+      network_connection: 1

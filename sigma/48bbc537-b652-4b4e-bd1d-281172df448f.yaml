@@ -1,0 +1,629 @@
+name: Sysinternals PsSuspend Execution
+id: 2c19d8f3-71d0-48fe-815a-d050a493db0b
+description: |
+  Detects execution of the Sysinternals PsSuspend utility (pssuspend.exe or pssuspend64.exe), identified
+  by OriginalFileName or by the image name ending in those binaries. PsSuspend pauses and resumes processes
+  on the local or a remote system and is a legitimate administration tool, but the same capability is abused
+  to suspend security processes (for example MsMpEng.exe) so malware can run while real-time protection is
+  effectively frozen rather than killed. The investigation should determine which process PsSuspend targeted,
+  whether the resume (-r) flag or a remote computer argument was used, who ran it, and whether the execution
+  fits routine administration or sits in a chain of evasion and follow-on activity.
+type: detection
+detection_id: 48bbc537-b652-4b4e-bd1d-281172df448f
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- source: template:universal.verify_trigger_match
+  question: Is the alerting binary actually PsSuspend by image name or original file name?
+  context: Before investing investigation time, confirm the alert is a true positive. The rule fires when the
+    process original file name is pssuspend.exe or the image path ends in pssuspend.exe or pssuspend64.exe.
+    Confirm the original file name has not been spoofed by a rename and that the image is the genuine
+    Sysinternals utility.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- source: template:universal.host_user_context
+  question: Is this user and host expected to suspend or resume processes with PsSuspend?
+  context: Legitimate administrative activity can trigger this detection. PsSuspend is normally run by IT or
+    server administrators managing resource contention. Knowing whether this user role and host function are
+    consistent with process-suspension activity is often the fastest path to distinguishing routine operations
+    from abuse.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What did this PsSuspend invocation target? Decode the command line to identify the process, the
+    resume flag, and any remote computer or credentials.
+  context: The full command line reveals the specific action. PsSuspend takes a process name or process ID to
+    suspend; the -r switch resumes a previously suspended process; a leading double-backslash computer argument
+    with optional -u username and -p password directs the operation at a remote host. A target that names a
+    security process or a remote computer is a different disposition than a developer pausing a runaway local
+    process.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:cue_process_tool.process_chain
+  question: What process spawned PsSuspend and is that parent chain expected?
+  context: The parent process reveals how the tool was invoked. Legitimate usage often has predictable parents
+    such as explorer.exe for an interactive admin or a management agent for automation. Unusual parents like
+    mshta.exe, wscript.exe, powershell.exe download cradles, or Office applications point toward automated
+    post-exploitation rather than hands-on administration.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.follow_on
+  question: What child processes did PsSuspend spawn afterward?
+  context: The processes that run after a suspension reveal its purpose. When PsSuspend is used to freeze
+    security tooling, the analyst expects payload execution to follow in the same window. Unexpected children
+    such as cmd.exe, powershell.exe, or a dropped binary indicate the suspension cleared the way for further
+    activity.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in the hour before the alert?
+  context: PsSuspend can freeze a security process such as MsMpEng.exe without stopping its service, so other
+    tampering may run alongside it. The query surfaces direct attempts to disable AV or EDR services, flip
+    Defender flags, add broad exclusions, clear logs, or patch AMSI and ETW. Zero rows is a useful signal that
+    those command-line paths were not used, though a suspend-based freeze and kernel-level tampering will not
+    appear here. Populated rows shift the disposition toward operator preparation; review the parent process
+    and signing chain to identify the writer.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+- source: template:cue_process_tool.baseline
+  question: Does this host normally run PsSuspend?
+  context: A process that has never been seen on a host is more notable than one that runs regularly. Zero or
+    very low historical counts indicate first-time or rare execution, which raises the weight of the other
+    answers. On servers where PsSuspend is part of routine maintenance, a steady non-zero baseline points
+    toward expected activity.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired the PsSuspend pattern, what parents and users normally drive it,
+    and does the current alert fit that pattern?
+  context: Even common tools can be abused. The query mirrors the rule's selection structure scoped to this
+    host, so the resulting parent and user distribution reflects how this specific firing pattern has
+    historically run here, not generic binary usage. A new parent process, an unexpected user account, or an
+    unusual image path that does not match the established baseline is the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+      - OriginalFileName: pssuspend.exe
+      - Image|endswith:
+        - \pssuspend.exe
+        - \pssuspend64.exe
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired the PsSuspend pattern in the past week, and does the cross-host distribution
+    look like consistent automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide
+    count of this firing pattern rather than generic usage of the binary. Many hosts firing the same pattern
+    points to scripted deployment or vendor automation; one host or a small unrelated set points to manual
+    operator activity. Use the host distribution and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+      - OriginalFileName: pssuspend.exe
+      - Image|endswith:
+        - \pssuspend.exe
+        - \pssuspend64.exe
+      condition: selection
+    fields:
+    - host.name
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run PsSuspend or similar process-control tooling?
+  context: Compare this user's current action against their historical behavior. A user who has never run this
+    tool is more notable than one who does so regularly, and the user's role should align with process-control
+    activity. Administrators managing servers may run it routinely; a standard user account running it is the
+    deviation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent and PsSuspend combination historically routine on this host or across the
+    environment, or is the parent unusual for this binary?
+  context: When the alert fires under a service principal, user identity does not attribute behavior. The
+    meaningful pivot is the launch mechanism, which parent process spawned PsSuspend and whether that pair is
+    historically common. A new or rare parent for this binary on this host or environment-wide is the deviation
+    worth chasing; a pair that already accounts for thousands of prior events is vendor or operating-system
+    automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spread across
+    multiple endpoints. If the same user triggered similar process-control or evasion activity on multiple
+    hosts, the scope of the operation may be larger than the single alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent and PsSuspend combination fire on other hosts in the same window, indicating a
+    coordinated automation rollout rather than isolated activity?
+  context: Under a service principal, asking what else the user did across the network returns agent-telemetry
+    noise because every host runs system-owned agents constantly. The meaningful question is whether the same
+    launch mechanism, parent process and spawned binary, fired on other hosts in the alert window. Multiple
+    hosts in the same window points to scheduled or pushed automation; a single host points to a host-local
+    trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: Alerts rarely occur in isolation. Examining activity around the alert reveals what led to this event,
+    what happened after, and whether it is part of a larger sequence. Look for reconnaissance, defense tampering,
+    privilege escalation, or persistence installation near the suspension event.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Earlier detections on the same host, such as defense tampering, reconnaissance, or credential access,
+    may reveal the attack stages that preceded the suspension and help reconstruct the timeline. Suspending a
+    security process is frequently a setup step rather than the goal, so what came before is informative.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:organizational_context.human_recall
+  question: Does the user or administrator recall running PsSuspend against this process?
+  context: Direct confirmation from the human behind the account is often the fastest path to determining
+    legitimacy. If the user does not recall the action, the credentials may be compromised or the activity may
+    be automated. If they do recall it, capture why a process needed to be suspended and which one.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:organizational_context.change_ticket
+  question: Was there a change ticket, maintenance window, or documented approval for this process-suspension
+    action?
+  context: Many organizations require change tickets or maintenance windows for hands-on server administration.
+    A corresponding ticket suggests authorized activity; absence of one when policy requires it suggests the
+    action was unauthorized. This check can quickly close false positives or escalate true positives.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:persistence_scope.process_based_persistence
+  question: Were other process-based persistence mechanisms installed on this host around the same time?
+  context: Suspending a security process is often paired with establishing a foothold. Attackers commonly install
+    backup persistence using scheduled tasks, services, registry Run keys, BITS jobs, or WMI subscriptions.
+    Multiple persistence installations from the same timeframe indicate intentional stacking rather than an
+    isolated maintenance action.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1543.003
+      name: Windows Service
+      role: primary
+    - id: T1543
+      name: Create or Modify System Process
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: tool_invocation
+      description: PsSuspend is launched and its command line names a target process, the resume flag, or a remote computer
+      mapped_to: Q3
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 2
+      label: parent_lineage
+      description: Parent process spawning the service/process-control tool is examined for legitimacy
+      mapped_to: Q4
+      source: template:cue_process_tool.process_chain
+    - stage: 3
+      label: post_suspend_effect
+      description: Activity enabled by the suspension (payload execution, tampering, persistence) follows in the window
+      mapped_to: Q5
+      source: template:cue_process_tool.follow_on
+  dimension_coverage:
+    - dimension: parent_process_analysis
+      technique: T1543
+      covered_by: Q4
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1543
+      covered_by: Q9
+      source: template:cue_process_tool.baseline_deviation
+      coverage_type: partial
+    - dimension: tuning_parameter
+      technique: T1543.003
+      covered_by: Q9
+      source: template:cue_process_tool.baseline_deviation
+      coverage_type: partial
+  mutable_dispositions:
+    - element: ServiceNamePattern
+      dimension: tuning_parameter
+      specific_values: "svhostx, winhelp (anomalous service names)"
+      disposition: context
+      target_question: Q9
+      notes: "Values describe service-creation analytics; PsSuspend installs no service. The anomalous-name concept is carried generically as deviation framing in the host baseline-deviation question; no service-name query selection added because the rule has no service field."
+    - element: ImagePathFilter
+      dimension: tuning_parameter
+      specific_values: "C:\\Users\\, C:\\Temp\\ (uncommon image directories)"
+      disposition: context
+      target_question: Q3
+      notes: "Image-path provenance is surfaced by decoding the command line and current directory; no service ImagePath field exists for a process-suspension event."
+    - element: DriverExtensionList
+      dimension: tuning_parameter
+      specific_values: ".sys driver loads via sc / ZwLoadDriver"
+      disposition: context
+      target_question: Q5
+      notes: "PsSuspend loads no driver; driver-install detection belongs to service-creation analytics not exercised by this rule. Follow-on question would surface a driver-install child if one ran."
+    - element: StartupTypeChangeWindow
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q14
+      notes: "Temporal correlation of service Start-key changes is not applicable to a suspension event; host-clustering provides the general same-window correlation instead."
+    - element: UnsignedBinaryAlert
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q4
+      notes: "Signing of a registered service binary does not apply; parent-chain legitimacy carries the closest equivalent (was the launcher expected)."
+    - element: ParentProcessFilter
+      dimension: parent_process_analysis
+      specific_values: "non-administrative processes starting service-management tools"
+      disposition: context
+      target_question: Q4
+      notes: "Unusual-parent rationale drives the process-chain question framing."
+    - element: RegistryPathList
+      dimension: tuning_parameter
+      specific_values: "HKLM\\System\\CurrentControlSet\\Services"
+      disposition: blocked_query
+      target_question: Q9
+      notes: "Registry Services-key monitoring describes service creation/modification, which this rule does not detect; no compensating registry_set question authored — see hint_dispositions."
+  dedup_decisions: []
+  skipped_templates:
+    - template: cue_process_tool.mechanism_decode
+      reason: "NOT skipped — retained as Phase 2 because the genuine 'what did the tool do' for PsSuspend is decoding the suspension target; the brief's replaced_by (service_persistence.service_configuration) is declined (see hint_dispositions)."
+    - template: service_persistence.service_configuration
+      reason: "Designated Phase-2 replacement, but its EventID 7045 service-install query does not describe PsSuspend (a process-suspension tool installs no service). Declined; mechanism_decode kept as the honest Phase 2."
+    - template: service_persistence.service_current_status
+      reason: "Asks about a created service's run state; PsSuspend creates no service, so there is no service status to verify."
+    - template: discovery_recon.discovery_burst_detection
+      reason: "Recon-burst correlation is loosely tied to this rule (discovery tactic is inherited from the technique tag, not the binary's behavior); same-window context is already covered by host-clustering, and budget is at the 18-question cap."
+    - template: discovery_recon.discovery_parent_chain
+      reason: "Duplicates the parent-lineage angle already covered by cue_process_tool.process_chain for this non-discovery tool; dropped for budget."
+    - template: discovery_recon.discovery_user_context
+      reason: "Overlaps universal.host_user_context, which is retained; the discovery-specific framing does not fit a process-suspension tool."
+    - template: organizational_context.timing_alignment
+      reason: "Off-hours timing judgment is partially carried by the human_recall and change_ticket questions; dropped to stay within the 18-question cap."
+    - template: organizational_context.procedural_consistency
+      reason: "Procedure-consistency framing targets service/account/registry change tooling, not a one-shot process-suspension command; dropped for budget."
+    - template: persistence_scope.file_based_persistence
+      reason: "File-drop persistence is a parallel mechanism but lower-yield for a suspension alert; process-based persistence sweep retained instead, file-event sweep dropped for budget."
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "service_persistence.service_configuration replaces cue_process_tool.mechanism_decode"
+      disposition: declined
+      reason: >-
+        PsSuspend suspends and resumes processes and installs no Windows service, so the replacement's
+        EventID 7045 service-install query reveals nothing about what this tool did. The genuine Phase-2
+        mechanism for this rule is decoding the PsSuspend command line — the target process name or PID,
+        the -r resume flag, and any remote double-backslash computer with -u/-p credentials — so
+        cue_process_tool.mechanism_decode is retained as Phase 2 instead of the service-creation template.
+    - hint: "logsource 'registry_set' (recommended by techniques: T1543.003) is not covered — pull in cue_registry_key.* or author a custom question with `category: registry_set`"
+      disposition: declined
+      reason: >-
+        The registry_set analytic monitors HKLM\System\CurrentControlSet\Services key changes that accompany
+        service creation or modification. This rule detects the PsSuspend binary, which suspends a running
+        process and writes no Services registry key, so a registry_set question would query a behavior the
+        rule does not exercise. No compensating attack:T1543.003.registry_set question authored.
+    - hint: "logsource 'security' (recommended by techniques: T1543.003) is not covered and no template family exists — author a custom question with `category: security`"
+      disposition: declined
+      reason: >-
+        The security analytic keys on EventID 4697 (service installation). PsSuspend installs no service, so
+        a 4697 query would return service-creation events unrelated to this suspension event. The T1543.003
+        tag is a loose mapping for the abuse case (suspending a security service rather than creating one);
+        analysis here genuinely lives in process_creation, not the Security service-install channel. No
+        compensating attack:T1543.003.security question authored.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - organizational_context
+    - persistence_scope
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 18
+      attack: 0
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 15
+    logsource_diversity:
+      process_creation: 17
+      sigma_alert: 1

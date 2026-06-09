@@ -1,0 +1,535 @@
+name: Potential UAC Bypass Via Sdclt.EXE
+id: 2069b73b-dca0-4c8f-8998-769b7ef6d9d5
+description: |
+  Fires when sdclt.exe runs at High or elevated integrity (IntegrityLevel High or S-1-16-12288). Sdclt.exe is an auto-elevating
+  Windows binary, so an attacker can stage a registry-based hijack and let sdclt launch an attacker-controlled command at high
+  integrity without a consent prompt. Legitimately, sdclt is the Backup and Restore control panel and elevates when a user
+  launches it interactively from explorer.exe. The investigation should determine whether the elevation was operator-driven
+  through a registry hijack, what command sdclt executed, and what was done with the elevated privileges afterward.
+type: detection
+detection_id: 40f9af16-589d-4984-b78d-8c2aec023197
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- source: template:universal.verify_trigger_match
+  question: Did sdclt.exe run at High or elevated integrity as the rule detects?
+  context: Before investing investigation time, confirm the alert is a true positive by reviewing the process image and integrity
+    level against the rule's criteria. The rule fires on sdclt.exe running at IntegrityLevel High or S-1-16-12288, the auto-elevated
+    state an attacker abuses to launch a hijacked command without a consent prompt.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - IntegrityLevel
+- source: template:universal.host_user_context
+  question: Is this user and host expected to launch the Backup and Restore control panel at elevated integrity?
+  context: Legitimate sdclt elevation comes from a user interactively opening Backup and Restore from explorer.exe. If the user
+    role and host function do not include backup administration, or the launch was not interactive, the elevation is harder
+    to explain as routine and points toward an auto-elevation abuse.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.process_chain
+  question: What process spawned sdclt.exe, and is that parent expected to launch an auto-elevated binary?
+  context: The parent reveals how sdclt was invoked. Interactive use spawns from explorer.exe. A non-elevated process spawning
+    an auto-elevated child (an uncommon elevation path) or an unusual parent such as a script host, mshta.exe, or an Office
+    application points to a bypass setup rather than a user opening Backup and Restore.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.mechanism_decode
+  question: What command line did sdclt.exe run with, and what does it reveal about the elevated action?
+  context: Decode the full command line for flags, file paths, or referenced objects. Sdclt invoked through a Folder or
+    exefile hijack typically carries no telling arguments of its own, so the command line that matters is the one the hijacked
+    registry value launched on its behalf. Pair this with the spawned-children and registry questions to recover the actual
+    payload.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: attack:T1548.002.registry_set
+  question: Were the registry keys sdclt reads for auto-elevation modified shortly before this alert?
+  context: Sdclt-based UAC bypass works by writing an attacker command into a registry value that the auto-elevated process
+    reads, commonly HKCU\Software\Classes\Folder\shell\open\command or the exefile runas isolatedCommand value, sometimes
+    via HKCU\Environment. A registry write to one of these paths in the minutes before the elevation confirms the bypass
+    mechanism and identifies the payload.
+  range: -15m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetObject|contains:
+          - 'Classes\Folder\shell'
+          - 'Classes\exefile\shell\runas'
+          - 'isolatedCommand'
+          - 'Classes\ms-settings\shell'
+          - 'Environment\windir'
+          - 'Environment\SystemRoot'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+      - Image
+      - User
+- source: template:uac_bypass.bypass_technique_registry_artifacts
+  question: Did a command interpreter write to a UAC-bypass registry path on this host?
+  context: Many UAC bypass techniques set up the hijack by running reg.exe, powershell.exe, or cmd.exe to write a command
+    into a key an auto-elevated process reads. For sdclt the relevant target is the Folder or exefile shell open command;
+    related techniques use ms-settings or Environment keys. Finding the interpreter-driven write reveals the exact payload
+    staged for elevated execution and complements the registry-event view of the same write.
+  range: -15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith:
+          - '\reg.exe'
+          - '\powershell.exe'
+          - '\cmd.exe'
+        CommandLine|contains:
+          - 'ms-settings'
+          - 'mscfile'
+          - 'Classes\exefile'
+          - 'Classes\Folder'
+          - 'Environment'
+          - 'Shell\Open\command'
+          - 'DelegateExecute'
+      condition: selection
+    fields:
+      - CommandLine
+      - Image
+- source: attack:T1548.002.image_load
+  question: What modules did sdclt.exe load, and were any loaded from a user-writable path?
+  context: Auto-elevated binaries can be coerced into loading attacker-controlled code through COM object or DLL hijacking.
+    Modules loaded by sdclt from a user-writable location such as a user profile, AppData, or a temp directory, or unsigned
+    modules outside System32, indicate the elevation was used to load attacker code rather than the binary's normal dependencies.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith: '\sdclt.exe'
+      condition: selection
+    fields:
+      - ImageLoaded
+      - Signed
+      - Signature
+- source: attack:T1548.002.security
+  question: Was an elevated logon token with special privileges assigned on this host around the alert time?
+  context: Successful elevation produces a privileged logon event where sensitive privileges such as SeDebugPrivilege or
+    SeTcbPrivilege are assigned to the new session. Correlating that special-privileges assignment with the sdclt execution
+    window confirms the process genuinely ran with the high-integrity token rather than being mislabeled, and ties the
+    elevation to a specific account.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: security
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4672
+      condition: selection
+    fields:
+      - SubjectUserName
+      - PrivilegeList
+- source: attack:T1548.002.process_access
+  question: Did any process open a handle to sdclt.exe or its child with rights that allow code injection?
+  context: A bypass that hands an attacker an elevated process is often followed by, or set up through, cross-process access
+    into that elevated process to inject or read memory. A handle opened against sdclt or the high-integrity process it
+    spawned, with access masks granting write, inject, or full control, indicates manipulation of the elevated process rather
+    than a clean interactive launch.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_access
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetImage|endswith: '\sdclt.exe'
+      condition: selection
+    fields:
+      - SourceImage
+      - GrantedAccess
+      - CallTrace
+- source: template:uac_bypass.elevated_action_after_bypass
+  question: What action was performed at High or System integrity after the sdclt elevation?
+  context: 'UAC bypass is a means to an end: attackers elevate to perform actions that require high integrity such as
+    installing persistence, dumping credentials, tampering with security tools, or accessing protected resources. Examining
+    high-integrity processes on the host in the window after the elevation reveals the objective. The brief calls out a tunable
+    correlation window such as 30 seconds for tightly coupled registry-then-elevation chains; widen it toward a few minutes
+    when the payload starts asynchronously.'
+  range: +30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        IntegrityLevel:
+          - 'High'
+          - 'System'
+          - 'S-1-16-16384'
+          - 'S-1-16-12288'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - IntegrityLevel
+- source: template:cue_process_tool.follow_on
+  question: What child processes did sdclt.exe spawn?
+  context: With a Folder or exefile hijack in place, the command sdclt launches surfaces as its child process. Backup and
+    Restore normally spawns control panel helpers; a command interpreter, script host, or downloader spawned by sdclt is the
+    hijacked payload running at high integrity and is the most direct evidence of abuse.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:uac_bypass.other_escalation_attempts
+  question: Did other privilege-escalation or UAC-bypass detections fire on this host around this time?
+  context: Attackers who attempt one UAC bypass often try several methods until one succeeds, especially when the OS version
+    or configuration blocks a given technique. Multiple bypass or escalation detections clustered on this host point to
+    deliberate privilege-escalation activity rather than a benign elevation, and this sigma-alert sweep also surfaces any
+    earlier or later detections that frame the timeline.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - rule.name
+      - rule.uuid
+      - event.severity_label
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host previously fired the sdclt elevation pattern, what parents and users drove it, and does this alert
+    fit that pattern?
+  context: The query mirrors the rule's selection scoped to this host, so the parent and user distribution reflects how the
+    sdclt-at-elevated-integrity pattern has historically run here rather than generic sdclt usage. A new parent process or
+    an unexpected account is the deviation worth chasing; a parent and user that already account for prior firings suggest
+    routine interactive elevation.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: sdclt.exe
+        IntegrityLevel:
+        - High
+        - S-1-16-12288
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run sdclt.exe at elevated integrity?
+  context: Compare this user's current action against their historical behavior. A user who has never elevated sdclt is more
+    suspicious than one who administers backups regularly. User role and typical toolset should align with launching the
+    Backup and Restore control panel at high integrity.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent and sdclt.exe combination historically routine on this host or environment-wide, or is the parent
+    unusual for this binary?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior. The meaningful pivot
+    is the launch mechanism: which parent spawned sdclt, and whether that pair is historically common. A new or rare parent
+    for sdclt is the deviation worth chasing; a pair that already accounts for many prior events is OS or vendor automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints.
+    If the same user drove similar elevation activity on several hosts, the scope of the operation may be larger than this
+    single alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent and sdclt.exe combination fire on other hosts in the same window, indicating a coordinated
+    rollout rather than isolated activity?
+  context: Under a service principal, asking what else the user did across the network returns agent-telemetry noise. The
+    meaningful question is whether the same launch mechanism, the parent process spawning sdclt, fired on other hosts in the
+    alert window. Multiple hosts point to scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired the sdclt elevation pattern in the past week, and does the distribution look like automation
+    or one-off activity?
+  context: The query mirrors the rule's selection with no host scope, giving a fleet-wide count of the elevation pattern
+    rather than generic sdclt usage. Many hosts firing the same pattern suggests scripted deployment or vendor automation;
+    one host or a small unrelated set points to manual operator activity. Use the host spread to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: sdclt.exe
+        IntegrityLevel:
+        - High
+        - S-1-16-12288
+      condition: selection
+    fields:
+    - host.name
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1548.002
+      name: Bypass User Account Control
+      role: primary
+    - id: T1548
+      name: Abuse Elevation Control Mechanism
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: registry_hijack_setup
+      description: "Actor writes an attacker command into a registry value that the auto-elevated sdclt reads (Folder/exefile/isolatedCommand)"
+      mapped_to: Q5
+      source: attack:T1548.002.registry_set
+    - stage: 2
+      label: auto_elevated_invocation
+      description: "sdclt.exe runs auto-elevated at High integrity and launches the hijacked command without a consent prompt"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 3
+      label: elevated_action
+      description: "Attacker-controlled command executes at High/System integrity to install persistence, dump credentials, or tamper with security tools"
+      mapped_to: Q10
+      source: template:uac_bypass.elevated_action_after_bypass
+  dimension_coverage:
+    - dimension: parent_process_analysis
+      technique: T1548.002
+      covered_by: Q3
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1548.002
+      covered_by: Q10
+      source: template:uac_bypass.elevated_action_after_bypass
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1548.002
+      covered_by: Q10
+      source: template:uac_bypass.elevated_action_after_bypass
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1548
+      covered_by: Q3
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1548
+      covered_by: Q5
+      source: attack:T1548.002.registry_set
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1548
+      covered_by: Q4
+      source: template:cue_process_tool.mechanism_decode
+      coverage_type: indirect
+    - dimension: user_context
+      technique: T1548
+      covered_by: Q2
+      source: template:universal.host_user_context
+      coverage_type: direct
+  mutable_dispositions:
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only (e.g. 30 seconds)"
+      disposition: context
+      target_question: Q10
+      notes: "Tunable correlation window noted in Q10 context; no fixed threshold injectable into a sigma query"
+    - element: ElevatedProcessNameList
+      dimension: tuning_parameter
+      specific_values: "sdclt.exe, eventvwr.exe, computerdefaults.exe"
+      disposition: context
+      target_question: Q3
+      notes: "Rule already constrains Image to sdclt.exe; sibling auto-elevated binaries described in process_chain context, not re-queried"
+    - element: ParentProcessAnomalyThreshold
+      dimension: parent_process_analysis
+      specific_values: "rationale only (non-elevated parent spawning auto-elevated child)"
+      disposition: context
+      target_question: Q3
+      notes: "Anomaly logic described in process_chain context; baseline_deviation Q13 supplies the historical parent distribution"
+    - element: ElevatedProcessPath
+      dimension: tuning_parameter
+      specific_values: "rationale only (paths of unsigned/unexpected elevated binaries)"
+      disposition: context
+      target_question: Q7
+      notes: "User-writable load paths surfaced via image_load question Q7"
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "rationale only (suspicious local parent-child chains)"
+      disposition: new_question
+      target_question: Q15
+      notes: "Parent+binary baseline (baseline_svc) Q15 measures whether the parent is routine for sdclt"
+  dedup_decisions:
+    - dropped: cue_process_tool.baseline
+      reason: "baseline_deviation (reflected, rule-pattern scoped) supersedes the generic binary-count baseline on this host"
+      kept: cue_process_tool.baseline_deviation
+    - dropped: cue_process_tool.clustering
+      reason: "host-scoped what-else-ran is covered by other host-context questions; aggregate host clustering adds no unique angle here"
+      kept: cue_host_context.clustering
+    - dropped: cue_host_context.clustering
+      reason: "uac_bypass.other_escalation_attempts already sweeps host activity via the sigma-alert correlation; process-level clustering would duplicate scope"
+      kept: uac_bypass.other_escalation_attempts
+    - dropped: cue_host_context.precursor
+      reason: "uac_bypass.other_escalation_attempts is the same sigma-alert host sweep widened to +/-1h, covering prior detections that frame the timeline"
+      kept: uac_bypass.other_escalation_attempts
+    - dropped: cue_user_actor.baseline_svc_pairing
+      reason: "user_actor pair — non-deduplicable; baseline and baseline_svc both emitted (Q14/Q15)"
+      kept: cue_user_actor.baseline + cue_user_actor.baseline_svc
+    - dropped: cue_user_actor.clustering_svc_pairing
+      reason: "user_actor pair — non-deduplicable; clustering and clustering_svc both emitted (Q16/Q17)"
+      kept: cue_user_actor.clustering + cue_user_actor.clustering_svc
+  skipped_templates:
+    - template: universal.endpoint_protection_health
+      reason: "Generic host tamper-sweep; uac_bypass.other_escalation_attempts surfaces prior tamper/escalation detections on this host and the disposition for a UAC-bypass rule turns on the elevated action (Q10) rather than a pre-staged AV/EDR disable, so the slot is spent on the elevated-action and image_load/security/process_access coverage instead"
+  reflection_overrides: []
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - uac_bypass
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 14
+      attack: 4
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 15
+    logsource_diversity:
+      process_creation: 13
+      registry_set: 1
+      image_load: 1
+      security: 1
+      process_access: 1
+      sigma_alert: 1

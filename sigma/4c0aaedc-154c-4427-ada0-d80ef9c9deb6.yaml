@@ -1,0 +1,647 @@
+name: Process Access via TrolleyExpress Exclusion
+id: 406670dd-a374-473d-a7ad-234724b9387f
+description: |
+  Detects use of the allow-listed Citrix TrolleyExpress.exe filename as a way to dump LSASS process
+  memory while evading AV/EDR allow-listing. The rule fires when a command line contains the
+  TrolleyExpress dump invocation (numbered dump argument or -ma), OR when a process whose image name
+  ends in TrolleyExpress.exe runs but its embedded OriginalFileName is not the genuine Citrix
+  CtxInstall value (indicating a renamed binary masquerading as the trusted tool). Legitimately,
+  TrolleyExpress.exe is part of Citrix software installation; maliciously, an operator copies or
+  renames a memory-dump utility to that name so that LSASS access blends with trusted tooling. The
+  investigation should determine whether the running binary is the genuine signed Citrix file, what
+  process it accessed and with what intent, and whether a dump file or follow-on credential use
+  resulted.
+type: detection
+detection_id: 4c0aaedc-154c-4427-ada0-d80ef9c9deb6
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line carry a TrolleyExpress dump invocation, or is the running image a renamed binary masquerading as TrolleyExpress.exe?
+  context: >-
+    Confirm which branch of the rule fired before investing time. One branch matches a command line
+    containing a numbered TrolleyExpress dump argument or the -ma memory-dump switch. The other
+    branch matches any process whose image name ends in TrolleyExpress.exe whose embedded
+    OriginalFileName is not the genuine Citrix CtxInstall value, which flags a renamed binary
+    impersonating the trusted tool. Note which branch fired, because the command-line branch points
+    to dump syntax while the renamed branch points to a masquerading executable, and each steers the
+    rest of the investigation differently.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run Citrix installer tooling or memory-dump utilities?
+  context: >-
+    Legitimate TrolleyExpress.exe activity comes from Citrix software installation or update on hosts
+    that run Citrix products. A memory-dump invocation of this name on a host with no Citrix
+    footprint, or run by a user with no administrative or software-deployment role, is the deviation
+    worth chasing. Knowing whether the user role and host function fit Citrix maintenance is often
+    the fastest way to separate routine installs from masquerading abuse.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:credential_access.credential_target_identification
+  question: Was LSASS memory accessed or dumped, and by what method?
+  context: >-
+    This technique targets LSASS process memory to scrape credentials. Decode the full command line
+    of the alerting process to determine the dump method and target. The -ma switch and numbered
+    arguments are consistent with a full memory dump of a target process; identify whether lsass is
+    the named target and whether the syntax matches a known dumper invocation, a renamed procdump, or
+    a custom dumper. The method named on the command line reveals operator intent and sophistication.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: attack:T1003.001.access_verification
+  question: Did a process open a full-access handle to lsass.exe on this host around the alert time?
+  context: >-
+    Credential dumping requires opening a handle to lsass.exe with broad rights; an access mask of
+    0x1F0FFF grants full process access and is the read primitive a memory dump depends on. A handle
+    request against lsass from a non-security process corroborates that the TrolleyExpress invocation
+    was actually reaching into LSASS memory rather than performing benign installer work. Absence of
+    such a handle, or a handle held only by genuine AV/EDR tooling, weakens the dump hypothesis.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_access
+      product: windows
+    detection:
+      selection:
+        TargetImage|endswith: \lsass.exe
+        GrantedAccess: '0x1F0FFF'
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - SourceImage
+      - GrantedAccess
+      - CallTrace
+- source: attack:T1003.001.dump_file_creation
+  question: Was a memory dump file written on this host shortly after the alert?
+  context: >-
+    A successful LSASS memory dump leaves an artifact on disk that the operator must later read or
+    exfiltrate; common write locations are temporary and public paths such as the user temp folder
+    and the Windows Temp directory. Correlating dump-file creation in the minutes after the process
+    access confirms the access actually produced a credential artifact. Pay attention to large files
+    with generic or .dmp-style names appearing right after the alerting process ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith:
+          - .dmp
+          - .bin
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - User
+- source: template:cue_process_tool.process_chain
+  question: What process spawned this binary, and is that parent chain expected for Citrix tooling?
+  context: >-
+    The parent process reveals how the binary was launched. Genuine Citrix installer components are
+    started by installer or service chains; a TrolleyExpress-named process spawned by a shell, script
+    host, Office application, or a hands-on-keyboard session points to operator-driven execution
+    rather than vendor maintenance. Walk up from the immediate parent to see what set the activity in
+    motion.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: attack:T1003.001.command_analysis
+  question: Did other known credential-dumping command patterns run on this host around the alert time?
+  context: >-
+    Operators frequently stage credential access with more than one tool, or retry with an alternate
+    method when one is blocked. Surfacing other dumping syntaxes nearby — comsvcs.dll MiniDump,
+    procdump on lsass, reg save of registry hives, or rundll32 against process memory — shows whether
+    the TrolleyExpress invocation was an isolated attempt or one move in a credential-theft sequence.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        CommandLine|contains:
+          - 'comsvcs.dll'
+          - 'MiniDump'
+          - 'procdump'
+          - 'lsass'
+          - 'reg save'
+          - 'reg.exe save'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - User
+- source: template:cue_process_tool.baseline
+  question: Does this host normally run a TrolleyExpress-named binary?
+  context: >-
+    A binary by this name that has never run on the host, or runs only rarely, is more suspicious
+    than one that appears on a regular Citrix maintenance cadence. Zero or very low historical counts
+    indicate first-time or rare execution and point toward a planted or renamed file rather than
+    installed Citrix software.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host previously matched the rule's pattern, what parents and users drove it, and does the current alert fit?
+  context: >-
+    Even a legitimately present tool can be abused. The query mirrors the rule's selection structure
+    scoped to this host, so the resulting parent and user distribution reflects how this specific
+    firing pattern has historically run here rather than generic binary usage. A new parent process,
+    an unexpected user account, or an unusual command-line shape is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        CommandLine|contains:
+        - \TrolleyExpress 7
+        - \TrolleyExpress 8
+        - \TrolleyExpress 9
+        - \TrolleyExpress.exe 7
+        - \TrolleyExpress.exe 8
+        - \TrolleyExpress.exe 9
+        - '\TrolleyExpress.exe -ma '
+      renamed:
+        Image|endswith: \TrolleyExpress.exe
+      filter_renamed:
+        OriginalFileName|contains: CtxInstall
+      filter_empty:
+        OriginalFileName: null
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection or ( renamed and not 1 of filter* )) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_process_tool.follow_on
+  question: What child processes did this binary spawn afterward?
+  context: >-
+    The processes spawned by the binary reveal its actual impact. A genuine installer has predictable
+    children; a masquerading dumper may spawn command interpreters, archive utilities, or transfer
+    tools to package and move the credential artifact. Unexpected children point to post-access
+    activity beyond the memory dump itself.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run Citrix tooling or memory-dump utilities?
+  context: >-
+    Compare this user's current action against their historical behavior. A user who has never run a
+    TrolleyExpress-named binary is more suspicious than one who does so as part of a known Citrix
+    administration or deployment role. User role and typical toolset should align with the activity.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent and binary combination historically routine on this host or environment, or is the parent unusual for this binary?
+  context: >-
+    When the alert fires under a service principal, user identity does not attribute behavior. The
+    meaningful pivot is the launch mechanism — which parent process spawned this binary, and whether
+    that pair is historically common. A new or rare parent for a TrolleyExpress-named binary is the
+    deviation worth chasing; a pair that already accounts for many prior events is vendor or OS
+    automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: >-
+    Tracking the user's activity across all hosts reveals lateral movement or activity spanning
+    multiple endpoints. If the same user triggered similar credential-access activity on more than one
+    host, the scope of compromise may be larger than the single alerting host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent and binary combination fire on other hosts in the same window, or is the activity isolated to this host?
+  context: >-
+    Under a service principal, asking what else the user did across the network returns agent-telemetry
+    noise. The meaningful question is whether the same launch mechanism — parent process plus spawned
+    binary — fired on other hosts in the alert window. Multiple hosts in the same window points to
+    scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:credential_access.post_access_lateral_movement
+  question: Were any new logon sessions or remote connections initiated after this event?
+  context: >-
+    Credential theft is typically followed by lateral movement as the operator uses stolen
+    credentials to reach other systems. Detecting new logon events or outbound remote connections
+    shortly after the LSASS access indicates active exploitation of the harvested credentials. Look
+    for RDP, SMB, WinRM, or remote-execution alerts on this host after the event.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - rule.name
+      - rule.uuid
+      - event.severity_label
+- source: template:credential_access.credential_exposure_assessment
+  question: Which accounts may be compromised, and do any have elevated privileges?
+  context: >-
+    The severity of an LSASS dump depends on which credentials were resident in memory at dump time —
+    every account with an active session or cached logon on the host is potentially exposed. Domain
+    admin or service-account credentials require incident escalation; a standard user account may only
+    need monitoring and a password reset. Cross-reference the active and recent logon accounts on this
+    host against their privilege levels.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: >-
+    Credential access rarely happens in isolation. Earlier detections on the same host — defense
+    tampering, allow-list or exclusion changes, reconnaissance, or privilege escalation — may reveal
+    the stages that preceded the LSASS dump and help reconstruct the full timeline. Tampering with
+    protection or adding exclusions often precedes a dump attempt against an allow-listed binary name.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1003.001
+      name: LSASS Memory
+      role: primary
+    - id: T1218.011
+      name: Rundll32
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: lsass_handle_open
+      description: A non-privileged or abnormal process opens a full-access handle (0x1F0FFF) to lsass.exe
+      mapped_to: Q4
+      source: attack:T1003.001.access_verification
+    - stage: 2
+      label: memory_dump_invocation
+      description: The process invokes a memory dump of LSASS via command-line dump syntax (-ma / numbered dump args)
+      mapped_to: Q3
+      source: template:credential_access.credential_target_identification
+    - stage: 3
+      label: dump_artifact_creation
+      description: A dump file or credential artifact is written to disk following the access
+      mapped_to: Q5
+      source: attack:T1003.001.dump_file_creation
+    - stage: 4
+      label: credential_use_lateral_movement
+      description: Harvested credentials are used for follow-on logons or remote connections
+      mapped_to: Q15
+      source: template:credential_access.post_access_lateral_movement
+  dimension_coverage:
+    - dimension: access_verification
+      technique: T1003.001
+      covered_by: Q4
+      source: attack:T1003.001.access_verification
+      coverage_type: direct
+    - dimension: command_analysis
+      technique: T1003.001
+      covered_by: Q7
+      source: attack:T1003.001.command_analysis
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1003.001
+      covered_by: Q6
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1003.001
+      covered_by: Q5
+      source: attack:T1003.001.dump_file_creation
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1003.001
+      covered_by: Q5
+      source: attack:T1003.001.dump_file_creation
+      coverage_type: partial
+    - dimension: access_verification
+      technique: T1003
+      covered_by: Q4
+      source: attack:T1003.001.access_verification
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1003
+      covered_by: Q6
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1003
+      covered_by: Q5
+      source: attack:T1003.001.dump_file_creation
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1003
+      covered_by: Q5
+      source: attack:T1003.001.dump_file_creation
+      coverage_type: partial
+    - dimension: parent_process_analysis
+      technique: T1218.011
+      covered_by: Q6
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1218.011
+      covered_by: Q7
+      source: attack:T1003.001.command_analysis
+      coverage_type: indirect
+    - dimension: tuning_parameter
+      technique: T1218.011
+      covered_by: Q8
+      source: template:cue_process_tool.baseline
+      coverage_type: partial
+    - dimension: command_analysis
+      technique: T1218
+      covered_by: Q3
+      source: template:credential_access.credential_target_identification
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1218
+      covered_by: Q6
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1218
+      covered_by: Q8
+      source: template:cue_process_tool.baseline
+      coverage_type: partial
+  mutable_dispositions:
+    - element: AccessMask
+      dimension: access_verification
+      specific_values: '0x1F0FFF'
+      disposition: query_injection
+      target_question: Q4
+      notes: GrantedAccess 0x1F0FFF injected into the process_access selection for the LSASS handle check
+    - element: DumpFilePath
+      dimension: tuning_parameter
+      specific_values: '%TEMP%, C:\Windows\Temp'
+      disposition: context
+      target_question: Q5
+      notes: Temp/public dump paths named in context; query scopes by host and dump-file extension rather than hardcoded path
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: 'e.g. 5 minutes between access and dump'
+      disposition: query_injection
+      target_question: Q5
+      notes: +/-5m window between LSASS access and dump-file creation enforced via the file_event range
+    - element: CommandLinePattern
+      dimension: command_analysis
+      specific_values: 'rundll32, procdump, comsvcs.dll, MiniDump, reg save'
+      disposition: query_injection
+      target_question: Q7
+      notes: Dumping syntaxes injected as CommandLine|contains in the host-scoped command-analysis sweep
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: rationale only
+      disposition: context
+      target_question: Q6
+      notes: Parent-legitimacy framing carried in process_chain context (genuine installer vs shell/script parent)
+    - element: SignedBinaryList
+      dimension: tuning_parameter
+      specific_values: rationale only
+      disposition: context
+      target_question: Q1
+      notes: Renamed-binary / OriginalFileName masquerade framing carried in verify_trigger_match context
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: rationale only
+      disposition: context
+      target_question: Q7
+      notes: T1218.011 TimeWindow rationale folded into the +/-15m command-analysis correlation window
+    - element: CommandLineRegex
+      dimension: command_analysis
+      specific_values: rationale only
+      disposition: context
+      target_question: Q3
+      notes: Suspicious-argument rationale folded into mechanism decode of the alerting command line
+    - element: AllowedDLLs
+      dimension: tuning_parameter
+      specific_values: rationale only
+      disposition: context
+      target_question: Q8
+      notes: Baseline-allowlist rationale expressed as the host baseline of the TrolleyExpress-named binary
+    - element: ExternalIPRange
+      dimension: tuning_parameter
+      specific_values: rationale only
+      disposition: blocked_query
+      target_question: Q15
+      notes: Rundll32 external-IP tuning does not apply to a renamed local dumper; network follow-on handled via post-access alert correlation
+    - element: RemoteDomainAllowlist
+      dimension: tuning_parameter
+      specific_values: rationale only
+      disposition: blocked_query
+      target_question: Q15
+      notes: Enterprise-domain allowlist tuning belongs to network-retrieval proxy execution, not local LSASS dumping
+  dedup_decisions:
+    - dropped: cue_process_tool.mechanism_decode
+      reason: 'replaced_by: credential_access.credential_target_identification — technique-set Phase 2 is more specific for LSASS dumping'
+      kept: credential_access.credential_target_identification
+    - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc
+      reason: 'user_actor pair — non-deduplicable; both user-pivot and parent+binary-substitute emitted'
+      kept: both
+    - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc
+      reason: 'user_actor pair — non-deduplicable; both user-pivot and parent+binary-substitute emitted'
+      kept: both
+  skipped_templates:
+    - template: cue_process_tool.mechanism_decode
+      reason: 'replaced_by: credential_access.credential_target_identification'
+    - template: cue_process_tool.clustering
+      reason: 'subsumed by cue_host_context coverage and user_actor.clustering; host-wide same-time activity is already reachable via the precursor and clustering questions without a third near-duplicate aggregation'
+    - template: cue_process_tool.scope
+      reason: 'fleet-wide REFLECTED scope question dropped to stay within the 18-question cap; cross-host spread is already addressed by the service-principal clustering substitute (same-window other-host firing) and the host baseline-deviation question'
+    - template: universal.endpoint_protection_health
+      reason: 'cue_host_context.precursor is present and its context explicitly directs the analyst to prior tamper/exclusion alerts on this host; the generic host-tamper sweep would duplicate that signal and pushes past the 18-question cap'
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: 'logsource ''image_load'' (recommended by techniques: T1218.011) is not covered — pull in cue_image_load.* or author a custom question with `category: image_load`'
+      disposition: declined
+      reason: >-
+        The image_load analytic belongs to the T1218.011 rundll32 chain (a DLL mapped into rundll32
+        memory). This rule fires on a renamed/allow-listed Citrix executable invoking a memory dump,
+        not on rundll32 loading an atypical DLL; there is no DLL-load stage in the TrolleyExpress
+        dump pattern. The load-bearing cross-logsource pivot for this rule is the LSASS handle open,
+        covered by the process_access question, not a module load on the dumper.
+    - hint: 'logsource ''network_connection'' (recommended by techniques: T1218.011) is not covered — pull in cue_network_endpoint.* or author a custom question with `category: network_connection`'
+      disposition: declined
+      reason: >-
+        Network connection coverage in the brief derives from the T1218.011/T1218 proxy-execution
+        analytic where rundll32 fetches a remote .sct/.hta payload. The TrolleyExpress pattern is a
+        local LSASS memory dump with no remote-retrieval stage. Post-dump network follow-on (the only
+        network angle that applies) is covered by the post-access lateral-movement alert correlation
+        rather than a raw network_connection query that would return host-wide egress noise.
+    - hint: 'logsource ''registry_set'' (recommended by techniques: T1003.001) is not covered — pull in cue_registry_key.* or author a custom question with `category: registry_set`'
+      disposition: declined
+      reason: >-
+        The registry_set channel in the T1003.001 analytic covers the SAM/SECURITY hive-access and
+        RunAsPPL-style variants of credential dumping. This rule's selection is specific to LSASS
+        memory dumping via the TrolleyExpress command line, with no registry-hive component; the dump
+        artifact lands on disk (covered by the file_event question), not in a registry value.
+    - hint: 'logsource ''security'' (recommended by techniques: T1003.001) is not covered and no template family exists — author a custom question with `category: security`'
+      disposition: declined
+      reason: >-
+        The security channel (4673 sensitive-privilege use / 4663 object access on lsass) is the
+        Windows Security-log equivalent of the Sysmon process_access handle-open evidence. That exact
+        access-verification signal is already authored as a process_access question (Sysmon EventCode
+        10, GrantedAccess 0x1F0FFF). Adding a parallel security-channel question would duplicate the
+        handle-open coverage rather than add a distinct stage.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - credential_access
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 14
+      attack: 3
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 14
+    logsource_diversity:
+      process_creation: 13
+      process_access: 1
+      file_event: 1
+      sigma_alert: 2

@@ -1,0 +1,511 @@
+name: Potential Active Directory Enumeration Using AD Module - ProcCreation
+id: 0e2f22ff-42da-4575-a66a-71e6a6fba222
+description: |
+  Detects PowerShell (powershell.exe or pwsh.exe, identified by Image or OriginalFileName) being used to import the
+  Microsoft.ActiveDirectory.Management.dll assembly via Import-Module or its ipmo alias. Loading this signed DLL directly
+  makes the ActiveDirectory cmdlets available without RSAT installed and without administrative privileges, and it works
+  from Constrained Language Mode, so operators use it to enumerate domain users, computers, groups, and trust relationships
+  with low detection footprint. The rule fires only when the interpreter selection AND the Import-Module/ipmo selection AND
+  the Microsoft.ActiveDirectory.Management.dll selection all match. Administrators do legitimately load this module, so the
+  investigation should confirm the full command, establish whether the user and host normally perform AD administration,
+  and look for the surrounding reconnaissance or staging that distinguishes routine administration from operator enumeration.
+type: detection
+detection_id: 70bc5215-526f-4477-963c-a47a5c9ebd12
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line match what this rule detects, with PowerShell importing Microsoft.ActiveDirectory.Management.dll?
+  context: Before investing investigation time, confirm the alert is a true positive by reviewing the exact command line and
+    process details against the rule's criteria. The rule fires only when all three conditions hold together, a PowerShell
+    interpreter (powershell.exe or pwsh.exe by Image or OriginalFileName) AND an Import-Module or ipmo invocation AND a reference
+    to Microsoft.ActiveDirectory.Management.dll on the same command line. Confirm all three are present in the actual event.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to load the ActiveDirectory module and run domain enumeration?
+  context: Domain administrators, identity engineers, and directory automation legitimately load the ActiveDirectory module
+    to query users, computers, and groups. Standard users and non-administrative endpoints rarely have a reason to. Knowing
+    whether the user role and host function involve AD administration is often the fastest path to separating routine work
+    from operator reconnaissance.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What is the full PowerShell command, and is the module loaded from the standard module path or from an attacker-supplied
+    DLL path?
+  context: The full command line reveals where the DLL was loaded from. A path under C:\Windows\System32\WindowsPowerShell
+    or the global assembly cache points to an RSAT-installed module; a path under a user-writable, temp, or download directory
+    points to a DLL copied onto the host specifically to enable enumeration without RSAT. Decode any subsequent cmdlets on
+    the same line (Get-ADUser, Get-ADComputer, Get-ADGroup, Get-ADTrust) to read what was queried.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+        CommandLine|contains: Microsoft.ActiveDirectory.Management.dll
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:powershell.encoded_command_decode
+  question: Was the DLL written to disk first, or loaded in memory through a download cradle?
+  context: The module can be loaded two ways. One writes Microsoft.ActiveDirectory.Management.dll to disk and imports it by
+    path. The other fetches a loader script over HTTP and executes it in memory with an Invoke-Expression download cradle,
+    leaving no DLL on disk. Inspect the command line for a download cradle (IEX with Net.WebClient.DownloadString or Invoke-WebRequest,
+    Reflection.Assembly load) and identify the source URL or local path. The in-memory variant is the stealthier of the two
+    and indicates deliberate evasion.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:powershell.script_block_logging
+  question: Did PowerShell script block logging capture the full module-load and the cmdlets run after it?
+  context: Script block logging records the deobfuscated script content PowerShell actually executed, including the Import-Module
+    call and every ActiveDirectory cmdlet run in the same session. This is ground truth for what was enumerated even when the
+    process command line only shows the module load. If PowerShell operational logs are not ingested in this environment, treat
+    zero results as a visibility gap rather than evidence nothing ran.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: powershell
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 4104
+      condition: selection
+    fields:
+      - ScriptBlockText
+      - ScriptBlockId
+      - Path
+- source: template:powershell.powershell_security_bypass
+  question: Were PowerShell security controls bypassed or weakened before this module load?
+  context: Loading the AD module without RSAT is itself an RSAT-and-admin bypass, and operators often pair it with weakening
+    other controls first. Look for execution policy changes (Set-ExecutionPolicy or -ep bypass), AMSI patching (amsiInitFailed,
+    AmsiUtils), a downgrade to PowerShell v2 which lacks logging, or Defender preference changes. Finding these precursor events
+    strengthens the case for deliberate enumeration over routine administration.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_bypass:
+        CommandLine|contains:
+          - 'Set-MpPreference'
+          - 'DisableRealtimeMonitoring'
+          - '-ExecutionPolicy Bypass'
+          - '-ep bypass'
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'Invoke-Obfuscation'
+          - '-Version 2'
+          - '-v 2'
+      condition: selection and selection_bypass
+    fields:
+      - CommandLine
+- source: template:cue_process_tool.process_chain
+  question: What process spawned this PowerShell instance, and is that parent chain expected?
+  context: The parent process reveals how PowerShell was invoked. User-driven administration typically descends from explorer.exe
+    or a shell; service automation from services.exe or a scheduler. Parents like winword.exe, mshta.exe, wscript.exe, wmiprvse.exe,
+    or wsmprovhost.exe indicate macro-driven, scripted, or remote execution rather than an interactive admin session. Walk
+    up the tree to see what spawned the parent.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:discovery_recon.discovery_burst_detection
+  question: Did other reconnaissance commands run on this host around the same time?
+  context: A single module load may be legitimate administration, but multiple reconnaissance actions in rapid succession point
+    to post-compromise enumeration. Look for native discovery binaries (whoami, nltest, net, dsquery, setspn, adfind, nslookup)
+    and PowerShell AD cmdlets (Get-ADUser, Get-ADComputer, Get-ADGroup) running alongside the module load. Three or more distinct
+    recon actions within the window typically indicates automated enumeration rather than a one-off lookup.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_recon:
+        Image|endswith:
+          - '\whoami.exe'
+          - '\systeminfo.exe'
+          - '\ipconfig.exe'
+          - '\net.exe'
+          - '\net1.exe'
+          - '\nltest.exe'
+          - '\dsquery.exe'
+          - '\nbtstat.exe'
+          - '\arp.exe'
+          - '\netstat.exe'
+          - '\tasklist.exe'
+          - '\qprocess.exe'
+          - '\query.exe'
+          - '\quser.exe'
+          - '\hostname.exe'
+          - '\nslookup.exe'
+          - '\adfind.exe'
+          - '\csvde.exe'
+          - '\ldifde.exe'
+          - '\dnscmd.exe'
+          - '\cmdkey.exe'
+          - '\setspn.exe'
+      condition: selection and selection_recon
+    fields:
+      - Image
+      - User
+- source: template:cue_process_tool.baseline
+  question: Does this host normally run PowerShell with the ActiveDirectory module?
+  context: A host that has never loaded the AD module before is more suspicious than one that does so as part of routine directory
+    administration. Zero or very low historical counts indicate first-time or rare use, which on a workstation or non-administrative
+    server raises the priority of the enumeration result.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired the rule's pattern, what parents and users normally drive that activity, and
+    does the current alert fit that pattern?
+  context: Even routine AD administration leaves a baseline. The query mirrors the rule's selection structure scoped to this
+    host, so the resulting parent and user distribution reflects how this specific module-load firing pattern has historically
+    run here, not generic PowerShell usage. A new parent process, an unexpected user account, or an unusual command shape is
+    the anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+      - OriginalFileName:
+        - PowerShell.EXE
+        - pwsh.dll
+      selection_cmdlet:
+        CommandLine|contains:
+        - 'Import-Module '
+        - 'ipmo '
+      selection_dll:
+        CommandLine|contains: Microsoft.ActiveDirectory.Management.dll
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_user_actor.baseline
+  question: Does this user normally load the ActiveDirectory module across the environment?
+  context: Compare this user's current action against their historical behavior. A user who has never loaded the AD module
+    is more suspicious than one who does so regularly as part of an identity or directory administration role. User role and
+    typical toolset should align with running domain enumeration cmdlets.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent and PowerShell combination historically routine on this host or across the environment, or is the
+    parent unusual for the interpreter?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior. The meaningful pivot
+    is the launch mechanism: which parent process spawned PowerShell, and is that pair historically common. A new or rare parent
+    for PowerShell on this host or environment-wide is the deviation worth chasing; a pair that already accounts for thousands
+    of prior events is vendor or scheduled automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints.
+    AD enumeration is reconnaissance that often precedes targeted lateral movement, so if the same user triggered similar activity
+    on other hosts, the scope of the operation may be larger than a single endpoint.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent and PowerShell combination fire on other hosts in the same window, indicating a coordinated
+    automation rollout rather than isolated activity?
+  context: Under a service principal, asking what else this user did across the network returns agent-telemetry noise, since
+    every host runs SYSTEM-owned agents constantly. The meaningful question is whether the same launch mechanism, parent process
+    plus spawned PowerShell, fired on other hosts in the alert window. Multiple hosts in the same window points to scheduled
+    or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: 'Alerts rarely occur in isolation. Examining activity around the alert reveals the immediate context: what led to
+    this event, what happened after, and whether it is part of a larger sequence. Look for additional reconnaissance, credential
+    access, privilege escalation, or staging that surrounds the module load.'
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired the rule's pattern in the past week, and does the cross-host distribution look like consistent
+    automation or one-off activity?
+  context: The query mirrors the rule's selection structure with no host scope, so the result is a fleet-wide count of this
+    AD-module load pattern, not generic PowerShell usage. Many hosts firing the same pattern points to scripted deployment
+    or directory-management automation; one host or a small unrelated set points to manual operator activity. Use host distribution
+    and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+      - OriginalFileName:
+        - PowerShell.EXE
+        - pwsh.dll
+      selection_cmdlet:
+        CommandLine|contains:
+        - 'Import-Module '
+        - 'ipmo '
+      selection_dll:
+        CommandLine|contains: Microsoft.ActiveDirectory.Management.dll
+      condition: all of selection_*
+    fields:
+    - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: 'Alerts rarely happen in isolation. Earlier detections on the same host, defense tampering, credential access, or
+    other reconnaissance, may reveal the stages that preceded this enumeration and help reconstruct the timeline. Look for
+    patterns: tampering followed by execution, or initial access followed by discovery.'
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:network_scope.actor_authentication_trail
+  question: Where has this user authenticated recently?
+  context: Authentication events show which systems the user accessed before and after the module load. Domain enumeration
+    frequently precedes lateral movement, so a user authenticating to many systems in a short period, especially network or
+    RDP logons following the enumeration, suggests movement in progress rather than isolated administration.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      service: security
+    detection:
+      selection:
+        EventID:
+          - 4624
+          - 4625
+        TargetUserName|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - IpAddress
+      - EventID
+      - LogonType
+_generation_meta:
+  has_attack_brief: false
+  techniques: []
+  attack_chain_coverage: []
+  dimension_coverage: []
+  mutable_dispositions: []
+  dedup_decisions:
+    - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable (subject vs. launch-mechanism pivot); both emitted"
+      kept: both
+    - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable (subject vs. launch-mechanism pivot); both emitted"
+      kept: both
+    - dropped: cue_process_tool.clustering
+      reason: "host-clustering coverage provided by cue_host_context.clustering (same +/-15m host-scoped aggregation, grouped by Image+ParentImage which surfaces novel parent-child pairs); process_tool variant redundant"
+      kept: cue_host_context.clustering
+    - dropped: cue_process_tool.follow_on
+      reason: "AD enumeration is a read-only discovery action that rarely spawns children; child-process follow-on adds little here, and the +/-15m host clustering question already surfaces any process spawned around the alert"
+      kept: cue_host_context.clustering
+    - dropped: discovery_recon.discovery_parent_chain
+      reason: "parent-lineage question is the same investigative angle as cue_process_tool.process_chain (what spawned this and is the parent normal); kept the process_tool version which walks the parent tree via ParentProcessGuid"
+      kept: cue_process_tool.process_chain
+    - dropped: discovery_recon.discovery_user_context
+      reason: "duplicates the user-expectation triage question (universal.host_user_context); both ask whether the user is expected to run this administrative/discovery action, kept the universal version per template note"
+      kept: universal.host_user_context
+    - dropped: network_scope.same_action_other_hosts
+      reason: "cross-host same-action coverage provided by cue_process_tool.scope, which mirrors the full rule selection (interpreter + Import-Module + DLL) rather than the bare Image, giving a rule-pattern fleet count instead of generic powershell.exe usage"
+      kept: cue_process_tool.scope
+    - dropped: network_scope.actor_activity_network_wide
+      reason: "user network-wide activity covered by cue_user_actor.clustering (same User-scoped +/-1h aggregation by host+Image); duplicate"
+      kept: cue_user_actor.clustering
+  skipped_templates:
+    - template: universal.endpoint_protection_health
+      reason: >-
+        RECOMMENDED, not must_include. This is a read-only AD-reconnaissance rule, not a
+        payload-execution or credential-access rule, so tamper-as-precursor is not the
+        load-bearing question. Per the template's own drop criteria, it is safe to omit
+        when the rule is not execution/credential-centric AND the cue_host_context.precursor
+        question is present — both hold here. Prior tamper activity is surfaced by the
+        precursor question (sigma alerts on this host in the preceding 6 hours) and by the
+        powershell.powershell_security_bypass question (AMSI/execution-policy/Defender
+        weakening in the preceding hour). The slot was given to network_scope.actor_authentication_trail,
+        which is more relevant to enumeration-before-lateral-movement.
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "powershell.exe: too common for Image-based scoping — use CommandLine patterns for mechanism_decode"
+      disposition: acted_on
+      notes: >-
+        mechanism_decode (cue_process_tool.mechanism_decode, ADAPT_STRUCTURALLY) was tightened
+        with CommandLine|contains: Microsoft.ActiveDirectory.Management.dll alongside the
+        host+Image scope, so the Phase 2 decode question returns only AD-module loads on the
+        host rather than every powershell.exe execution. Recorded as acted_on (not a decline).
+    - hint: "powershell.encoded_command_decode replaces obfuscation.encoded_payload_decode"
+      disposition: acted_on
+      notes: >-
+        powershell.encoded_command_decode is included as the Phase 2 decode-companion question
+        (reframed to ask whether the DLL was written to disk or loaded via in-memory download
+        cradle); obfuscation.encoded_payload_decode is not present in the playbook, so the
+        supersession the hint directs is satisfied by construction.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - powershell
+    - discovery_recon
+    - network_scope
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 18
+      attack: 0
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 2
+      context: 14
+    logsource_diversity:
+      process_creation: 15
+      powershell_script_block: 1
+      security_log: 1
+      sigma_alert: 1

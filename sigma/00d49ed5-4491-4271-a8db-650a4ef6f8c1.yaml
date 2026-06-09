@@ -1,0 +1,441 @@
+name: Suspicious Download from Office Domain
+id: 4df10e3d-6012-4c53-8487-df96e64cf788
+description: |
+  Detects a command-line download tool (curl.exe, wget.exe) or a PowerShell download cradle (Invoke-WebRequest, iwr, curl, wget, Start-BitsTransfer, .DownloadFile(, .DownloadString() retrieving a file from a Microsoft attachment domain used by Outlook on the web and OneNote (attachment.outlook.live.net, onenoteonlinesync.onenote.com). The rule fires only when both conditions hold: a download mechanism is present AND the command line references one of those domains. These domains host file attachments inserted into emails or OneNote notebooks, and their direct-download links are reachable without authentication, so they are abused to stage payloads from infrastructure that looks trusted. Determine whether the download was an expected automation against these domains or an operator fetching a staged payload, what was retrieved, and whether it executed.
+type: detection
+detection_id: 00d49ed5-4491-4271-a8db-650a4ef6f8c1
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line contain both a download mechanism and one of the monitored Office or OneNote attachment domains?
+  context: Before investing investigation time, confirm the alert is a true positive. The rule fires only when the command line both invokes a download tool (curl.exe or wget.exe, or a PowerShell cradle such as Invoke-WebRequest, Start-BitsTransfer, .DownloadFile(, .DownloadString() AND references attachment.outlook.live.net or onenoteonlinesync.onenote.com. Confirm both parts are present in the exact command that fired.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to download attachments from Outlook or OneNote with command-line tools?
+  context: Legitimate use exists -- some scripts and tools download attachments from these Microsoft domains for backup or migration. A user or host with no business reason to fetch Office attachments through curl, wget, or a PowerShell cradle is a stronger signal than an administrator or automation account that routinely does so.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:cue_process_tool.mechanism_decode
+  question: What exactly did the download command do? Decode the full command line, the download mechanism, and the target URL.
+  context: The full command line reveals which mechanism was used (curl/wget binary versus a PowerShell cradle), the exact attachment URL on the Office or OneNote domain, any output path the file was written to, and follow-on actions chained with semicolons or pipes. Pull the destination path so the downloaded file can be located on disk.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:cue_process_tool.process_chain
+  question: What process spawned this download command, and is that parent chain expected?
+  context: The parent process reveals how the download was invoked. A user-driven download from explorer.exe or a shell differs from one launched by Office applications (winword.exe, onenote.exe), mshta.exe, wscript.exe, or another script host -- those parents suggest a malicious document or macro reached out to the attachment domain. Walk up the tree to see what spawned the parent.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_network_endpoint.mechanism_decode
+  question: What is the destination URL, and does it match a legitimate Outlook or OneNote attachment link?
+  context: The domain is a fixed Microsoft attachment endpoint, so reputation of the domain itself is not the question -- the host path and the specific attachment identifier in the URL are. These links require no authentication, so any user can publish a file there and share the direct-download link. Examine the full URL path, when the attachment was created, and whether the link resolves to an expected document. The destination is an external Microsoft IP block, so internal-versus-external filtering will not separate this from benign Office traffic.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - Image
+- source: template:cue_artifact.artifact_verification
+  question: What is the hash of the downloaded file, and does it have known threat-intelligence detections?
+  context: A file hash uniquely identifies the payload for reputation lookup. Submit the hash to threat-intelligence services to determine whether the retrieved file is known malicious, known benign, or previously unseen. This answers whether the file is known; it does not replace reading the file's actual content.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Hashes
+- source: template:universal.evidence_preservation
+  question: Is the downloaded file still on disk for analysis?
+  context: The command references a download destination. Checking whether that file still exists on disk enables hash lookups, sandbox submission, and content review. Watch for drops into user-writable staging directories such as Public, Temp, Downloads, or ProgramData, which are common payload landing paths.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: template:download_tool.download_success_verification
+  question: Was the download successful? Check for file creation at the destination.
+  context: A download command does not guarantee the file was retrieved. Network errors, blocked URLs, or security controls may have prevented the transfer. Confirming file creation at the target path establishes whether the activity progressed past delivery.
+  range: +15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: template:download_tool.payload_analysis
+  question: Can you retrieve and analyze the downloaded payload in a safe environment?
+  context: If the downloaded file is still on disk, detonating it in a sandbox or analyzing its content reveals whether it is a known malicious payload, a legitimate document, or something novel. For scripts and text files, check for encoded strings, embedded URLs, and command sequences; for binaries, check signing status and imports.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Hashes
+- source: template:download_tool.directory_activity
+  question: What other file activity occurred in the target directory?
+  context: Operators often download multiple files to the same staging directory, or the downloaded file triggers further writes (extraction, decompression, additional downloads). Directory-level file activity reveals the broader scope of the delivery, excluding the file already identified.
+  range: +1h
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|contains|expand: '%file_dirs%'
+      filter_self:
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection and not filter_self
+    fields:
+      - TargetFilename
+      - Image
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run command-line download tools?
+  context: Compare this user's current action against their historical pattern. A user who has never invoked curl, wget, or a PowerShell download cradle is more suspicious than one who does so regularly. User role and typical toolset should align with command-line file retrieval.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent and binary combination historically routine on this host or across the environment, or is the parent unusual for this download tool?
+  context: When the alert fires under a service principal, user identity does not attribute behavior; the meaningful pivot is which parent process spawned the download tool and whether that pair is historically common. A new or rare parent for this binary is the deviation worth chasing; a pair already accounting for thousands of prior events is vendor or operating-system automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints. If the same user triggered similar downloads on several hosts, the scope of the activity may be larger than this single alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent and binary combination fire on other hosts in the same window, indicating coordinated automation rather than isolated activity?
+  context: Under a service principal, asking what else the user did across the network returns agent-telemetry noise because every host runs system-owned agents constantly. The meaningful question is whether the same launch mechanism -- parent process plus spawned download tool -- fired on other hosts in the alert window. Multiple hosts point to scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:lolbin.technique_class_lateral
+  question: Were any other download LOLBins used on this host recently?
+  context: Operators who use one download LOLBin often use several. If curl or wget fetched a file, check whether certutil, bitsadmin, expand, or other transfer-capable LOLBins were also used on this host. Multiple download utilities performing the same objective strengthens the case for staged delivery rather than incidental use.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_img:
+        Image|endswith:
+          - '\certutil.exe'
+          - '\bitsadmin.exe'
+          - '\esentutl.exe'
+          - '\expand.exe'
+          - '\extrac32.exe'
+          - '\makecab.exe'
+          - '\replace.exe'
+          - '\hh.exe'
+      condition: selection and selection_img
+    fields:
+      - Image
+      - CommandLine
+- source: template:lolbin.renamed_binary_check
+  question: Was the download tool executed from its expected system path?
+  context: A download tool executed from outside System32 or SysWOW64 may have been copied or renamed to evade path-based allowlists. A curl.exe running from a user's temp or Downloads directory is more suspicious than one in System32. Compare the Image path against OriginalFileName to spot renamed copies.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- source: template:lolbin.historical_lolbin_baseline
+  question: How often has this host fired the rule's download pattern over the past 90 days, and what command-line shapes are typical?
+  context: A download from these attachment domains with no prior history on a host is more suspicious than one used regularly under stable parents. The query mirrors the rule's selection structure scoped to this host, so the count reflects the rule's specific firing pattern rather than generic use of the binary. The command-line projection lets the typical invocation shapes be compared against the alerting one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      category: process_creation
+    detection:
+      selection_download:
+      - Image|endswith:
+        - \curl.exe
+        - \wget.exe
+      - CommandLine|contains:
+        - Invoke-WebRequest
+        - 'iwr '
+        - 'curl '
+        - 'wget '
+        - Start-BitsTransfer
+        - .DownloadFile(
+        - .DownloadString(
+      selection_domains:
+        CommandLine|contains:
+        - https://attachment.outlook.live.net/owa/
+        - https://onenoteonlinesync.onenote.com/onenoteonlinesync/
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - CommandLine
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1105
+      name: Ingress Tool Transfer
+      role: primary
+    - id: T1608
+      name: Stage Capabilities
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: download_invocation
+      description: "Unusual or uncommon process initiates a download from an external Microsoft attachment domain via a command-line tool or PowerShell cradle"
+      mapped_to: Q3
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 2
+      label: external_destination
+      description: "Network retrieval from the external Office/OneNote attachment endpoint"
+      mapped_to: Q5
+      source: template:cue_network_endpoint.mechanism_decode
+    - stage: 3
+      label: file_creation
+      description: "Downloaded tool/payload written to disk at the destination path"
+      mapped_to: Q8
+      source: template:download_tool.download_success_verification
+  dimension_coverage:
+    - dimension: file_path_analysis
+      technique: T1105
+      covered_by: Q7
+      source: template:universal.evidence_preservation
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1105
+      covered_by: Q4
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1105
+      covered_by: Q5
+      source: template:cue_network_endpoint.mechanism_decode
+      coverage_type: partial
+  mutable_dispositions:
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "rationale only (tune for known-good updaters)"
+      disposition: context
+      target_question: Q4
+      notes: "process_chain question surfaces the parent and asks whether the chain is expected; known-good-updater tuning is the analyst judgment the question prompts"
+    - element: DestinationIPCategory
+      dimension: tuning_parameter
+      specific_values: "rationale only (internal vs external IP block filtering)"
+      disposition: context
+      target_question: Q5
+      notes: "destination is a fixed external Microsoft attachment domain; internal/external filtering cannot separate this from benign Office traffic. Noted in context that the IP block is external and not discriminating"
+    - element: FilePathRegex
+      dimension: file_path_analysis
+      specific_values: "C:\\Users\\Public\\ (example uncommon drop path)"
+      disposition: context
+      target_question: Q7
+      notes: "evidence_preservation uses %file_paths% scoping; user-writable staging paths (Public, Temp, Downloads, ProgramData) called out in context as the drop locations to watch"
+  dedup_decisions:
+    - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc
+      reason: "user_actor pair -- non-deduplicable; emitted both per AGENTS.md"
+      kept: both (Q11, Q12)
+    - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc
+      reason: "user_actor pair -- non-deduplicable; emitted both per AGENTS.md"
+      kept: both (Q13, Q14)
+    - dropped: cue_process_tool.baseline_deviation
+      reason: "REFLECTED host_pattern baseline overlaps lolbin.historical_lolbin_baseline -- both mirror the rule's selection scoped to this host and project parent/user/command-line distribution. Kept the lolbin must_include version (Q17); dropped to stay within the 18-question cap"
+      kept: lolbin.historical_lolbin_baseline (Q17)
+    - dropped: cue_process_tool.scope
+      reason: "REFLECTED fleet_pattern cross-host count; cue_user_actor.clustering_svc (Q14) already provides the cross-host rollout-vs-isolated signal for this pattern. Dropped to stay within cap"
+      kept: cue_user_actor.clustering_svc (Q14)
+    - dropped: cue_artifact.mechanism_decode
+      reason: "content analysis overlaps download_tool.payload_analysis (Q9) which already prompts sandbox/content review of the retrieved file; kept the technique-set version (more specific to download payload)"
+      kept: download_tool.payload_analysis (Q9)
+    - dropped: cue_process_tool.baseline
+      reason: "generic per-binary host baseline subsumed by the rule-pattern host baseline lolbin.historical_lolbin_baseline (Q17), which counts only the rule's firing pattern rather than all curl/wget use"
+      kept: lolbin.historical_lolbin_baseline (Q17)
+    - dropped: cue_host_context.clustering
+      reason: "host-local around-the-alert process clustering overlaps lolbin.technique_class_lateral (Q15, other download LOLBins on host) and cue_user_actor.clustering (Q13, network-wide user activity); dropped to stay within cap"
+      kept: lolbin.technique_class_lateral (Q15)
+    - dropped: cue_process_tool.follow_on
+      reason: "child-process-of-download-tool angle; curl/wget rarely spawn children and the delivery-stage focus is carried by download_success_verification (Q8) and directory_activity (Q10). Dropped to stay within cap"
+      kept: download_tool.directory_activity (Q10)
+    - dropped: cue_network_endpoint.baseline
+      reason: "destination-frequency baseline is non-discriminating here -- the destination is a fixed Microsoft attachment domain that benign Office traffic also reaches, so a host's connection history to it does not separate malicious from legitimate"
+      kept: none
+  skipped_templates:
+    - template: cue_artifact.baseline
+      reason: "file-appearance baseline overlaps evidence_preservation (Q7) and download_success_verification (Q8); the rule derives file paths from CommandLine and the on-disk/first-seen question is already covered"
+    - template: cue_process_tool.clustering
+      reason: "broad host process clustering overlaps the retained cross-host and LOLBin clustering questions (Q13, Q15)"
+    - template: cue_host_context.precursor
+      reason: "prior-sigma-alerts question dropped to stay within the 18-question cap; this is a delivery-stage download rule, not a hands-on-keyboard impact rule where prior-alert precursor context is decisive"
+    - template: universal.endpoint_protection_health
+      reason: "recommended (not must_include) generic tamper sweep; this rule fires on file delivery, not payload execution or credential access, so AV/EDR-tamper-as-precursor is not the live disposition question, and defense_tampering is not a confirmed technique set. Dropped to stay within cap"
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - download_tool
+    - lolbin
+    - cue_process_tool
+    - cue_network_endpoint
+    - cue_artifact
+    - cue_user_actor
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 17
+      attack: 0
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 3
+      context: 12
+    logsource_diversity:
+      process_creation: 12
+      file_event: 5

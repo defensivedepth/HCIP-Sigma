@@ -1,0 +1,561 @@
+name: WSL Kali-Linux Usage
+id: 50c45601-4437-4965-a48c-2beee5680d8f
+description: |
+  Detects use of the Kali Linux distribution under Windows Subsystem for Linux, either by the Kali launcher or
+  distribution binary running from its install path (an AppData package directory, the WindowsApps store path, or
+  kali.exe under WindowsApps) or by wsl.exe / wslhost.exe spawning a child whose Image or command line references the
+  Kali distribution while excluding the install and unregister invocations. WSL provides a Linux execution environment
+  that runs Bash and offensive tooling natively on a Windows host, which sidesteps Windows-centric process and command
+  monitoring, so the technique is a form of indirect command execution. Legitimate administrators and security teams do
+  install and use Kali WSL, so the investigation should confirm who launched it, decode what was actually run inside the
+  distribution, and determine whether the Linux process reached out to the network or spawned follow-on Windows tooling.
+type: detection
+detection_id: 6f1a11aa-4b8a-4b7f-9e13-4d3e4ff0e0d4
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does this event match what the rule detects, either a Kali launcher or distribution binary running from its install path, or wsl.exe or wslhost.exe spawning a Kali-referencing child outside of install or unregister?
+  context: Before investing investigation time, confirm the alert is a true positive. The rule fires on either of two independent branches, so note which one fired because it changes what matters downstream. The first branch matches when the Image is the Kali distribution binary running from an AppData package directory or the WindowsApps store path. The second branch matches when the parent is wsl.exe or wslhost.exe and the child Image or command line references the Kali distribution, and the command line is not an install or unregister invocation. If the second branch fired, the parent wsl.exe command line and the spawned child are the load-bearing detail; if the first branch fired, the launcher path and its arguments are.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to run Kali Linux under WSL?
+  context: Administrators, penetration testers, and security teams legitimately install and run Kali WSL, but it is uncommon on general-purpose workstations and servers. Knowing whether the user role and host function involve offensive tooling or Linux development is often the fastest path to separating sanctioned use from an actor staging a Linux toolchain to evade Windows monitoring.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:parent_child.parent_process_legitimacy
+  question: Is wsl.exe or wslhost.exe expected to spawn this Kali process here, and what started the WSL parent itself?
+  context: The parent-child relationship is the core signal for the WSL-parent branch of this detection. Tracing the WSL parent's own origin shows whether the chain is interactive (a user launched a shell or terminal that started WSL) or automated and unattended (a script, scheduled task, or remote management tool drove it). An unexpected grandparent such as a script host, an Office application, or a remote-access tool reframes the activity from analyst-driven testing to staged execution.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- source: template:parent_child.sibling_processes
+  question: What other child processes did the same WSL parent spawn around the time of the alert?
+  context: If wsl.exe or wslhost.exe spawned the detected Kali process, it likely spawned other processes too. Examining siblings of the same parent instance reveals the full scope of what was launched through the WSL bridge, including additional distribution binaries or Windows tools invoked from inside the Linux environment.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in the hour before the alert?
+  context: A Linux execution environment is attractive precisely because it runs outside Windows-centric monitoring, and an actor staging it may first weaken host protection. The query surfaces direct attempts to disable AV/EDR services, flip Defender flags, add broad exclusions, clear logs, or patch AMSI/ETW. Zero rows is a useful protection-looks-healthy signal; kernel-level driver tampering and in-memory patches will not appear here. Populated rows shift the disposition toward operator preparation; review the parent process and signing chain to identify the writer.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+- source: template:cue_parent_process.mechanism_decode
+  question: What did the WSL parent actually invoke? Decode its command line and arguments.
+  context: The wsl.exe or wslhost.exe command line shows what was requested of the distribution. Read its arguments for a distribution selector, a run flag, or an inline Linux command passed through to Kali, since wsl.exe can run a single command inside a distro directly from the Windows side. Decode any inline command or referenced script to understand the operation rather than just confirming the distribution was launched.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+- source: template:cue_process_tool.mechanism_decode
+  question: What exactly did the Kali distribution binary do? Decode its command line and arguments.
+  context: 'The full command line of the Kali launcher or distribution binary reveals the specific action taken. Decode any flags, an inline command, a referenced script path, or a tool name passed to the distribution. Distinguish setup-style invocations from operational ones: a bare launch that opens an interactive shell looks different from one that runs a named tool or pipes a Linux command, and the latter is where reconnaissance, tunneling, or payload staging would appear.'
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|contains|expand: '%Image%'
+        CommandLine|contains:
+          - Kali.exe
+          - Kali-linux
+          - kalilinux
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: attack:T1202.follow_on_execution
+  question: Did the WSL or Kali process write or drop files on the Windows filesystem around the time of the alert?
+  context: Indirect execution through WSL frequently crosses back to the Windows side to stage tools, drop payloads, or write output. File events authored by the WSL bridge or the distribution binary on the mounted Windows filesystem reveal artifacts that survive the Linux session, such as downloaded binaries, scripts, or exfiltration staging. Review the written paths and any that land in user-writable or temporary directories.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|contains:
+          - \wsl.exe
+          - \wslhost.exe
+          - \kali.exe
+          - \KaliLinux
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+- source: attack:T1202.network_activity
+  question: Did the WSL or Kali process open outbound network connections around the time of the alert, and to where?
+  context: Offensive Linux tooling run under WSL commonly reaches the network for reconnaissance, command-and-control, tunneling, or data transfer, and because the traffic originates from the WSL bridge it can be missed by Windows-process-centric monitoring. Reviewing outbound connections from the WSL or Kali process and their destinations distinguishes a local-only launch from active network operations. Internal targets suggest lateral reconnaissance; external destinations suggest egress or remote access.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|contains:
+          - \wsl.exe
+          - \wslhost.exe
+          - \kali.exe
+          - \KaliLinux
+      condition: selection
+    fields:
+      - DestinationIp
+      - DestinationPort
+      - Image
+- source: template:cue_parent_process.follow_on
+  question: What other child processes did the WSL parent binary spawn on this host over the following hours?
+  context: An actor using a compromised or operator-driven WSL session often launches multiple tools in sequence through the same bridge. Seeing all children of the WSL parent binary over a longer window reveals follow-on stages such as reconnaissance utilities, additional distribution invocations, or Windows tools proxied out of the Linux environment that did not coincide with the initial alert.
+  range: +4h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%ParentImage%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:cue_parent_process.baseline
+  question: Does this host normally see wsl.exe or wslhost.exe spawn the Kali distribution?
+  context: Some parent-child pairings are routine on a host that is provisioned for WSL development, while a first-time or rare wsl.exe to Kali spawn is the deviation worth chasing. Historical frequency of this specific parent-to-child pairing on this host distinguishes a sanctioned, recurring workflow from a novel introduction of the distribution.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentImage|endswith|expand: '%ParentImage%'
+        Image|contains|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:cue_process_tool.baseline
+  question: Does this host normally run the Kali distribution binary at all?
+  context: A distribution binary that has never been seen on a host is more suspicious than one that runs regularly. Zero or very low historical counts indicate first-time or rare execution, which on a host with no sanctioned WSL or offensive-tooling role raises the priority of the launch.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|contains|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run the Kali distribution across the environment?
+  context: Compare this user's current action against their historical behavior. A user who has never launched Kali under WSL is more suspicious than one who does so regularly as part of a security or development role. User role and typical toolset should align with running an offensive Linux distribution.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|contains|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent and Kali binary combination historically routine on this host or across the environment, or is the parent unusual for this binary?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior. The meaningful pivot is the launch mechanism: which parent process spawned the distribution binary, and is that pair historically common. A new or rare parent for the Kali binary on this host or environment-wide is the deviation worth chasing; a pair that already accounts for thousands of prior events is provisioned automation.'
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith|expand: '%ParentImage%'
+        Image|contains|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints. If the same user launched Kali or other tooling on multiple hosts in the same window, the scope of the operation may be larger than a single endpoint.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent and Kali binary combination fire on other hosts in the same window, indicating a coordinated rollout rather than isolated activity?
+  context: Under a service principal, asking what else this user did across the network returns agent-telemetry noise, since every host runs SYSTEM-owned agents constantly. The meaningful question is whether the same launch mechanism, the WSL parent plus the spawned Kali binary, fired on other hosts in the alert window. Multiple hosts in the same window points to scheduled or pushed automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith|expand: '%ParentImage%'
+        Image|contains|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.clustering
+  question: What other activity occurred on this host around the time of the alert?
+  context: 'Alerts rarely occur in isolation. Examining activity around the alert reveals the immediate context: what led to this event, what happened after, and whether it is part of a larger sequence. Look for reconnaissance, privilege escalation, persistence installation, or data staging that brackets the WSL launch.'
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - ParentImage
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: 'Alerts rarely happen in isolation. Earlier detections on the same host, defense tampering, reconnaissance, or credential access, may reveal the stages that preceded this event and help reconstruct the timeline. Look for patterns: tampering followed by execution, or reconnaissance followed by lateral movement.'
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1202
+      name: Indirect Command Execution
+      role: primary
+  attack_chain_coverage:
+    - stage: 1
+      label: indirection_utility_launch
+      description: A user or service launches the WSL indirection utility (wsl.exe / wslhost.exe) which runs or hosts the Kali distribution.
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2a
+      label: secondary_command_execution
+      description: The utility runs a secondary program / inline command inside the Kali distribution, decoded from the WSL parent and the distribution binary command lines.
+      mapped_to: Q6
+      source: template:cue_parent_process.mechanism_decode
+    - stage: 2b
+      label: spawned_program
+      description: The distribution binary executes its operation; follow-on Windows children of the WSL parent are surfaced.
+      mapped_to: Q7
+      source: template:cue_process_tool.mechanism_decode
+    - stage: 2c
+      label: network_activity
+      description: The utility or its child opens outbound network connections (EventCode 3, 22).
+      mapped_to: Q9
+      source: attack:T1202.network_activity
+    - stage: 3
+      label: filesystem_artifacts
+      description: File access / writes crossing back to the Windows filesystem (EventCode 11), including the SSH-config precursor angle, generalized to artifacts the WSL bridge writes.
+      mapped_to: Q8
+      source: attack:T1202.follow_on_execution
+  dimension_coverage:
+    - dimension: time_correlation
+      technique: T1202
+      covered_by: Q17
+      source: template:cue_host_context.clustering
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1202
+      covered_by: Q8
+      source: attack:T1202.follow_on_execution
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1202
+      covered_by: Q2
+      source: template:universal.host_user_context
+      coverage_type: direct
+  mutable_dispositions:
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "10-30 minutes (rationale only)"
+      disposition: context
+      target_question: Q8
+      notes: "Correlation-window rationale carries no fixed queryable value; the +/-15m file_event and network_connection windows and the host-clustering window realize the launcher-to-child/network correlation intent."
+    - element: AllowedUtilities
+      dimension: tuning_parameter
+      specific_values: "forfiles, wsl, ssh (allow-list rationale)"
+      disposition: context
+      target_question: Q2
+      notes: "Allow-list of permitted indirection utilities is an environment-tuning rationale, not a rule value; user/host-expectation question carries the 'is this utility sanctioned here' judgment."
+    - element: HighRiskChildren
+      dimension: tuning_parameter
+      specific_values: "powershell.exe, cmd.exe, rundll32.exe, regsvr32.exe, mshta.exe, msiexec.exe, curl.exe, bitsadmin.exe"
+      disposition: new_question
+      target_question: Q8
+      notes: "High-risk-child concept drove the follow_on_execution and follow-on-children questions; the brief lists these as example children of the indirection utility, surfaced via the WSL-parent file_event and ParentImage child queries rather than hard-coded into a single Image|endswith list."
+    - element: UserContext
+      dimension: user_context
+      specific_values: "standard/interactive user on a workstation vs server/CI agent (rationale only)"
+      disposition: context
+      target_question: Q2
+      notes: "No fixed account values; host_user_context plus the user-actor baseline carry the standard-user-on-workstation severity rationale."
+    - element: DestCIDRs
+      dimension: tuning_parameter
+      specific_values: "known-good egress networks (rationale only)"
+      disposition: context
+      target_question: Q9
+      notes: "Allow-listed egress ranges are an environment-tuning rationale with no rule-supplied CIDRs; the network_activity question surfaces destinations for the analyst to compare against known-good egress."
+  dedup_decisions:
+    - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable (subject vs. launch-mechanism pivot); both emitted"
+      kept: both
+    - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable (subject vs. launch-mechanism pivot); both emitted"
+      kept: both
+    - dropped: cue_process_tool.process_chain
+      reason: "parent_process is primary cue and parent_child technique set active — parent_child.parent_process_legitimacy and cue_parent_process.mechanism_decode subsume the parent-chain question (brief hint)"
+      kept: template:parent_child.parent_process_legitimacy
+    - dropped: cue_parent_process.clustering
+      reason: "+/-15m parent-binary activity on this host overlaps cue_host_context.clustering (same host-scoped window); host-context variant kept for the broader per-host view"
+      kept: template:cue_host_context.clustering
+    - dropped: cue_parent_process.scope
+      reason: "enterprise-wide parent-child spread covered by cue_user_actor.clustering_svc (same ParentImage+Image cross-host pivot in the alert window)"
+      kept: template:cue_user_actor.clustering_svc
+  skipped_templates:
+    - template: cue_process_tool.process_chain
+      reason: "brief hint: parent_process is primary — drop cue_process_tool:process_chain"
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "Condition has nested structure that the topology decomposer could not fully flatten. Read rule.detection.condition by hand and verify Q1 framing reflects the actual logical shape — see rule.condition_topology.raw."
+      disposition: declined
+      reason: >-
+        Acted on, not declined in substance — recorded here for the audit trail
+        since it drove framing rather than a new question. The raw condition
+        '1 of selection_img_* or all of selection_kali_* and not 1 of filter_main_*'
+        was parsed by Sigma precedence (not > and > or) into two OR branches:
+        (A) 1 of selection_img_* (Kali binary at an install path), and
+        (B) all of selection_kali_* AND NOT 1 of filter_main_* (wsl.exe/wslhost.exe
+        parent spawning a Kali-referencing child, excluding install/unregister).
+        Q1 and the description use disjunctive 'either ... or' framing and Q1's
+        context tells the analyst to note which branch fired.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - parent_child
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 16
+      attack: 2
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 2
+      context: 14
+    logsource_diversity:
+      process_creation: 15
+      file_event: 1
+      network_connection: 1
+      sigma_alert: 1

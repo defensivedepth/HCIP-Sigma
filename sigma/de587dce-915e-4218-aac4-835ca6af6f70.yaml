@@ -1,0 +1,575 @@
+name: Potential Persistence Attempt Via Run Keys Using Reg.EXE
+id: 31bc2756-e0a4-4439-975a-3d12ff5d03aa
+description: |
+  Detects reg.exe invoked with an add operation that targets a logon autostart Run key — the
+  HKLM or HKCU CurrentVersion\Run path, its WOW6432Node 32-bit equivalent, or the
+  Policies\Explorer\Run policy key. The rule fires only when all three conditions match together:
+  the reg.exe binary, the reg and add tokens on the command line, and one of those Run-key paths.
+  Writing a Run key registers an executable or script to launch automatically at user logon or
+  system start, which is a common persistence mechanism. Legitimate software installers and
+  administrators also write these keys, so the investigation should decode which value name and
+  data were written, confirm the registry value via registry telemetry, determine whether the
+  referenced payload exists on disk, establish whether the user, host, and parent process are
+  expected to set autostart entries, and check for surrounding registry, persistence, and LOLBin
+  activity.
+type: detection
+detection_id: de587dce-915e-4218-aac4-835ca6af6f70
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-09
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line run reg.exe with an add operation against a Run autostart key?
+  context: Confirm the alert is a true positive by reviewing the exact command line and process
+    details. The rule fires only when the reg.exe binary, the reg and add tokens, and one of the
+    autostart Run-key paths (CurrentVersion\Run, the WOW6432Node 32-bit equivalent, or
+    Policies\Explorer\Run) all appear together. Verify the full command, the value name and data
+    being written, and that the binary is genuinely reg.exe before investing further time.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to write registry Run keys for autostart?
+  context: Legitimate administrative activity can trigger this detection — installers and IT staff
+    occasionally register autostart entries by hand, and packaging or deployment routines write Run
+    keys during setup. Knowing whether the user role and host function include configuring autostart
+    persistence is often the fastest way to separate routine operations from an operator establishing
+    a foothold.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:organizational_context.change_ticket
+  question: Was there a change ticket, maintenance window, or documented approval for this registry change?
+  context: Many organizations require change records for persistence-relevant modifications such as
+    autostart Run keys. A corresponding ticket or deployment record suggests authorized activity;
+    absence of one when policy requires it suggests the change was unauthorized. This check can quickly
+    close false positives raised by approved software rollouts or escalate true positives.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:registry.registry_key_context
+  question: Which Run key and value were written, and what executable or script does the value data reference?
+  context: The registry path and value data reveal intent. A Run or RunOnce entry under
+    CurrentVersion\Run launches the referenced payload at the next logon; the Policies\Explorer\Run
+    variant runs it under the Explorer policy path. Identify the value name and the command or file
+    path written as the data — a payload in a user-writable location (AppData, Temp, Public,
+    ProgramData) or an obfuscated command points to operator persistence, while a vendor install path
+    points to legitimate software. The query retrieves the registry_set event linked to the same
+    process so the analyst reads the path and data as structured fields rather than parsing them from
+    the reg.exe command line. If registry-set telemetry is not collected in this environment, decode
+    the value name and data from the alerting command line directly.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+- source: template:registry.registry_value_persistence_check
+  question: Does the referenced executable or script exist on disk, and what is it?
+  context: Run-key persistence is only effective if the payload referenced by the value data exists
+    at the path written to the registry. If the value points to an executable or script in a
+    user-writable location, confirming the file exists and inspecting its hash determines whether the
+    persistence mechanism is active and what would run at the next logon. The %file_paths% placeholder
+    resolves to the path extracted from the value data; if no concrete path is available, examine the
+    value data from the registry entry and verify the referenced file on the host manually.
+  range: +15m
+  query: |
+    aggregation: false
+    logsource:
+      category: file_event
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        TargetFilename|endswith|expand: '%file_paths%'
+      condition: selection
+    fields:
+      - TargetFilename
+      - Image
+      - Hashes
+- source: template:parent_child.parent_process_legitimacy
+  question: What spawned reg.exe, and is that parent chain expected for a registry write?
+  context: The parent process reveals how reg.exe was invoked and is the core attribution signal for
+    this detection. An autostart write driven by an installer, a management console, or an interactive
+    admin shell differs sharply from one spawned by cmd.exe under wscript.exe, mshta.exe, powershell.exe,
+    or an Office application — parents that point to scripted delivery or a macro rather than deliberate
+    administration. Tracing the parent's own origin shows whether the chain is a routine logon session
+    or a delivery sequence.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- source: template:parent_child.sibling_processes
+  question: What other child processes did the same parent spawn around this time?
+  context: If a suspicious parent spawned reg.exe to set the Run key, it likely spawned other
+    processes too. Examining sibling processes reveals the full scope of activity from that parent —
+    a payload being dropped, additional persistence tooling, or reconnaissance — and multiple
+    suspicious children from one parent points to orchestrated rather than isolated activity.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: template:registry.registry_related_modifications
+  question: Were other registry modifications made via reg.exe on this host in the same session?
+  context: Operators who write one Run key often make several registry changes — stacking a second
+    autostart entry, disabling a security setting, or altering firewall rules in the same window.
+    Finding a cluster of reg.exe write operations (add, delete, import) on the host within a short
+    period reveals the full scope of configuration changes and whether multiple objectives were
+    pursued alongside the detected persistence. Correlating the timing of these changes with the
+    triggering event shows whether they belong to one operation.
+  range: +/-30m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_reg:
+        Image|endswith:
+          - '\reg.exe'
+          - '\regedit.exe'
+        CommandLine|contains:
+          - ' add '
+          - ' delete '
+          - ' import '
+          - '/s '
+      condition: selection and selection_reg
+    fields:
+      - CommandLine
+- source: template:cue_process_tool.baseline
+  question: Does this host normally run reg.exe?
+  context: A binary that has rarely run on a host is more notable than one that runs regularly. Zero
+    or very low historical counts for reg.exe indicate first-time or rare execution, which raises the
+    weight of an autostart write; a host where reg.exe runs routinely as part of provisioning or
+    administration lowers it.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - User
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously written a Run key with reg.exe, what parents and users normally drive it, and does this alert fit?
+  context: Even routine provisioning leaves a pattern. The query mirrors the rule's selection structure
+    scoped to this host, so the resulting parent and user distribution reflects how the rule's specific
+    firing pattern — reg add against a Run key — has historically run here, not generic reg.exe usage.
+    A new parent process, an unexpected user account, or a first-time appearance of this pattern is the
+    anomaly worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \reg.exe
+        CommandLine|contains|all:
+        - reg
+        - ' add '
+        CommandLine|contains:
+        - Software\Microsoft\Windows\CurrentVersion\Run
+        - \Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Run
+        - \Software\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run reg.exe?
+  context: Compare this user's current action against their historical behavior. A user who has never
+    run reg.exe is more notable than one for whom it appears regularly as part of a known administrative
+    role. The query counts how often this user has run reg.exe across all hosts over 90 days; the result
+    should align with their job function and typical toolset.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent-process and reg.exe combination historically routine on this host or across the environment, or is the parent unusual for it?
+  context: When the alert fires under a service principal, user identity does not attribute behavior;
+    the meaningful pivot is the launch mechanism. The query counts how often this same parent process
+    has spawned reg.exe over 90 days, grouped by host. A new or rare parent for reg.exe on this host or
+    environment-wide is the deviation worth chasing; a parent that already accounts for thousands of
+    prior events is vendor or operating-system automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or coordinated
+    activity on multiple endpoints. If the same user wrote autostart keys or ran related tooling
+    elsewhere in the same window, the scope of the incident may be larger than this single host.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent and reg.exe combination fire on other hosts in the same window, or is the activity isolated to this host?
+  context: Under a service principal, asking what else the user did returns agent-telemetry noise
+    because every host runs system-owned agents constantly. The meaningful question is whether the same
+    launch mechanism — the parent process spawning reg.exe — fired on other hosts in the alert window.
+    Multiple hosts point to scheduled or pushed automation such as a software rollout; a single host
+    points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:persistence_scope.process_based_persistence
+  question: Were other process-based persistence mechanisms installed on this host?
+  context: Attackers rarely rely on a single persistence mechanism. After establishing one foothold
+    (the detected Run-key write), they commonly install backups using different techniques — scheduled
+    tasks, services, BITS jobs, or WMI subscriptions. Multiple persistence installations in the same
+    timeframe point to intentional stacking rather than an isolated administrative action.
+  range: +/-4h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_persist:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\at.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\bitsadmin.exe'
+          - '\wmic.exe'
+      condition: selection and selection_persist
+    fields:
+      - Image
+      - CommandLine
+- source: template:lolbin.renamed_binary_check
+  question: Was reg.exe executed from its expected System32 path?
+  context: LOLBins executed from non-standard paths (outside System32 or SysWOW64) may indicate the
+    binary was copied or renamed to evade path-based allowlists. A reg.exe running from a user's temp
+    or download directory is more notable than one in System32, especially when it is writing an
+    autostart key.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- source: template:lolbin.technique_class_lateral
+  question: Were any other persistence or tampering LOLBins used on this host recently?
+  context: Operators who use one LOLBin for persistence often use several. If reg.exe wrote a Run key,
+    check whether schtasks, sc, at, netsh, wevtutil, bcdedit, or related binaries were also used to add
+    redundant persistence or weaken defenses in the same period. Finding multiple LOLBins working
+    toward the same objective strengthens the case for malicious activity.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_img:
+        Image|endswith:
+          - '\schtasks.exe'
+          - '\sc.exe'
+          - '\at.exe'
+          - '\netsh.exe'
+          - '\wevtutil.exe'
+          - '\bcdedit.exe'
+          - '\vssadmin.exe'
+          - '\diskshadow.exe'
+          - '\dnscmd.exe'
+      condition: selection and selection_img
+    fields:
+      - Image
+      - CommandLine
+- source: template:lolbin.historical_lolbin_baseline
+  question: How often has this host written a Run key with reg.exe over the past 90 days, and what command-line shapes are typical?
+  context: A Run-key write with no prior history on a host is more notable than one that recurs under
+    stable parents as part of routine provisioning. The query mirrors the rule's selection structure
+    scoped to this host, so the count reflects the rule's specific firing pattern rather than generic
+    reg.exe usage. The command-line projection lets the analyst compare typical invocation shapes —
+    which value names, which target keys — against the alerting one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        Image|endswith: \reg.exe
+        CommandLine|contains|all:
+        - reg
+        - ' add '
+        CommandLine|contains:
+        - Software\Microsoft\Windows\CurrentVersion\Run
+        - \Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Run
+        - \Software\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - CommandLine
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1547.001
+      name: Registry Run Keys / Startup Folder
+      role: primary
+    - id: T1547
+      name: Boot or Logon Autostart Execution
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: runkey_write_execution
+      description: "reg.exe is invoked with an add operation targeting a CurrentVersion\\Run, WOW6432Node\\Run, or Policies\\Explorer\\Run autostart key"
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: registry_value_identification
+      description: "The specific Run key path, value name, and value data (the registered executable or script) are read from the linked registry_set event"
+      mapped_to: Q4
+      source: template:registry.registry_key_context
+    - stage: 3
+      label: payload_presence_on_disk
+      description: "The executable or script referenced by the Run value is confirmed present on disk and its identity/hash established"
+      mapped_to: Q5
+      source: template:registry.registry_value_persistence_check
+    - stage: 4
+      label: parent_attribution
+      description: "Abnormal parent-child lineage is examined — what spawned reg.exe and whether that chain is expected for an autostart write"
+      mapped_to: Q6
+      source: template:parent_child.parent_process_legitimacy
+  dimension_coverage:
+    - dimension: time_correlation
+      technique: T1547.001
+      covered_by: Q8
+      source: template:registry.registry_related_modifications
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1547.001
+      covered_by: Q4
+      source: template:registry.registry_key_context
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1547.001
+      covered_by: Q11
+      source: template:cue_user_actor.baseline
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1547
+      covered_by: Q6
+      source: template:parent_child.parent_process_legitimacy
+      coverage_type: direct
+  mutable_dispositions:
+    - element: ImagePath
+      dimension: tuning_parameter
+      specific_values: "rationale only (full path of the binary/script registered in the Run key; tunable to exclude known software baselines)"
+      disposition: query_injection
+      target_question: Q5
+      notes: "Realized as the file_event check for the referenced payload path (%file_paths%); the value data path is extracted from the registry value and verified on disk via TargetFilename + Hashes."
+    - element: RegistryKeyPath
+      dimension: tuning_parameter
+      specific_values: "Software\\Microsoft\\Windows\\CurrentVersion\\Run, WOW6432Node\\...\\Run, ...\\Policies\\Explorer\\Run"
+      disposition: query_injection
+      target_question: Q4
+      notes: "The three Run-key paths are the rule's own selection and are enforced verbatim in the reflected baseline_deviation/scope/historical_lolbin_baseline queries; registry_key_context surfaces the exact key written (TargetObject)."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "5-10 minutes (default correlation window for registry creation + process execution)"
+      disposition: query_injection
+      target_question: Q8
+      notes: "Realized as the +/-30m registry_related_modifications window correlating reg.exe write operations in the same session; widened beyond the 5-10m default to catch slow-and-steady modification."
+    - element: UserContext
+      dimension: user_context
+      specific_values: "rationale only (filter for specific user SIDs or exclude known admin/script accounts)"
+      disposition: context
+      target_question: Q11
+      notes: "Folded into the user-actor baseline context (compare the firing user against their historical reg.exe usage and role)."
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "rationale only (T1547 secondary: expected parent-child lineage for autostarts)"
+      disposition: query_injection
+      target_question: Q6
+      notes: "Realized as the parent_process_legitimacy lookup of %ParentProcessGuid% surfacing the parent that spawned reg.exe and its own origin."
+    - element: StartupRegistryPath
+      dimension: tuning_parameter
+      specific_values: "rationale only (T1547 secondary: startup key list varies by org policy/installed software)"
+      disposition: query_injection
+      target_question: Q4
+      notes: "Same coverage as RegistryKeyPath — the registry_key_context query reads the exact autostart key the rule fired on."
+  dedup_decisions:
+    - dropped: cue_process_tool.process_chain
+      reason: "parent_child technique set active — parent_process_legitimacy is more specific (looks up parent and its own origin) and supersedes the generic process_chain cue"
+      kept: template:parent_child.parent_process_legitimacy
+    - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable"
+      kept: both emitted (Q11 user-pivot, Q12 service-principal substitute)
+    - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable"
+      kept: both emitted (Q13 user-pivot, Q14 service-principal substitute)
+  skipped_templates:
+    - template: cue_process_tool.mechanism_decode
+      reason: "replaced_by: registry.registry_key_context (per brief hint). The registry_key_context question (Q4) decodes what was written by reading the structured TargetObject/Details registry fields instead of parsing reg.exe's command line."
+    - template: cue_process_tool.follow_on
+      reason: "reg.exe writing a Run key is self-contained and does not spawn the persisted payload (which runs at next logon, not now); parent_child.sibling_processes (Q7) already surfaces what the same parent spawned around this time, and persistence_scope.process_based_persistence (Q15) covers follow-on persistence tooling. A reg.exe-child query would return near-empty by construction."
+    - template: cue_process_tool.clustering
+      reason: "host-wide around-time Image aggregation overlaps cue_user_actor.clustering (cross-host user activity in the same window) and persistence_scope.process_based_persistence (host persistence tooling +/-4h); dropped to stay at 18 without losing a dimension."
+    - template: cue_host_context.clustering
+      reason: "around-time host Image+ParentImage aggregation overlaps parent_child.sibling_processes and persistence_scope.process_based_persistence for host context; dropped to keep the count at the 18 cap."
+    - template: cue_host_context.precursor
+      reason: "prior-alert host timeline is useful but this persistence rule's disposition turns on the Run-key payload and parent attribution rather than a preceding alert chain; dropped to stay within the 18-question cap after all must_include and always_include templates were placed."
+    - template: cue_process_tool.scope
+      reason: "fleet-wide rule-pattern count overlaps lolbin.historical_lolbin_baseline (Q18, the rule's host-scoped 90-day pattern history) and cue_user_actor.clustering_svc (Q14, same-window cross-host launch-mechanism check); dropped to stay within the 18-question cap. Cross-host rollout signal is preserved via Q14."
+    - template: persistence_scope.file_based_persistence
+      reason: "file-event drops into Startup/Run paths are a parallel mechanism, but registry.registry_value_persistence_check (Q5) already pivots to file_event to confirm the referenced payload on disk; dropped to stay within the 18-question cap without losing the file-event persistence angle."
+    - template: organizational_context.human_recall
+      reason: "organizational_context.change_ticket (Q3) already provides the authorized-change check for this persistence write; human_recall, timing_alignment, and procedural_consistency are recommended-only and would push past the 18-question cap without adding an uncovered dimension."
+    - template: organizational_context.timing_alignment
+      reason: "recommended-only; off-hours timing judgment adds no uncovered dimension over the change_ticket authorization check (Q3) and the registry_related_modifications timing correlation (Q8). Dropped to stay within the 18-question cap."
+    - template: organizational_context.procedural_consistency
+      reason: "recommended-only; the 'is reg.exe the normal way changes are made here' angle is already carried by the parent_process_legitimacy (Q6) and procedural framing in change_ticket (Q3). Dropped to stay within the 18-question cap."
+    - template: universal.endpoint_protection_health
+      reason: "RECOMMENDED, not must_include. This rule fires on a single persistence action (Run-key write), not a payload-execution or credential-access rule where the disposition turns on whether AV/EDR was weakened first. lolbin.technique_class_lateral (Q17) already includes defense-tampering LOLBins (wevtutil, netsh, sc) in its host sweep, so the generic tamper sweep adds no decisive signal here and would push toward the 18-question cap."
+  reflection_overrides: []
+  hint_dispositions: []
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - registry
+    - organizational_context
+    - persistence_scope
+    - parent_child
+    - lolbin
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 18
+      attack: 0
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 15
+    logsource_diversity:
+      process_creation: 16
+      registry_set: 1
+      file_event: 1

@@ -1,0 +1,718 @@
+name: Suspicious BitLocker Access Agent Update Utility Execution
+id: 247c33dd-60d4-4de8-916d-7d6e1579d839
+description: |
+  Detects baaupdate.exe (the BitLocker Access Agent Update Utility) spawning a command interpreter,
+  script host, or system binary such as bitsadmin.exe, cmd.exe, powershell.exe, rundll32.exe,
+  regsvr32.exe, mshta.exe, wmic.exe, or schtasks.exe. baaupdate.exe is not a normal parent for these
+  binaries; this parent-child relationship is associated with lateral movement that abuses BitLocker
+  DCOM interfaces together with COM hijacking, where a DLL is dropped to a target and triggered through
+  a hijacked COM/DCOM interface so code runs inside a trusted signed process or a freshly spawned child.
+  Investigation should confirm what command the child ran, what loaded baaupdate.exe, whether a DLL was
+  written and loaded around the same time, and whether remote authentication or DCOM activity correlates
+  with the spawn.
+type: detection
+detection_id: 9f38c1db-e2ae-40bf-81d0-5b68f73fb512
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-08
+questions:
+- source: template:universal.verify_trigger_match
+  question: Did baaupdate.exe spawn one of the command interpreters or system binaries this rule detects?
+  context: Before investing investigation time, confirm the alert is a true positive by reviewing the
+    triggering event. The rule fires when a process whose parent image ends in baaupdate.exe spawns a
+    child whose image ends in bitsadmin.exe, cmd.exe, cscript.exe, mshta.exe, powershell_ise.exe,
+    powershell.exe, regsvr32.exe, rundll32.exe, schtasks.exe, wmic.exe, or wscript.exe. Verify both the
+    parent and the child image against this list.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+- source: template:universal.host_user_context
+  question: Is this user and host expected to be running BitLocker update tooling that spawns these binaries?
+  context: Legitimate BitLocker servicing rarely launches command interpreters or LOLBins as children.
+    Knowing whether the host is a managed endpoint where BitLocker tooling runs, and whether the user is
+    an administrator performing maintenance, is often the fastest way to separate routine operations from
+    abuse of the parent process.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:parent_child.parent_process_legitimacy
+  question: What started baaupdate.exe, and is that grandparent chain expected?
+  context: The parent-child relationship is the core signal for this detection. baaupdate.exe being driven
+    to spawn a command interpreter suggests it was invoked or hijacked rather than running as a routine
+    update. Tracing what spawned baaupdate.exe itself reveals whether the chain is a legitimate servicing
+    flow or a remote/COM trigger.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+      - ParentImage
+      - ParentCommandLine
+- source: template:parent_child.sibling_processes
+  question: What other child processes did this same baaupdate.exe instance spawn?
+  context: If baaupdate.exe spawned the detected child, it may have spawned others. Examining siblings of
+    the same parent instance reveals the full scope of activity initiated through this execution chain;
+    multiple LOLBin or interpreter children from the same parent points to orchestrated activity.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        ParentProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - CommandLine
+- source: attack:T1218.command_analysis
+  question: What did the child binary actually do? Decode its full command line and any arguments.
+  context: The triggering event confirms which binary ran, but the operational purpose lives in the
+    arguments. Decode any flags, encoded content, file paths, URLs, DLL entry points, or remote targets.
+    For proxy-execution binaries such as rundll32.exe and regsvr32.exe, identify the DLL and entry point;
+    for bitsadmin.exe identify any transfer source and destination; for powershell.exe decode encoded
+    payloads. This query returns every execution of this binary on the host within a few minutes of the
+    alert, so multi-step operations that span sequential invocations appear together.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+      - CurrentDirectory
+- source: template:lolbin.renamed_binary_check
+  question: Was the child binary executed from its expected system path?
+  context: The detected binaries normally live in System32 or SysWOW64. A copy running from a user-writable
+    or temp directory may indicate the binary was relocated or renamed to evade path-based allowlists, and
+    is more suspicious than the same binary in its standard location.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- source: template:cue_parent_process.baseline
+  question: Does baaupdate.exe on this host normally spawn this child binary?
+  context: Some parent-child relationships are routine while others are inherently unusual. baaupdate.exe
+    spawning a command interpreter or LOLBin should be rare to nonexistent on a typical host. Zero or very
+    low historical counts for this specific parent-child pairing indicate a novel spawning relationship
+    worth treating as suspicious.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: attack:T1021.003.image_load
+  question: Was a DLL written or loaded into a trusted process on this host around the time of the alert?
+  context: DCOM-based lateral movement combined with COM hijacking drops a DLL to the target and triggers
+    it through a hijacked COM/DCOM interface, often so the code executes inside an already-trusted signed
+    process rather than a freshly spawned child. Reviewing module loads from temporary or user-writable
+    paths around the alert surfaces the implanted DLL even when no obvious child process was created. If
+    module-load telemetry is not collected in this environment, treat zero results as a visibility gap.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: image_load
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_paths:
+        ImageLoaded|contains:
+          - '\Temp\'
+          - '\Users\'
+          - '\ProgramData\'
+          - '\Windows\Temp\'
+      condition: selection and selection_paths
+    fields:
+      - ImageLoaded
+      - Image
+- source: attack:T1021.003.remote_logon
+  question: Was there a remote logon to this host around the time of the spawn, and from which account and source?
+  context: DCOM invocation across hosts authenticates first, so a network or explicit-credential logon
+    shortly before the parent process spawned indicates the activity was driven remotely rather than by a
+    local user. Network logons (type 3) and explicit-credential logons correlate the remote trigger to an
+    account and source address. If Windows Security logs are not collected in this environment, treat zero
+    results as a visibility gap.
+  range: +/-15m
+  query: |
+    aggregation: true
+    logsource:
+      product: windows
+      service: security
+    detection:
+      selection:
+        EventID:
+          - 4624
+          - 4648
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - TargetUserName
+      - IpAddress
+      - LogonType
+      - EventID
+- source: template:lateral_movement.source_host_identification
+  question: What host initiated the remote connection to this system, and is it an expected administrative source?
+  context: Lateral movement requires a source and a destination. DCOM uses the RPC endpoint mapper on port
+    135 plus dynamic high ports; SMB and remote management ports often accompany it. Identifying the
+    originating address reveals whether the connection came from a known admin jump box or an unexpected,
+    possibly compromised, source being used as a pivot.
+  range: +/-15m
+  query: |
+    aggregation: false
+    logsource:
+      category: network_connection
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        DestinationPort:
+          - 135
+          - 445
+          - 5985
+          - 5986
+          - 3389
+      condition: selection
+    fields:
+      - SourceIp
+      - DestinationPort
+- source: template:lateral_movement.target_activity_after_access
+  question: What processes ran on this host shortly after the spawn, and under which accounts?
+  context: Lateral movement is a means to an end. Examining processes that ran in the window after the
+    detected execution reveals the operator's objectives on this host -- additional tooling, credential
+    access, reconnaissance, or further movement. Grouping by user and image helps separate the relevant
+    follow-on activity from routine background processes.
+  range: +30m
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - User
+      - Image
+- source: template:cue_user_actor.baseline
+  question: Does this user normally run these binaries under BitLocker update tooling?
+  context: Compare this user's current action against their historical pattern. A user who has never been
+    seen launching these interpreters or LOLBins is more suspicious than one who does so routinely. User
+    role and typical toolset should align with the detected behavior.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is the baaupdate.exe-to-child launch mechanism historically routine on this host or environment, or is this parent unusual for this binary?
+  context: When the alert fires under a service principal, user identity does not attribute behavior; the
+    meaningful pivot is the launch mechanism. A new or rare parent for this binary on this host or across
+    the environment is the deviation worth chasing, while a pair that already accounts for many prior
+    events points to existing automation rather than abuse.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host -- defense tampering,
+    reconnaissance, credential access, or remote-service activity -- may reveal the stages that preceded
+    this execution and help reconstruct the timeline of how the parent came to spawn the child.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:universal.endpoint_protection_health
+  question: Were any tamper attempts against endpoint protection seen on this host in the hour before the alert?
+  context: This rule's parent-child pattern is associated with defense evasion via trusted signed binaries,
+    and operators often weaken protection before hands-on activity. The query surfaces direct attempts to
+    disable AV/EDR services, flip Defender flags, add broad exclusions, clear logs, or patch AMSI/ETW.
+    Zero rows is a useful "protection looks healthy" signal; kernel-level driver tampering and in-memory
+    patches will not appear here. Populated rows shift the disposition toward operator preparation -- review
+    the parent process and signing chain to identify the writer.
+  range: -1h
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_host:
+        host.name|expand: '%hostname%'
+      selection_defender_disable:
+        CommandLine|contains:
+          - 'Set-MpPreference -Disable'
+          - 'Set-MpPreference -MAPSReporting Disabled'
+          - 'Set-MpPreference -SubmitSamplesConsent NeverSend'
+          - 'Set-MpPreference -PUAProtection Disabled'
+          - 'Set-MpPreference -ScanScheduleDay Never'
+          - 'MpCmdRun.exe -RemoveDefinitions'
+          - 'MpCmdRun.exe -DisableIOAVProtection'
+      selection_exclusions:
+        CommandLine|contains:
+          - 'Add-MpPreference -ExclusionPath'
+          - 'Add-MpPreference -ExclusionProcess'
+          - 'Add-MpPreference -ExclusionExtension'
+          - 'Add-MpPreference -ExclusionIpAddress'
+      selection_service_tamper:
+        - CommandLine|contains|all:
+            - 'config'
+            - 'start='
+            - 'disabled'
+        - CommandLine|contains:
+            - 'Stop-Service '
+            - 'Remove-Service '
+            - 'sc stop '
+            - 'sc delete '
+            - 'net stop '
+            - 'taskkill /F /IM '
+            - 'taskkill /IM '
+      selection_service_names:
+        CommandLine|contains:
+          - 'WinDefend'
+          - 'WdNisSvc'
+          - 'Sense'
+          - 'SecurityHealthService'
+          - 'mssecflt'
+          - 'mpssvc'
+          - 'MsMpEng'
+          - 'MsSense'
+          - 'CSFalconService'
+          - 'CSAgent'
+          - 'SentinelAgent'
+          - 'SentinelHelperService'
+          - 'SentinelStaticEngine'
+          - 'LogProcessorService'
+          - 'elastic-endpoint'
+          - 'ElasticEndpoint'
+          - 'Elastic Agent'
+          - 'AVP'
+          - 'klnagent'
+          - 'KAVFS'
+          - 'CbDefense'
+          - 'CarbonBlack'
+          - 'McAfeeFramework'
+          - 'McShield'
+          - 'McTaskManager'
+          - 'mfemms'
+          - 'mfevtp'
+          - 'mfefire'
+          - 'masvc'
+          - 'macmnsvc'
+          - 'TmListen'
+          - 'ntrtscan'
+          - 'TmCCSF'
+          - 'SepMasterService'
+          - 'SmcService'
+          - 'ccSvcHst'
+          - 'SAVService'
+          - 'SAVAdminService'
+          - 'Sophos Endpoint Defense'
+          - 'hmpalertsvc'
+          - 'CylanceSvc'
+          - 'CyOptics'
+      selection_log_tamper:
+        - CommandLine|contains:
+            - 'wevtutil cl '
+            - 'wevtutil clear-log'
+            - 'Clear-EventLog'
+            - 'Limit-EventLog'
+            - 'auditpol /clear'
+            - 'auditpol /remove'
+        - CommandLine|contains|all:
+            - 'wevtutil sl'
+            - '/e:false'
+        - CommandLine|contains|all:
+            - 'auditpol /set'
+            - ':disable'
+      selection_amsi_etw:
+        CommandLine|contains:
+          - 'AmsiUtils'
+          - 'amsiInitFailed'
+          - 'AmsiScanBuffer'
+          - 'amsiContext'
+          - 'EtwEventWrite'
+          - 'NtTraceEvent'
+          - 'EventWriteEndpoint'
+      condition: selection_host and (selection_defender_disable or selection_exclusions or (selection_service_tamper and selection_service_names) or selection_log_tamper or selection_amsi_etw)
+    fields:
+      - Image
+      - CommandLine
+      - User
+      - ParentImage
+- source: template:lolbin.historical_lolbin_baseline
+  question: How often has this host fired the baaupdate.exe-to-LOLBin pattern over the past 90 days, and what command-line shapes are typical?
+  context: A pattern with no prior history on a host is more suspicious than one seen regularly under
+    stable conditions. The query mirrors the rule's selection scoped to this host, so the count reflects
+    this rule's specific firing pattern rather than generic usage of the child binaries. The command-line
+    projection lets the typical invocation shapes be compared against the alerting one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ParentImage|endswith: \baaupdate.exe
+        Image|endswith:
+        - \bitsadmin.exe
+        - \cmd.exe
+        - \cscript.exe
+        - \mshta.exe
+        - \powershell_ise.exe
+        - \powershell.exe
+        - \regsvr32.exe
+        - \rundll32.exe
+        - \schtasks.exe
+        - \wmic.exe
+        - \wscript.exe
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (selection) and _pb_scope
+    fields:
+    - CommandLine
+- source: template:cue_parent_process.scope
+  question: Is the baaupdate.exe-to-child spawning pattern occurring on other hosts in the environment?
+  context: The same parent-child relationship appearing on multiple hosts may indicate lateral movement
+    across the environment or a coordinated push, while a single occurrence is more likely targeted.
+    Enterprise-wide comparison helps calibrate scope and identify additional affected systems.
+  range: -24h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+      - CommandLine
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1218
+      name: System Binary Proxy Execution
+      role: primary
+    - id: T1021.003
+      name: Distributed Component Object Model
+      role: primary
+    - id: T1021
+      name: Remote Services
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: remote_dcom_invocation
+      description: "Remote DCOM/COM-hijack invocation authenticates and drives baaupdate.exe to act"
+      mapped_to: Q9
+      source: attack:T1021.003.remote_logon
+    - stage: 2
+      label: parent_trigger
+      description: "baaupdate.exe is triggered and spawns a command interpreter / LOLBin child"
+      mapped_to: Q3
+      source: template:parent_child.parent_process_legitimacy
+    - stage: 3
+      label: dll_implant_load
+      description: "A dropped DLL is loaded into a trusted process via the hijacked COM/DCOM interface"
+      mapped_to: Q8
+      source: attack:T1021.003.image_load
+    - stage: 4
+      label: proxy_execution
+      description: "Trusted signed binary proxy-executes the payload (rundll32/regsvr32/bitsadmin/etc.)"
+      mapped_to: Q5
+      source: attack:T1218.command_analysis
+    - stage: 5
+      label: post_access_objectives
+      description: "Follow-on processes execute the operator's objectives on the target"
+      mapped_to: Q11
+      source: template:lateral_movement.target_activity_after_access
+  dimension_coverage:
+    - dimension: command_analysis
+      technique: T1218
+      covered_by: Q5
+      source: attack:T1218.command_analysis
+      coverage_type: direct
+    - dimension: parent_process_analysis
+      technique: T1218
+      covered_by: Q3
+      source: template:parent_child.parent_process_legitimacy
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1218
+      covered_by: Q17
+      source: template:cue_parent_process.scope
+      coverage_type: indirect
+    - dimension: process_identification
+      technique: T1021.003
+      covered_by: Q5
+      source: attack:T1218.command_analysis
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1021.003
+      covered_by: Q11
+      source: template:lateral_movement.target_activity_after_access
+      coverage_type: direct
+    - dimension: user_context
+      technique: T1021.003
+      covered_by: Q9
+      source: attack:T1021.003.remote_logon
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1021.003
+      covered_by: Q14
+      source: template:cue_user_actor.baseline_svc
+      coverage_type: indirect
+    - dimension: command_analysis
+      technique: T1021
+      covered_by: Q5
+      source: attack:T1218.command_analysis
+      coverage_type: direct
+    - dimension: time_correlation
+      technique: T1021
+      covered_by: Q11
+      source: template:lateral_movement.target_activity_after_access
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1021
+      covered_by: Q13
+      source: template:cue_user_actor.baseline
+      coverage_type: indirect
+  mutable_dispositions:
+    - element: ParentProcessName
+      dimension: parent_process_analysis
+      specific_values: "rationale only (profile unexpected parent-child)"
+      disposition: context
+      target_question: Q7
+      notes: "baaupdate.exe parent vs. child pairing surfaced via cue_parent_process.baseline and parent_process_legitimacy"
+    - element: SignedBinaryList
+      dimension: tuning_parameter
+      specific_values: "msiexec.exe, regsvr32.exe, rundll32.exe"
+      disposition: context
+      target_question: Q5
+      notes: "Rule already constrains the child image list; the signed-proxy-binary set is the rule's own Image selection. Decode question covers entry points."
+    - element: CommandLineRegex
+      dimension: command_analysis
+      specific_values: "URLs, script paths, DLL entrypoints"
+      disposition: context
+      target_question: Q5
+      notes: "Rule has no commandline_values; child decode question directs analyst to URLs/script paths/DLL entry points."
+    - element: RemoteDomainAllowlist
+      dimension: tuning_parameter
+      specific_values: "rationale only (suppress enterprise domains)"
+      disposition: context
+      target_question: Q10
+      notes: "Suppression rationale; source-host identification asks whether the source is an expected admin host."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "300s correlation window"
+      disposition: context
+      target_question: Q9
+      notes: "remote_logon and image_load questions use +/-15m windows to correlate RPC/logon with the spawn."
+    - element: UserContext
+      dimension: user_context
+      specific_values: "rare/first-time DCOM invocations by account"
+      disposition: new_question
+      target_question: Q9
+      notes: "Authored attack:T1021.003.remote_logon to surface logon account/source from Security logs."
+    - element: ProcessName
+      dimension: process_identification
+      specific_values: "excel.exe, wmiprvse.exe (DCOM-abused executables)"
+      disposition: context
+      target_question: Q5
+      notes: "Rule's own Image list is the abused-binary set; decode question identifies the specific child."
+    - element: RemoteHostList
+      dimension: tuning_parameter
+      specific_values: "rationale only (allowlist known DCOM sources)"
+      disposition: context
+      target_question: Q10
+      notes: "Source-host identification asks whether the originating host is an expected admin source."
+    - element: LogonUser
+      dimension: tuning_parameter
+      specific_values: "service/privileged accounts"
+      disposition: context
+      target_question: Q9
+      notes: "remote_logon projects TargetUserName so the analyst can scope to privileged/service accounts."
+  dedup_decisions:
+    - dropped: cue_process_tool.process_chain
+      reason: "parent_process is primary cue (per hint); cue_parent_process subsumes process_chain"
+      kept: template:parent_child.parent_process_legitimacy
+    - dropped: cue_user_actor.clustering / clustering_svc
+      reason: "user_actor is a secondary cue; baseline pair (user-pivot + service-principal substitute) carries the user dimension. Network-wide right-now clustering would duplicate lateral_movement.target_activity_after_access and cue_parent_process.scope for this parent-child rule."
+      kept: template:cue_user_actor.baseline + cue_user_actor.baseline_svc
+    - dropped: cue_user_actor.baseline pair note
+      reason: "user_actor pair (baseline + baseline_svc) emitted as TWO non-deduplicable questions"
+      kept: both Q13 and Q14
+  skipped_templates:
+    - template: cue_process_tool.mechanism_decode
+      reason: "replaced_by: scheduled_task.task_configuration (per template). Phase-2 decode authored as attack:T1218.command_analysis covering all 11 child binaries, not only schtasks."
+    - template: scheduled_task.task_configuration
+      reason: "schtasks.exe is only 1 of 11 possible children; the rule is a parent-child proxy/lateral-movement detection, not a scheduled-task rule. A schtasks-specific decode would not fit the 10 non-schtasks fires. attack:T1218.command_analysis decodes whichever child ran."
+    - template: scheduled_task.task_trigger_and_timing
+      reason: "schtasks-specific; not the rule's focus (1 of 11 children)"
+    - template: scheduled_task.task_still_present
+      reason: "schtasks-specific; not the rule's focus (1 of 11 children)"
+    - template: powershell.encoded_command_decode
+      reason: "powershell_ise.exe/powershell.exe are 2 of 11 children with no CommandLine constraint in the rule. attack:T1218.command_analysis already directs encoded-payload decode for the powershell case; a dedicated encoded-command question would idle on the other 9 fires."
+    - template: powershell.script_block_logging
+      reason: "powershell is only 2 of 11 possible children; script-block coverage would idle on the non-powershell fires. Child decode covers the powershell case."
+    - template: powershell.powershell_security_bypass
+      reason: "Generic PowerShell bypass sweep; powershell is 2 of 11 children. universal.endpoint_protection_health covers tamper/bypass precursors host-wide for all fires."
+    - template: lateral_movement.authentication_method
+      reason: "Re-displays the alert event with a manual auth-method prompt; attack:T1021.003.remote_logon queries Security logon events directly (4624/4648) which actually answer the authentication question."
+    - template: lateral_movement.lateral_movement_scope
+      reason: "Filters on psexec/mstsc/ssh/plink lateral tools; this rule's movement is DCOM/COM-hijack, not those tools. cue_parent_process.scope and network_scope source-host identification carry cross-host scope."
+    - template: network_scope.same_action_other_hosts
+      reason: "Overlaps cue_parent_process.scope, which scopes the parent+child pair env-wide; same_action_other_hosts on Image alone would be broader and noisier for these common binaries."
+    - template: network_scope.actor_activity_network_wide
+      reason: "Duplicates cue_user_actor.clustering intent; user dimension carried by baseline pair, cross-host scope by cue_parent_process.scope."
+    - template: network_scope.actor_authentication_trail
+      reason: "attack:T1021.003.remote_logon already queries Security logon events (4624/4648) scoped to the alert window on this host; the network-wide auth-trail variant would duplicate that source."
+    - template: persistence_scope.process_based_persistence
+      reason: "is_persistence_rule is false; this is a lateral-movement/proxy-execution detection. Follow-on objectives are covered by lateral_movement.target_activity_after_access."
+    - template: persistence_scope.file_based_persistence
+      reason: "is_persistence_rule is false; file-drop angle relevant to DCOM is covered by the implanted-DLL image_load question, not Startup/Run-key persistence."
+    - template: lolbin.technique_class_lateral
+      reason: "Other-LOLBins-same-objective sweep; the rule already enumerates the LOLBin child set and cue_parent_process.scope/historical_lolbin_baseline carry the LOLBin-usage angle. Avoids a broad host-wide LOLBin list duplicating baseline coverage."
+    - template: cue_parent_process.follow_on
+      reason: "Duplicates parent_child.sibling_processes (children of the same parent); sibling_processes uses the precise ParentProcessGuid scope."
+    - template: cue_parent_process.clustering
+      reason: "Duplicates cue_host_context activity context; host-wide around-the-alert context carried by target_activity_after_access and precursor."
+    - template: cue_process_tool.baseline
+      reason: "Per-binary host baseline duplicates cue_parent_process.baseline and cue_user_actor.baseline_svc, which baseline the more specific parent+child pairing."
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "scheduled_task.task_configuration replaces cue_process_tool.mechanism_decode"
+      disposition: declined
+      reason: >-
+        Acted on the replacement intent (skipped cue_process_tool.mechanism_decode) but did not adopt
+        scheduled_task.task_configuration as the Phase-2 decode, because schtasks.exe is only 1 of 11
+        possible children. The Phase-2 decode is authored as attack:T1218.command_analysis (Q5), which
+        decodes whichever child binary fired across all 11 cases. Recorded under skipped_templates.
+    - hint: "powershell.encoded_command_decode replaces obfuscation.encoded_payload_decode"
+      disposition: declined
+      reason: >-
+        No obfuscation.encoded_payload_decode template was selected (this is not an obfuscation rule),
+        so there is nothing for encoded_command_decode to replace. powershell is only 2 of 11 possible
+        children with no CommandLine constraint in the rule; a dedicated encoded-command question would
+        idle on the other 9 fires. attack:T1218.command_analysis (Q5) already directs the analyst to
+        decode encoded PowerShell payloads when the child binary is powershell. Recorded under
+        skipped_templates.
+    - hint: "logsource 'security' (recommended by techniques: T1021.003) is not covered and no template family exists — author a custom question with `category: security`"
+      disposition: declined
+      reason: >-
+        Acted on by authoring attack:T1021.003.remote_logon (Q9) using logsource product: windows /
+        service: security querying EventID 4624/4648 scoped to this host's alert window. The hint's
+        "decline" entry is recorded only because the hint phrasing names category:security; the authored
+        question uses the equivalent service:security logsource that the Security-channel events require.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - parent_child
+    - lateral_movement
+    - lolbin
+  generation_stats:
+    total_questions: 17
+    source_counts:
+      template: 14
+      attack: 3
+    phase_distribution:
+      triage: 2
+      analysis: 1
+      context: 14
+    logsource_diversity:
+      process_creation: 13
+      image_load: 1
+      security: 1
+      network_connection: 1
+      sigma_alert: 1

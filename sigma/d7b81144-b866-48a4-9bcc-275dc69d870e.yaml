@@ -1,0 +1,596 @@
+name: Windows EventLog Autologger Session Registry Modification Via CommandLine
+id: 8a2409e5-dcec-4cd9-8459-2acb46d1c97f
+description: |
+  Detects reg.exe or PowerShell (powershell.exe / pwsh.exe) modifying an AutoLogger event-tracing session under
+  HKLM\SYSTEM\CurrentControlSet\Control\WMI\Autologger\ from the command line, where the command both performs a
+  write action (reg add, Set-ItemProperty, New-ItemProperty, si) AND references the Autologger path AND touches a
+  Start or Enabled value. AutoLogger sessions capture event-tracing data early in the boot process before user
+  logon; flipping these Start/Enabled values disables early-boot telemetry collection so the change takes effect on
+  the next reboot, blinding monitoring of boot-time activity. The rule fires only when all four conditions match
+  together, so legitimate AutoLogger tuning by administrators or imaging/provisioning tooling can also trip it.
+  Determine which session or provider was targeted, whether the change reduced telemetry, who or what launched the
+  command, and whether other defense-tampering activity accompanied it.
+type: detection
+detection_id: d7b81144-b866-48a4-9bcc-275dc69d870e
+detection_category: ''
+detection_type: sigma
+contributors:
+- SecurityOnionSolutions
+created: 2026-06-09
+questions:
+- source: template:universal.verify_trigger_match
+  question: Does the command line match what this rule detects — a write to an Autologger session key that sets a Start or Enabled value?
+  context: Before investing investigation time, confirm the alert is a true positive. The rule fires only when the
+    image is reg.exe, powershell.exe, or pwsh.exe AND the command line contains a write action (reg add,
+    Set-ItemProperty, New-ItemProperty, or si) AND references the path \Control\WMI\Autologger\ AND touches a Start
+    or Enabled value. Confirm all four conditions are present in the same invocation rather than inferred from
+    separate events.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+      - CommandLine
+- source: template:universal.host_user_context
+  question: Is this user and host expected to reconfigure AutoLogger event-tracing sessions from the command line?
+  context: Direct AutoLogger reconfiguration is normally done by imaging/provisioning tooling, monitoring-agent
+    installers, or a documented maintenance routine — not by an interactive operator. Knowing whether this account
+    and host function normally tune early-boot tracing is often the fastest way to separate a routine change from
+    deliberate tampering.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:registry.registry_key_context
+  question: What specific Autologger session key and value were modified, and which provider or session does it target?
+  context: The registry path reveals intent. Each AutoLogger session lives as a named subkey under
+    HKLM\SYSTEM\CurrentControlSet\Control\WMI\Autologger\, and individual event-provider GUIDs are stored as
+    further subkeys under each session. Setting the session's Start or Enabled value to 0, or flipping a provider's
+    EnableProperty, stops that session or provider from collecting traces on the next boot. Read the exact session
+    name, value name, and data written to determine which telemetry source was cut off. If registry-modification
+    events are not collected in this environment, treat zero results as a visibility gap rather than evidence
+    nothing changed.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: registry_set
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - TargetObject
+      - Details
+- source: template:defense_tampering.what_was_disabled
+  question: Which AutoLogger session or telemetry provider was targeted, and was its Start or Enabled value set to disable collection?
+  context: Re-read the full command line of the triggering event. The value written determines impact — setting
+    Start or Enabled to 0 on a security-relevant session (for example the EventLog or PowerShell scriptblock
+    tracing session) stops that source from capturing events after the next reboot. Note the exact session name and
+    the value data so the disposition reflects whether monitoring was actually reduced or merely reconfigured.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: attack:T1562.002.security
+  question: Was the Security event log cleared or audit policy altered on this host around the time of the alert?
+  context: AutoLogger tampering targets early-boot telemetry; operators disabling logging often pair it with
+    clearing or reconfiguring the live audit trail. The Security channel records log clearing under event 1102.
+    A 1102 record close to the AutoLogger modification points to a broader effort to destroy and suppress evidence
+    rather than an isolated configuration change. If Security audit logging is not collected in this environment,
+    treat zero results as a visibility gap rather than evidence nothing was cleared.
+  range: +/-1h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+      service: security
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+        EventID: 1102
+      condition: selection
+    fields:
+      - host.name
+      - User
+- source: template:defense_tampering.protection_status
+  question: Is the targeted Autologger session currently enabled, or does it remain disabled and unable to collect telemetry?
+  context: The change may be temporary or persistent, and AutoLogger settings take effect on the next boot. Confirm
+    the current Start and Enabled values on the targeted session and whether the session is actively collecting.
+    If the session remains disabled, re-enabling it restores the boot-time telemetry before deeper investigation
+    proceeds.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - CommandLine
+- source: template:defense_tampering.activity_after_tampering
+  question: What activity occurred on this host after the Autologger session was modified?
+  context: Logging is reduced for a reason — to execute a payload, dump credentials, or take actions that the
+    suppressed telemetry would otherwise have recorded. Examining process activity in the window after the
+    modification reveals what the tampering was meant to hide or enable. Because AutoLogger changes apply on the
+    next reboot, also look across a reboot boundary if one occurred. Correlate with network connections and file
+    writes during this window.
+  range: +1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - Image
+      - User
+- source: template:defense_tampering.other_tampering_activity
+  question: Were other defense tampering actions performed on this host beyond the Autologger change?
+  context: Operators who suppress one telemetry source often disable several — stopping the EventLog service,
+    clearing event logs, deleting shadow copies, or turning off Defender — to maximize the window of reduced
+    visibility. Multiple tampering events from the same user or parent process in the same window indicate a
+    coordinated effort rather than an isolated configuration change.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        host.name|expand: '%hostname%'
+      selection_tamper:
+        Image|endswith:
+          - '\wevtutil.exe'
+          - '\vssadmin.exe'
+          - '\bcdedit.exe'
+          - '\wbadmin.exe'
+          - '\netsh.exe'
+          - '\sc.exe'
+          - '\reg.exe'
+          - '\powershell.exe'
+        CommandLine|contains:
+          - 'cl '
+          - 'clear-log'
+          - 'delete shadows'
+          - 'recoveryenabled'
+          - 'DisableRealtimeMonitoring'
+          - 'advfirewall'
+          - 'stop'
+          - 'delete'
+      condition: selection and selection_tamper
+    fields:
+      - Image
+      - User
+- source: template:cue_process_tool.process_chain
+  question: What process spawned this reg.exe or PowerShell invocation, and is that parent chain expected?
+  context: The parent reveals how the command was launched. Provisioning frameworks, monitoring-agent installers,
+    and scheduled maintenance run reg.exe and PowerShell from predictable service parents. An interactive shell, a
+    script host such as wscript.exe or mshta.exe, or an Office application as the parent points toward an operator
+    or a malicious launcher rather than routine automation.
+  range: -7d
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ParentProcessGuid%'
+      condition: selection
+    fields:
+      - ParentImage
+      - Image
+      - CommandLine
+- source: template:cue_process_tool.baseline_deviation
+  question: When this host has previously fired this Autologger-modification pattern, what parents and users drove it, and does the current alert fit?
+  context: The query mirrors the rule's selection — reg.exe or PowerShell writing a Start or Enabled value under
+    \Control\WMI\Autologger\ — scoped to this host. The resulting parent and user distribution reflects how this
+    specific firing pattern has historically run here, not generic reg.exe or PowerShell usage. A new parent
+    process, an unexpected user account, or a first-ever occurrence is the deviation worth chasing.
+  range: -14d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \reg.exe
+        - \powershell.exe
+        - \pwsh.exe
+      - OriginalFileName:
+        - reg.exe
+        - PowerShell.EXE
+        - pwsh.dll
+      selection_cli_action:
+        CommandLine|contains:
+        - 'add '
+        - Set-ItemProperty
+        - New-ItemProperty
+        - 'si '
+      selection_cli_base:
+        CommandLine|contains: \Control\WMI\Autologger\
+      selection_cli_key:
+        CommandLine|contains:
+        - Start
+        - Enabled
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - ParentImage
+    - User
+- source: template:cue_user_actor.baseline
+  question: Does this user normally reconfigure AutoLogger sessions or perform similar registry maintenance?
+  context: Compare this user's current action against their historical behavior. A user who has never modified
+    AutoLogger keys is more suspicious than an administrator who does so as part of documented imaging or monitoring
+    maintenance. The user's role and typical toolset should align with tuning early-boot event tracing.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.baseline_svc
+  question: Is this parent and binary combination historically routine on this host or across the environment, or is the parent unusual for this binary?
+  context: When the alert fires under a service principal, user identity does not attribute the behavior; the
+    meaningful pivot is the launch mechanism. A new or rare parent for this reg.exe or PowerShell invocation on this
+    host or environment-wide is the deviation worth chasing, whereas a pair that already accounts for many prior
+    events reflects platform or vendor automation.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_user_actor.clustering
+  question: What else did this user do across the network around this time?
+  context: Tracking the user's activity across all hosts reveals lateral movement or parallel actions on multiple
+    endpoints. If the same user modified AutoLogger sessions or performed related tampering on several hosts, the
+    scope of the operation may be larger than this single alert.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        User|expand: '%User%'
+      condition: selection
+    fields:
+      - host.name
+      - Image
+- source: template:cue_user_actor.clustering_svc
+  question: Did this same parent and binary combination fire on other hosts in the same window, indicating a coordinated rollout rather than isolated activity?
+  context: Under a service principal, asking what else the user did network-wide returns agent-telemetry noise. The
+    meaningful question is whether the same launch mechanism — the parent process spawning this reg.exe or
+    PowerShell invocation — fired on other hosts in the alert window. Multiple hosts point to scheduled or pushed
+    automation; a single host points to a host-local trigger.
+  range: +/-1h
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        process.parent.name|expand: '%ParentName%'
+        Image|endswith|expand: '%Image%'
+      condition: selection
+    fields:
+      - host.name
+- source: template:cue_process_tool.scope
+  question: Have other hosts fired this Autologger-modification pattern in the past week, and does the cross-host distribution look like automation or one-off activity?
+  context: The query mirrors the rule's selection with no host scope, giving a fleet-wide count of this specific
+    firing pattern rather than generic reg.exe or PowerShell usage. Many hosts firing the same pattern points to
+    scripted deployment or monitoring-agent automation; one host or a small unrelated set points to manual operator
+    activity. Use the host distribution and parent consistency to calibrate severity.
+  range: -7d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \reg.exe
+        - \powershell.exe
+        - \pwsh.exe
+      - OriginalFileName:
+        - reg.exe
+        - PowerShell.EXE
+        - pwsh.dll
+      selection_cli_action:
+        CommandLine|contains:
+        - 'add '
+        - Set-ItemProperty
+        - New-ItemProperty
+        - 'si '
+      selection_cli_base:
+        CommandLine|contains: \Control\WMI\Autologger\
+      selection_cli_key:
+        CommandLine|contains:
+        - Start
+        - Enabled
+      condition: all of selection_*
+    fields:
+    - host.name
+- source: template:cue_host_context.precursor
+  question: Did other detections fire on this host in the hours before this alert?
+  context: Alerts rarely happen in isolation. Earlier detections on the same host — reconnaissance, credential
+    access, or other defense tampering — may reveal the attack stages that preceded the AutoLogger modification and
+    help reconstruct the full timeline.
+  range: -6h
+  query: |
+    aggregation: false
+    logsource:
+      product: windows
+    detection:
+      selection:
+        event.module: sigma
+        host.name|expand: '%hostname%'
+      condition: selection
+    fields:
+      - event.severity_label
+      - rule.name
+      - rule.uuid
+- source: template:lolbin.renamed_binary_check
+  question: Was reg.exe or the PowerShell binary executed from an expected path?
+  context: reg.exe, powershell.exe, and pwsh.exe run from System32 or SysWOW64 in normal operation. The same binary
+    executing from a user-writable directory such as a temp or download folder may have been copied or renamed to
+    evade path-based allowlists, which raises suspicion independent of the command it ran. Compare the image path
+    against the original file name recorded for the process.
+  range: +/-5m
+  query: |
+    aggregation: false
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection:
+        ProcessGuid|expand: '%ProcessGuid%'
+      condition: selection
+    fields:
+      - Image
+      - OriginalFileName
+- source: template:lolbin.historical_lolbin_baseline
+  question: How often has this host fired the Autologger-modification pattern over the past 90 days, and what command-line shapes are typical?
+  context: A registry-tampering pattern with no prior history on a host is more suspicious than one used regularly
+    under stable parents. The query mirrors the rule's selection scoped to this host, so the resulting count
+    reflects this specific firing pattern rather than generic reg.exe or PowerShell usage. The command-line
+    projection lets the analyst compare typical invocation shapes against the alerting one.
+  range: -90d
+  query: |
+    aggregation: true
+    logsource:
+      category: process_creation
+      product: windows
+    detection:
+      selection_img:
+      - Image|endswith:
+        - \reg.exe
+        - \powershell.exe
+        - \pwsh.exe
+      - OriginalFileName:
+        - reg.exe
+        - PowerShell.EXE
+        - pwsh.dll
+      selection_cli_action:
+        CommandLine|contains:
+        - 'add '
+        - Set-ItemProperty
+        - New-ItemProperty
+        - 'si '
+      selection_cli_base:
+        CommandLine|contains: \Control\WMI\Autologger\
+      selection_cli_key:
+        CommandLine|contains:
+        - Start
+        - Enabled
+      _pb_scope:
+        host.name|expand: '%hostname%'
+      condition: (all of selection_*) and _pb_scope
+    fields:
+    - CommandLine
+_generation_meta:
+  has_attack_brief: true
+  techniques:
+    - id: T1562.002
+      name: Disable Windows Event Logging
+      role: primary
+    - id: T1562
+      name: Impair Defenses
+      role: secondary
+  attack_chain_coverage:
+    - stage: 1
+      label: tool_invocation
+      description: "Actor runs reg.exe or PowerShell with a write action against an Autologger session key, setting Start or Enabled."
+      mapped_to: Q1
+      source: template:universal.verify_trigger_match
+    - stage: 2
+      label: registry_modification
+      description: "AutoLogger session/provider key under \\Control\\WMI\\Autologger\\ modified to disable early-boot telemetry."
+      mapped_to: Q3
+      source: template:registry.registry_key_context
+    - stage: 3
+      label: logging_disabled
+      description: "Targeted session's Start/Enabled value set to stop trace collection after the next boot."
+      mapped_to: Q4
+      source: template:defense_tampering.what_was_disabled
+    - stage: 4
+      label: audit_trail_suppression
+      description: "Correlated clearing of the live Security audit log (event 1102) accompanying the tracing change."
+      mapped_to: Q5
+      source: attack:T1562.002.security
+    - stage: 5
+      label: post_tamper_activity
+      description: "Payload execution, credential access, or other actions enabled by the reduced telemetry."
+      mapped_to: Q7
+      source: template:defense_tampering.activity_after_tampering
+  dimension_coverage:
+    - dimension: time_correlation
+      technique: T1562.002
+      covered_by: Q5
+      source: attack:T1562.002.security
+      coverage_type: direct
+    - dimension: tuning_parameter
+      technique: T1562.002
+      covered_by: Q4
+      source: template:defense_tampering.what_was_disabled
+      coverage_type: direct
+    - dimension: process_identification
+      technique: T1562
+      covered_by: Q9
+      source: template:cue_process_tool.process_chain
+      coverage_type: direct
+  mutable_dispositions:
+    - element: AuthorizedAdminAccounts
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q11
+      notes: "Authorized-admin exclusion rationale surfaced as the user-role baseline check rather than a query value."
+    - element: TimeWindow
+      dimension: time_correlation
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q5
+      notes: "Correlation window between registry modification and audit-log clearing expressed as the +/-1h range on the Security 1102 question."
+    - element: ServiceNames
+      dimension: tuning_parameter
+      specific_values: "EventLog, Sysmon, custom loggers (rationale)"
+      disposition: context
+      target_question: Q4
+      notes: "Monitored-service/session naming covered as context in the what-was-disabled question; the rule already constrains to the Autologger registry path, so no query value added."
+    - element: ProcessWhitelist
+      dimension: process_identification
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q9
+      notes: "Authorized administrative-tool exclusion rationale covered by the parent-chain legitimacy question."
+    - element: ServiceNamePatterns
+      dimension: tuning_parameter
+      specific_values: "rationale only"
+      disposition: context
+      target_question: Q8
+      notes: "Security-critical service naming covered by the other-tampering sweep's service filters."
+  dedup_decisions:
+    - dropped: cue_user_actor.baseline / cue_user_actor.baseline_svc
+      reason: "user_actor pair — non-deduplicable; emit both (subject identity vs. launch mechanism)"
+      kept: both
+    - dropped: cue_user_actor.clustering / cue_user_actor.clustering_svc
+      reason: "user_actor pair — non-deduplicable; emit both (network-wide user vs. parent+binary rollout)"
+      kept: both
+  skipped_templates:
+    - template: cue_process_tool.mechanism_decode
+      reason: "replaced_by: registry.registry_key_context (and defense_tampering.what_was_disabled); both supersede the generic mechanism decode with registry-path and tamper-target framing"
+    - template: cue_process_tool.baseline
+      reason: "host-baseline of generic reg.exe/PowerShell usage superseded by cue_process_tool.baseline_deviation, which scopes to the rule's specific Autologger-modification pattern"
+    - template: cue_process_tool.follow_on
+      reason: "child-of-reg.exe/PowerShell pivot subsumed by defense_tampering.activity_after_tampering (post-tamper host activity); a registry write does not characteristically spawn children, so the post-tamper sweep is the relevant question"
+    - template: cue_process_tool.clustering
+      reason: "host-wide around-the-time process clustering covered by cue_host_context.precursor (prior alerts) and defense_tampering.activity_after_tampering (post activity); generic clustering would duplicate without adding signal"
+    - template: cue_host_context.clustering
+      reason: "host-wide Image+ParentImage clustering overlaps activity_after_tampering and other_tampering_activity; dropped to stay within the 18-question cap without losing tamper-specific coverage"
+    - template: universal.endpoint_protection_health
+      reason: "defense_tampering technique set is confirmed for this rule; its what_was_disabled / other_tampering_activity / activity_after_tampering questions are more specific than the generic host-tamper sweep and supersede it per the template's own RECOMMENDED guidance"
+    - template: registry.registry_related_modifications
+      reason: "other-registry-modification scope overlaps cue_process_tool.scope and defense_tampering.other_tampering_activity (which already includes reg.exe write actions); dropped to stay within the 18-question cap"
+    - template: persistence_scope.process_based_persistence
+      reason: "recommended, not must_include; this rule is defense-evasion (telemetry suppression), not persistence — persistence-tool sweep adds little signal for an AutoLogger-disable action and would displace tamper-specific coverage under the 18-question cap"
+    - template: persistence_scope.file_based_persistence
+      reason: "recommended, not must_include; no file_reference in this rule's detection and the action is registry-only telemetry suppression — Startup/Run-key file-drop sweep is off-objective for an AutoLogger-disable alert"
+    - template: lolbin.technique_class_lateral
+      reason: "other-LOLBins sweep targets download/proxy-execution objectives; this rule's objective is registry-based telemetry suppression, already covered by defense_tampering.other_tampering_activity (which sweeps reg.exe, sc.exe, wevtutil.exe, etc. for tampering); dropped to stay within the 18-question cap"
+  reflection_overrides: []
+  hint_dispositions:
+    - hint: "powershell.encoded_command_decode replaces obfuscation.encoded_payload_decode"
+      disposition: declined
+      reason: >-
+        The rule's CommandLine selections are plaintext registry-write tokens
+        (reg add / Set-ItemProperty / New-ItemProperty / si, the literal
+        \Control\WMI\Autologger\ path, and the Start/Enabled value names). It
+        does not detect -EncodedCommand or obfuscation, and the triggering
+        command is already human-readable, so per the template's own guidance
+        the encoding-decode question adds no value. The decode of the actual
+        registry target is instead handled by Q3
+        (registry.registry_key_context) and Q4
+        (defense_tampering.what_was_disabled). No encoded_command_decode,
+        script_block_logging, or powershell_security_bypass question authored —
+        the PowerShell branch here is a registry-write vector, not an encoded
+        payload runner.
+  contextual_sets:
+    included: []
+    excluded: []
+  technique_sets_applied:
+    - universal
+    - defense_tampering
+    - registry
+    - lolbin
+    - persistence_scope
+  generation_stats:
+    total_questions: 18
+    source_counts:
+      template: 17
+      attack: 1
+      llm_generated: 0
+    phase_distribution:
+      triage: 2
+      analysis: 2
+      context: 14
+    logsource_diversity:
+      process_creation: 15
+      registry_set: 1
+      security: 1
+      sigma_alert: 1

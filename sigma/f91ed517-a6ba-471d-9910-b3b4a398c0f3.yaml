@@ -12,7 +12,7 @@ created: 2026-06-03
 questions:
 - source: template:universal.verify_trigger_match
   question: Does this match the rule — a WindowsApps-packaged parent spawning a listed interpreter or a suspicious command line?
-  context: Confirm the alert before investing time. The rule fires when the parent runs from C:\Program Files\WindowsApps\ AND the child EITHER ends in one of the listed interpreters (cmd, cscript, mshta, powershell, powershell_ise, pwsh, regsvr32, rundll32, wscript) OR has a command line containing cmd /c, Invoke-, or Base64 — and the Windows Terminal and Sysinternals packages are excluded. Note which branch fired, because a known interpreter as the child versus a suspicious command string shapes what to decode next.
+  context: Confirm the alert before investing time. The rule fires when the parent runs from C:\Program Files\WindowsApps\ AND the child EITHER ends in one of the listed interpreters (cmd, cscript, mshta, powershell, powershell_ise, pwsh, regsvr32, rundll32, wscript) OR has a command line containing cmd /c, Invoke-, or Base64 — and the Windows Terminal and Sysinternals packages are excluded. Note which branch fired, because a known interpreter as the child versus a suspicious command string determines what to decode next.
   range: +/-5m
   query: |
     aggregation: false
@@ -282,37 +282,99 @@ questions:
       - User
       - ParentImage
 - source: template:cue_user_actor.baseline
-  question: Does this user normally run this binary?
-  context: Compare this user's current action against their historical pattern. A user who has never run this interpreter is more notable than one who does so regularly, and the user's role and typical toolset should align with the activity. This pivot is meaningful only when a real user account fired the alert; the launch-mechanism baseline alongside it carries the answer when it did not.
+  question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
   range: -90d
   query: |
     aggregation: true
     logsource:
-      category: process_creation
       product: windows
+      category: process_creation
     detection:
-      selection:
+      selection_parent:
+        ParentImage|contains: C:\Program Files\WindowsApps\
+      selection_susp_img:
+        Image|endswith:
+        - \cmd.exe
+        - \cscript.exe
+        - \mshta.exe
+        - \powershell.exe
+        - \powershell_ise.exe
+        - \pwsh.exe
+        - \regsvr32.exe
+        - \rundll32.exe
+        - \wscript.exe
+      selection_susp_cli:
+        CommandLine|contains:
+        - cmd /c
+        - Invoke-
+        - Base64
+      filter_optional_terminal:
+        ParentImage|contains: :\Program Files\WindowsApps\Microsoft.WindowsTerminal
+        ParentImage|endswith: \WindowsTerminal.exe
+        Image|endswith:
+        - \powershell.exe
+        - \cmd.exe
+        - \pwsh.exe
+      filter_optional_sysinternals:
+        ParentImage|startswith: C:\Program Files\WindowsApps\Microsoft.SysinternalsSuite
+        Image|endswith: \cmd.exe
+      _pb_scope:
         User|expand: '%User%'
-        Image|endswith|expand: '%Image%'
-      condition: selection
+      condition: (selection_parent and 1 of selection_susp_* and not 1 of filter_optional_*) and _pb_scope
     fields:
-      - host.name
+    - host.name
 - source: template:cue_user_actor.baseline_svc
-  question: Is this app-and-child binary combination historically routine on this host or across the environment?
-  context: When the alert fires under a service or computer account, user identity does not attribute behavior, so the meaningful baseline is the launch mechanism — which packaged app spawned this binary, and whether that pairing is historically common. A new or rare app-to-child pairing is the deviation worth chasing; one that already accounts for many prior events points to a legitimate package helper.
+  question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
   range: -90d
   query: |
     aggregation: true
     logsource:
-      category: process_creation
       product: windows
+      category: process_creation
     detection:
-      selection:
+      selection_parent:
+        ParentImage|contains: C:\Program Files\WindowsApps\
+      selection_susp_img:
+        Image|endswith:
+        - \cmd.exe
+        - \cscript.exe
+        - \mshta.exe
+        - \powershell.exe
+        - \powershell_ise.exe
+        - \pwsh.exe
+        - \regsvr32.exe
+        - \rundll32.exe
+        - \wscript.exe
+      selection_susp_cli:
+        CommandLine|contains:
+        - cmd /c
+        - Invoke-
+        - Base64
+      filter_optional_terminal:
+        ParentImage|contains: :\Program Files\WindowsApps\Microsoft.WindowsTerminal
+        ParentImage|endswith: \WindowsTerminal.exe
+        Image|endswith:
+        - \powershell.exe
+        - \cmd.exe
+        - \pwsh.exe
+      filter_optional_sysinternals:
+        ParentImage|startswith: C:\Program Files\WindowsApps\Microsoft.SysinternalsSuite
+        Image|endswith: \cmd.exe
+      _pb_scope:
         process.parent.name|expand: '%ParentName%'
-        Image|endswith|expand: '%Image%'
-      condition: selection
+      condition: (selection_parent and 1 of selection_susp_* and not 1 of filter_optional_*) and _pb_scope
     fields:
-      - host.name
+    - host.name
 - source: template:cue_user_actor.clustering
   question: What else did this user do across the network around this time?
   context: Tracking the user's activity across all hosts in a tight window reveals lateral movement or activity spanning multiple endpoints. If the same user triggered similar activity elsewhere, the scope is larger than a single host. This pivot is meaningful only when a real user account fired the alert.
@@ -330,21 +392,53 @@ questions:
       - host.name
       - Image
 - source: template:cue_user_actor.clustering_svc
-  question: Did this same app-and-child binary combination fire on other hosts in the same window?
-  context: Under a service or computer account, asking what else the user did returns agent-telemetry noise. The meaningful question is whether the same launch mechanism — this packaged app spawning this binary — fired on other hosts in the alert window. Multiple hosts at once points to a pushed or trojanized package distributed across the environment; a single host points to a host-local trigger.
+  question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
   range: +/-1h
   query: |
     aggregation: true
     logsource:
-      category: process_creation
       product: windows
+      category: process_creation
     detection:
-      selection:
+      selection_parent:
+        ParentImage|contains: C:\Program Files\WindowsApps\
+      selection_susp_img:
+        Image|endswith:
+        - \cmd.exe
+        - \cscript.exe
+        - \mshta.exe
+        - \powershell.exe
+        - \powershell_ise.exe
+        - \pwsh.exe
+        - \regsvr32.exe
+        - \rundll32.exe
+        - \wscript.exe
+      selection_susp_cli:
+        CommandLine|contains:
+        - cmd /c
+        - Invoke-
+        - Base64
+      filter_optional_terminal:
+        ParentImage|contains: :\Program Files\WindowsApps\Microsoft.WindowsTerminal
+        ParentImage|endswith: \WindowsTerminal.exe
+        Image|endswith:
+        - \powershell.exe
+        - \cmd.exe
+        - \pwsh.exe
+      filter_optional_sysinternals:
+        ParentImage|startswith: C:\Program Files\WindowsApps\Microsoft.SysinternalsSuite
+        Image|endswith: \cmd.exe
+      _pb_scope:
         process.parent.name|expand: '%ParentName%'
-        Image|endswith|expand: '%Image%'
-      condition: selection
+      condition: (selection_parent and 1 of selection_susp_* and not 1 of filter_optional_*) and _pb_scope
     fields:
-      - host.name
+    - host.name
 - source: template:cue_host_context.precursor
   question: Did other detections fire on this host in the hours before this alert?
   context: Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering, reconnaissance, credential access — may reveal the stages that preceded this event and help reconstruct the timeline that led to the packaged app spawning an interpreter.

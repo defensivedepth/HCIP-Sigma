@@ -249,28 +249,37 @@ questions:
       - TargetFilename
       - Image
 - source: template:credential_access.post_access_lateral_movement
-  question: Did any new logon sessions, remote connections, or follow-on detections fire
-    on this host after the browser database was read?
-  context: Harvested session cookies are replayed against web applications and stolen
-    credentials are reused to reach other systems, so credential theft is often
-    followed quickly by lateral movement or outbound connections. Surfacing later
-    detections on the same host - new logons, remote-access activity, or
-    credential-reuse alerts - shows whether the extracted browser data is already
-    being used.
+  question: Were outbound remote-access connections (RDP, SMB, WinRM, SSH) initiated from this host after
+    this event?
+  context: Credential theft is typically followed by lateral movement. The query returns outbound connections
+    from this host to remote-access ports -- 3389 (RDP), 445 (SMB/PsExec), 5985/5986 (WinRM), 22 (SSH)
+    -- in the hours after the event; the originating Image and User show what drove each connection. Two
+    limits to keep in mind -- credentials exfiltrated and replayed from another machine will not appear
+    here (check security 4624 logons on suspected targets for this account and any accounts with sessions
+    on this host), and the query requires Sysmon network telemetry (EID 3); if that is not collected from
+    this host, treat zero rows as a visibility gap, not as evidence no movement occurred.
   range: +4h
   query: |
     aggregation: false
     logsource:
+      category: network_connection
       product: windows
     detection:
       selection:
-        event.module: sigma
         host.name|expand: '%hostname%'
+        Initiated: 'true'
+        DestinationPort:
+          - 3389
+          - 445
+          - 5985
+          - 5986
+          - 22
       condition: selection
     fields:
-      - rule.name
-      - rule.uuid
-      - event.severity_label
+      - DestinationIp
+      - DestinationPort
+      - Image
+      - User
 - source: template:credential_access.credential_exposure_assessment
   question: Whose browser profile was read, and does that account have access to
     sensitive applications or elevated privileges?
@@ -293,13 +302,11 @@ questions:
     fields:
       - CommandLine
 - source: template:cue_user_actor.baseline
-  question: Does this user normally run a SQLite client against browser profile
-    databases?
-  context: Compare the acting account against its own history. A forensics analyst or
-    a developer may read cookies.sqlite or places.sqlite as part of routine work; an
-    account that has never done so running a SQLite client against a browser profile
-    is more notable. The user role and typical toolset should align with browser data
-    handling.
+  question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
   range: -90d
   query: |
     aggregation: true
@@ -307,24 +314,28 @@ questions:
       category: process_creation
       product: windows
     detection:
-      selection:
+      selection_sql:
+      - Product: SQLite
+      - Image|endswith:
+        - \sqlite.exe
+        - \sqlite3.exe
+      selection_firefox:
+        CommandLine|contains:
+        - cookies.sqlite
+        - places.sqlite
+      _pb_scope:
         User|expand: '%User%'
-        CommandLine|contains:
-          - cookies.sqlite
-          - places.sqlite
-      condition: selection
+      condition: (all of selection_*) and _pb_scope
     fields:
-      - host.name
+    - host.name
 - source: template:cue_user_actor.baseline_svc
-  question: Is this parent process and browser-database query pattern historically
-    routine on this host or across the environment, or is the parent unusual for it?
-  context: When the alert fires under a service principal, user identity does not
-    attribute the behavior; the meaningful pivot is which parent process launched a
-    child that queries a browser profile database, and whether that pairing is
-    historically common. A new or rare parent for this pattern on this host or
-    environment-wide is the deviation worth chasing, while a parent that already
-    accounts for many prior events is more likely a forensics tool or migration
-    pipeline.
+  question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
   range: -90d
   query: |
     aggregation: true
@@ -332,14 +343,20 @@ questions:
       category: process_creation
       product: windows
     detection:
-      selection:
-        process.parent.name|expand: '%ParentName%'
+      selection_sql:
+      - Product: SQLite
+      - Image|endswith:
+        - \sqlite.exe
+        - \sqlite3.exe
+      selection_firefox:
         CommandLine|contains:
-          - cookies.sqlite
-          - places.sqlite
-      condition: selection
+        - cookies.sqlite
+        - places.sqlite
+      _pb_scope:
+        process.parent.name|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
     fields:
-      - host.name
+    - host.name
 - source: template:cue_user_actor.clustering
   question: What else did this user do across the network around this time?
   context: Tracking the acting account's activity across all hosts reveals whether the
@@ -360,15 +377,13 @@ questions:
       - host.name
       - Image
 - source: template:cue_user_actor.clustering_svc
-  question: Did this same parent process and browser-database query pattern fire on
-    other hosts in the same window, indicating a coordinated rollout rather than
-    isolated activity?
-  context: Under a service principal, asking what else the user did across the network
-    returns agent-telemetry noise, since every host runs system-owned agents
-    constantly. The meaningful question is whether the same launch mechanism - a
-    parent process spawning a child that queries a browser profile database - fired on
-    other hosts in the alert window. Multiple hosts in the same window points to
-    scheduled or pushed automation; a single host points to a host-local trigger.
+  question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
   range: +/-1h
   query: |
     aggregation: true
@@ -376,14 +391,20 @@ questions:
       category: process_creation
       product: windows
     detection:
-      selection:
-        process.parent.name|expand: '%ParentName%'
+      selection_sql:
+      - Product: SQLite
+      - Image|endswith:
+        - \sqlite.exe
+        - \sqlite3.exe
+      selection_firefox:
         CommandLine|contains:
-          - cookies.sqlite
-          - places.sqlite
-      condition: selection
+        - cookies.sqlite
+        - places.sqlite
+      _pb_scope:
+        process.parent.name|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
     fields:
-      - host.name
+    - host.name
 - source: template:cue_host_context.clustering
   question: What other activity occurred on this host around the time of the alert?
   context: Alerts rarely occur in isolation. Examining the activity surrounding the

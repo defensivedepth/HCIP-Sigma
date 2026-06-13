@@ -4,7 +4,7 @@ description: |
   Detects execution of SharpMove, a .NET utility for authenticated remote execution that performs lateral movement
   over WMI, including remote service creation or binary-path modification, scheduled task creation, DCOM invocation,
   and VBScript execution. The rule fires when EITHER the binary is identified by its name or PE original filename,
-  OR the command line carries a computername= target, OR the command line carries one of the action= verbs (create,
+  OR the command line carries BOTH a computername= target AND one of the action= verbs (create,
   dcom, executevbs, hijackdcom, modschtask, modsvc, query, scm, startservice, taskscheduler). Legitimate use is
   effectively limited to authorized red-team or penetration-test engagements; outside that, the execution indicates
   an operator attempting authenticated remote execution against another host. Investigation should confirm which
@@ -19,10 +19,9 @@ contributors:
 created: '2026-06-04'
 questions:
 - source: template:universal.verify_trigger_match
-  question: Did this alert fire on the SharpMove binary name, on a computername= target, or on an action= verb in the command line?
+  question: Did this alert fire on the SharpMove binary name, or on a command line carrying both a computername= target and an action= verb?
   context: >-
-    The rule matches when EITHER the image name or PE original filename is SharpMove.exe, OR the command line contains
-    computername=, OR the command line contains one of the action= verbs (create, dcom, executevbs, hijackdcom,
+    The rule matches when EITHER the image name or PE original filename is SharpMove.exe, OR the command line contains BOTH computername= AND one of the action= verbs (create, dcom, executevbs, hijackdcom,
     modschtask, modsvc, query, scm, startservice, taskscheduler). Confirm which branch fired by reviewing the exact
     Image, OriginalFileName, and CommandLine. Note the branch: a name-only match without a computername= target or an
     action= verb may be a renamed or staged binary, while an action= or computername= match identifies the specific
@@ -148,7 +147,7 @@ questions:
   context: >-
     Even sanctioned tooling can be abused. The query mirrors the rule's selection structure scoped to this host, so the
     resulting parent and user distribution reflects how this specific firing pattern has historically run here, not
-    generic binary usage. A new parent process, an unexpected user account, or an unusual command-line shape is the
+    generic binary usage. A new parent process, an unexpected user account, or an unusual command-line structure is the
     deviation worth chasing.
   range: -14d
   query: |
@@ -255,11 +254,11 @@ questions:
       - host.name
       - Image
 - source: template:cue_user_actor.baseline
-  question: Does this user normally run SharpMove or comparable remote-execution tooling?
-  context: >-
-    Compare this user's current action against their historical behavior. A user who has never run this tool is more
-    suspicious than one who does so regularly as part of a sanctioned role. Zero or very low historical counts indicate
-    first-time or rare execution for this account.
+  question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
   range: -90d
   query: |
     aggregation: true
@@ -267,19 +266,36 @@ questions:
       category: process_creation
       product: windows
     detection:
-      selection:
+      selection_img:
+      - Image|endswith: \SharpMove.exe
+      - OriginalFileName: SharpMove.exe
+      selection_cli_computer:
+        CommandLine|contains: computername=
+      selection_cli_actions:
+        CommandLine|contains:
+        - action=create
+        - action=dcom
+        - action=executevbs
+        - action=hijackdcom
+        - action=modschtask
+        - action=modsvc
+        - action=query
+        - action=scm
+        - action=startservice
+        - action=taskscheduler
+      _pb_scope:
         User|expand: '%User%'
-        Image|endswith|expand: '%Image%'
-      condition: selection
+      condition: (selection_img or all of selection_cli_*) and _pb_scope
     fields:
-      - host.name
+    - host.name
 - source: template:cue_user_actor.baseline_svc
-  question: Is this parent+binary combination historically routine on this host or environment-wide, or is the parent unusual for SharpMove?
-  context: >-
-    When the alert fires under a service principal, user identity does not attribute behavior; the meaningful pivot is
-    the launch mechanism. Which parent process spawned SharpMove, and is that pair historically common. A new or rare
-    parent for this binary on this host or environment-wide is the deviation worth chasing; a pair that already accounts
-    for many prior events is more likely sanctioned automation.
+  question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
   range: -90d
   query: |
     aggregation: true
@@ -287,12 +303,28 @@ questions:
       category: process_creation
       product: windows
     detection:
-      selection:
+      selection_img:
+      - Image|endswith: \SharpMove.exe
+      - OriginalFileName: SharpMove.exe
+      selection_cli_computer:
+        CommandLine|contains: computername=
+      selection_cli_actions:
+        CommandLine|contains:
+        - action=create
+        - action=dcom
+        - action=executevbs
+        - action=hijackdcom
+        - action=modschtask
+        - action=modsvc
+        - action=query
+        - action=scm
+        - action=startservice
+        - action=taskscheduler
+      _pb_scope:
         process.parent.name|expand: '%ParentName%'
-        Image|endswith|expand: '%Image%'
-      condition: selection
+      condition: (selection_img or all of selection_cli_*) and _pb_scope
     fields:
-      - host.name
+    - host.name
 - source: template:cue_user_actor.clustering
   question: What else did this user do across the network around this time?
   context: >-
@@ -313,12 +345,13 @@ questions:
       - host.name
       - Image
 - source: template:cue_user_actor.clustering_svc
-  question: Did this same parent+binary combination fire on other hosts in the same window, indicating a coordinated rollout rather than isolated activity?
-  context: >-
-    Under a service principal, asking what else the user did across the network returns agent-telemetry noise because
-    every host runs service-owned agents constantly. The meaningful question is whether the same launch mechanism, the
-    parent process plus spawned binary, fired on other hosts in the alert window. Multiple hosts in the same window
-    point to scheduled or pushed automation; a single host points to a host-local trigger.
+  question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
   range: +/-1h
   query: |
     aggregation: true
@@ -326,12 +359,28 @@ questions:
       category: process_creation
       product: windows
     detection:
-      selection:
+      selection_img:
+      - Image|endswith: \SharpMove.exe
+      - OriginalFileName: SharpMove.exe
+      selection_cli_computer:
+        CommandLine|contains: computername=
+      selection_cli_actions:
+        CommandLine|contains:
+        - action=create
+        - action=dcom
+        - action=executevbs
+        - action=hijackdcom
+        - action=modschtask
+        - action=modsvc
+        - action=query
+        - action=scm
+        - action=startservice
+        - action=taskscheduler
+      _pb_scope:
         process.parent.name|expand: '%ParentName%'
-        Image|endswith|expand: '%Image%'
-      condition: selection
+      condition: (selection_img or all of selection_cli_*) and _pb_scope
     fields:
-      - host.name
+    - host.name
 - source: template:cue_host_context.clustering
   question: What other activity occurred on this host around the time of the alert?
   context: >-

@@ -4,8 +4,7 @@ description: |
   Detects the IIS command-line tool appcmd.exe being used to list configuration in a form that decrypts and reveals
   application-pool or virtual-directory service-account passwords stored in applicationHost.config. The rule fires when the
   command targets appcmd.exe (by image name or original file name) with a 'list ' verb AND EITHER references the IIS config
-  (/config, /xml) OR uses one of the value-dumping flags (/text, /@t, /show, including the undocumented variants) OR includes
-  password-revealing tokens (:\* or 'password'). Legitimate administrators do enumerate IIS configuration, but reading the
+  (/config, /xml) OR uses one of the value-dumping flags (/text, /@t, /show, including the undocumented variants) together with a password-revealing token (:\* or 'password'). Legitimate administrators do enumerate IIS configuration, but reading the
   cleartext processmodel password is a credential-access action; an operator who has reached the IIS host via a web shell or
   RDP uses this same command to extract the service-account credential and pivot. The investigation should confirm which
   credential store was targeted, who and what launched the command, and whether the stolen credential was immediately reused.
@@ -18,14 +17,13 @@ contributors:
 created: 2026-06-05
 questions:
 - source: template:universal.verify_trigger_match
-  question: Does the appcmd command line match this rule — a 'list' verb on appcmd.exe combined with either an IIS config reference or a value-dumping flag or a password token?
+  question: Does the appcmd command line match this rule — a 'list' verb on appcmd.exe combined with either an IIS config reference, or a value-dumping flag together with a password token?
   context: >-
     Confirm the alert is a true positive before investing time. The rule fires when appcmd.exe (by image name or original
-    file name) runs 'list ' AND at least one of three branches matched: an IIS config reference (/config, /xml), a value-dumping
-    flag (/text, /@t, /show and their undocumented variants), or a password-revealing token (:\* or the literal 'password').
+    file name) runs 'list ' AND at least one of two branches matched: an IIS config reference (/config, /xml), or a value-dumping flag (/text, /@t, /show and their undocumented variants) together with a password-revealing token (:\* or the literal 'password').
     Note which branch fired — a bare /config or /xml dump exposes the whole applicationHost.config including encrypted-then-decrypted
     secrets, while /text:processmodel.password or /text:* targets the cleartext credential directly, and that distinction
-    shapes how aggressively to treat the result.
+    determines how aggressively to treat the result.
   range: +/-5m
   query: |
     aggregation: false
@@ -275,7 +273,7 @@ questions:
 - source: template:cue_process_tool.baseline_deviation
   question: When this host has previously fired the rule's appcmd credential-listing pattern, what parents and users normally drive it, and does the current alert fit?
   context: >-
-    Even on a managed IIS server, the rule's specific firing pattern has a historical shape. The query mirrors the rule's
+    Even on a managed IIS server, the rule's specific firing pattern has a historical pattern. The query mirrors the rule's
     selection structure scoped to this host, so the resulting parent/user distribution reflects how this credential-listing
     pattern (not generic appcmd usage) has run here before. A new parent process, an unexpected user, or the application-pool
     worker showing up as the launcher is the deviation worth chasing.
@@ -366,11 +364,11 @@ questions:
       - Image
       - User
 - source: template:cue_user_actor.baseline
-  question: Does this user normally run appcmd to read IIS configuration?
-  context: >-
-    Compare this user's current action against their historical pattern across all hosts. A user who has never run appcmd, or
-    never run it against credential-bearing configuration, is more suspicious than one who does so as part of their IIS
-    administration role. The user's role and typical toolset should align with reading service-account passwords.
+  question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
   range: -90d
   query: |
     aggregation: true
@@ -378,19 +376,42 @@ questions:
       category: process_creation
       product: windows
     detection:
-      selection:
+      selection_base_name:
+      - Image|endswith: \appcmd.exe
+      - OriginalFileName: appcmd.exe
+      selection_base_list:
+        CommandLine|contains: 'list '
+      selection_standalone:
+        CommandLine|contains:
+        - ' /config'
+        - ' /xml'
+        - ' -config'
+        - ' -xml'
+      selection_cmd_flags:
+        CommandLine|contains:
+        - ' /@t'
+        - ' /text'
+        - ' /show'
+        - ' -@t'
+        - ' -text'
+        - ' -show'
+      selection_cmd_grep:
+        CommandLine|contains:
+        - :\*
+        - password
+      _pb_scope:
         User|expand: '%User%'
-        Image|endswith|expand: '%Image%'
-      condition: selection
+      condition: (all of selection_base_* and (selection_standalone or all of selection_cmd_*)) and _pb_scope
     fields:
-      - host.name
+    - host.name
 - source: template:cue_user_actor.baseline_svc
-  question: Is this parent-plus-appcmd combination historically routine on this host or across the environment, or is the parent unusual for appcmd?
-  context: >-
-    When the alert fires under a service principal or application-pool identity, the user name does not attribute behavior.
-    The meaningful pivot is the launch mechanism: which parent process spawned appcmd, and is that pair historically common.
-    A new or rare parent for appcmd — especially the IIS worker process or a scripting host — is the deviation worth chasing,
-    while a parent that already accounts for thousands of prior events is configuration-management automation.
+  question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
   range: -90d
   query: |
     aggregation: true
@@ -398,12 +419,34 @@ questions:
       category: process_creation
       product: windows
     detection:
-      selection:
+      selection_base_name:
+      - Image|endswith: \appcmd.exe
+      - OriginalFileName: appcmd.exe
+      selection_base_list:
+        CommandLine|contains: 'list '
+      selection_standalone:
+        CommandLine|contains:
+        - ' /config'
+        - ' /xml'
+        - ' -config'
+        - ' -xml'
+      selection_cmd_flags:
+        CommandLine|contains:
+        - ' /@t'
+        - ' /text'
+        - ' /show'
+        - ' -@t'
+        - ' -text'
+        - ' -show'
+      selection_cmd_grep:
+        CommandLine|contains:
+        - :\*
+        - password
+      _pb_scope:
         process.parent.name|expand: '%ParentName%'
-        Image|endswith|expand: '%Image%'
-      condition: selection
+      condition: (all of selection_base_* and (selection_standalone or all of selection_cmd_*)) and _pb_scope
     fields:
-      - host.name
+    - host.name
 - source: template:cue_user_actor.clustering
   question: What else did this user do across the network around this time?
   context: >-
@@ -424,12 +467,13 @@ questions:
       - host.name
       - Image
 - source: template:cue_user_actor.clustering_svc
-  question: Did this same parent-plus-appcmd combination fire on other hosts in the same window — a coordinated rollout, or isolated to this host?
-  context: >-
-    Under a service principal, asking what the user did network-wide returns agent-telemetry noise. The meaningful question
-    is whether the same launch mechanism — parent process plus appcmd — fired on other hosts in the alert window. Multiple
-    IIS servers showing the same parent-plus-appcmd pattern points to scripted or pushed automation across the web tier; a
-    single host points to a host-local trigger such as a web shell on that one server.
+  question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
   range: +/-1h
   query: |
     aggregation: true
@@ -437,33 +481,66 @@ questions:
       category: process_creation
       product: windows
     detection:
-      selection:
+      selection_base_name:
+      - Image|endswith: \appcmd.exe
+      - OriginalFileName: appcmd.exe
+      selection_base_list:
+        CommandLine|contains: 'list '
+      selection_standalone:
+        CommandLine|contains:
+        - ' /config'
+        - ' /xml'
+        - ' -config'
+        - ' -xml'
+      selection_cmd_flags:
+        CommandLine|contains:
+        - ' /@t'
+        - ' /text'
+        - ' /show'
+        - ' -@t'
+        - ' -text'
+        - ' -show'
+      selection_cmd_grep:
+        CommandLine|contains:
+        - :\*
+        - password
+      _pb_scope:
         process.parent.name|expand: '%ParentName%'
-        Image|endswith|expand: '%Image%'
-      condition: selection
+      condition: (all of selection_base_* and (selection_standalone or all of selection_cmd_*)) and _pb_scope
     fields:
-      - host.name
+    - host.name
 - source: template:credential_access.post_access_lateral_movement
-  question: Were any new logon sessions or remote connections initiated after this event?
-  context: >-
-    Credential theft is typically followed by reuse — the stolen service-account credential is used to authenticate to other
-    systems. Look for follow-on alerts on this host indicating new logons, RDP, SMB, WinRM, or remote-execution activity
-    shortly after the credential listing, which would indicate the dumped account is being actively exercised to pivot off
-    the IIS host.
+  question: Were outbound remote-access connections (RDP, SMB, WinRM, SSH) initiated from this host after
+    this event?
+  context: Credential theft is typically followed by lateral movement. The query returns outbound connections
+    from this host to remote-access ports -- 3389 (RDP), 445 (SMB/PsExec), 5985/5986 (WinRM), 22 (SSH)
+    -- in the hours after the event; the originating Image and User show what drove each connection. Two
+    limits to keep in mind -- credentials exfiltrated and replayed from another machine will not appear
+    here (check security 4624 logons on suspected targets for this account and any accounts with sessions
+    on this host), and the query requires Sysmon network telemetry (EID 3); if that is not collected from
+    this host, treat zero rows as a visibility gap, not as evidence no movement occurred.
   range: +4h
   query: |
     aggregation: false
     logsource:
+      category: network_connection
       product: windows
     detection:
       selection:
-        event.module: sigma
         host.name|expand: '%hostname%'
+        Initiated: 'true'
+        DestinationPort:
+          - 3389
+          - 445
+          - 5985
+          - 5986
+          - 22
       condition: selection
     fields:
-      - rule.name
-      - rule.uuid
-      - event.severity_label
+      - DestinationIp
+      - DestinationPort
+      - Image
+      - User
 - source: template:cue_host_context.clustering
   question: What other activity occurred on this host around the time of the alert?
   context: >-

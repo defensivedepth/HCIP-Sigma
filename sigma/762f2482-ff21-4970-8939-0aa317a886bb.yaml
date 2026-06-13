@@ -3,8 +3,7 @@ id: 495b7b13-a0c7-4309-9555-934464f6365d
 description: |
   Detects execution of Certify, a tool for enumerating and abusing misconfigurations in Active
   Directory Certificate Services (AD CS). The rule fires when EITHER the process image, original
-  filename, or description identifies the Certify binary, OR all of a set of Certify subcommand
-  strings appear in the command line, OR all of a set of Certify option flags appear. Legitimate
+  filename, or description identifies the Certify binary, OR all of a set of Certify subcommand strings appear in the command line together with all of a set of Certify option flags. Legitimate
   use is limited to authorized penetration tests or red team engagements; outside that, execution
   points to an operator enumerating vulnerable certificate templates or requesting a certificate to
   forge or steal authentication material. Investigation should confirm the trigger, identify which
@@ -21,10 +20,7 @@ questions:
 - source: template:universal.verify_trigger_match
   question: Does this execution match the Certify pattern the rule detects?
   context: >-
-    The rule fires when EITHER the image, original filename, or description identifies Certify, OR
-    the command line contains all of a set of Certify subcommand strings (cas, find, pkiobjects,
-    request, download), OR it contains all of a set of Certify option flags (/vulnerable, /template,
-    /altname, /domain, /path, /ca). Confirm which branch fired by reviewing the image, original
+    The rule fires when EITHER the image, original filename, or description identifies Certify, OR the command line contains all of a set of Certify subcommand strings (cas, find, pkiobjects, request, download) together with all of a set of Certify option flags (/vulnerable, /template, /altname, /domain, /path, /ca). Confirm which branch fired by reviewing the image, original
     filename, description, and full command line. The image/description branch can fire on a renamed
     or recompiled binary, while the command-line branches fire on the argument pattern regardless of
     the binary name.
@@ -242,26 +238,37 @@ questions:
       - ParentImage
       - ParentCommandLine
 - source: template:credential_access.post_access_lateral_movement
-  question: Were any new logon sessions or remote connections initiated after this event?
-  context: >-
-    Certificate theft or forgery is typically followed by use of the obtained certificate to
-    authenticate to other systems. New authentication alerts, RDP or WinRM sessions, or SMB
-    connections shortly after the execution indicate the certificate may already be in use for
-    lateral movement. Adjust the window based on whether the request appeared to complete.
+  question: Were outbound remote-access connections (RDP, SMB, WinRM, SSH) initiated from this host after
+    this event?
+  context: Credential theft is typically followed by lateral movement. The query returns outbound connections
+    from this host to remote-access ports -- 3389 (RDP), 445 (SMB/PsExec), 5985/5986 (WinRM), 22 (SSH)
+    -- in the hours after the event; the originating Image and User show what drove each connection. Two
+    limits to keep in mind -- credentials exfiltrated and replayed from another machine will not appear
+    here (check security 4624 logons on suspected targets for this account and any accounts with sessions
+    on this host), and the query requires Sysmon network telemetry (EID 3); if that is not collected from
+    this host, treat zero rows as a visibility gap, not as evidence no movement occurred.
   range: +4h
   query: |
     aggregation: false
     logsource:
+      category: network_connection
       product: windows
     detection:
       selection:
-        event.module: sigma
         host.name|expand: '%hostname%'
+        Initiated: 'true'
+        DestinationPort:
+          - 3389
+          - 445
+          - 5985
+          - 5986
+          - 22
       condition: selection
     fields:
-      - rule.name
-      - rule.uuid
-      - event.severity_label
+      - DestinationIp
+      - DestinationPort
+      - Image
+      - User
 - source: template:credential_access.credential_exposure_assessment
   question: Which accounts or principals may be compromised, and do any have elevated privileges?
   context: >-
@@ -406,7 +413,7 @@ questions:
     The query mirrors the rule's selection structure scoped to this host, so the resulting
     parent/user distribution reflects how this specific firing pattern has historically run here, not
     generic binary usage. A new parent process, an unexpected user account, or an unusual
-    command-line shape is the deviation worth chasing. On a host that has never legitimately run AD CS
+    command-line structure is the deviation worth chasing. On a host that has never legitimately run AD CS
     tooling, any history at all is itself notable.
   range: -14d
   query: |
@@ -499,12 +506,11 @@ questions:
       - TargetFilename
       - Image
 - source: template:cue_user_actor.baseline
-  question: Does this user normally run this tool?
-  context: >-
-    Compare this user's current action against their historical behavior. A user who has never run
-    AD CS enumeration tooling is more suspicious than one who does so regularly as part of a PKI
-    administration role. Zero or very low historical counts indicate first-time or rare execution by
-    this account.
+  question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
   range: -90d
   query: |
     aggregation: true
@@ -512,20 +518,38 @@ questions:
       category: process_creation
       product: windows
     detection:
-      selection:
+      selection_img:
+      - Image|endswith: \Certify.exe
+      - OriginalFileName: Certify.exe
+      - Description|contains: Certify
+      selection_cli_commands:
+        CommandLine|contains:
+        - '.exe cas '
+        - '.exe find '
+        - '.exe pkiobjects '
+        - '.exe request '
+        - '.exe download '
+      selection_cli_options:
+        CommandLine|contains:
+        - ' /vulnerable'
+        - ' /template:'
+        - ' /altname:'
+        - ' /domain:'
+        - ' /path:'
+        - ' /ca:'
+      _pb_scope:
         User|expand: '%User%'
-        Image|endswith|expand: '%Image%'
-      condition: selection
+      condition: (selection_img or all of selection_cli_*) and _pb_scope
     fields:
-      - host.name
+    - host.name
 - source: template:cue_user_actor.baseline_svc
-  question: Is this parent and binary combination historically routine on this host or across the environment?
-  context: >-
-    When the alert fires under a service principal, user identity does not attribute behavior. The
-    meaningful pivot is the launch mechanism: which parent process spawned this binary, and whether
-    that pair is historically common. A new or rare parent for this binary is the deviation worth
-    chasing; a pair that already accounts for many prior events is automation. This pivots on a
-    different identity dimension than the user baseline and is kept alongside it deliberately.
+  question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
   range: -90d
   query: |
     aggregation: true
@@ -533,12 +557,30 @@ questions:
       category: process_creation
       product: windows
     detection:
-      selection:
+      selection_img:
+      - Image|endswith: \Certify.exe
+      - OriginalFileName: Certify.exe
+      - Description|contains: Certify
+      selection_cli_commands:
+        CommandLine|contains:
+        - '.exe cas '
+        - '.exe find '
+        - '.exe pkiobjects '
+        - '.exe request '
+        - '.exe download '
+      selection_cli_options:
+        CommandLine|contains:
+        - ' /vulnerable'
+        - ' /template:'
+        - ' /altname:'
+        - ' /domain:'
+        - ' /path:'
+        - ' /ca:'
+      _pb_scope:
         process.parent.name|expand: '%ParentName%'
-        Image|endswith|expand: '%Image%'
-      condition: selection
+      condition: (selection_img or all of selection_cli_*) and _pb_scope
     fields:
-      - host.name
+    - host.name
 - source: template:cue_host_context.precursor
   question: Did other detections fire on this host in the hours before this alert?
   context: >-

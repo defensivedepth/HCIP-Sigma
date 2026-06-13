@@ -104,22 +104,37 @@ questions:
       - winlog.event_data.SubjectUserName
       - winlog.event_data.TargetUserName
 - source: template:credential_access.post_access_lateral_movement
-  question: Were any new logon sessions or remote connections initiated using the relayed identity after this event?
-  context: A certificate obtained by relay is typically used immediately to authenticate as the coerced account, then to access other systems. Detecting new authentication or outbound remote connections shortly after the relay indicates the relayed identity is being actively exercised. Look specifically for authentication originating from the certificate or from the relaying host into domain controllers and certificate services.
+  question: Were outbound remote-access connections (RDP, SMB, WinRM, SSH) initiated from this host after
+    this event?
+  context: Credential theft is typically followed by lateral movement. The query returns outbound connections
+    from this host to remote-access ports -- 3389 (RDP), 445 (SMB/PsExec), 5985/5986 (WinRM), 22 (SSH)
+    -- in the hours after the event; the originating Image and User show what drove each connection. Two
+    limits to keep in mind -- credentials exfiltrated and replayed from another machine will not appear
+    here (check security 4624 logons on suspected targets for this account and any accounts with sessions
+    on this host), and the query requires Sysmon network telemetry (EID 3); if that is not collected from
+    this host, treat zero rows as a visibility gap, not as evidence no movement occurred.
   range: +4h
   query: |
     aggregation: false
     logsource:
+      category: network_connection
       product: windows
     detection:
       selection:
-        event.module: sigma
         host.name|expand: '%hostname%'
+        Initiated: 'true'
+        DestinationPort:
+          - 3389
+          - 445
+          - 5985
+          - 5986
+          - 22
       condition: selection
     fields:
-      - rule.name
-      - rule.uuid
-      - event.severity_label
+      - DestinationIp
+      - DestinationPort
+      - Image
+      - User
 - source: template:credential_access.credential_exposure_assessment
   question: Which account was coerced and relayed, and does it hold elevated privileges?
   context: The severity of this attack depends on the account whose authentication was relayed. A relayed domain-controller machine account or a privileged machine identity enables domain-wide impact and requires incident escalation; a low-value workstation account is more contained. Cross-reference the coerced machine named on the command line against Active Directory to determine its privilege level and group memberships.
@@ -156,8 +171,11 @@ questions:
     - ParentImage
     - User
 - source: template:cue_user_actor.baseline
-  question: Does this user normally run the --adcs/--port relay pattern anywhere in the environment?
-  context: Compare the user's current action against their historical behavior over the past 90 days. A user who has never matched this relay command pattern is far more suspicious than one who does so regularly as part of sanctioned testing. The user's role should align with running AD CS relay tooling.
+  question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
   range: -90d
   query: |
     aggregation: true
@@ -166,16 +184,22 @@ questions:
       product: windows
     detection:
       selection:
-        User|expand: '%User%'
         CommandLine|contains|all:
         - ' --adcs '
         - ' --port '
-      condition: selection
+      _pb_scope:
+        User|expand: '%User%'
+      condition: (selection) and _pb_scope
     fields:
-      - host.name
+    - host.name
 - source: template:cue_user_actor.baseline_svc
-  question: Is this parent and binary launch combination historically routine on this host or environment-wide, or is the parent unusual?
-  context: 'When the alert fires under a service principal, user identity does not attribute behavior. The meaningful pivot is the launch mechanism: which parent process spawned this binary, and whether that pair is historically common. A new or rare parent for this binary is the deviation worth chasing; a pair that already accounts for thousands of prior events is vendor or OS automation.'
+  question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
   range: -90d
   query: |
     aggregation: true
@@ -184,11 +208,14 @@ questions:
       product: windows
     detection:
       selection:
+        CommandLine|contains|all:
+        - ' --adcs '
+        - ' --port '
+      _pb_scope:
         process.parent.name|expand: '%ParentName%'
-        Image|endswith|expand: '%Image%'
-      condition: selection
+      condition: (selection) and _pb_scope
     fields:
-      - host.name
+    - host.name
 - source: template:cue_user_actor.clustering
   question: What else did this user do across the network around the time of this alert?
   context: Tracking the user's activity across all hosts reveals lateral movement or activity spanning multiple endpoints. A relay attack is often one step in a chain, so if the same account drove other activity on other hosts in this window, the scope of the operation may be larger than a single endpoint.
@@ -206,8 +233,13 @@ questions:
       - host.name
       - Image
 - source: template:cue_user_actor.clustering_svc
-  question: Did this same parent and binary launch combination fire on other hosts in the same window?
-  context: Under a service principal, asking what else the user did across the network returns agent-telemetry noise. The meaningful question is whether the same launch mechanism — parent process plus spawned binary — fired on other hosts in the alert window. Multiple hosts in the same window points to scheduled or pushed automation; a single host points to a host-local trigger.
+  question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
   range: +/-1h
   query: |
     aggregation: true
@@ -216,11 +248,14 @@ questions:
       product: windows
     detection:
       selection:
+        CommandLine|contains|all:
+        - ' --adcs '
+        - ' --port '
+      _pb_scope:
         process.parent.name|expand: '%ParentName%'
-        Image|endswith|expand: '%Image%'
-      condition: selection
+      condition: (selection) and _pb_scope
     fields:
-      - host.name
+    - host.name
 - source: template:cue_process_tool.scope
   question: Have other hosts matched the --adcs/--port relay pattern in the past week, and does the spread look like automation or operator activity?
   context: The query mirrors the rule's selection with no host scope, returning a fleet-wide count of this specific relay command pattern rather than generic tool usage. Several hosts matching the same pattern points to a sanctioned testing sweep or scripted deployment; one host or a small unrelated set points to manual operator activity. Use the host distribution to calibrate severity.

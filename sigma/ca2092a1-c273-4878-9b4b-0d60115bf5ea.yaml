@@ -1,7 +1,7 @@
 name: Suspicious Encoded PowerShell Command Line
 id: 0550c9a0-b5a1-4616-bfd4-25d6d91a9364
 description: |
-  Detects powershell.exe or pwsh.exe launched with a command line that carries an encoded-command flag or base64-looking content. The rule fires when the process is PowerShell AND the command line matches EITHER an encoded-command flag (a contains-match on ' -e', covering -e/-en/-enc/-EncodedCommand), OR one of several base64 prefixes that commonly begin an encoded PowerShell payload, OR a standalone marker such as '.exe -ENCOD ' — and the command line does NOT carry the ' -ExecutionPolicy remotesigned ' benign filter. Encoded PowerShell is a routine way to pass complex scripts and is used by management tooling, but it is also the most common form of payload concealment for download cradles, in-memory .NET loaders, and reverse shells. Decode the command line, recover what actually ran, and determine whether the encoding hid a legitimate script or a malicious payload.
+  Detects powershell.exe or pwsh.exe launched with a command line that carries an encoded-command flag or base64-looking content. The rule fires when the process is PowerShell AND the command line matches EITHER an encoded-command flag (a contains-match on ' -e', covering -e/-en/-enc/-EncodedCommand) together with one of several base64 prefixes that commonly begin an encoded PowerShell payload, OR a standalone marker such as '.exe -ENCOD ' — and the command line does NOT carry the ' -ExecutionPolicy remotesigned ' benign filter. Encoded PowerShell is a routine way to pass complex scripts and is used by management tooling, but it is also the most common form of payload concealment for download cradles, in-memory .NET loaders, and reverse shells. Decode the command line, recover what actually ran, and determine whether the encoding hid a legitimate script or a malicious payload.
 type: detection
 detection_id: ca2092a1-c273-4878-9b4b-0d60115bf5ea
 detection_category: ''
@@ -11,8 +11,8 @@ contributors:
 created: 2026-06-09
 questions:
 - source: template:universal.verify_trigger_match
-  question: Is this powershell.exe or pwsh.exe, and does the command line carry an encoded-command flag, base64 content, or a standalone encode marker?
-  context: Confirm the alert is a true positive by reviewing the exact command line. The rule fires when the process is PowerShell AND the command line matches at least one of three independent branches — an encoded-command flag (' -e'), a base64 prefix (such as ' JAB', ' IEX'-style tokens, ' UwB', ' cwB'), or a standalone marker ('.exe -ENCOD '). Note which branch fired, because it shapes the rest of the investigation; the ' -ExecutionPolicy remotesigned ' filter cancels the rule, so its absence is also part of the match.
+  question: Is this powershell.exe or pwsh.exe, and does the command line carry an encoded-command flag together with base64 content, or a standalone encode marker?
+  context: Confirm the alert is a true positive by reviewing the exact command line. The rule fires when the process is PowerShell AND the command line matches at least one of two branches — an encoded-command flag (' -e') together with a base64 prefix (such as ' JAB', ' IEX'-style tokens, ' UwB', ' cwB'), or a standalone marker ('.exe -ENCOD '). Note which branch fired, because it determines the rest of the investigation; the ' -ExecutionPolicy remotesigned ' filter cancels the rule, so its absence is also part of the match.
   range: +/-5m
   query: |
     aggregation: false
@@ -175,7 +175,7 @@ questions:
       - User
 - source: template:cue_process_tool.baseline_deviation
   question: When this host has previously matched the rule's pattern, what parents and users drove it, and does the current alert fit that pattern?
-  context: The query mirrors the rule's selection structure scoped to this host, so the parent/user distribution reflects how this exact encoded-PowerShell pattern has historically run here — not generic PowerShell usage. A new parent process, an unexpected account, or an unusual command shape is the deviation worth chasing.
+  context: The query mirrors the rule's selection structure scoped to this host, so the parent/user distribution reflects how this exact encoded-PowerShell pattern has historically run here — not generic PowerShell usage. A new parent process, an unexpected account, or an unusual command structure is the deviation worth chasing.
   range: -14d
   query: |
     aggregation: true
@@ -216,8 +216,11 @@ questions:
     - ParentImage
     - User
 - source: template:cue_user_actor.baseline
-  question: Has this user run powershell.exe or pwsh.exe before across the environment?
-  context: Compare this account's current action against its history across all hosts. A user who routinely runs PowerShell as part of their role is expected; one who has never run the interpreter is the anomaly. Combine this count with knowledge of the account's role and whether it is a human or automation identity.
+  question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
   range: -90d
   query: |
     aggregation: true
@@ -225,15 +228,45 @@ questions:
       category: process_creation
       product: windows
     detection:
-      selection:
+      selection_img:
+      - Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+      - OriginalFileName:
+        - PowerShell.EXE
+        - pwsh.dll
+      selection_cli_enc:
+        CommandLine|contains: ' -e'
+      selection_cli_content:
+        CommandLine|contains:
+        - ' JAB'
+        - ' SUVYI'
+        - ' SQBFAFgA'
+        - ' aQBlAHgA'
+        - ' aWV4I'
+        - ' IAA'
+        - ' IAB'
+        - ' UwB'
+        - ' cwB'
+      selection_standalone:
+        CommandLine|contains:
+        - '.exe -ENCOD '
+        - ' BA^J e-'
+      filter_optional_remote_signed:
+        CommandLine|contains: ' -ExecutionPolicy remotesigned '
+      _pb_scope:
         User|expand: '%User%'
-        Image|endswith|expand: '%Image%'
-      condition: selection
+      condition: (selection_img and (all of selection_cli_* or selection_standalone) and not 1 of filter_optional_*) and _pb_scope
     fields:
-      - host.name
+    - host.name
 - source: template:cue_user_actor.baseline_svc
-  question: Is this parent-plus-PowerShell combination historically routine on this host or environment-wide?
-  context: When the alert fires under a service principal, user identity does not attribute behavior; the meaningful pivot is the launch mechanism. A parent process that has launched PowerShell thousands of times before looks like vendor or OS automation, while a new or rare parent for this binary is the deviation worth chasing. Host concentration in the result points to a host-local scheduled task or service.
+  question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
   range: -90d
   query: |
     aggregation: true
@@ -241,12 +274,37 @@ questions:
       category: process_creation
       product: windows
     detection:
-      selection:
+      selection_img:
+      - Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+      - OriginalFileName:
+        - PowerShell.EXE
+        - pwsh.dll
+      selection_cli_enc:
+        CommandLine|contains: ' -e'
+      selection_cli_content:
+        CommandLine|contains:
+        - ' JAB'
+        - ' SUVYI'
+        - ' SQBFAFgA'
+        - ' aQBlAHgA'
+        - ' aWV4I'
+        - ' IAA'
+        - ' IAB'
+        - ' UwB'
+        - ' cwB'
+      selection_standalone:
+        CommandLine|contains:
+        - '.exe -ENCOD '
+        - ' BA^J e-'
+      filter_optional_remote_signed:
+        CommandLine|contains: ' -ExecutionPolicy remotesigned '
+      _pb_scope:
         process.parent.name|expand: '%ParentName%'
-        Image|endswith|expand: '%Image%'
-      condition: selection
+      condition: (selection_img and (all of selection_cli_* or selection_standalone) and not 1 of filter_optional_*) and _pb_scope
     fields:
-      - host.name
+    - host.name
 - source: template:cue_user_actor.clustering
   question: What else did this user do across the network around the time of the alert?
   context: Tracking the account's activity across all hosts reveals lateral movement or coordinated activity on multiple endpoints. If the same user triggered similar activity elsewhere, the scope may be larger than this single host.
@@ -264,8 +322,13 @@ questions:
       - host.name
       - Image
 - source: template:cue_user_actor.clustering_svc
-  question: Did the same parent-plus-PowerShell combination fire on other hosts in the alert window?
-  context: Under a service principal, a user-wide network sweep returns agent-telemetry noise because every host constantly runs SYSTEM-owned PowerShell. The meaningful question is whether the same launch mechanism — the parent process spawning PowerShell — fired on other hosts in the same window. Multiple hosts point to scheduled or pushed automation; a single host points to a host-local trigger.
+  question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
   range: +/-1h
   query: |
     aggregation: true
@@ -273,12 +336,37 @@ questions:
       category: process_creation
       product: windows
     detection:
-      selection:
+      selection_img:
+      - Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+      - OriginalFileName:
+        - PowerShell.EXE
+        - pwsh.dll
+      selection_cli_enc:
+        CommandLine|contains: ' -e'
+      selection_cli_content:
+        CommandLine|contains:
+        - ' JAB'
+        - ' SUVYI'
+        - ' SQBFAFgA'
+        - ' aQBlAHgA'
+        - ' aWV4I'
+        - ' IAA'
+        - ' IAB'
+        - ' UwB'
+        - ' cwB'
+      selection_standalone:
+        CommandLine|contains:
+        - '.exe -ENCOD '
+        - ' BA^J e-'
+      filter_optional_remote_signed:
+        CommandLine|contains: ' -ExecutionPolicy remotesigned '
+      _pb_scope:
         process.parent.name|expand: '%ParentName%'
-        Image|endswith|expand: '%Image%'
-      condition: selection
+      condition: (selection_img and (all of selection_cli_* or selection_standalone) and not 1 of filter_optional_*) and _pb_scope
     fields:
-      - host.name
+    - host.name
 - source: template:universal.endpoint_protection_health
   question: Were any tamper attempts against endpoint protection seen on this host in the hour before the alert?
   context: Tampering with protection often precedes payload execution. The query surfaces direct attempts to disable AV/EDR services, flip Defender flags, add broad exclusions, clear logs, or patch AMSI/ETW. Zero rows is a useful signal that protection looks healthy, though kernel-level driver tampering and in-memory patches will not appear here. Populated rows shift the disposition toward operator preparation; review the parent process and signing chain to identify the writer.

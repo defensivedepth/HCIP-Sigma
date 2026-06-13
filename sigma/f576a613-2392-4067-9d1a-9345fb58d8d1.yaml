@@ -1,7 +1,7 @@
 name: Automated Collection Command Prompt
 id: fdc94e31-62b7-4cf6-abc1-716822597c53
 description: |
-  Detects command-prompt activity that enumerates or searches for document files in bulk. The rule fires when a command line references at least one document extension (.doc, .docx, .xls, .xlsx, .ppt, .pptx, .rtf, .pdf, .txt) AND EITHER a recursive bare directory listing (dir with /b and /s) OR a findstr search (FINDSTR.EXE with /e or /si). This is the shape of automated file collection: a script or operator walking the filesystem for office documents and text files, often a precursor to staging and exfiltration, and a way to locate credentials embedded in files. Legitimate administration, backup tooling, and developer scripts can produce the same pattern, so the investigation should determine what was searched for, who and what drove it, whether it ran once or as part of a repeating automated job, and whether the located files were subsequently archived, moved, or used to access other systems.
+  Detects command-prompt activity that enumerates or searches for document files in bulk. The rule fires when a command line references at least one document extension (.doc, .docx, .xls, .xlsx, .ppt, .pptx, .rtf, .pdf, .txt) AND EITHER a recursive bare directory listing (dir with /b and /s) OR a findstr search (FINDSTR.EXE with /e or /si). This is the pattern of automated file collection: a script or operator walking the filesystem for office documents and text files, often a precursor to staging and exfiltration, and a way to locate credentials embedded in files. Legitimate administration, backup tooling, and developer scripts can produce the same pattern, so the investigation should determine what was searched for, who and what drove it, whether it ran once or as part of a repeating automated job, and whether the located files were subsequently archived, moved, or used to access other systems.
 type: detection
 detection_id: f576a613-2392-4067-9d1a-9345fb58d8d1
 detection_category: ''
@@ -12,7 +12,7 @@ created: 2026-06-09
 questions:
 - source: template:universal.verify_trigger_match
   question: Does the command line reference a document extension AND either a recursive dir listing or a findstr search?
-  context: Confirm the alert before investing time. The rule fires only when the command line names a document extension (.doc, .docx, .xls, .xlsx, .ppt, .pptx, .rtf, .pdf, .txt) AND EITHER runs a recursive bare directory listing (dir with /b and /s) OR runs a findstr search (FINDSTR.EXE with /e or /si). Note which branch fired - the dir branch points to filesystem enumeration, the findstr branch points to content searching - because that distinction shapes which downstream questions carry weight.
+  context: Confirm the alert before investing time. The rule fires only when the command line names a document extension (.doc, .docx, .xls, .xlsx, .ppt, .pptx, .rtf, .pdf, .txt) AND EITHER runs a recursive bare directory listing (dir with /b and /s) OR runs a findstr search (FINDSTR.EXE with /e or /si). Note which branch fired - the dir branch points to filesystem enumeration, the findstr branch points to content searching - because that distinction patterns which downstream questions carry weight.
   range: +/-5m
   query: |
     aggregation: false
@@ -144,22 +144,37 @@ questions:
       - TargetFilename
       - Image
 - source: template:credential_access.post_access_lateral_movement
-  question: Were any new logon sessions or remote connections initiated from this host after the search?
-  context: When a search recovers credentials from files, the next step is usually to use them to reach other systems. Detecting follow-on alerts on this host - RDP sessions, SMB connections, WinRM usage, or remote execution shortly after the search - indicates active use of material the search may have exposed.
+  question: Were outbound remote-access connections (RDP, SMB, WinRM, SSH) initiated from this host after
+    this event?
+  context: Credential theft is typically followed by lateral movement. The query returns outbound connections
+    from this host to remote-access ports -- 3389 (RDP), 445 (SMB/PsExec), 5985/5986 (WinRM), 22 (SSH)
+    -- in the hours after the event; the originating Image and User show what drove each connection. Two
+    limits to keep in mind -- credentials exfiltrated and replayed from another machine will not appear
+    here (check security 4624 logons on suspected targets for this account and any accounts with sessions
+    on this host), and the query requires Sysmon network telemetry (EID 3); if that is not collected from
+    this host, treat zero rows as a visibility gap, not as evidence no movement occurred.
   range: +4h
   query: |
     aggregation: false
     logsource:
+      category: network_connection
       product: windows
     detection:
       selection:
-        event.module: sigma
         host.name|expand: '%hostname%'
+        Initiated: 'true'
+        DestinationPort:
+          - 3389
+          - 445
+          - 5985
+          - 5986
+          - 22
       condition: selection
     fields:
-      - rule.name
-      - rule.uuid
-      - event.severity_label
+      - DestinationIp
+      - DestinationPort
+      - Image
+      - User
 - source: template:credential_access.credential_exposure_assessment
   question: Which accounts may be exposed by the searched files, and do any have elevated privileges?
   context: The severity depends on what the located files held and whose credentials they could expose. Configuration files, scripts, and saved-credential stores often contain service-account or administrative secrets. A standard user's documents may only need monitoring, while files holding domain-admin or service-account credentials require escalation; cross-reference the affected accounts against directory group memberships.
@@ -177,7 +192,7 @@ questions:
       - CommandLine
 - source: template:cue_process_tool.baseline_deviation
   question: When this host has previously fired this document-search pattern, what parents and users drove it, and does the current alert fit?
-  context: Even routine tools produce this pattern. The query mirrors the rule's selection scoped to this host, so the resulting parent/user distribution reflects how this specific search pattern - not generic command-interpreter usage - has historically run here. A new parent process, an unexpected account, or a command-line shape never seen before is the deviation worth chasing.
+  context: Even routine tools produce this pattern. The query mirrors the rule's selection scoped to this host, so the resulting parent/user distribution reflects how this specific search pattern - not generic command-interpreter usage - has historically run here. A new parent process, an unexpected account, or a command-line structure never seen before is the deviation worth chasing.
   range: -14d
   query: |
     aggregation: true
@@ -230,8 +245,11 @@ questions:
       - Image
       - CommandLine
 - source: template:cue_user_actor.baseline
-  question: Does this user account normally run recursive document searches from the command line?
-  context: Compare the alerting account's history against this kind of activity. An account that routinely runs scripted file enumeration (backup operators, indexing service accounts, developers) is less suspicious than one that has never done so. Align the account against its expected role and toolset.
+  question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
   range: -90d
   query: |
     aggregation: true
@@ -239,15 +257,40 @@ questions:
       category: process_creation
       product: windows
     detection:
-      selection:
+      selection_ext:
+        CommandLine|contains:
+        - .doc
+        - .docx
+        - .xls
+        - .xlsx
+        - .ppt
+        - .pptx
+        - .rtf
+        - .pdf
+        - .txt
+      selection_other_dir:
+        CommandLine|contains|all:
+        - 'dir '
+        - ' /b '
+        - ' /s '
+      selection_other_findstr:
+        OriginalFileName: FINDSTR.EXE
+        CommandLine|contains:
+        - ' /e '
+        - ' /si '
+      _pb_scope:
         User|expand: '%User%'
-        Image|endswith|expand: '%Image%'
-      condition: selection
+      condition: (selection_ext and 1 of selection_other_*) and _pb_scope
     fields:
-      - host.name
+    - host.name
 - source: template:cue_user_actor.baseline_svc
-  question: Is this parent+command-interpreter combination historically routine on this host or across the environment, or is the parent unusual?
-  context: When the alert fires under a service principal such as SYSTEM, user identity does not attribute behavior; the meaningful pivot is which parent spawned the interpreter and whether that pair is historically common. A new or rare parent for this binary on this host or environment-wide is the deviation worth chasing, while a pair that already accounts for many prior events is backup or management automation.
+  question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
   range: -90d
   query: |
     aggregation: true
@@ -255,12 +298,32 @@ questions:
       category: process_creation
       product: windows
     detection:
-      selection:
+      selection_ext:
+        CommandLine|contains:
+        - .doc
+        - .docx
+        - .xls
+        - .xlsx
+        - .ppt
+        - .pptx
+        - .rtf
+        - .pdf
+        - .txt
+      selection_other_dir:
+        CommandLine|contains|all:
+        - 'dir '
+        - ' /b '
+        - ' /s '
+      selection_other_findstr:
+        OriginalFileName: FINDSTR.EXE
+        CommandLine|contains:
+        - ' /e '
+        - ' /si '
+      _pb_scope:
         process.parent.name|expand: '%ParentName%'
-        Image|endswith|expand: '%Image%'
-      condition: selection
+      condition: (selection_ext and 1 of selection_other_*) and _pb_scope
     fields:
-      - host.name
+    - host.name
 - source: template:cue_user_actor.clustering
   question: What else did this user account do across the environment around this time?
   context: Tracking the account's activity across all hosts in the alert window reveals lateral movement or coordinated collection across endpoints. If the same account ran similar document searches on multiple hosts, the scope may be larger than one endpoint.
@@ -278,8 +341,13 @@ questions:
       - host.name
       - Image
 - source: template:cue_user_actor.clustering_svc
-  question: Did this same parent+command-interpreter combination fire on other hosts in the same window - a coordinated rollout, or isolated to this host?
-  context: Under a service principal, asking what the account did across the network returns agent-telemetry noise. The meaningful question is whether the same launch mechanism - the parent process spawning this interpreter - appeared on other hosts in the alert window. Multiple hosts in the same window point to scheduled or pushed automation; a single host points to a host-local trigger.
+  question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
   range: +/-1h
   query: |
     aggregation: true
@@ -287,12 +355,32 @@ questions:
       category: process_creation
       product: windows
     detection:
-      selection:
+      selection_ext:
+        CommandLine|contains:
+        - .doc
+        - .docx
+        - .xls
+        - .xlsx
+        - .ppt
+        - .pptx
+        - .rtf
+        - .pdf
+        - .txt
+      selection_other_dir:
+        CommandLine|contains|all:
+        - 'dir '
+        - ' /b '
+        - ' /s '
+      selection_other_findstr:
+        OriginalFileName: FINDSTR.EXE
+        CommandLine|contains:
+        - ' /e '
+        - ' /si '
+      _pb_scope:
         process.parent.name|expand: '%ParentName%'
-        Image|endswith|expand: '%Image%'
-      condition: selection
+      condition: (selection_ext and 1 of selection_other_*) and _pb_scope
     fields:
-      - host.name
+    - host.name
 - source: template:cue_process_tool.scope
   question: Have other hosts fired this document-search pattern in the past week, and does the cross-host distribution look like automation or one-off activity?
   context: The query mirrors the rule's selection with no host scope, giving a fleet-wide count of this specific search pattern rather than generic interpreter usage. Many hosts firing the same pattern points to scripted deployment or backup automation; one host or a small unrelated set points to manual operator activity. Use the host distribution and parent consistency to calibrate severity.

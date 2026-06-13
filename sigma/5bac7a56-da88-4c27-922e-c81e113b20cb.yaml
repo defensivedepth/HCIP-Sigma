@@ -12,7 +12,7 @@ created: 2026-06-08
 questions:
 - source: template:universal.verify_trigger_match
   question: Does this event match what the rule detects — either a runner worker process with a spawnclient command line, or a runner listener process running configure or run?
-  context: Before investing investigation time, confirm the alert is a true positive by reviewing the exact Image, OriginalFileName, and command line. The rule fires on EITHER of two branches, so note which one matched. The worker branch requires Runner.Worker.exe (or OriginalFileName Runner.Worker.dll) together with spawnclient on the command line; the listener branch requires Runner.Listener.exe (or OriginalFileName Runner.Listener.dll) together with run or configure. The listener configure verb means a runner is being registered or re-registered, which is the install moment; run means an already-registered runner is starting; spawnclient on the worker means it is executing a job. Which branch fired shapes what the rest of the investigation should weigh.
+  context: Before investing investigation time, confirm the alert is a true positive by reviewing the exact Image, OriginalFileName, and command line. The rule fires on EITHER of two branches, so note which one matched. The worker branch requires Runner.Worker.exe (or OriginalFileName Runner.Worker.dll) together with spawnclient on the command line; the listener branch requires Runner.Listener.exe (or OriginalFileName Runner.Listener.dll) together with run or configure. The listener configure verb means a runner is being registered or re-registered, which is the install moment; run means an already-registered runner is starting; spawnclient on the worker means it is executing a job. Which branch fired determines what the rest of the investigation should weigh.
   range: +/-5m
   query: |
     aggregation: false
@@ -148,7 +148,7 @@ questions:
       - User
 - source: template:cue_process_tool.baseline_deviation
   question: When this host has previously fired the runner pattern, what parents and users normally drive it, and does the current alert fit?
-  context: Even a legitimate build agent has a consistent footprint. The query mirrors the rule's selection structure scoped to this host, so the resulting parent and user distribution reflects how this specific runner firing pattern has historically run here, not generic process activity. A new parent process, an unexpected account, or an unusual command shape relative to the established pattern is the deviation worth chasing.
+  context: Even a legitimate build agent has a consistent footprint. The query mirrors the rule's selection structure scoped to this host, so the resulting parent and user distribution reflects how this specific runner firing pattern has historically run here, not generic process activity. A new parent process, an unexpected account, or an unusual command structure relative to the established pattern is the deviation worth chasing.
   range: -14d
   query: |
     aggregation: true
@@ -175,8 +175,11 @@ questions:
     - ParentImage
     - User
 - source: template:cue_user_actor.baseline
-  question: Does this user normally run the GitHub runner binaries across the environment?
-  context: Compare this user's current action against their historical behavior. A deployment or service account that routinely manages build agents is expected to run these binaries; a developer or general-purpose account that has never done so is more suspicious, and the user role should align with operating CI/CD infrastructure.
+  question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
   range: -90d
   query: |
     aggregation: true
@@ -184,15 +187,31 @@ questions:
       category: process_creation
       product: windows
     detection:
-      selection:
+      selection_worker_img:
+      - Image|endswith: \Runner.Worker.exe
+      - OriginalFileName: Runner.Worker.dll
+      selection_worker_cli:
+        CommandLine|contains: spawnclient
+      selection_listener_img:
+      - Image|endswith: \Runner.Listener.exe
+      - OriginalFileName: Runner.Listener.dll
+      selection_listener_cli:
+        CommandLine|contains:
+        - run
+        - configure
+      _pb_scope:
         User|expand: '%User%'
-        Image|endswith|expand: '%Image%'
-      condition: selection
+      condition: (all of selection_worker_* or all of selection_listener_*) and _pb_scope
     fields:
-      - host.name
+    - host.name
 - source: template:cue_user_actor.baseline_svc
-  question: Is this parent and runner binary combination historically routine on this host or across the environment, or is the parent unusual for the runner?
-  context: 'When the alert fires under a service principal, user identity does not attribute behavior. The meaningful pivot is the launch mechanism: which parent process spawned the runner, and is that pair historically common. A new or rare parent for the runner on this host or environment-wide is the deviation worth chasing; a pair that already accounts for thousands of prior events is the established deployment or service automation.'
+  question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
   range: -90d
   query: |
     aggregation: true
@@ -200,12 +219,23 @@ questions:
       category: process_creation
       product: windows
     detection:
-      selection:
+      selection_worker_img:
+      - Image|endswith: \Runner.Worker.exe
+      - OriginalFileName: Runner.Worker.dll
+      selection_worker_cli:
+        CommandLine|contains: spawnclient
+      selection_listener_img:
+      - Image|endswith: \Runner.Listener.exe
+      - OriginalFileName: Runner.Listener.dll
+      selection_listener_cli:
+        CommandLine|contains:
+        - run
+        - configure
+      _pb_scope:
         process.parent.name|expand: '%ParentName%'
-        Image|endswith|expand: '%Image%'
-      condition: selection
+      condition: (all of selection_worker_* or all of selection_listener_*) and _pb_scope
     fields:
-      - host.name
+    - host.name
 - source: template:cue_user_actor.clustering
   question: What else did this user do across the network around this time?
   context: Tracking the user's activity across all hosts reveals whether runner installation is isolated or part of broader hands-on activity. If the same account stood up runners or ran related tooling on multiple endpoints in the same window, the scope of the operation may be larger than a single host.
@@ -223,8 +253,13 @@ questions:
       - host.name
       - Image
 - source: template:cue_user_actor.clustering_svc
-  question: Did this same parent and runner binary combination fire on other hosts in the same window, indicating a coordinated rollout rather than isolated activity?
-  context: Under a service principal, asking what else this user did across the network returns agent-telemetry noise, since every host runs SYSTEM-owned agents constantly. The meaningful question is whether the same launch mechanism, parent process plus spawned runner, fired on other hosts in the alert window. Multiple hosts in the same window points to scripted or pushed deployment, whether a sanctioned rollout or a worm-like spread across CI/CD hosts; a single host points to a host-local trigger.
+  question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
   range: +/-1h
   query: |
     aggregation: true
@@ -232,12 +267,23 @@ questions:
       category: process_creation
       product: windows
     detection:
-      selection:
+      selection_worker_img:
+      - Image|endswith: \Runner.Worker.exe
+      - OriginalFileName: Runner.Worker.dll
+      selection_worker_cli:
+        CommandLine|contains: spawnclient
+      selection_listener_img:
+      - Image|endswith: \Runner.Listener.exe
+      - OriginalFileName: Runner.Listener.dll
+      selection_listener_cli:
+        CommandLine|contains:
+        - run
+        - configure
+      _pb_scope:
         process.parent.name|expand: '%ParentName%'
-        Image|endswith|expand: '%Image%'
-      condition: selection
+      condition: (all of selection_worker_* or all of selection_listener_*) and _pb_scope
     fields:
-      - host.name
+    - host.name
 - source: template:cue_host_context.clustering
   question: What other activity occurred on this host around the time of the alert?
   context: 'Alerts rarely occur in isolation. Examining activity around the runner execution reveals the immediate context: what led to it, what happened after, and whether it is part of a larger sequence. Look for credential harvesting, token theft from developer tooling, reconnaissance, or download cradles that commonly accompany a runner stood up for unauthorized access.'

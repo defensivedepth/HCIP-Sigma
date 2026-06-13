@@ -264,27 +264,37 @@ questions:
       - Image
       - OriginalFileName
 - source: template:credential_access.post_access_lateral_movement
-  question: Were any new logon sessions, remote connections, or follow-on detections
-    seen on this host after the key was read?
-  context: Harvested wireless keys are typically staged for exfiltration or reused to
-    reach other networks. Follow-on alerts on the same host - outbound connections, new
-    authentication, or further credential access - indicate the disclosure is being
-    acted on rather than a one-off recovery. The window after the read is where staging
-    and exfiltration appear.
+  question: Were outbound remote-access connections (RDP, SMB, WinRM, SSH) initiated from this host after
+    this event?
+  context: Credential theft is typically followed by lateral movement. The query returns outbound connections
+    from this host to remote-access ports -- 3389 (RDP), 445 (SMB/PsExec), 5985/5986 (WinRM), 22 (SSH)
+    -- in the hours after the event; the originating Image and User show what drove each connection. Two
+    limits to keep in mind -- credentials exfiltrated and replayed from another machine will not appear
+    here (check security 4624 logons on suspected targets for this account and any accounts with sessions
+    on this host), and the query requires Sysmon network telemetry (EID 3); if that is not collected from
+    this host, treat zero rows as a visibility gap, not as evidence no movement occurred.
   range: +4h
   query: |
     aggregation: false
     logsource:
+      category: network_connection
       product: windows
     detection:
       selection:
-        event.module: sigma
         host.name|expand: '%hostname%'
+        Initiated: 'true'
+        DestinationPort:
+          - 3389
+          - 445
+          - 5985
+          - 5986
+          - 22
       condition: selection
     fields:
-      - rule.name
-      - rule.uuid
-      - event.severity_label
+      - DestinationIp
+      - DestinationPort
+      - Image
+      - User
 - source: template:discovery_recon.discovery_burst_detection
   question: Did other reconnaissance or system-information commands run on this host
     around the same time?
@@ -355,11 +365,11 @@ questions:
       - Image
       - CommandLine
 - source: template:cue_user_actor.baseline
-  question: Does this user normally read stored wireless keys with netsh?
-  context: Compare the acting account against its own history. A network support
-    technician may run netsh wlan show profile key=clear as part of provisioning; an
-    account that has never done so suddenly dumping a stored key is more notable. The
-    user role and typical toolset should align with wireless or laptop support.
+  question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
   range: -90d
   query: |
     aggregation: true
@@ -367,27 +377,29 @@ questions:
       category: process_creation
       product: windows
     detection:
-      selection:
+      selection_img:
+      - Image|endswith: \netsh.exe
+      - OriginalFileName: netsh.exe
+      selection_cli:
+        CommandLine|contains|all:
+        - wlan
+        - ' s'
+        - ' p'
+        - ' k'
+        - =clear
+      _pb_scope:
         User|expand: '%User%'
-        CommandLine|contains|all:
-          - wlan
-          - ' s'
-          - ' p'
-          - ' k'
-          - =clear
-      condition: selection
+      condition: (all of selection_*) and _pb_scope
     fields:
-      - host.name
+    - host.name
 - source: template:cue_user_actor.baseline_svc
-  question: Is this parent process and wireless-key-read command-line pattern
-    historically routine on this host or across the environment, or is the parent
-    unusual for it?
-  context: When the alert fires under a service principal, user identity does not
-    attribute the behavior; the meaningful pivot is which parent process launched a
-    child that read a stored wireless key, and whether that pairing is historically
-    common. A new or rare parent for this pattern is the deviation worth chasing, while
-    a parent that already accounts for many prior events is more likely a management
-    tool or scripted provisioning.
+  question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
   range: -90d
   query: |
     aggregation: true
@@ -395,17 +407,21 @@ questions:
       category: process_creation
       product: windows
     detection:
-      selection:
-        process.parent.name|expand: '%ParentName%'
+      selection_img:
+      - Image|endswith: \netsh.exe
+      - OriginalFileName: netsh.exe
+      selection_cli:
         CommandLine|contains|all:
-          - wlan
-          - ' s'
-          - ' p'
-          - ' k'
-          - =clear
-      condition: selection
+        - wlan
+        - ' s'
+        - ' p'
+        - ' k'
+        - =clear
+      _pb_scope:
+        process.parent.name|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
     fields:
-      - host.name
+    - host.name
 - source: template:cue_user_actor.clustering
   question: What else did this user do across the network around this time?
   context: Tracking the acting account's activity across all hosts reveals whether the
@@ -426,15 +442,13 @@ questions:
       - host.name
       - Image
 - source: template:cue_user_actor.clustering_svc
-  question: Did this same parent process and wireless-key-read command-line pattern
-    fire on other hosts in the same window, indicating a coordinated rollout rather
-    than isolated activity?
-  context: Under a service principal, asking what else the user did across the network
-    returns agent-telemetry noise, since every host runs system-owned agents
-    constantly. The meaningful question is whether the same launch mechanism - a parent
-    process spawning a child that reads a stored wireless key - fired on other hosts in
-    the alert window. Multiple hosts in the same window points to scheduled or pushed
-    automation; a single host points to a host-local trigger.
+  question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
   range: +/-1h
   query: |
     aggregation: true
@@ -442,17 +456,21 @@ questions:
       category: process_creation
       product: windows
     detection:
-      selection:
-        process.parent.name|expand: '%ParentName%'
+      selection_img:
+      - Image|endswith: \netsh.exe
+      - OriginalFileName: netsh.exe
+      selection_cli:
         CommandLine|contains|all:
-          - wlan
-          - ' s'
-          - ' p'
-          - ' k'
-          - =clear
-      condition: selection
+        - wlan
+        - ' s'
+        - ' p'
+        - ' k'
+        - =clear
+      _pb_scope:
+        process.parent.name|expand: '%ParentName%'
+      condition: (all of selection_*) and _pb_scope
     fields:
-      - host.name
+    - host.name
 - source: template:cue_host_context.clustering
   question: What other activity occurred on this host around the time of the alert?
   context: Alerts rarely occur in isolation. Examining the activity surrounding the

@@ -237,22 +237,37 @@ questions:
     fields:
       - CommandLine
 - source: template:credential_access.post_access_lateral_movement
-  question: Were any new logon sessions or remote connections initiated after this event?
-  context: Credential theft is typically followed by lateral movement — recovered hashes or secrets are used to authenticate to other systems. Detecting new logon events or outbound remote connections (RDP, SMB, WinRM, PsExec, pass-the-hash) shortly after this credential-parsing activity indicates active use of the stolen material. Offline cracking of SAM hashes can delay this, so absence in the immediate window does not rule it out.
+  question: Were outbound remote-access connections (RDP, SMB, WinRM, SSH) initiated from this host after
+    this event?
+  context: Credential theft is typically followed by lateral movement. The query returns outbound connections
+    from this host to remote-access ports -- 3389 (RDP), 445 (SMB/PsExec), 5985/5986 (WinRM), 22 (SSH)
+    -- in the hours after the event; the originating Image and User show what drove each connection. Two
+    limits to keep in mind -- credentials exfiltrated and replayed from another machine will not appear
+    here (check security 4624 logons on suspected targets for this account and any accounts with sessions
+    on this host), and the query requires Sysmon network telemetry (EID 3); if that is not collected from
+    this host, treat zero rows as a visibility gap, not as evidence no movement occurred.
   range: +4h
   query: |
     aggregation: false
     logsource:
+      category: network_connection
       product: windows
     detection:
       selection:
-        event.module: sigma
         host.name|expand: '%hostname%'
+        Initiated: 'true'
+        DestinationPort:
+          - 3389
+          - 445
+          - 5985
+          - 5986
+          - 22
       condition: selection
     fields:
-      - rule.name
-      - rule.uuid
-      - event.severity_label
+      - DestinationIp
+      - DestinationPort
+      - Image
+      - User
 - source: template:hacking_tool.tool_specific_artifacts
   question: Did this process create credential-dump or output artifacts on the host?
   context: Pypykatz can write parsed credentials to output files even when reading hives in memory, and related dumping flows leave .save hive copies or .dmp files. Checking for files created by this process confirms execution and reveals where recovered credential material may have been staged, even if the original process has exited.
@@ -289,7 +304,7 @@ questions:
       - CommandLine
 - source: template:cue_process_tool.baseline_deviation
   question: When this host previously ran pypykatz against the registry, what parents and users drove it, and does this alert fit that pattern?
-  context: Even sanctioned tooling leaves a baseline. The query mirrors the rule's selection — image pypykatz.exe or python.exe with a command line containing both "live" and "registry" — scoped to this host, so the parent/user distribution reflects how this specific firing pattern has run here before. A new parent process, an unexpected user account, or an unusual command shape is the anomaly worth chasing.
+  context: Even sanctioned tooling leaves a baseline. The query mirrors the rule's selection — image pypykatz.exe or python.exe with a command line containing both "live" and "registry" — scoped to this host, so the parent/user distribution reflects how this specific firing pattern has run here before. A new parent process, an unexpected user account, or an unusual command structure is the anomaly worth chasing.
   range: -14d
   query: |
     aggregation: true
@@ -311,8 +326,11 @@ questions:
     - ParentImage
     - User
 - source: template:cue_user_actor.baseline
-  question: Does this user normally run pypykatz or other credential-parsing tools?
-  context: Compare this user's current action against their historical behavior. A user who has never run pypykatz registry parsing is more suspicious than one who does so as part of a known security role. User role and typical toolset should align with credential-dumping activity.
+  question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
   range: -90d
   query: |
     aggregation: true
@@ -321,14 +339,25 @@ questions:
       product: windows
     detection:
       selection:
+        Image|endswith:
+        - \pypykatz.exe
+        - \python.exe
+        CommandLine|contains|all:
+        - live
+        - registry
+      _pb_scope:
         User|expand: '%User%'
-        Image|endswith|expand: '%Image%'
-      condition: selection
+      condition: (selection) and _pb_scope
     fields:
-      - host.name
+    - host.name
 - source: template:cue_user_actor.baseline_svc
-  question: Is this parent and binary combination historically routine on this host or across the environment, or is the parent unusual for this binary?
-  context: 'When the alert fires under a service principal, user identity does not attribute behavior. The meaningful pivot is the launch mechanism: which parent process spawned this binary, and is that pair historically common. A new or rare parent for pypykatz/python on this host or env-wide is the deviation worth chasing; a pair that already accounts for many prior events is more likely sanctioned automation.'
+  question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
   range: -90d
   query: |
     aggregation: true
@@ -337,11 +366,17 @@ questions:
       product: windows
     detection:
       selection:
+        Image|endswith:
+        - \pypykatz.exe
+        - \python.exe
+        CommandLine|contains|all:
+        - live
+        - registry
+      _pb_scope:
         process.parent.name|expand: '%ParentName%'
-        Image|endswith|expand: '%Image%'
-      condition: selection
+      condition: (selection) and _pb_scope
     fields:
-      - host.name
+    - host.name
 - source: template:cue_user_actor.clustering
   question: What else did this user do across the network around this time?
   context: Tracking the user's activity across all hosts reveals lateral movement or activity across multiple endpoints. If the same user triggered credential access or other suspicious activity on multiple hosts, the scope of compromise may be larger than this single alert.
@@ -359,8 +394,13 @@ questions:
       - host.name
       - Image
 - source: template:cue_user_actor.clustering_svc
-  question: Did this same parent and binary combination fire on other hosts in the same window — a coordinated automation rollout, or activity isolated to this host?
-  context: Under a service principal, "what else did this user do across the network" returns agent-telemetry noise because every host runs SYSTEM-owned agents constantly. The meaningful question is whether the same launch mechanism — parent process plus spawned binary — fired on other hosts in the alert window. Multiple hosts in the same window points to scheduled or pushed automation; a single host points to a host-local trigger.
+  question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
   range: +/-1h
   query: |
     aggregation: true
@@ -369,11 +409,17 @@ questions:
       product: windows
     detection:
       selection:
+        Image|endswith:
+        - \pypykatz.exe
+        - \python.exe
+        CommandLine|contains|all:
+        - live
+        - registry
+      _pb_scope:
         process.parent.name|expand: '%ParentName%'
-        Image|endswith|expand: '%Image%'
-      condition: selection
+      condition: (selection) and _pb_scope
     fields:
-      - host.name
+    - host.name
 - source: template:cue_host_context.precursor
   question: Did other detections fire on this host in the hours before this alert?
   context: Alerts rarely happen in isolation. Earlier detections on the same host — defense tampering, reconnaissance, or privilege escalation — may reveal the attack stages that preceded credential access and help reconstruct the full timeline leading up to this event.

@@ -1,7 +1,7 @@
 name: PUA - Chisel Tunneling Tool Execution
 id: d9e042bb-2922-4daa-956c-0188f12dc30a
 description: |
-  Detects execution of Chisel, a single-binary Go-based TCP/UDP tunnel that relays traffic over HTTP/WebSocket and secures it with SSH. The rule fires when EITHER the process image ends in chisel.exe, OR the command line carries the client/server subcommand strings, OR it carries Chisel's tunneling flags (-socks5, -reverse, reverse-forward "r:" prefixes, the loopback ":127.0.0.1:" relay form, -tls-skip-verify, or :socks) — any one branch is sufficient. Chisel is a dual-use tool: it has legitimate uses for traversing firewalls during development and remote administration, but in intrusions it is used to build SOCKS proxies and reverse port forwards that bridge an internal host to operator infrastructure for command-and-control and lateral pivoting. Investigation should confirm the command line matches the tunneling pattern, identify the tunnel direction and endpoints, and determine whether the tool and its destination are authorized for this host.
+  Detects execution of Chisel, a single-binary Go-based TCP/UDP tunnel that relays traffic over HTTP/WebSocket and secures it with SSH. The rule fires when EITHER the process image ends in chisel.exe, OR the command line carries the client/server subcommand strings together with one of Chisel's tunneling flags (-socks5, -reverse, reverse-forward "r:" prefixes, the loopback ":127.0.0.1:" relay form, -tls-skip-verify, or :socks) — either branch is sufficient. Chisel is a dual-use tool: it has legitimate uses for traversing firewalls during development and remote administration, but in intrusions it is used to build SOCKS proxies and reverse port forwards that bridge an internal host to operator infrastructure for command-and-control and lateral pivoting. Investigation should confirm the command line matches the tunneling pattern, identify the tunnel direction and endpoints, and determine whether the tool and its destination are authorized for this host.
 type: detection
 detection_id: 8b0e12da-d3c3-49db-bb4f-256703f380e5
 detection_category: ''
@@ -11,8 +11,8 @@ contributors:
 created: 2026-06-05
 questions:
 - source: template:universal.verify_trigger_match
-  question: Does this process match the Chisel tunneling pattern via its image name, its client/server subcommand, or its tunneling flags?
-  context: The rule fires when EITHER the image ends in chisel.exe, OR the command line contains 'exe client '/'exe server ', OR it contains a tunneling flag (-socks5, -reverse, ' r:', ':127.0.0.1:', '-tls-skip-verify ', or :socks). Confirm which branch matched and read the full command line — a rename can hide the image branch while the flags still fire, and a flag-only match is meaningful because operators frequently rename the binary. Note which branch fired; the image-name branch alone implies an unmodified binary, while a flag-only match on a renamed image points to deliberate evasion and makes the command-line decode load-bearing.
+  question: Does this process match the Chisel tunneling pattern via its image name, or a client/server subcommand together with a tunneling flag?
+  context: The rule fires when EITHER the image ends in chisel.exe, OR the command line contains 'exe client '/'exe server ' together with a tunneling flag (-socks5, -reverse, ' r:', ':127.0.0.1:', '-tls-skip-verify ', or :socks). Confirm which branch matched and read the full command line — a rename can hide the image branch while the flags still fire, and a flag-only match is meaningful because operators frequently rename the binary. Note which branch fired; the image-name branch alone implies an unmodified binary, while a flag-only match on a renamed image points to deliberate evasion and makes the command-line decode load-bearing.
   range: +/-5m
   query: |
     aggregation: false
@@ -44,7 +44,7 @@ questions:
       - User
 - source: template:cue_process_tool.mechanism_decode
   question: What tunnel did this Chisel invocation build? Decode the subcommand, mode, endpoints, and TLS flags from the command line.
-  context: The full command line reveals the tunnel's shape. Determine whether it ran as client or server; whether it enables a SOCKS5 proxy (-socks5 / the socks remote token) or reverse forwarding (-reverse / 'r:' / 'R:' prefixes); the server address and port; and whether certificate validation was skipped (-tls-skip-verify). The ':127.0.0.1:' form and the socks token bridge to a loopback service, exposing it through the tunnel. A reverse forward means the server side listens and the client proxies an internal service outward — the pattern most often seen in intrusions.
+  context: The full command line reveals the tunnel's pattern. Determine whether it ran as client or server; whether it enables a SOCKS5 proxy (-socks5 / the socks remote token) or reverse forwarding (-reverse / 'r:' / 'R:' prefixes); the server address and port; and whether certificate validation was skipped (-tls-skip-verify). The ':127.0.0.1:' form and the socks token bridge to a loopback service, exposing it through the tunnel. A reverse forward means the server side listens and the client proxies an internal service outward — the pattern most often seen in intrusions.
   range: +/-5m
   query: |
     aggregation: false
@@ -181,7 +181,7 @@ questions:
       - CommandLine
 - source: template:cue_process_tool.baseline_deviation
   question: When this host has previously fired the Chisel pattern, what parents and users drove it, and does the current alert fit?
-  context: Even a sanctioned tunneling tool tends to run from a consistent parent and account. The query mirrors the rule's selection structure scoped to this host, so the resulting parent/user distribution reflects how the rule's specific firing pattern -- not generic binary usage -- has historically run here. A new parent process, an unexpected user account, or an unusual command-line shape relative to that history is the deviation worth chasing.
+  context: Even a sanctioned tunneling tool tends to run from a consistent parent and account. The query mirrors the rule's selection structure scoped to this host, so the resulting parent/user distribution reflects how the rule's specific firing pattern -- not generic binary usage -- has historically run here. A new parent process, an unexpected user account, or an unusual command-line structure relative to that history is the deviation worth chasing.
   range: -14d
   query: |
     aggregation: true
@@ -210,8 +210,11 @@ questions:
     - ParentImage
     - User
 - source: template:cue_user_actor.baseline
-  question: Does this user normally run network tunneling tools?
-  context: Compare this user's current action against their historical behavior across all hosts. A user who has never run a tunneling tool is more suspicious than one whose role -- network engineering, penetration testing, or development -- regularly involves them. The user's role and typical toolset should align with building a proxy or reverse forward.
+  question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
   range: -90d
   query: |
     aggregation: true
@@ -219,15 +222,33 @@ questions:
       category: process_creation
       product: windows
     detection:
-      selection:
+      selection_img:
+        Image|endswith: \chisel.exe
+      selection_param1:
+        CommandLine|contains:
+        - 'exe client '
+        - 'exe server '
+      selection_param2:
+        CommandLine|contains:
+        - -socks5
+        - -reverse
+        - ' r:'
+        - ':127.0.0.1:'
+        - '-tls-skip-verify '
+        - :socks
+      _pb_scope:
         User|expand: '%User%'
-        Image|endswith|expand: '%Image%'
-      condition: selection
+      condition: (selection_img or all of selection_param*) and _pb_scope
     fields:
-      - host.name
+    - host.name
 - source: template:cue_user_actor.baseline_svc
-  question: Is this parent and Chisel combination historically routine on this host or across the environment, or is the parent unusual for this binary?
-  context: When the alert fires under a service principal, user identity does not attribute the behavior; the meaningful pivot is the launch mechanism. Which parent process spawned Chisel, and is that pair historically common here. A new or rare parent for this binary -- on this host or environment-wide -- is the deviation worth chasing; a pair that already accounts for many prior events is more likely deployment or scheduled automation.
+  question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
   range: -90d
   query: |
     aggregation: true
@@ -235,12 +256,25 @@ questions:
       category: process_creation
       product: windows
     detection:
-      selection:
+      selection_img:
+        Image|endswith: \chisel.exe
+      selection_param1:
+        CommandLine|contains:
+        - 'exe client '
+        - 'exe server '
+      selection_param2:
+        CommandLine|contains:
+        - -socks5
+        - -reverse
+        - ' r:'
+        - ':127.0.0.1:'
+        - '-tls-skip-verify '
+        - :socks
+      _pb_scope:
         process.parent.name|expand: '%ParentName%'
-        Image|endswith|expand: '%Image%'
-      condition: selection
+      condition: (selection_img or all of selection_param*) and _pb_scope
     fields:
-      - host.name
+    - host.name
 - source: template:cue_user_actor.clustering
   question: What else did this user do across the network around this time?
   context: Tracking the user's activity across all hosts in the surrounding window reveals lateral movement or activity spanning multiple endpoints. If the same user triggered tunneling or other operator activity on several hosts, the scope of the activity is larger than this single alert.
@@ -258,8 +292,13 @@ questions:
       - host.name
       - Image
 - source: template:cue_user_actor.clustering_svc
-  question: Did this same parent and Chisel combination fire on other hosts in the same window, indicating a coordinated rollout rather than isolated activity?
-  context: Under a service principal, asking what else the user did across the network returns agent-telemetry noise. The meaningful question is whether the same launch mechanism -- parent process plus spawned binary -- fired on other hosts in the alert window. Multiple hosts in the same window points to scheduled or pushed deployment; a single host points to a host-local trigger.
+  question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
   range: +/-1h
   query: |
     aggregation: true
@@ -267,12 +306,25 @@ questions:
       category: process_creation
       product: windows
     detection:
-      selection:
+      selection_img:
+        Image|endswith: \chisel.exe
+      selection_param1:
+        CommandLine|contains:
+        - 'exe client '
+        - 'exe server '
+      selection_param2:
+        CommandLine|contains:
+        - -socks5
+        - -reverse
+        - ' r:'
+        - ':127.0.0.1:'
+        - '-tls-skip-verify '
+        - :socks
+      _pb_scope:
         process.parent.name|expand: '%ParentName%'
-        Image|endswith|expand: '%Image%'
-      condition: selection
+      condition: (selection_img or all of selection_param*) and _pb_scope
     fields:
-      - host.name
+    - host.name
 - source: template:cue_host_context.clustering
   question: What other activity occurred on this host around the time of the alert?
   context: Tunnel setup rarely occurs in isolation. Examining activity in the window around the alert reveals what led to the tunnel and what followed -- reconnaissance, credential access, privilege escalation, or staging -- and whether the tunnel is one stage of a larger sequence. Novel parent-child pairs at low counts are what to scan for.

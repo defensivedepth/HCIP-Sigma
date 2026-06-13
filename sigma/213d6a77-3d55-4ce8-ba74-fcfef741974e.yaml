@@ -12,7 +12,7 @@ created: 2026-06-08
 questions:
 - source: template:universal.verify_trigger_match
   question: Does the command line search for private-key extensions using cmd dir, PowerShell Get-ChildItem, or findstr?
-  context: Confirm the alert is a true positive by reviewing the exact command line, Image, and OriginalFileName against the rule's criteria. The rule fires when a key extension (.key, .pem, .pfx, .ppk, .p12, .pgp, .gpg, .cer, .p7b, .asc) appears on the command line AND one of three branches matched — cmd.exe with a dir search, powershell.exe/pwsh.exe with Get-ChildItem, or findstr.exe. Note which branch fired and which extensions were named, because the search tool and the targeted extensions shape every downstream question.
+  context: Confirm the alert is a true positive by reviewing the exact command line, Image, and OriginalFileName against the rule's criteria. The rule fires when a key extension (.key, .pem, .pfx, .ppk, .p12, .pgp, .gpg, .cer, .p7b, .asc) appears on the command line AND one of three branches matched — cmd.exe with a dir search, powershell.exe/pwsh.exe with Get-ChildItem, or findstr.exe. Note which branch fired and which extensions were named, because the search tool and the targeted extensions pattern every downstream question.
   range: +/-5m
   query: |
     aggregation: false
@@ -169,22 +169,37 @@ questions:
       - ShareName
       - SubjectUserName
 - source: template:credential_access.post_access_lateral_movement
-  question: Did any new logon sessions or remote connections follow this search on the host?
-  context: Located private keys are used to authenticate elsewhere — SSH keys for remote shells, client certificates for VPN or web services, code-signing keys for tampering. Follow-on alerts indicating new authentications, remote sessions, or outbound connections shortly after the search point to the discovered key material already being put to use.
+  question: Were outbound remote-access connections (RDP, SMB, WinRM, SSH) initiated from this host after
+    this event?
+  context: Credential theft is typically followed by lateral movement. The query returns outbound connections
+    from this host to remote-access ports -- 3389 (RDP), 445 (SMB/PsExec), 5985/5986 (WinRM), 22 (SSH)
+    -- in the hours after the event; the originating Image and User show what drove each connection. Two
+    limits to keep in mind -- credentials exfiltrated and replayed from another machine will not appear
+    here (check security 4624 logons on suspected targets for this account and any accounts with sessions
+    on this host), and the query requires Sysmon network telemetry (EID 3); if that is not collected from
+    this host, treat zero rows as a visibility gap, not as evidence no movement occurred.
   range: +4h
   query: |
     aggregation: false
     logsource:
+      category: network_connection
       product: windows
     detection:
       selection:
-        event.module: sigma
         host.name|expand: '%hostname%'
+        Initiated: 'true'
+        DestinationPort:
+          - 3389
+          - 445
+          - 5985
+          - 5986
+          - 22
       condition: selection
     fields:
-      - rule.name
-      - rule.uuid
-      - event.severity_label
+      - DestinationIp
+      - DestinationPort
+      - Image
+      - User
 - source: template:credential_access.credential_exposure_assessment
   question: Which keys or certificates would the searched paths expose, and do any protect privileged access?
   context: The severity depends on what the located key material protects. A domain code-signing certificate, a CA key, an SSH key for a privileged jump host, or a VPN client certificate warrants escalation and rotation; a self-signed developer key may only need monitoring. Cross-reference the targeted paths and any matching files against the systems and identities those credentials authenticate to.
@@ -202,7 +217,7 @@ questions:
       - CommandLine
 - source: template:cue_process_tool.baseline_deviation
   question: When this host previously matched the rule's key-search pattern, what parents and users drove it, and does the current alert fit?
-  context: Even routine PKI and backup tooling can search for key files. The query mirrors the rule's full selection structure scoped to this host, so the resulting parent/user distribution reflects how this specific key-search pattern has historically run here. A new parent process, an unexpected user account, or an unusual command-line shape relative to that history is the deviation worth chasing.
+  context: Even routine PKI and backup tooling can search for key files. The query mirrors the rule's full selection structure scoped to this host, so the resulting parent/user distribution reflects how this specific key-search pattern has historically run here. A new parent process, an unexpected user account, or an unusual command-line structure relative to that history is the deviation worth chasing.
   range: -14d
   query: |
     aggregation: true
@@ -246,8 +261,11 @@ questions:
     - ParentImage
     - User
 - source: template:cue_user_actor.baseline
-  question: Does this user normally run command-line searches for key or certificate files?
-  context: Compare this user's current action against their historical behavior. A user who has never searched for key material is more suspicious than a certificate administrator or backup operator who does so regularly. The query counts this user's executions of the same search binary across all hosts over 90 days; zero or very low counts indicate first-time or rare activity.
+  question: Has this user previously produced the rule's pattern, and does that history fit their role?
+  context: The query mirrors the rule's selection structure scoped to this user — the result is the user's
+    90-day history of the rule's specific firing pattern (not generic use of the binary), aggregated by
+    host. A user who has never produced this pattern is more suspicious than one who does so regularly;
+    weigh the count against the user's role and typical toolset.
   range: -90d
   query: |
     aggregation: true
@@ -255,15 +273,48 @@ questions:
       category: process_creation
       product: windows
     detection:
-      selection:
+      selection_cmd_img:
+      - Image|endswith: \cmd.exe
+      - OriginalFileName: Cmd.Exe
+      selection_cmd_cli:
+        CommandLine|contains: 'dir '
+      selection_pwsh_img:
+      - Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+      - OriginalFileName:
+        - PowerShell.EXE
+        - pwsh.dll
+      selection_pwsh_cli:
+        CommandLine|contains: 'Get-ChildItem '
+      selection_findstr:
+      - Image|endswith: \findstr.exe
+      - OriginalFileName: FINDSTR.EXE
+      selection_ext:
+        CommandLine|contains:
+        - .key
+        - .pgp
+        - .gpg
+        - .ppk
+        - .p12
+        - .pem
+        - .pfx
+        - .cer
+        - .p7b
+        - .asc
+      _pb_scope:
         User|expand: '%User%'
-        Image|endswith|expand: '%Image%'
-      condition: selection
+      condition: (selection_ext and (all of selection_cmd_* or all of selection_pwsh_* or selection_findstr)) and _pb_scope
     fields:
-      - host.name
+    - host.name
 - source: template:cue_user_actor.baseline_svc
-  question: Is this parent+binary launch routine on this host or across the environment, or is the parent unusual for this search tool?
-  context: When the alert fires under a service principal, user identity does not attribute behavior; the meaningful pivot is the launch mechanism. A parent process that already accounts for many prior executions of this search binary is backup or PKI automation; a new or rare parent for this binary is the deviation worth chasing.
+  question: Has this parent process historically driven the rule's pattern on this host or across the
+    environment, or is the parent new for this activity?
+  context: 'When the alert fires under a service principal, user identity does not attribute behavior.
+    The meaningful pivot is the launch mechanism: the query mirrors the rule''s selection structure scoped
+    to the alerting parent process, so the result is the 90-day history of this parent driving this specific
+    pattern (not generic parent+binary co-occurrence). A new or rare parent for this pattern is the deviation
+    worth chasing; a parent that already accounts for thousands of prior events is vendor or OS automation.'
   range: -90d
   query: |
     aggregation: true
@@ -271,12 +322,40 @@ questions:
       category: process_creation
       product: windows
     detection:
-      selection:
+      selection_cmd_img:
+      - Image|endswith: \cmd.exe
+      - OriginalFileName: Cmd.Exe
+      selection_cmd_cli:
+        CommandLine|contains: 'dir '
+      selection_pwsh_img:
+      - Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+      - OriginalFileName:
+        - PowerShell.EXE
+        - pwsh.dll
+      selection_pwsh_cli:
+        CommandLine|contains: 'Get-ChildItem '
+      selection_findstr:
+      - Image|endswith: \findstr.exe
+      - OriginalFileName: FINDSTR.EXE
+      selection_ext:
+        CommandLine|contains:
+        - .key
+        - .pgp
+        - .gpg
+        - .ppk
+        - .p12
+        - .pem
+        - .pfx
+        - .cer
+        - .p7b
+        - .asc
+      _pb_scope:
         process.parent.name|expand: '%ParentName%'
-        Image|endswith|expand: '%Image%'
-      condition: selection
+      condition: (selection_ext and (all of selection_cmd_* or all of selection_pwsh_* or selection_findstr)) and _pb_scope
     fields:
-      - host.name
+    - host.name
 - source: template:cue_user_actor.clustering
   question: What else did this user do across the network around this time?
   context: Tracking the user's activity across all hosts reveals whether the key search was an isolated action or part of broader hands-on activity. The same user searching for key material or running other reconnaissance on multiple endpoints in the same window widens the likely scope of compromise.
@@ -294,8 +373,13 @@ questions:
       - host.name
       - Image
 - source: template:cue_user_actor.clustering_svc
-  question: Did this same parent+binary combination fire on other hosts in the same window?
-  context: Under a service principal, user-pivoted clustering returns agent-telemetry noise. The meaningful question is whether the same launch mechanism — parent process plus search binary — fired on other hosts in the alert window. Multiple hosts point to scheduled or pushed automation searching for key files fleet-wide; a single host points to a host-local trigger.
+  question: Did this same parent-driven pattern fire on other hosts in the same window — i.e., is this
+    a coordinated automation rollout, or is the activity isolated to this host?
+  context: 'Under a service principal, "what else did this user do across the network" returns agent-telemetry
+    noise (every host runs SYSTEM-owned agents constantly). The meaningful question is whether the same
+    launch mechanism fired elsewhere: the query mirrors the rule''s selection structure scoped to the
+    alerting parent process, fleet-wide, in the alert window. Multiple hosts in the same window points
+    to scheduled or pushed automation; a single host points to a host-local trigger.'
   range: +/-1h
   query: |
     aggregation: true
@@ -303,12 +387,40 @@ questions:
       category: process_creation
       product: windows
     detection:
-      selection:
+      selection_cmd_img:
+      - Image|endswith: \cmd.exe
+      - OriginalFileName: Cmd.Exe
+      selection_cmd_cli:
+        CommandLine|contains: 'dir '
+      selection_pwsh_img:
+      - Image|endswith:
+        - \powershell.exe
+        - \pwsh.exe
+      - OriginalFileName:
+        - PowerShell.EXE
+        - pwsh.dll
+      selection_pwsh_cli:
+        CommandLine|contains: 'Get-ChildItem '
+      selection_findstr:
+      - Image|endswith: \findstr.exe
+      - OriginalFileName: FINDSTR.EXE
+      selection_ext:
+        CommandLine|contains:
+        - .key
+        - .pgp
+        - .gpg
+        - .ppk
+        - .p12
+        - .pem
+        - .pfx
+        - .cer
+        - .p7b
+        - .asc
+      _pb_scope:
         process.parent.name|expand: '%ParentName%'
-        Image|endswith|expand: '%Image%'
-      condition: selection
+      condition: (selection_ext and (all of selection_cmd_* or all of selection_pwsh_* or selection_findstr)) and _pb_scope
     fields:
-      - host.name
+    - host.name
 - source: template:cue_host_context.precursor
   question: Did other detections fire on this host in the hours before this search?
   context: A key-file search rarely stands alone. Earlier detections on the same host — execution from a script host, defense tampering, or other reconnaissance — may reveal the access stage that preceded this credential-hunting step and help reconstruct the timeline.

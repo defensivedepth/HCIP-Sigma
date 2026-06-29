@@ -10,7 +10,7 @@ regenerate rather than hand-edit.
 |---|---|---|
 | `field_inventory.md` | Catalogue of every field name used in the playbook question queries, grouped by logsource category, with the SO/ECS field each converts to. ECS targets are ground-truth — derived by running `sigma convert` through the deployed pipeline stack. | `python3 scratch/gen_field_inventory.py` |
 | `generation_meta.json` | Build-time provenance lifted out of every playbook: the per-question `source:` marker (which template / ATT&CK analytic produced each question) and the full `_generation_meta` audit block (techniques, attack-chain & dimension coverage, dedup and hint dispositions, template sets applied, generation stats), plus a corpus-level rollup. | `python3 _meta/build_generation_meta.py` |
-| `generation_meta.html` | Self-contained viewer for `generation_meta.json` — corpus rollup, filter-by-name/id/technique/source, and a per-playbook drill-down. Open directly or serve the `_meta/` dir. | n/a (static) |
+| `../docs/generation_meta.html` | Self-contained viewer for `generation_meta.json`. **Lives in `docs/`, not here** — GitHub Pages publishes only `docs/` and Jekyll ignores `_`-prefixed dirs, so a viewer under `_meta/` would not be web-served. It fetches this archive from `raw.githubusercontent.com`. Live at `https://defensivedepth.github.io/HCIP-Sigma/generation_meta.html` (linked from the site index). | n/a (static) |
 
 > **Regenerating `generation_meta.json`:** the published playbooks no longer carry
 > the `_generation_meta` block or per-question `source:` markers (they were stripped

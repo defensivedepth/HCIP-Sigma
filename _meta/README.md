@@ -9,6 +9,19 @@ regenerate rather than hand-edit.
 | file | what it is | regenerate |
 |---|---|---|
 | `field_inventory.md` | Catalogue of every field name used in the playbook question queries, grouped by logsource category, with the SO/ECS field each converts to. ECS targets are ground-truth — derived by running `sigma convert` through the deployed pipeline stack. | `python3 scratch/gen_field_inventory.py` |
+| `generation_meta.json` | Build-time provenance lifted out of every playbook: the per-question `source:` marker (which template / ATT&CK analytic produced each question) and the full `_generation_meta` audit block (techniques, attack-chain & dimension coverage, dedup and hint dispositions, template sets applied, generation stats), plus a corpus-level rollup. | `python3 _meta/build_generation_meta.py` |
+| `generation_meta.html` | Self-contained viewer for `generation_meta.json` — corpus rollup, filter-by-name/id/technique/source, and a per-playbook drill-down. Open directly or serve the `_meta/` dir. | n/a (static) |
+
+> **Regenerating `generation_meta.json`:** the published playbooks no longer carry
+> the `_generation_meta` block or per-question `source:` markers (they were stripped
+> into this archive). Running the generator against the stripped `sigma/` tree
+> produces an **empty** archive. Point it at a pre-strip tree instead:
+> ```bash
+> TMP=$(mktemp -d) && git archive HEAD sigma | tar -x -C "$TMP"
+> SIGMA_DIR="$TMP/sigma" python3 _meta/build_generation_meta.py && rm -rf "$TMP"
+> ```
+> Better, regenerate it at generation time from the pipeline's pre-publish output.
+> `generation_meta.json` uses compact (no-whitespace) JSON — read it with `jq`.
 
 ## Field-name convention (summary)
 

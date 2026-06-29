@@ -13,11 +13,24 @@ import pathlib
 DOCS = pathlib.Path(__file__).resolve().parent
 SIGMA = DOCS.parent / "sigma"
 OUT = DOCS / "playbooks.json"
+# Provenance (techniques, logsource diversity) was lifted out of the playbooks
+# into this archive; it is the source of truth for those fields here.
+GEN_META = DOCS.parent / "_meta" / "generation_meta.json"
 
 try:
     import yaml
 except ImportError:
     raise SystemExit("PyYAML required: pip install pyyaml")
+
+
+def load_gen_meta():
+    """Map playbook id -> its _generation_meta block from the _meta archive."""
+    if not GEN_META.exists():
+        print(f"  WARNING: {GEN_META.name} not found — techniques/data_sources will "
+              f"fall back to query parsing. Run _meta/build_generation_meta.py first.")
+        return {}
+    doc = json.loads(GEN_META.read_text())
+    return {p["id"]: (p.get("generation_meta") or {}) for p in doc.get("playbooks", [])}
 
 
 def first_line(text):
@@ -26,8 +39,7 @@ def first_line(text):
     return " ".join(str(text).split())
 
 
-def techniques_of(data):
-    meta = data.get("_generation_meta") or {}
+def techniques_of(meta):
     out = []
     for t in meta.get("techniques") or []:
         tid = t.get("id")
@@ -36,9 +48,8 @@ def techniques_of(data):
     return out
 
 
-def data_sources_of(data):
+def data_sources_of(meta, data):
     """Distinct logsource categories used across the playbook's question queries."""
-    meta = data.get("_generation_meta") or {}
     diversity = (meta.get("generation_stats") or {}).get("logsource_diversity") or {}
     if diversity:
         return sorted(diversity.keys())
@@ -57,6 +68,7 @@ def data_sources_of(data):
 
 
 def main():
+    gen_meta = load_gen_meta()
     entries = []
     for path in sorted(SIGMA.glob("*.yaml")):
         try:
@@ -64,13 +76,14 @@ def main():
         except yaml.YAMLError as e:
             print(f"  skip {path.name}: {e}")
             continue
+        meta = gen_meta.get(path.stem, {})
         entries.append({
             "id": path.stem,
             "name": data.get("name", path.stem),
             "description": first_line(data.get("description"))[:400],
             "questions": len(data.get("questions") or []),
-            "techniques": techniques_of(data),
-            "data_sources": data_sources_of(data),
+            "techniques": techniques_of(meta),
+            "data_sources": data_sources_of(meta, data),
         })
 
     entries.sort(key=lambda e: e["name"].lower())

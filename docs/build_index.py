@@ -39,7 +39,10 @@ def classify(rel: pathlib.Path):
             return (f"sos/{sub}" if sub else "sos"), "Security Onion"
         return src_dir, SOURCE_DISPLAY.get(src_dir, src_dir.replace("-", " ").title())
     if top in ("engine", "category"):
-        return top, "Baseline"
+        # Baseline (engine/category) playbooks are authored by Security Onion —
+        # group them under Security Onion for the detection-source breakdown. The
+        # granular `source` slug still distinguishes engine vs category.
+        return top, "Security Onion"
     return top, top.title()
 # Provenance (techniques, logsource diversity) was lifted out of the playbooks
 # into this archive; it is the source of truth for those fields here.
